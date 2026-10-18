@@ -213,8 +213,19 @@ def test_name_filter_commands_and_spoiler_list_and_immediate_scan(tmp_path, monk
             fake_bot, ev_add, "فیلتر اسم علی", chat_id, admin_user.id, admin_user.username
         )
         assert handled is True
-        assert "فیلتر اسم ثبت شد" in ev_add.replies[-1][0]
-        assert "سکوت" in ev_add.replies[-1][0]
+        expected_add_text = "☑️ نام «علی» در فیلتر اسم ثبت شد"
+        add_reply_text, add_reply_kwargs = ev_add.replies[-1]
+        assert add_reply_text == expected_add_text
+        add_entities = add_reply_kwargs.get("formatting_entities", [])
+        expected_u16_len = len(expected_add_text.encode("utf-16-le")) // 2
+        assert any(
+            isinstance(e, MessageEntityBold) and e.offset == 0 and e.length == expected_u16_len
+            for e in add_entities
+        )
+        assert any(
+            isinstance(e, MessageEntityBlockquote) and e.offset == 0 and e.length == expected_u16_len
+            for e in add_entities
+        )
         assert muted_ids == [ali_member.id]
         assert banned_ids == []
 
@@ -224,6 +235,7 @@ def test_name_filter_commands_and_spoiler_list_and_immediate_scan(tmp_path, monk
         await handle_group_word_command(
             fake_bot, ev_add2, "فیلتر اسم عسل", chat_id, admin_user.id, admin_user.username
         )
+        assert ev_add2.replies[-1][0] == "☑️ نام «عسل» در فیلتر اسم ثبت شد"
         assert group_names_storage.get_names(chat_id) == ["علی", "عسل"]
 
         # ۴. نمایش لیست فیلتر اسم با اسپویلر

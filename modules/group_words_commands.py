@@ -203,9 +203,13 @@ async def _punish_existing_members_by_filtered_name(bot, event, chat_id, actor_u
     return punished_count, is_mute_mode
 
 
-def _reply_spoiler_list(title: str, items: list[str]):
+def _reply_spoiler_list(title: str, items: list[str], *, blockquote_header: bool = False):
     try:
-        from splusthon.tl.types import MessageEntitySpoiler, MessageEntityBold
+        from splusthon.tl.types import (
+            MessageEntitySpoiler,
+            MessageEntityBold,
+            MessageEntityBlockquote,
+        )
         has_entities = True
     except ImportError:
         has_entities = False
@@ -214,7 +218,10 @@ def _reply_spoiler_list(title: str, items: list[str]):
     full_text = f"{title}\n\n"
     entities = []
     if has_entities:
-        entities.append(MessageEntityBold(offset=0, length=u16(title)))
+        title_len = u16(title)
+        entities.append(MessageEntityBold(offset=0, length=title_len))
+        if blockquote_header:
+            entities.append(MessageEntityBlockquote(offset=0, length=title_len))
 
     for i, item in enumerate(items):
         start = u16(full_text)
@@ -226,6 +233,19 @@ def _reply_spoiler_list(title: str, items: list[str]):
             full_text += "\n"
 
     return full_text, entities
+
+
+async def _reply_bold_blockquote(event, msg: str):
+    try:
+        from splusthon.tl.types import MessageEntityBold, MessageEntityBlockquote
+        u16_len = len(msg.encode("utf-16-le")) // 2
+        entities = [
+            MessageEntityBold(offset=0, length=u16_len),
+            MessageEntityBlockquote(offset=0, length=u16_len),
+        ]
+        return await event.reply(msg, formatting_entities=entities)
+    except ImportError:
+        return await event.reply(msg)
 
 
 async def handle_group_word_command(bot, event, text, chat_id, user_id, username=None):
@@ -257,30 +277,26 @@ async def handle_group_word_command(bot, event, text, chat_id, user_id, username
                 break
         phrase = phrase.strip()
         if not phrase:
-            await event.reply("⚠️ لطفاً نام مورد نظر را وارد کنید. مثال: فیلتر اسم عسل")
+            await _reply_bold_blockquote(
+                event,
+                "⚠️ لطفاً نام مورد نظر را وارد کنید. مثال: فیلتر اسم عسل",
+            )
             return True
 
         added = add_name(chat_id, phrase)
-        punished_count, is_mute_mode = await _punish_existing_members_by_filtered_name(
+        await _punish_existing_members_by_filtered_name(
             bot, event, chat_id, user_id, phrase
         )
-        action_word = "سکوت" if is_mute_mode else "اخراج"
         if added:
-            if punished_count > 0:
-                await event.reply(
-                    f"☑️ نام «{phrase}» در فیلتر اسم ثبت شد و تعداد {punished_count} کاربر با این نام {action_word} شدند."
-                )
-            else:
-                await event.reply(
-                    f"☑️ نام «{phrase}» در فیلتر اسم ثبت شد (مجازات گروه: {action_word})."
-                )
+            await _reply_bold_blockquote(
+                event,
+                f"☑️ نام «{phrase}» در فیلتر اسم ثبت شد",
+            )
         else:
-            if punished_count > 0:
-                await event.reply(
-                    f"⚠️ نام «{phrase}» قبلاً در فیلتر اسم ثبت شده بود و تعداد {punished_count} کاربر با این نام {action_word} شدند."
-                )
-            else:
-                await event.reply("⚠️ این نام قبلا در فیلتر اسم این گروه ثبت شده است")
+            await _reply_bold_blockquote(
+                event,
+                "⚠️ این نام قبلا در فیلتر اسم این گروه ثبت شده است",
+            )
         return True
 
     if text in _REMOVE_NAME_BARE or text.startswith(_REMOVE_NAME_PREFIXES):
@@ -291,25 +307,41 @@ async def handle_group_word_command(bot, event, text, chat_id, user_id, username
                 break
         phrase = phrase.strip()
         if not phrase:
-            await event.reply("⚠️ لطفاً نام مورد نظر را وارد کنید. مثال: لغو اسم عسل")
+            await _reply_bold_blockquote(
+                event,
+                "⚠️ لطفاً نام مورد نظر را وارد کنید. مثال: لغو اسم عسل",
+            )
             return True
 
         if remove_name(chat_id, phrase):
-            await event.reply(f"✅ نام «{phrase}» از فیلتر اسم این گروه حذف شد")
+            await _reply_bold_blockquote(
+                event,
+                f"✅ نام «{phrase}» از فیلتر اسم این گروه حذف شد",
+            )
         else:
-            await event.reply("⚠️ این نام در فیلتر اسم این گروه نیست")
+            await _reply_bold_blockquote(
+                event,
+                "⚠️ این نام در فیلتر اسم این گروه نیست",
+            )
         return True
 
     if text in _LIST_NAME_COMMANDS:
         names = get_names(chat_id)
         if names:
-            full_text, entities = _reply_spoiler_list("📋 لیست فیلتر اسم:", names)
+            full_text, entities = _reply_spoiler_list(
+                "📋 لیست فیلتر اسم:",
+                names,
+                blockquote_header=True,
+            )
             if entities:
                 await event.reply(full_text, formatting_entities=entities)
             else:
                 await event.reply(full_text)
         else:
-            await event.reply("📋 هیچ نامی در فیلتر اسم ثبت نشده")
+            await _reply_bold_blockquote(
+                event,
+                "📋 هیچ نامی در فیلتر اسم ثبت نشده",
+            )
         return True
 
     # ============================================================
