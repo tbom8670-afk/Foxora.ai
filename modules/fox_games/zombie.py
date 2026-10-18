@@ -478,6 +478,21 @@ def _strip_target_prefix(raw_text):
 
 def match_target_candidate(targets, raw_text):
     """تطبیق متن ارسالی زامبی با یکی از سه گزینهٔ هدف (بر اساس نام نمایشی یا یوزرنیم)."""
+    raw_norm = normalize_text(raw_text)
+    option_map = {
+        normalize_text("کاربر یک"): 0,
+        normalize_text("کاربر ۱"): 0,
+        normalize_text("کاربر 1"): 0,
+        normalize_text("کاربر دو"): 1,
+        normalize_text("کاربر ۲"): 1,
+        normalize_text("کاربر 2"): 1,
+        normalize_text("کاربر سه"): 2,
+        normalize_text("کاربر ۳"): 2,
+        normalize_text("کاربر 3"): 2,
+    }
+    if raw_norm in option_map and option_map[raw_norm] < len(targets):
+        return dict(targets[option_map[raw_norm]])
+
     cleaned = _strip_target_prefix(raw_text)
     if not cleaned:
         return None

@@ -1277,13 +1277,18 @@ async def _start_zombie(bot, event, chat_id, logger):
             bot.client, chat_id, assignment, logger=logger,
         )
 
-    async def on_started(_assignment):
+    async def on_started(assignment):
+        zombie_player = assignment["by_role"][zombie.ROLE_ZOMBIE]
+        targets = assignment["targets"]
+        prompt_text, prompt_entities = zombie.build_zombie_prompt(
+            zombie_player, targets
+        )
         await _send_group_only(
             bot,
             event,
             chat_id,
-            "🧟‍♂ نقش‌های بازی زامبی به پیوی خصوصی بازیکنان ارسال شد!\n"
-            f"⏳ زامبی {to_persian_digits(zombie.BITE_SECONDS)} ثانیه فرصت دارد هدف خود را انتخاب کند.",
+            prompt_text,
+            prompt_entities,
         )
 
     async def on_timeout(_info):

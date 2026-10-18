@@ -615,3 +615,49 @@ def test_multi_group_isolation():
         assert zombie.get_apocalypse_state(chat_b) is None
 
     asyncio.run(_run())
+
+
+def test_group_start_sends_full_zombie_target_prompt_after_4_joins():
+    """پس از تکمیل ۴ شرکت‌کننده در گروه، پیام کامل «🧟‍♂ بازیکن زامبی انتخاب شد : ...» با کوت واقعی و Bold ارسال می‌شود."""
+    async def _run():
+        chat_id = -10077099
+        client = FakeClient()
+        bot = FakeBot(client=client)
+
+        players = [
+            FakeUser(991, "امیر", username="amir_z1"),
+            FakeUser(992, "بهنام", username="behnam_z2"),
+            FakeUser(993, "پویا", last_name="مرادی"),
+            FakeUser(994, "تارا", username="tara_z4"),
+        ]
+
+        start_ev = FakeEvent(chat_id, players[0], "زامبی")
+        await router.handle(bot, start_ev, chat_id, players[0].id, players[0], "زامبی", bot.logger)
+
+        for p in players:
+            join_ev = FakeEvent(chat_id, p, "شرکت")
+            await router.handle(bot, join_ev, chat_id, p.id, p, "شرکت", bot.logger)
+
+        # صبر کوتاه برای اجرای تکمیل ثبت‌نام و ارسال پیام شروع در گروه
+        for _ in range(30):
+            if len(start_ev.replies) >= 2:
+                break
+            await asyncio.sleep(0.02)
+
+        assert len(start_ev.replies) >= 2
+        started_text, started_entities = start_ev.replies[1]
+        assert started_text.startswith("🧟‍♂ بازیکن زامبی انتخاب شد : ")
+        assert "دقت کن از سه کاربر زیر فقط می‌توانی یک نفر را با گاز زدن تبدیل به زامبی کنی" in started_text
+        assert "کاربر یک:" in started_text
+        assert "کاربر دو:" in started_text
+        assert "کاربر سه:" in started_text
+        assert "یک نفر انتخاب کن؛ مهلت ۱۷ ثانیه" in started_text
+
+        quotes = [e for e in (started_entities or []) if isinstance(e, MessageEntityBlockquote)]
+        bolds = [e for e in (started_entities or []) if isinstance(e, MessageEntityBold)]
+        assert len(quotes) == 1
+        assert len(bolds) == 1
+        first_line = started_text.splitlines()[0]
+        assert _slice_u16(started_text, quotes[0].offset, quotes[0].length) == first_line
+
+    asyncio.run(_run())
