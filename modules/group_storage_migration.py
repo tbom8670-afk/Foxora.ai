@@ -105,6 +105,7 @@ def migrate_all_group_storage():
         (runtime_config_file("groups.json"), _merge_group_record),
         (runtime_config_file("admins.json"), _merge_list),
         (runtime_config_file("group_words.json"), _merge_list),
+        (runtime_config_file("group_filtered_names.json"), _merge_list),
         (runtime_config_file("group_banned_words.json"), _merge_flag),
         (runtime_config_file("banned_users.json"), _merge_list),
         (runtime_log_file("group_stats.json", migrate=True), _merge_counters),

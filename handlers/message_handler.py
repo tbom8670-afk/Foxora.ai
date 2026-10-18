@@ -3490,18 +3490,29 @@ async def handle_new_message(bot, event):
         profiler.mark("RECEIVE")
         # Independent advertising-name guard: runs before text moderation and
         # never contributes a warning or banned-word record.
-        command_priority = normalize_command(message_text) in {
-            "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
-            "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
-            "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
-            "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
-            "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه",
-            "فعال", "غیر فعال", "فعال سازی",
-            "کپی بورد", "کپی",
-            "ثبت مالک", "لغو مالک", "برکناری مالک",
-            "ثبت گروه", "حذف گروه",
-            "۵ روز", "یک هفته", "دو هفته", "یک ماه",
-        }
+        norm_cmd_text = normalize_command(message_text)
+        command_priority = (
+            norm_cmd_text in {
+                "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
+                "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
+                "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
+                "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+                "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه",
+                "فعال", "غیر فعال", "فعال سازی",
+                "کپی بورد", "کپی",
+                "ثبت مالک", "لغو مالک", "برکناری مالک",
+                "ثبت گروه", "حذف گروه",
+                "۵ روز", "یک هفته", "دو هفته", "یک ماه",
+                "لیست فیلتر اسم", "لیست فیلتر نام", "فیلترهای اسم",
+            }
+            or norm_cmd_text.startswith((
+                "سکوت نام", "اخراج نام",
+                "فیلتر اسم", "لغو اسم", "فیلتر نام", "لغو نام",
+                "لغو فیلتر اسم", "حذف فیلتر اسم", "رفع فیلتر اسم",
+                "/فیلتر اسم", "!فیلتر اسم", "/لغو اسم", "!لغو اسم",
+                "/لیست فیلتر اسم", "!لیست فیلتر اسم",
+            ))
+        )
         if (sender and not event.is_private and not command_priority
                 and not is_global_owner(user_id)
                 and not native_admin_warn_only
@@ -3619,6 +3630,155 @@ async def handle_new_message(bot, event):
                             f"chat_id={chat_id} user_id={user_id} "
                             f"name={shown_name!r} reason={ad_reason!r}"
                         )
+                    return
+
+                # فیلتر اسم اختصاصی گروه (ثبت‌شده با «فیلتر اسم ...»):
+                # کاربر دارای نام فیلترشده طبق مجازات فعلی گروه سکوت یا اخراج می‌شود.
+                from modules.group_names_storage import find_matching_filtered_name
+                matched_filtered_name = find_matching_filtered_name(
+                    sender, group_id=chat_id
+                )
+                if matched_filtered_name:
+                    punish_key = _punishment_key(chat_id, user_id)
+                    if punish_key in bot.punished_users:
+                        bot.logger.log_info(
+                            "GROUP NAME FILTER DUPLICATE SKIPPED "
+                            f"chat_id={chat_id} user_id={user_id} "
+                            f"message_id={getattr(event.message, 'id', None)}"
+                        )
+                        return
+                    bot.punished_users.add(punish_key)
+                    current_msg_id = getattr(event.message, "id", None)
+                    fn_ids = message_tracker.spam_snapshot(chat_id, user_id, current_msg_id)
+                    if not fn_ids and current_msg_id:
+                        fn_ids = [current_msg_id]
+                    if fn_ids:
+                        _queue_message_deletes(bot, chat_id, list(fn_ids))
+                    bot.logger.log_deleted_message(
+                        user_id=user_id,
+                        username=sender_username,
+                        group_id=chat_id,
+                        group_title=getattr(event_chat, "title", str(chat_id)),
+                        original_text=message_text,
+                        reason=f"فیلتر اسم: {matched_filtered_name}",
+                        message_id=current_msg_id,
+                    )
+                    shown_name = ad_name_detector.display_name(sender)
+                    is_mute_mode = bool(punishment_mode.is_mute(chat_id))
+                    if is_mute_mode:
+                        fn_action_line = (
+                            f"به دلیل داشتن نام فیلترشده («{matched_filtered_name}») سکوت دائم شد."
+                        )
+                    else:
+                        fn_action_line = (
+                            f"به دلیل داشتن نام فیلترشده («{matched_filtered_name}») اخراج شد."
+                        )
+                    fn_notice = (
+                        "⚠️ کاربر\n"
+                        f"{shown_name}\n\n"
+                        f"{fn_action_line}"
+                    )
+
+                    async def _run_filtered_name_punishment():
+                        if (
+                            is_mute_mode
+                            and getattr(type(bot.admin_actions), "__module__", "") != "modules.admin_actions"
+                            and callable(getattr(bot.admin_actions, "mute_user", None))
+                        ):
+                            return await bot.admin_actions.mute_user(
+                                chat_id, user_id, None, user=sender
+                            )
+                        return await bot.admin_actions.ban_user(
+                            chat_id,
+                            user_id,
+                            reason=f"فیلتر اسم: {matched_filtered_name}",
+                            user=sender,
+                        )
+
+                    async def filtered_name_punish_succeeded(_result):
+                        if fn_ids:
+                            _queue_message_deletes(bot, chat_id, list(fn_ids))
+                        raw_dname = " ".join(
+                            p for p in (
+                                getattr(sender, "first_name", "") or "",
+                                getattr(sender, "last_name", "") or "",
+                            ) if p
+                        ).strip()
+                        try:
+                            if is_mute_mode:
+                                add_mute(chat_id)
+                                from modules import manual_mute_storage
+                                manual_mute_storage.add_manual_mute(
+                                    chat_id, user_id, username=sender_username, display_name=raw_dname
+                                )
+                                user_history.add_mute(chat_id, sender, f"فیلتر اسم {matched_filtered_name}")
+                            else:
+                                add_kick(chat_id)
+                                from modules import banned_storage
+                                banned_storage.add_banned(
+                                    chat_id,
+                                    user_id,
+                                    username=sender_username,
+                                    display_name=raw_dname,
+                                    reason=f"فیلتر اسم {matched_filtered_name}",
+                                    source="name_filter",
+                                )
+                                user_history.add_kick(chat_id, sender, f"فیلتر اسم {matched_filtered_name}")
+                        except Exception:
+                            pass
+
+                        sender3 = getattr(bot, "outgoing_sender", None)
+                        name_start = len("⚠️ کاربر\n".encode("utf-16-le")) // 2
+                        name_len = len(shown_name.encode("utf-16-le")) // 2
+                        bold_len = len("⚠️ کاربر".encode("utf-16-le")) // 2
+                        entities = [
+                            MessageEntityBold(offset=0, length=bold_len),
+                            MessageEntityBlockquote(offset=name_start, length=name_len),
+                        ]
+                        if sender3 is not None:
+                            try:
+                                sender3.enqueue_reply(
+                                    event,
+                                    fn_notice,
+                                    formatting_entities=entities,
+                                    on_done=lambda sent: capture_sent(bot, chat_id, sent),
+                                )
+                            except Exception:
+                                sender3.enqueue_reply(
+                                    event,
+                                    fn_notice,
+                                    on_done=lambda sent: capture_sent(bot, chat_id, sent),
+                                )
+                        else:
+                            try:
+                                sent = await event.reply(fn_notice, formatting_entities=entities)
+                            except Exception:
+                                sent = await event.reply(fn_notice)
+                            capture_sent(bot, chat_id, sent)
+                        bot.logger.log_info(
+                            "GROUP NAME FILTER PUNISH FINISHED "
+                            f"chat_id={chat_id} user_id={user_id} "
+                            f"filtered_name={matched_filtered_name!r} mute={is_mute_mode}"
+                        )
+
+                    async def filtered_name_punish_failed(error):
+                        bot.punished_users.discard(punish_key)
+                        bot.logger.log_error(
+                            "GROUP NAME FILTER PUNISH FAILED "
+                            f"chat_id={chat_id} user_id={user_id} error={error!r}"
+                        )
+
+                    queued = bot.moderation_queue.enqueue(
+                        chat_id,
+                        "ban",
+                        user_id=user_id,
+                        timeout_seconds=45,
+                        operation=_run_filtered_name_punishment,
+                        on_success=filtered_name_punish_succeeded,
+                        on_failure=filtered_name_punish_failed,
+                    )
+                    if not queued:
+                        bot.punished_users.discard(punish_key)
                     return
         # حساب سشن نباید وارد activity، فیلتر یا مجازات شود. با این حال، در
         # معماری userbot مالک همان حساب برای صدور فرمان عمومی استفاده می‌کند.
@@ -4092,15 +4252,21 @@ async def handle_new_message(bot, event):
             _schedule_reply(bot, event, personal_reply)
             return
 
+        from modules.group_words_commands import is_group_filter_command_text
+        _is_grp_filter_cmd = is_group_filter_command_text(clean_text)
+
         fast_command = (
-            clean_text in SIMPLE_REPLIES
-            or clean_text in INSULTS
-            or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "دانستنی", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
-            or clean_text.startswith(("سکوت نام", "اخراج نام"))
-            or (
-                clean_text.startswith(("!", "/", "."))
-                and not clean_text.startswith(("/فیلتر ", "/رفع "))
-                and clean_text != "/فیلترها"
+            not _is_grp_filter_cmd
+            and (
+                clean_text in SIMPLE_REPLIES
+                or clean_text in INSULTS
+                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "دانستنی", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
+                or clean_text.startswith(("سکوت نام", "اخراج نام"))
+                or (
+                    clean_text.startswith(("!", "/", "."))
+                    and not clean_text.startswith(("/فیلتر ", "/رفع "))
+                    and clean_text != "/فیلترها"
+                )
             )
         )
         # پاسخ ویژه فقط برای مالکِ ثبت‌شدهٔ همین گروه، پیش از پاسخ‌های عمومی.
@@ -6255,8 +6421,7 @@ async def handle_new_message(bot, event):
 
         if (
             clean_text.startswith(("!", "/", "."))
-            and not clean_text.startswith(("/فیلتر ", "/رفع "))
-            and clean_text != "/فیلترها"
+            and not is_group_filter_command_text(clean_text)
         ):
             try:
                 sender = await event.get_sender()

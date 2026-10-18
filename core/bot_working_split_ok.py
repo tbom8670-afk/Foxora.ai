@@ -1502,6 +1502,39 @@ class SoroushAntiSpamBot:
                         ),
                     )
                     print(f"🚫 queued banned user rejoin block: {user_id}")
+                    return
+
+                # بررسی فیلتر اسم گروه هنگام ورود کاربر جدید
+                try:
+                    from modules.group_names_storage import find_matching_filtered_name
+                    from modules.group_storage import get_group_owner
+                    from modules import vip_storage
+                    group_owner_id = get_group_owner(chat_id)
+                    is_exempt = (
+                        is_global_owner(user_id)
+                        or (group_owner_id is not None and str(user_id) == str(group_owner_id))
+                        or is_admin(chat_id, user_id, username)
+                        or vip_storage.is_vip(chat_id, user_id)
+                    )
+                    if not is_exempt:
+                        matched_filtered_name = find_matching_filtered_name(
+                            user, group_id=chat_id
+                        )
+                        if matched_filtered_name and getattr(self, "admin_actions", None) is not None:
+                            self.moderation_queue.enqueue(
+                                chat_id,
+                                "ban",
+                                user_id=user_id,
+                                timeout_seconds=30,
+                                operation=lambda: self.admin_actions.ban_user(
+                                    chat_id,
+                                    user_id,
+                                    reason=f"فیلتر اسم: {matched_filtered_name}",
+                                    user=user,
+                                ),
+                            )
+                except Exception as nf_err:
+                    self.logger.log_error(f"JOIN NAME FILTER ERROR: {nf_err!r}")
 
             except Exception as e:
                 print(f"join ban check error: {e}")
@@ -1730,7 +1763,12 @@ class SoroushAntiSpamBot:
                     "۵ روز", "یک هفته", "دو هفته", "یک ماه",
                     "مهلت گروه", "لیست انقضا",
                     "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج",
-                } or command_priority_text.startswith(("سکوت نام", "اخراج نام")) or (expiry_command and expiry_command(command_priority_text) is not None)
+                    "لیست فیلتر اسم", "لیست فیلتر نام", "فیلترهای اسم",
+                } or command_priority_text.startswith((
+                    "سکوت نام", "اخراج نام",
+                    "فیلتر اسم", "لغو اسم", "فیلتر نام", "لغو نام",
+                    "لغو فیلتر اسم", "حذف فیلتر اسم", "رفع فیلتر اسم",
+                )) or (expiry_command and expiry_command(command_priority_text) is not None)
                 self.debug_message_log(
                     "COMMAND PRIORITY CHECK "
                     f"text={raw_text!r} normalized={command_priority_text!r} "
