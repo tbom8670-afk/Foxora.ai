@@ -57,6 +57,7 @@ from handlers.clipboard_handler import (
 )
 from modules import who_knows as _who_knows
 from modules import truth_or_lie as _truth_lie
+from modules import speed_bomb as _speed_bomb
 # 📥 قابلیت مستقل «دانلود عکس».
 from handlers.photo_download_handler import handle as handle_photo_download
 # ⏳ تاریخ انقضای گروه — قابلیتی کاملاً مستقل با مسیر پردازش جدا.
@@ -661,6 +662,7 @@ def is_game_answer_active(chat_id, user_id):
         or get_riddle_token(chat_id, user_id) is not None
         or _who_knows.is_active(chat_id)
         or _truth_lie.is_active(chat_id)
+        or _speed_bomb.is_active(chat_id)
     )
 
 
@@ -679,6 +681,7 @@ def _chat_game_busy(chat_id):
         or get_active_question(chat_id) is not None
         or _who_knows.is_active(chat_id)
         or _truth_lie.is_active(chat_id)
+        or _speed_bomb.is_active(chat_id)
     )
 
 
@@ -2906,6 +2909,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "یاد آوری", "ترجمه", "قفل", "باز", "جک", "تصحیح کلمات",
     "اسم فامیل", "حدس ایموجی", "حدس پرچم", "چهار گزینه ای", "جای خالی", "چیستان",
     "کی بیشتر بلده", "دروغ یا حقیقت",
+    "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
     "دانستنی", "حافظه من", "حذف اسم", "حذف حافظه", "قوانین",
     "ثبت قوانین", "حذف قوانین", "ثبت اصل", "اصلم", "موجودی", "فروشگاه",
     "انتقال سکه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن",
@@ -2953,6 +2957,7 @@ def _is_known_internal_command(clean_text, chat_id, user_id):
         or get_riddle_token(chat_id, user_id) is not None
         or _who_knows.is_active(chat_id)
         or _truth_lie.is_active(chat_id)
+        or _speed_bomb.is_active(chat_id)
     )
 
 
@@ -3497,6 +3502,7 @@ async def handle_new_message(bot, event):
                 "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
                 "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
                 "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+                "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
                 "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه",
                 "فعال", "غیر فعال", "فعال سازی",
                 "کپی بورد", "کپی",
@@ -4260,7 +4266,7 @@ async def handle_new_message(bot, event):
             and (
                 clean_text in SIMPLE_REPLIES
                 or clean_text in INSULTS
-                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "دانستنی", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
+                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
                 or clean_text.startswith(("سکوت نام", "اخراج نام"))
                 or (
                     clean_text.startswith(("!", "/", "."))
@@ -5464,6 +5470,30 @@ async def handle_new_message(bot, event):
                     )
                 return
 
+        # 💣 بمب سرعت روباه — بررسی پاسخ در مرحلهٔ فعال یا شروع بازی
+        if _speed_bomb.is_speed_bomb_command(clean_text):
+            await _speed_bomb.handle_command(
+                bot,
+                event,
+                chat_id,
+                chat_busy_check=lambda cid: _chat_game_busy(cid) or fox_game_active(cid),
+                busy_message=GAME_BUSY_MESSAGE,
+                track_timer=_track_group_timer,
+            )
+            return
+
+        if _speed_bomb.is_active(chat_id):
+            if await _speed_bomb.handle_answer(
+                bot,
+                event,
+                chat_id,
+                user_id,
+                sender,
+                clean_text,
+                track_timer=_track_group_timer,
+            ):
+                return
+
         # 🧠 شروع بازی «کی بیشتر بلده»
         if clean_text == "کی بیشتر بلده":
             if _who_knows.is_active(chat_id):
@@ -5897,6 +5927,8 @@ async def handle_new_message(bot, event):
                 "حدس کلمات با حرف تصادفی و جایزه.\n\n"
                 "🧠 دروغ یا حقیقت\n"
                 "تشخیص درست یا غلط بودن سوال‌ها.\n\n"
+                "💣 بمب سرعت\n"
+                "رقابت ۳ مرحله‌ای ۱۵ ثانیه‌ای با موضوع و حرف تصادفی (بمب سرعت / بمب ساعتی).\n\n"
                 "🕵️ کارگاه\n"
                 "حل پرونده و پیدا کردن دزد.\n\n"
                 "😄 جک\n"
@@ -5933,6 +5965,7 @@ async def handle_new_message(bot, event):
                 "با ارسال «جرعت» یا «حقیقت»، یک جرأت یا سوال صادقانه دریافت کن.",
                 "🧠 کی بیشتر بلده",
                 "🧠 دروغ یا حقیقت",
+                "💣 بمب سرعت",
                 "🕵️ کارگاه",
                 "😄 جک",
                 "با ارسال «جک»، یک جوک یا لطیفه خنده‌دار دریافت کن.",

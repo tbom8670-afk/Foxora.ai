@@ -37,6 +37,7 @@ _REWARDS = {
     "minesweeper":     (5, SILVER, "مین یاب"),
     "who_knows":       (2, BRONZE, "کی بیشتر بلده"),
     "truth_lie":       (2, BRONZE, "دروغ یا حقیقت"),
+    "speed_bomb":      (3, BRONZE, "بمب سرعت روباه"),
     "karagah_thief":   (12, BRONZE, "کارگاه — دزد"),
     # --- بازی‌های سخت → نقره --------------------------------------------
     "survival":        (8, SILVER, "بقا"),
