@@ -31,6 +31,7 @@ from modules.fox_games import (
     sentence_guess,
     survival,
     vampire,
+    zombie,
 )
 from modules.fox_games.session_core import (
     display_name,
@@ -59,6 +60,8 @@ FOX_GAME_COMMANDS = frozenset({
     "بهترین جواب",
     "نبرد",
     "کارگاه",
+    "زامبی",
+    "گروه آخرالزمان",
     "شرکت",
 })
 
@@ -94,6 +97,8 @@ def active_game_count(chat_id):
     if minesweeper.is_active(chat_id):
         count += 1
     if karagah.is_active(chat_id):
+        count += 1
+    if zombie.is_active(chat_id):
         count += 1
     return count
 
@@ -1170,9 +1175,186 @@ async def _karagah_message(bot, event, chat_id, user_id, sender, text, logger):
     return False
 
 
+# ---------------------------------------------------------------------------
+# 🧟‍♂ زامبی — بازی ۴ نفره با نقش‌های مخفی و ادامهٔ «گروه آخرالزمان»
+# ---------------------------------------------------------------------------
+async def _send_group_only(bot, group_event, chat_id, text, entities=None):
+    """ارسال پیام عمومی نتیجه/وضعیت فقط در گروه بازی (هرگز در پیوی)."""
+    if group_event is not None and not getattr(group_event, "is_private", False):
+        try:
+            await group_event.reply(text, formatting_entities=entities or None)
+            return True
+        except Exception:
+            try:
+                await group_event.reply(text)
+                return True
+            except Exception:
+                pass
+    client = getattr(bot, "client", None) if bot is not None else None
+    send_message = getattr(client, "send_message", None)
+    if callable(send_message) and chat_id is not None:
+        try:
+            await send_message(chat_id, text, formatting_entities=entities or None)
+            return True
+        except TypeError:
+            await send_message(chat_id, text)
+            return True
+    return False
+
+
+async def _resolve_zombie_outcome(bot, result, info, logger):
+    """پرداخت یک‌بارهٔ جوایز و ارسال پیام عمومی برد/باخت فقط در گروه بازی."""
+    chat_id = info["chat_id"]
+    session_id = info["session_id"]
+    group_event = info.get("group_event")
+
+    if result == "zombie_win":
+        zombie_p = info["zombie"]
+        bait_p = info["bait"]
+        _coins(
+            bot, chat_id, zombie_p["user_id"], zombie_p["name"],
+            zombie.ZOMBIE_WIN_SILVER, logger,
+            reference=f"zombie:{chat_id}:{session_id}:zombie:{zombie_p['user_id']}",
+            game="zombie",
+        )
+        _coins(
+            bot, chat_id, bait_p["user_id"], bait_p["name"],
+            zombie.BAIT_INFECTED_SILVER, logger,
+            reference=f"zombie:{chat_id}:{session_id}:bait:{bait_p['user_id']}",
+            game="zombie",
+        )
+        win_text, win_entities = zombie.build_public_win_message(bait_p)
+        await _send_group_only(bot, group_event, chat_id, win_text, win_entities)
+        return True
+
+    if result == "zombie_loss":
+        hunter_p = info["hunter"]
+        sniper_p = info["sniper"]
+        _coins(
+            bot, chat_id, hunter_p["user_id"], hunter_p["name"],
+            zombie.HUNTER_WIN_BRONZE, logger,
+            reference=f"zombie:{chat_id}:{session_id}:hunter:{hunter_p['user_id']}",
+            game="zombie_hunter",
+        )
+        _coins(
+            bot, chat_id, sniper_p["user_id"], sniper_p["name"],
+            zombie.SNIPER_WIN_BRONZE, logger,
+            reference=f"zombie:{chat_id}:{session_id}:sniper:{sniper_p['user_id']}",
+            game="zombie_hunter",
+        )
+        loss_text, loss_entities = zombie.build_public_loss_message(hunter_p, sniper_p)
+        await _send_group_only(bot, group_event, chat_id, loss_text, loss_entities)
+        return True
+
+    return False
+
+
+async def _start_zombie(bot, event, chat_id, logger):
+    if zombie.is_active(chat_id):
+        await event.reply(zombie.ALREADY_RUNNING)
+        return True
+    session = zombie.start(chat_id, logger=logger, group_event=event)
+    if session is None:
+        await event.reply(zombie.ALREADY_RUNNING)
+        return True
+
+    await event.reply(
+        "🧟‍♂ بازی زامبی ساخته شد!\n\n"
+        "منتظر بازیکنان...\n\n"
+        f"تعداد مورد نیاز: {to_persian_digits(zombie.REQUIRED_PLAYERS)} نفر\n\n"
+        f"برای شرکت بنویسید: {zombie.JOIN_WORD}\n"
+        f"⏳ مهلت ثبت‌نام: {to_persian_digits(zombie.JOIN_SECONDS)} ثانیه"
+    )
+
+    async def on_abort():
+        await _send_group_only(bot, event, chat_id, zombie.NOT_ENOUGH)
+
+    async def on_dm_failed():
+        await _send_group_only(bot, event, chat_id, zombie.DM_FAILED_MESSAGE)
+
+    async def on_roles(assignment):
+        return await zombie.deliver_roles_and_prompt(
+            bot.client, chat_id, assignment, logger=logger,
+        )
+
+    async def on_started(_assignment):
+        await _send_group_only(
+            bot,
+            event,
+            chat_id,
+            "🧟‍♂ نقش‌های بازی زامبی به پیوی خصوصی بازیکنان ارسال شد!\n"
+            f"⏳ زامبی {to_persian_digits(zombie.BITE_SECONDS)} ثانیه فرصت دارد هدف خود را انتخاب کند.",
+        )
+
+    async def on_timeout(_info):
+        await _send_group_only(bot, event, chat_id, zombie.TIMEOUT_MESSAGE)
+
+    zombie.schedule(chat_id, session["session_id"], {
+        "on_abort": on_abort,
+        "on_dm_failed": on_dm_failed,
+        "on_roles": on_roles,
+        "on_started": on_started,
+        "on_timeout": on_timeout,
+    }, logger=logger)
+    return True
+
+
+async def _zombie_message(bot, event, chat_id, user_id, sender, text, logger):
+    if not zombie.is_active(chat_id):
+        return False
+    state = zombie.phase(chat_id)
+    normalized = normalize_text(text)
+
+    if state == "joining":
+        if normalized != normalize_text(zombie.JOIN_WORD):
+            return False
+        result, players = zombie.join(chat_id, user_id, sender, logger)
+        if result == "joined":
+            await event.reply(
+                f"✅ ثبت شد ({to_persian_digits(len(players))}"
+                f"/{to_persian_digits(zombie.REQUIRED_PLAYERS)})"
+            )
+        elif result == "duplicate":
+            await event.reply("⚠️ شما قبلاً ثبت‌نام کرده‌اید.")
+        elif result == "full":
+            await event.reply("⚠️ ظرفیت تکمیل است.")
+        return True
+
+    if state == "choosing":
+        result, info = zombie.select_target(chat_id, user_id, text, logger)
+        if result in {"zombie_win", "zombie_loss"}:
+            await _resolve_zombie_outcome(bot, result, info, logger)
+            return True
+        return False
+
+    return False
+
+
+async def handle_private_zombie_selection(bot, user_id, text, logger=None):
+    """دریافت انتخاب هدف زامبی در پیوی خصوصی و اعلام نتیجه فقط در گروه بازی."""
+    chat_id = zombie.find_active_zombie_chat_for_user(user_id)
+    if chat_id is None:
+        return False
+    result, info = zombie.select_target(chat_id, user_id, text, logger)
+    if result in {"zombie_win", "zombie_loss"}:
+        await _resolve_zombie_outcome(bot, result, info, logger)
+        return True
+    if result == "invalid_target":
+        # پیام نامعتبر زامبی در پیوی نادیده گرفته می‌شود تا در مهلت ۱۷ ثانیه انتخاب معتبر بفرستد.
+        return True
+    return False
+
+
 async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
     """پیام را به بازی مربوطه می‌سپارد. True یعنی پیام مصرف شد."""
     command = normalize_text(text)
+
+    if command == normalize_text("گروه آخرالزمان"):
+        if await entertainment_control.guard(event, chat_id, text):
+            return True
+        status_text = zombie.format_apocalypse_status(chat_id)
+        await _bold_reply(event, status_text, [status_text])
+        return True
 
     start_games = {
         normalize_text("بخند یا بباز"): (laugh_or_lose, _start_laugh),
@@ -1187,6 +1369,7 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         normalize_text("بهترین جواب"): (best_answer, _start_best_answer),
         normalize_text("نبرد"): (battle, lambda b, e, c, l: _start_battle(b, e, c, user_id, sender, l)),
         normalize_text("کارگاه"): (karagah, _start_karagah),
+        normalize_text("زامبی"): (zombie, _start_zombie),
     }
 
     if command in start_games:
@@ -1205,7 +1388,7 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
     for responder in (
         _laugh_message, _survival_message, _lucky_box_message, _vampire_message,
         _maemma_message, _sentence_guess_message, _minesweeper_message,
-        _best_answer_message, _battle_message, _karagah_message,
+        _best_answer_message, _battle_message, _karagah_message, _zombie_message,
     ):
         if await responder(bot, event, chat_id, user_id, sender, text, logger):
             return True
@@ -1223,3 +1406,4 @@ def reset_all(chat_id=None):
     best_answer.reset_all(chat_id)
     battle.reset_all(chat_id)
     karagah.reset_all(chat_id)
+    zombie.reset_all(chat_id)

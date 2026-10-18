@@ -2511,6 +2511,20 @@ class SoroushAntiSpamBot:
                         self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='core_line_1328' chat_id={_sd_chat} message_id={_sd_mid}")
                         return
 
+                    try:
+                        from handlers.fox_games_router import handle_private_zombie_selection
+                        if await handle_private_zombie_selection(
+                            self,
+                            sender_id,
+                            event.message.message or "",
+                            logger=self.logger,
+                        ):
+                            return
+                    except Exception as zombie_pv_err:
+                        self.logger.log_error(
+                            f"ZOMBIE PRIVATE SELECTION FAILED error={zombie_pv_err!r}"
+                        )
+
                     # پیام خصوصی پس از route اختصاصی هرگز وارد handler گروهی نمی‌شود.
                     self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='core_line_1331' chat_id={_sd_chat} message_id={_sd_mid}")
                     return

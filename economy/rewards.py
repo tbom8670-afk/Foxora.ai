@@ -16,7 +16,7 @@ BRONZE = settings.BRONZE
 SILVER = settings.SILVER
 
 # بازی‌های سخت: چند مرحله‌ای، رقابتی یا نیازمند استدلال گروهی.
-HARD_GAMES = frozenset({"survival", "vampire"})
+HARD_GAMES = frozenset({"survival", "vampire", "zombie"})
 
 # (شناسه، مقدار، نوع سکه، نام فارسی)
 _REWARDS = {
@@ -39,11 +39,13 @@ _REWARDS = {
     "truth_lie":       (2, BRONZE, "دروغ یا حقیقت"),
     "speed_bomb":      (3, BRONZE, "بمب سرعت روباه"),
     "karagah_thief":   (12, BRONZE, "کارگاه — دزد"),
+    "zombie_hunter":   (7, BRONZE, "زامبی — شکارچی و تک‌تیرانداز"),
     # --- بازی‌های سخت → نقره --------------------------------------------
     "survival":        (8, SILVER, "بقا"),
     "survival_step":   (1, SILVER, "بقا — پاسخ صحیح"),
     "vampire":         (7, SILVER, "خون‌آشام"),
     "karagah":         (12, SILVER, "کارگاه"),
+    "zombie":          (5, SILVER, "زامبی"),
 }
 
 # جایزهٔ رتبهٔ روزانه (برنز، مثل قبل).
