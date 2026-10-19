@@ -120,3 +120,58 @@ def test_advertising_name_and_promo_markers():
 def test_legitimate_name_not_ad():
     user = SimpleNamespace(first_name="رضا", last_name="پیروز", username=None)
     assert ad_name_reason(user) is None
+
+
+def test_new_23_banned_words_and_pi_question_mark_vs_piyadeh():
+    from pathlib import Path
+    from modules.config_manager import ConfigManager
+
+    repo_root = Path(__file__).resolve().parents[1]
+    cm = ConfigManager(banned_words_path=str(repo_root / "config" / "banned_words.txt"))
+    det = SpamDetector(cm)
+
+    required_words = [
+        "برده",
+        "کال",
+        "بیاد پی",
+        "بیاد بی",
+        "استوریم",
+        "ف پ",
+        "کیونی",
+        "کونی",
+        "کون",
+        "شخصی",
+        "دختر بیاد",
+        "خانوم بیاد",
+        "رل",
+        "پوی",
+        "ب ی پی",
+        "بی‌غیرت",
+        "بیغیرت",
+        "جنده",
+        "فلم",
+        "پی؟",
+        "ت پ",
+        "یه خانوم",
+        "بیاد لطفاً",
+    ]
+    for phrase in required_words:
+        assert phrase in cm.banned_words, f"missing in banned_words.txt: {phrase}"
+        found, reason = det.check_banned_words(f"سلام {phrase} خوبی")
+        assert found is True, (phrase, reason)
+
+    # جملهٔ «بیا لطفاً پی؟» باید شناسایی شود
+    found_q, reason_q = det.check_banned_words("بیا لطفاً پی؟")
+    assert found_q is True, reason_q
+
+    # اما «بیا پیاده بدیم» نباید به خاطر «پی» داخل «پیاده» مسدود شود
+    for clean_sentence in (
+        "بیا پیاده بدیم",
+        "بیا پیاده بریم پارک",
+        "پیاده روی صبحگاهی",
+        "کالاهای ایرانی",
+        "مکالمه زبان انگلیسی",
+    ):
+        found_clean, reason_clean = det.check_banned_words(clean_sentence)
+        assert found_clean is False, (clean_sentence, reason_clean)
+

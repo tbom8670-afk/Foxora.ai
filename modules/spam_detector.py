@@ -49,7 +49,11 @@ class SpamDetector:
         # امتیاز برای تصمیم ترکیبی
         self.spam_score_threshold = 2
 
-    _BANNED_LETTER_CLASS = r"a-zA-Z0-9_\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFC"
+    _BANNED_LETTER_CLASS = (
+        r"a-zA-Z0-9_"
+        r"\u0621-\u063A\u0641-\u064A\u0660-\u0669\u066E-\u06D3\u06D5\u06F0-\u06FF"
+        r"\uFB50-\uFDFF\uFE70-\uFEFC"
+    )
     # Optional separators between letters of one token (space, ZWNJ, tatweel, punct).
     _BANNED_SEP_OPT = r"[\s\u200c\u200d\u0640\W_]*"
     # Required separator where the listed phrase itself contains a space.
@@ -62,6 +66,8 @@ class SpamDetector:
         "ه": "هة",
         "و": "وؤ",
         "ت": "تط",
+        "؟": "؟?",
+        "?": "؟?",
     }
 
     def _refresh_banned_word_patterns(self):

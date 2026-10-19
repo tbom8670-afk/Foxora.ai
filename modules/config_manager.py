@@ -18,9 +18,11 @@ class ConfigManager:
             PROJECT_ROOT / config_path if not os.path.isabs(config_path)
             else config_path
         )
+        self._uses_default_banned_words = (banned_words_path == "config/banned_words.txt")
+        self._repo_banned_words_path = str(PROJECT_ROOT / "config" / "banned_words.txt")
         self.banned_words_path = str(
             runtime_config_file("banned_words.txt")
-            if banned_words_path == "config/banned_words.txt"
+            if self._uses_default_banned_words
             else banned_words_path
         )
         self.whitelist_path = str(
@@ -53,7 +55,7 @@ class ConfigManager:
     def load_banned_words(self) -> Set[str]:
         """خواندن کلمات ممنوعه از فایل txt + config"""
         words = set()
-        # از فایل txt
+        # از فایل txt زمان اجرا
         if os.path.exists(self.banned_words_path):
             with open(self.banned_words_path, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -61,6 +63,31 @@ class ConfigManager:
                     if not line or line.startswith('#'):
                         continue
                     words.add(line.lower())
+        # همگام‌سازی کلمات جدید اضافه شده در مخزن (config/banned_words.txt) با فایل runtime
+        if (
+            getattr(self, "_uses_default_banned_words", False)
+            and os.path.exists(self._repo_banned_words_path)
+        ):
+            missing_in_runtime = []
+            with open(self._repo_banned_words_path, 'r', encoding='utf-8') as rf:
+                for line in rf:
+                    clean = line.strip()
+                    if not clean or clean.startswith('#'):
+                        continue
+                    lowered = clean.lower()
+                    if lowered not in words:
+                        words.add(lowered)
+                        missing_in_runtime.append(clean)
+            if (
+                missing_in_runtime
+                and os.path.abspath(self.banned_words_path)
+                != os.path.abspath(self._repo_banned_words_path)
+            ):
+                try:
+                    with open(self.banned_words_path, 'a', encoding='utf-8') as wf:
+                        wf.write("\n" + "\n".join(missing_in_runtime) + "\n")
+                except OSError:
+                    pass
         # از config.json اگر وجود داشته باشد
         if "banned_words" in self.config and isinstance(self.config["banned_words"], list):
             for w in self.config["banned_words"]:
