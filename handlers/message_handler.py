@@ -155,6 +155,10 @@ from modules import bot_detector
 from modules import ad_name_detector
 from modules import warning_threshold
 from modules import punishment_mode
+# 🖇 تشخیص لینک در بیوگرافی — منطق، storage و سرویس کاملاً مستقل.
+from modules import bio_link
+from modules import bio_link_storage
+from modules import bio_link_service
 from modules.user_display import format_user
 from modules import message_tracker
 from modules import big_spam
@@ -2373,7 +2377,7 @@ async def handle_fast_moderation_command(
         target_key = f"{chat_id}:{target_user.id}"
         if (
             manual_mute_storage.is_manual_muted(chat_id, target_user.id)
-            or target_key in getattr(bot.tracker, "muted_users", {})
+            or target_key in getattr(getattr(bot, "tracker", None), "muted_users", {})
             or target_key in getattr(bot, "punished_users", set())
         ):
             return {
@@ -3791,6 +3795,148 @@ async def handle_new_message(bot, event):
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
         # می‌بلعید و «راهنما»/«روباه» هیچ‌وقت به handler نمی‌رسیدند.
         clean_text = normalize_command(message_text)
+
+        # ===== 🖇 فیلتر لینک بیوگرافی =====
+        # مالک ربات/مالک گروه/ادمینِ ثبت‌شده تنها کسانی هستند که می‌توانند
+        # تنظیمات این قابلیت را تغییر دهند.
+        bio_command = bio_link_service.match_command(clean_text)
+        if bio_command:
+            sender_username = getattr(sender, "username", None)
+            if not _has_group_management_permission(
+                bot, chat_id, user_id, sender_username
+            ):
+                await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
+                return
+            try:
+                if bio_command == "enable":
+                    changed = bio_link_storage.set_enabled(chat_id, True)
+                    await event.reply(
+                        "✅ فیلتر لینک بیو روشن شد."
+                        if changed else
+                        "ℹ️ فیلتر لینک بیو از قبل روشن بود."
+                    )
+                    await event.reply(
+                        "🔍 برای بررسی فوری بیوی اعضا بنویسید: بررسی بیو"
+                    )
+                elif bio_command == "disable":
+                    changed = bio_link_storage.set_enabled(chat_id, False)
+                    await event.reply(
+                        "🛑 فیلتر لینک بیو خاموش شد."
+                        if changed else
+                        "ℹ️ فیلتر لینک بیو از قبل خاموش بود."
+                    )
+                elif bio_command == "status":
+                    info = bio_link_storage.stats(chat_id)
+                    hours = max(1, int(round(info["ttl_seconds"] / 3600)))
+                    lines = [
+                        "🖇 وضعیت فیلتر لینک بیو",
+                        f"وضعیت: {'روشن ✅' if info['enabled'] else 'خاموش ⛔️'}",
+                        f"شناسایی آیدی تنها: {'روشن' if info['detect_username'] else 'خاموش'}",
+                        f"حالت: بررسی همان لحظهٔ پیام"
+                        if not bio_link_service.auto_scan_members()
+                        else f"حالت: اسکن دوره‌ای اعضا",
+                        f"بررسی‌شده: {info['checked']}",
+                        f"دارای لینک: {info['with_link']}",
+                    ]
+                    if info.get("exempt"):
+                        lines.append(
+                            f"معاف (ادمین/مالک/VIP): {_math_digits(info['exempt'])}"
+                        )
+                    if info["errors"]:
+                        lines.append(f"بدون دسترسی/خطا: {info['errors']}")
+                    last = info.get("scan") or {}
+                    if last.get("at"):
+                        ago = max(0, int((time.time() - float(last["at"])) // 60))
+                        lines.append(f"آخرین بررسی: {ago} دقیقه پیش")
+                        lines.append(
+                            f"نتیجهٔ آخرین بررسی: {last.get('status') or '-'}"
+                        )
+                    lines.append(f"تازه‌سازی هر کاربر: هر {hours} ساعت")
+                    text_out = "\n".join(lines)
+                    await event.reply(
+                        text_out,
+                        formatting_entities=[
+                            MessageEntityBold(
+                                offset=0,
+                                length=len(lines[0].encode("utf-16-le")) // 2,
+                            )
+                        ],
+                    )
+                elif bio_command == "scan":
+                    limit = bio_link_service.scan_limit()
+                    _asyncio.create_task(
+                        bio_link_service.scan_group(bot, chat_id),
+                        name="bio-link-scan",
+                    )
+                    await event.reply(
+                        "🔍 بررسی بیوی اعضا در پس‌زمینه شروع شد "
+                        f"(حداکثر {_math_digits(limit)} نفر در این دور).\n"
+                        "پس از پایان، «وضعیت لینک بیو» را بزنید."
+                    )
+                elif bio_command == "list":
+                    rows = bio_link_storage.flagged_users(chat_id)
+                    if not rows:
+                        await event.reply(
+                            "📋 هیچ کاربری با لینک در بیوگرافی ثبت نشده است."
+                        )
+                        return
+                    header = "📋 کاربران دارای لینک در بیوگرافی"
+                    lines = [header, ""]
+                    for index, (key, record) in enumerate(rows[:30], 1):
+                        label = (record or {}).get("label") or "لینک"
+                        name = (record or {}).get("name") or f"شناسه {key}"
+                        lines.append(
+                            f"{_math_digits(index)}- {name} — {label}"
+                        )
+                    if len(rows) > 30:
+                        lines.append("")
+                        lines.append(
+                            f"و {_math_digits(len(rows) - 30)} کاربر دیگر…"
+                        )
+                    text_out = "\n".join(lines)
+                    await event.reply(
+                        text_out,
+                        formatting_entities=[
+                            MessageEntityBold(
+                                offset=0,
+                                length=len(header.encode("utf-16-le")) // 2,
+                            )
+                        ],
+                    )
+                elif bio_command == "clear":
+                    count = bio_link_storage.clear_group(chat_id)
+                    await event.reply(
+                        "🧹 وضعیت بررسی‌شدهٔ "
+                        f"{_math_digits(count)} کاربر پاک شد. "
+                        "برای بررسی مجدد: بررسی بیو"
+                    )
+                elif bio_command in {"username_on", "username_off"}:
+                    enable_ids = bio_command == "username_on"
+                    changed = bio_link_storage.set_detect_username(
+                        chat_id, enable_ids
+                    )
+                    if changed:
+                        bio_link_storage.clear_group(chat_id)
+                    await event.reply(
+                        ("✅ شناسایی «آیدی تنها» در بیو روشن شد."
+                         if enable_ids else
+                         "🛑 شناسایی «آیدی تنها» در بیو خاموش شد.")
+                        + ("\n♻️ وضعیت قبلی پاک شد؛ «بررسی بیو» را بزنید."
+                           if changed else
+                           "\nℹ️ از قبل همین‌طور بود.")
+                    )
+                admin_tools.log_action(
+                    chat_id, sender, f"فیلتر لینک بیو: {bio_command}"
+                )
+            except Exception as bio_command_error:
+                bot.logger.log_error(
+                    "BIO LINK COMMAND FAILED "
+                    f"chat_id={chat_id} action={bio_command} "
+                    f"error={bio_command_error!r}"
+                )
+                await event.reply("❌ خطا در اجرای دستور فیلتر لینک بیو.")
+            return
+
 
         # 📋 کپی بورد — یک مسیر زودهنگام و مستقل.
         # فرمان‌ها باید قبل از فیلتر اسپم/بازی/جستجو مصرف شوند و ذخیره فقط
@@ -8600,6 +8746,44 @@ async def handle_new_message(bot, event):
                 _vip_exempt = vip_storage.is_vip(chat_id, user_id)
             except Exception:
                 _vip_exempt = False
+        # --- 🖇 فیلتر لینک بیوگرافی -------------------------------------------------
+        # هر کاربری که در گروه پیام می‌دهد، بیوگرافی‌اش دیده می‌شود. برای هر
+        # کاربر فقط یک‌بار (تا انقضای TTL) این بررسی انجام می‌شود و نتیجه ذخیره
+        # می‌گردد؛ پس از آن فقط از حافظه/دیسک خوانده می‌شود و هیچ RPC اضافه‌ای
+        # در پیام‌های بعدی وجود ندارد. اگر سرویس کند/خطا بدهد، بررسی به
+        # پس‌زمینه می‌رود و همان پیام بدون تخلف پردازش می‌شود.
+        bio_link_hit = False
+        bio_link_reason = None
+        if (not event.is_private
+                and not (is_group_moderator or fast_command or _vip_exempt
+                         or native_admin_warn_only)
+                and user_id):
+            try:
+                if bio_link_storage.is_enabled(chat_id):
+                    if bio_link_service.await_first_check():
+                        await bio_link_service.ensure_user_now(
+                            bot, chat_id, sender
+                        )
+                    else:
+                        bio_link_service.schedule_check(bot, chat_id, sender)
+                    bio_link_hit, _bio_label = bio_link_service.link_state(
+                        chat_id, user_id
+                    )
+                    if bio_link_hit:
+                        bio_link_reason = bio_link.reason_text(_bio_label)
+                        _debug_log(
+                            bot,
+                            "BIO LINK HIT "
+                            f"chat_id={chat_id} user_id={user_id} "
+                            f"label={_bio_label!r}",
+                        )
+            except Exception as bio_error:
+                # خطای این قابلیت هرگز نباید مسیر اصلی پیام را بشکند.
+                bot.logger.log_error(
+                    "BIO LINK PRECHECK FAILED "
+                    f"chat_id={chat_id} user_id={user_id} error={bio_error!r}"
+                )
+
         # مدیر/مالک ثبت‌شده از فیلتر خودکار و فیلتر کلمات گروه عبور می‌کند،
         # اما اجرای راهنما، بازی‌ها و فرمان‌های مدیریت باید ادامه داشته باشد.
         if is_group_moderator or fast_command or _vip_exempt:
@@ -8617,6 +8801,12 @@ async def handle_new_message(bot, event):
             is_spam = True
             reason = group_word_reason
             moderation_trigger = "group_filter"
+        elif bio_link_hit:
+            # بیوگرافی این کاربر لینک دارد؛ همان مسیر استاندارد اخطار/حذف/مجازات
+            # گروه اجرا می‌شود (شمارنده، سابقه، سکوت یا اخراج طبق تنظیم گروه).
+            is_spam = True
+            reason = bio_link_reason
+            moderation_trigger = "bio_link"
         else:
             # `is_spam` remains the sole detector call.  Its existing reason
             # only labels the notification route after the decision is made.

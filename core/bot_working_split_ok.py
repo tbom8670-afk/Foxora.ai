@@ -51,6 +51,8 @@ from modules.outgoing_sender import install as install_outgoing_sender, install_
 from modules.group_dispatch import GroupDispatcher, classify_priority, looks_like_link
 from modules.light_spam_ingest import ingest_event
 from modules import connection_guard
+# 🖇 تشخیص لینک در بیوگرافی (سرویس مستقل، پایش دوره‌ای اعضا).
+from modules import bio_link_service
 from modules import site_policy
 from modules.runtime_maintenance import run as run_runtime_maintenance
 from modules.watchdog_reporting import deliver_pending_reports
@@ -1293,6 +1295,19 @@ class SoroushAntiSpamBot:
             self.cleanup_tasks = {}
         asyncio.create_task(run_cleanup_watcher(self, logger=self.logger))
 
+        # 🖇 ناظر «فیلتر لینک بیوگرافی» — سیاست پیش‌فرض: فقط کاربران پیام‌دهنده.
+        async def bio_link_watcher_loop():
+            try:
+                await bio_link_service.watcher(self, logger=self.logger)
+            except asyncio.CancelledError:
+                raise
+            except Exception as bio_watcher_error:
+                self.logger.log_error(
+                    f"BIO LINK WATCHER CRASHED error={bio_watcher_error!r}"
+                )
+
+        asyncio.create_task(bio_link_watcher_loop(), name="bio-link-watcher")
+
         # 🌙 ناظر گزارش فعالیت کمترین ادمین در ساعت ۱۱ شب (۲۳:۰۰ به وقت تهران)
         async def daily_admin_report_loop():
             from modules.daily_admin_report import run_daily_admin_report_watcher
@@ -1424,6 +1439,16 @@ class SoroushAntiSpamBot:
                     return
 
                 user_id = user.id
+                # 🖇 عضو تازه: بیوگرافی‌اش یک بار (در پس‌زمینه) بررسی می‌شود.
+                try:
+                    if bio_link_service.check_on_join():
+                        bio_link_service.schedule_check(self, chat_id, user)
+                except Exception as bio_join_error:
+                    self.logger.log_error(
+                        "BIO LINK JOIN CHECK FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={bio_join_error!r}"
+                    )
                 username = getattr(user, "username", None)
                 runtime_group, runtime_user = self._spam_state_key((chat_id, user_id))
                 punish_key = f"{runtime_group}:{runtime_user}"
@@ -2531,7 +2556,7 @@ class SoroushAntiSpamBot:
 
             
                     # اجرای دستورات مدیریتی
-                    if text.startswith(("!", "/", ".")):
+                    if text.startswith(("!", "/", ".")) and not bio_link_service.is_command(text):
                         try:
                             sender = await event.get_sender()
                             await handle_admin_commands(

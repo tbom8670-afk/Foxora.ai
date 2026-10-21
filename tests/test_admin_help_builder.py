@@ -43,8 +43,9 @@ def _slice_u16(text: str, offset: int, length: int) -> str:
 def test_blocks_count_and_contact():
     """بررسی تعداد بلوک‌های ورودی و عبارت سازنده."""
     bquote_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBlockquote)]
-    # 43 بلوک دستورات + 1 بلوک نقل‌قول تماس با سازنده = 44
-    assert len(bquote_entities) == 44
+    # ۴۷ بلوک دستورات (۴ بلوک «فیلتر لینک بیو» هم اضافه شده) + 1 بلوک
+    # نقل‌قول تماس با سازنده = 48
+    assert len(bquote_entities) == 48
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -86,7 +87,7 @@ def test_utf16_entities_validity():
 def test_blockquotes_span_exact_lines():
     """بررسی اینکه نقل‌قول‌های n، n2 و n3 دقیقاً تعداد خطوط مربوطه را پوشش می‌دهند."""
     bquote_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBlockquote)]
-    assert len(bquote_entities) == 44
+    assert len(bquote_entities) == 48
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -97,8 +98,8 @@ def test_blockquotes_span_exact_lines():
 def test_bold_entities_content():
     """بررسی اینکه تمام بخش‌های بولد (توضیحات و عناوین) به درستی مارک شده‌اند."""
     bold_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBold)]
-    # 43 عنوان بلوک + 1 هدر اولیه + 1 تماس با سازنده = 45
-    assert len(bold_entities) == 45
+    # 47 عنوان بلوک + 1 هدر اولیه + 1 تماس با سازنده = 49
+    assert len(bold_entities) == 49
 
     for ent in bold_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
