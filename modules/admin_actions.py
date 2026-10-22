@@ -548,27 +548,29 @@ class AdminActions:
             reason_line = public_warning_reason_line(reason)
             digits = str(count).translate(str.maketrans("0123456789", "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"))
             max_digits = str(threshold).translate(str.maketrans("0123456789", "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"))
-            # قالب استاندارد Foxora:
-            #   ⚠️ کاربر @name
-            #   <خط خالی>
-            #   پیام شما حذف شد | دلیل: …
-            #   <خط خالی>
-            #   <خط خالی>
-            #   تعداد اخطار: ۱/۵
-            prefix = f"⚠️ کاربر {name}\n\n"
+            # قالب استاندارد Foxora (دقیقاً مطابق تصویر تأییدشده):
+            #   [نقل‌قول] ⚠️ کاربر @name
+            #   پیام شما حذف شد | دلیل: …        ← بدون خط فاصله، چسبیده به بالا
+            #   (دو خط خالی)
+            #   [Bold] تعداد اخطار: 𝟮/𝟱
+            header = f"⚠️ کاربر {name}"
+            prefix = header + "\n"
             if is_edit:
                 body = f"پیام ویرایش‌شده شما حذف شد | {reason_line}\n"
             else:
                 body = f"پیام شما حذف شد | {reason_line}\n"
-            warning_label = "تعداد اخطار:"
-            suffix = f" {digits}/{max_digits}"
-            # دقیقاً دو خط خالی بین دلیل و شمارندهٔ اخطار.
-            msg = prefix + body + "\n\n" + warning_label + suffix
+            warning_label = "تعداد اخطار:" + f" {digits}/{max_digits}"
+            # body خودش با \n تمام می‌شود؛ دو \n دیگر = دو خط خالی قبل از شمارنده.
+            msg = prefix + body + "\n\n" + warning_label
             u16 = lambda value: len(value.encode("utf-16-le")) // 2
             if has_entities:
                 entities = [
-                    MessageEntityBlockquote(offset=0, length=u16(prefix)),
-                    MessageEntityBold(offset=u16(prefix + body), length=u16(warning_label)),
+                    # نقل‌قول فقط روی خط عنوان؛ هیچ خط خالی داخلش نیست.
+                    MessageEntityBlockquote(offset=0, length=u16(header)),
+                    MessageEntityBold(
+                        offset=u16(prefix + body + "\n\n"),
+                        length=u16(warning_label),
+                    ),
                 ]
             else:
                 entities = None

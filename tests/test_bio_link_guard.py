@@ -1166,12 +1166,19 @@ def test_warning_template_matches_required_format(tmp_path, monkeypatch):
     asyncio.run(_run())
     assert sent["text"] == (
         "⚠️ کاربر @Sjskajk\n"
-        "\n"
         "پیام شما حذف شد | دلیل: لینک در بیوگرافی\n"
         "\n"
         "\n"
         "تعداد اخطار: 𝟭/𝟱"
     )
     entities = sent["entities"]
-    assert any(isinstance(e, MessageEntityBlockquote) for e in entities)
-    assert any(isinstance(e, MessageEntityBold) for e in entities)
+    text = sent["text"]
+    quote = [e for e in entities if isinstance(e, MessageEntityBlockquote)]
+    bold = [e for e in entities if isinstance(e, MessageEntityBold)]
+    u16 = lambda v: len(v.encode("utf-16-le")) // 2
+    # نقل‌قول فقط خط عنوان را می‌گیرد و هیچ خط خالی داخلش نیست
+    assert len(quote) == 1 and quote[0].offset == 0
+    assert quote[0].length == u16("⚠️ کاربر @Sjskajk")
+    # «تعداد اخطار: 𝟭/𝟱» کامل Bold است
+    assert len(bold) == 1
+    assert text[bold[0].offset:bold[0].offset + bold[0].length] == "تعداد اخطار: 𝟭/𝟱"
