@@ -160,6 +160,8 @@ from modules import bio_link
 from modules import bio_link_storage
 from modules import bio_link_service
 from modules.user_display import format_user
+# 🧹 پاکسازی کامل پیام‌های یک کاربر («پاک کامل») — هستهٔ مستقل و خودکار.
+from modules import user_message_purge
 from modules import message_tracker
 from modules import big_spam
 from modules import search_access
@@ -2917,7 +2919,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "دانستنی", "حافظه من", "حذف اسم", "حذف حافظه", "قوانین",
     "ثبت قوانین", "حذف قوانین", "ثبت اصل", "اصلم", "موجودی", "فروشگاه",
     "انتقال سکه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن",
-    "سنجاق", "پیام سنجاق", "پاک", "ریست آمار", "ریست اخراجی ها",
+    "سنجاق", "پیام سنجاق", "پاک", "پاک کامل", "ریست آمار", "ریست اخراجی ها",
     "سطح گروه", "سابقه ها", "سابقه‌ها", "راهنمای امتیاز", "امتیاز من",
     "رتبه ها", "رتبه‌ها", "فعال سازی", "فعال", "غیر فعال",
     "لغو کلمات ممنوعه", "فعال کلمات ممنوعه", "پاکسازی خودکار",
@@ -7078,8 +7080,168 @@ async def handle_new_message(bot, event):
             return
 
 
+        # پاک کامل — حذف همهٔ پیام‌های یک کاربر با ریپلای روی پیام او.
+        # ⚠️ باید پیش از بلوک «پاک + عدد» بماند: «پاک کامل» هم با «پاک »
+        # شروع می‌شود و آن بلوک آن را «عدد نامعتبر» حساب می‌کرد. خودکار
+        # است و هیچ فعال‌سازی نمی‌خواهد؛ مجوز دقیقاً همان سیستم موجود
+        # «پاک» است (مالک اصلی/مالک گروه/ادمین ثبت‌شده در admins.json).
+        # اسکن تاریخچه و حذف در پس‌زمینه اجرا می‌شود تا لاین ادمین گروه
+        # درگیر نماند؛ فقط تأیید نهایی با تعداد واقعی فرستاده می‌شود.
+        if user_message_purge.is_purge_command(clean_text):
+            try:
+                if event.is_private:
+                    await event.reply(
+                        "❌ این دستور فقط در گروه قابل استفاده است"
+                    )
+                    return
+
+                purge_actor_username = getattr(sender, "username", None)
+                if not _can_delete_messages(
+                    bot, chat_id, user_id, purge_actor_username
+                ):
+                    await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
+                    return
+
+                # cooldown مشترک با «پاک»/«پاک عدد» برای کل گروه.
+                if not _delete_cooldown_allowed(chat_id):
+                    await event.reply(
+                        "لطفا ۵ ثانیه صبر کنید تا پاکسازی قبلی کامل شود ⏳"
+                    )
+                    return
+
+                purge_reply_id = _search_reply_message_id(event)
+                if not purge_reply_id:
+                    await event.reply("❌ باید روی پیام کاربر ریپلای کنید")
+                    return
+
+                purge_reply_msg = await bot.client.get_messages(
+                    chat_id, ids=purge_reply_id
+                )
+                if not purge_reply_msg:
+                    await event.reply("❌ پیام ریپلای‌شده پیدا نشد")
+                    return
+
+                purge_target_id = user_message_purge.message_sender_id(
+                    purge_reply_msg
+                )
+                purge_target_user = None
+                try:
+                    purge_target_user = await purge_reply_msg.get_sender()
+                except Exception:
+                    purge_target_user = None
+                if purge_target_id is None:
+                    purge_target_id = getattr(purge_target_user, "id", None)
+                if not purge_target_id:
+                    await event.reply("❌ کاربر پیدا نشد")
+                    return
+
+                purge_bot_id = (
+                    getattr(bot, "bot_account_id", None)
+                    or getattr(bot, "account_id", None)
+                )
+                if (
+                    purge_bot_id is not None
+                    and str(purge_target_id) == str(purge_bot_id)
+                ):
+                    await event.reply(
+                        "❌ پیام‌های خود ربات با این دستور پاک نمی‌شود"
+                    )
+                    return
+
+                purge_running = getattr(bot, "_user_purge_in_progress", None)
+                if purge_running is None:
+                    purge_running = bot._user_purge_in_progress = set()
+                purge_key = (
+                    normalize_group_id(chat_id), str(purge_target_id)
+                )
+                if purge_key in purge_running:
+                    await event.reply(
+                        "⏳ پاکسازی کامل این کاربر در همین گروه در حال انجام است"
+                    )
+                    return
+                purge_running.add(purge_key)
+
+                purge_peer_cache = (
+                    getattr(bot, "reply_input_peer_cache", None) or {}
+                )
+                try:
+                    purge_rpc_peer = purge_peer_cache.get(chat_id)
+                except Exception:
+                    purge_rpc_peer = None
+                if purge_rpc_peer is None:
+                    purge_rpc_peer = resolved_permission_chat or event_chat
+                purge_command_id = getattr(
+                    getattr(event, "message", None), "id", None
+                )
+                purge_actor_id = user_id
+                purge_actor = sender
+
+                async def finish_user_purge():
+                    try:
+                        (
+                            deleted_count,
+                            remaining,
+                        ) = await user_message_purge.purge_user_messages(
+                            bot,
+                            chat_id,
+                            purge_target_id,
+                            seed_ids=(purge_reply_id,),
+                            exclude_ids=(
+                                (purge_command_id,) if purge_command_id else ()
+                            ),
+                            target_user=purge_target_user,
+                            rpc_peer=purge_rpc_peer,
+                        )
+                        if deleted_count:
+                            add_deleted_count(
+                                chat_id,
+                                purge_actor_id,
+                                purge_actor_username or "",
+                                deleted_count,
+                            )
+                        admin_tools.log_action(
+                            chat_id,
+                            purge_actor,
+                            "پاک کامل پیام‌های کاربر",
+                            target=purge_target_user,
+                            note=f"{deleted_count} پیام حذف شد",
+                        )
+                        if remaining:
+                            bot.logger.log_error(
+                                f"USER PURGE INCOMPLETE chat_id={chat_id} "
+                                f"user_id={purge_target_id} "
+                                f"deleted={deleted_count} "
+                                f"remaining={len(remaining)}"
+                            )
+                        await event.reply(
+                            user_message_purge.confirmation_text(deleted_count)
+                        )
+                    except _asyncio.CancelledError:
+                        raise
+                    except Exception as purge_error:
+                        bot.logger.log_error(
+                            f"USER PURGE FAILED chat_id={chat_id} "
+                            f"user_id={purge_target_id} error={purge_error!r}"
+                        )
+                        try:
+                            await event.reply(f"❌ خطا: {purge_error}")
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            purge_running.discard(purge_key)
+                        except Exception:
+                            pass
+
+                _asyncio.create_task(
+                    finish_user_purge(), name="delete:user-purge"
+                )
+            except Exception as e:
+                await event.reply(f"❌ خطا: {e}")
+            return
+
         # حذف چند پیام آخر با پاک عدد
-        if clean_text.startswith("پاک ") and not clean_text.startswith(("پاک لیست سکوت", "پاک لیست اخراج")):
+        if clean_text.startswith("پاک ") and not clean_text.startswith(("پاک لیست سکوت", "پاک لیست اخراج", "پاک کامل")):
             try:
                 sender_username = getattr(sender, "username", None)
                 if not _can_delete_messages(
