@@ -868,12 +868,22 @@ def drop_stale_pending(sender, deadline):
     return removed
 
 
-def install_rpc_timeout(client, timeout=60.0, on_timeout=None, logger=None):
-    """`client._call` را با یک سقف زمانی می‌پیچد.
+def install_rpc_timeout(client, timeout=None, on_timeout=None, logger=None,
+                        policy=None):
+    """`client._call` را با یک سقف زمانی *per-request* می‌پیچد.
 
     بدون این، گم شدن یک پاسخ یعنی `await` ابدی. با این، درخواست پس از
-    `timeout` ثانیه شکست می‌خورد، تسکِ هندلر آزاد می‌شود و ناظر خبردار
-    می‌شود تا در صورت لزوم اتصال را بازسازی کند.
+    مهلت کلاس خودش (send / moderation / read / سایر) شکست می‌خورد، تسکِ
+    هندلر آزاد می‌شود و ناظر خبردار می‌شود.
+
+    ``timeout`` صریح (همان‌طور که تست‌ها می‌دهند) روی سیاست غلبه
+    می‌کند؛ در production برابر None است و
+    ``RpcPolicy.timeout_for(request)`` تصمیم می‌گیرد. این تنها جای تعیین
+    مهلت RPC است — اعداد 60/20/15 دیگر در لایه‌های مختلف پخش نشده‌اند.
+
+    ``flood_sleep_threshold`` همچنین به لایهٔ زیرین پاس داده می‌شود تا
+    SPlusthon داخل ``_call`` نخوابد؛ سیاست خواب/بک‌آف در
+    ``rpc_resilience`` است.
 
     ⚠️ صرفِ `wait_for` کافی نیست و خودش نشتی می‌سازد: درخواست در
     ``sender._pending_state`` جا می‌ماند. برای همین پس از هر timeout،
@@ -882,9 +892,21 @@ def install_rpc_timeout(client, timeout=60.0, on_timeout=None, logger=None):
     original = getattr(client, "_call", None)
     if original is None or getattr(original, _RPC_MARKER, False):
         return False
+    if policy is None:
+        from modules.rpc_policy import RpcPolicy
+        policy = RpcPolicy.from_environment()
 
     async def _call(sender, request, ordered=False, flood_sleep_threshold=None):
         started = time.monotonic()
+        deadline = (
+            float(timeout) if timeout is not None
+            else policy.timeout_for(request)
+        )
+        if flood_sleep_threshold is None:
+            flood_sleep_threshold = policy.flood_sleep_threshold_s
+        from modules.rpc_policy import RPC_REQUEST_ID
+        from modules import outgoing_profiler as _profiler
+        request_id = RPC_REQUEST_ID.get()
         task = asyncio.ensure_future(
             original(
                 sender,
@@ -893,6 +915,8 @@ def install_rpc_timeout(client, timeout=60.0, on_timeout=None, logger=None):
                 flood_sleep_threshold=flood_sleep_threshold,
             )
         )
+        # Watchdog cancels THIS inner task, never the caller's queue worker.
+        _profiler.attach_cancel_target(request_id, task)
         # یک چرخهٔ رویداد بعد، درخواست در جدول معلق‌ها نشسته است و
         # می‌توان زمان آن را ثبت کرد.
         try:
@@ -901,7 +925,7 @@ def install_rpc_timeout(client, timeout=60.0, on_timeout=None, logger=None):
         except Exception:
             pass
         try:
-            return await asyncio.wait_for(task, timeout=timeout)
+            return await asyncio.wait_for(task, timeout=deadline)
         except asyncio.TimeoutError:
             name = request.__class__.__name__
             # هر چیزی که پیش از شروع این درخواست معلق مانده قطعاً
@@ -910,17 +934,21 @@ def install_rpc_timeout(client, timeout=60.0, on_timeout=None, logger=None):
             dropped += drop_request_pending(sender, request)
             if logger is not None:
                 logger.log_error(
-                    f"CONNECTION GUARD rpc timeout after {timeout}s "
-                    f"request={name} dropped_pending={dropped}"
+                    f"CONNECTION GUARD rpc timeout after {deadline}s "
+                    f"request={name} request_id={request_id or '-'} "
+                    f"dropped_pending={dropped}"
                 )
                 logger.log_info(
                     "CONN TRACE TIMEOUT "
-                    f"request={name} after_s={timeout} "
+                    f"request={name} request_id={request_id or '-'} "
+                    f"after_s={deadline} "
                     f"dropped_pending={dropped}"
                 )
             if on_timeout is not None:
                 on_timeout(request)
-            raise RpcTimeout(f"{name} did not answer within {timeout}s") from None
+            raise RpcTimeout(
+                f"{name} did not answer within {deadline}s"
+            ) from None
         except asyncio.CancelledError:
             drop_request_pending(sender, request)
             drop_completed_pending(sender)
@@ -930,6 +958,7 @@ def install_rpc_timeout(client, timeout=60.0, on_timeout=None, logger=None):
             # is over. Leftover completed rows must not stay in the map.
             drop_completed_pending(sender)
             drop_request_pending(sender, request)
+            _profiler.detach_cancel_target(request_id)
 
     setattr(_call, _RPC_MARKER, True)
     client._call = _call
@@ -1311,7 +1340,8 @@ class ConnectionSupervisor:
 # ==========================================================================
 #  نصب یک‌جا
 # ==========================================================================
-def install(client, logger=None, rpc_timeout=60.0, **supervisor_options):
+def install(client, logger=None, rpc_timeout=None, policy=None,
+            **supervisor_options):
     """همهٔ اصلاحات را نصب و ناظر آماده‌به‌کار را برمی‌گرداند.
 
     فراخوانی دوباره بی‌خطر است؛ هر وصله فقط یک بار اعمال می‌شود.
@@ -1335,6 +1365,7 @@ def install(client, logger=None, rpc_timeout=60.0, **supervisor_options):
         timeout=rpc_timeout,
         on_timeout=supervisor.note_rpc_timeout,
         logger=logger,
+        policy=policy,
     )
     # سقف زمانی روی مسیر ارسال تا «send-side stall» دیگر ربات را بی‌صدا نکند.
     send_timeout = supervisor_options.get("send_timeout", SEND_TIMEOUT_SECONDS)

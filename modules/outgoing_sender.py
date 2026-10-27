@@ -22,6 +22,7 @@ import os
 import time
 
 from modules.rpc_governor import RpcGovernor, classify_request, is_keepalive_request
+from modules.rpc_resilience import install_rpc_resilience
 
 try:
     from modules.group_id import normalize_group_id
@@ -96,6 +97,10 @@ _DISPATCH_ACTIVE = contextvars.ContextVar("outgoing_dispatch_active", default=Fa
 # ``_call`` gate cannot otherwise tell an urgent priority-0 moderation notice
 # from an ordinary SendMessageRequest.
 _SEND_PRIORITY = contextvars.ContextVar("outgoing_send_priority", default=None)
+# Which send lane owns the current job.  Cosmetic auto-notices are a separate
+# lane: their own per-chat queue, their own gate and their own governor bucket.
+# The low-level _call wrapper reads this to pick the right gate/bucket.
+_SEND_CHANNEL = contextvars.ContextVar("outgoing_send_channel", default="main")
 
 # Each client gets its own OutgoingSender via client._outgoing_sender
 _SENDER_ATTR = "_outgoing_sender"
@@ -168,6 +173,29 @@ def _release_chat_gate(chat_id, gate):
         _CHAT_GATES.pop(key, None)
 
 
+# Dedicated gate table for cosmetic notices.  A stuck FloodWait on a notice
+# can only occupy its own single slot; it can never consume either of the two
+# ordinary-send slots of that chat.
+_NOTICE_GATES = {}
+_NOTICE_GATE_LIMIT = 1
+
+
+def _gate_for_notice(chat_id):
+    key = _chat_key(chat_id)
+    gate = _NOTICE_GATES.get(key)
+    if gate is None:
+        gate = _LowGate(limit=_NOTICE_GATE_LIMIT)
+        _NOTICE_GATES[key] = gate
+    return gate
+
+
+def _release_notice_gate(chat_id, gate):
+    gate.release()
+    key = _chat_key(chat_id)
+    if gate.idle() and _NOTICE_GATES.get(key) is gate:
+        _NOTICE_GATES.pop(key, None)
+
+
 class OutgoingSender:
     """Per-chat queue for outgoing sends. Separate from delete queues."""
 
@@ -192,6 +220,12 @@ class OutgoingSender:
             )
         except (TypeError, ValueError):
             self.normal_concurrency = 2
+        try:
+            self.notice_concurrency = max(1, min(2, int(os.getenv(
+                "BOT_SEND_NOTICE_WORKERS_PER_CHAT", "1"))))
+        except (TypeError, ValueError):
+            self.notice_concurrency = 1
+        self.notice_max_per_chat = min(self.max_per_chat, 10)
         # Urgent notifications and normal replies remain separate. Normal
         # sends use both slots already allowed by the low-level per-chat gate;
         # the former single worker left the second safe slot idle.
@@ -207,11 +241,13 @@ class OutgoingSender:
                 "notification_workers_per_chat=1"
             )
 
-    def _queue_key(self, chat_id, priority):
+    def _queue_key(self, chat_id, priority, channel="main"):
         try:
             pri = int(priority)
         except Exception:
             pri = 1
+        if channel == "notice":
+            return (_chat_key(chat_id), "notice")
         if pri <= 0:
             kind = "notif"
         elif pri == 1:
@@ -224,8 +260,8 @@ class OutgoingSender:
         return sum(queue.qsize() for (_chat, kind), queue in self._queues.items()
                    if kind in ("command", "normal"))
 
-    def _queue_for(self, chat_id, priority=1):
-        key = self._queue_key(chat_id, priority)
+    def _queue_for(self, chat_id, priority=1, channel="main"):
+        key = self._queue_key(chat_id, priority, channel)
         q = self._queues.get(key)
         if q is None:
             q = asyncio.PriorityQueue()
@@ -233,6 +269,8 @@ class OutgoingSender:
         return q
 
     def _worker_limit(self, qkey):
+        if qkey[1] == "notice":
+            return self.notice_concurrency
         return 1 if qkey[1] == "notif" else self.normal_concurrency
 
     def _start_worker_if_needed(self, qkey, chat_id, queue):
@@ -248,8 +286,13 @@ class OutgoingSender:
         ))
         return True
 
-    def enqueue(self, chat_id, coro_factory, *, priority=1, on_done=None):
-        """Enqueue a send. Never awaits. Returns True if accepted."""
+    def enqueue(self, chat_id, coro_factory, *, priority=1, on_done=None,
+                channel="main"):
+        """Enqueue a send. Never awaits. Returns True if accepted.
+
+        ``channel="notice"`` is the dedicated cosmetic-notice lane; callers
+        should use :meth:`enqueue_notice` / :meth:`enqueue_reply_notice`.
+        """
         if self._closed:
             return False
         if chat_id is None:
@@ -259,7 +302,8 @@ class OutgoingSender:
             pri = int(priority)
         except Exception:
             pri = 1
-        qkey = self._queue_key(chat_id, pri)
+        channel = "notice" if channel == "notice" else "main"
+        qkey = self._queue_key(chat_id, pri, channel)
         # Background/game sends (pri >= 2) are shed when normal backlog is saturated
         if pri >= 2 and self._normal_pending() >= self.max_normal_pending:
             self.stats["dropped"] += 1
@@ -271,8 +315,12 @@ class OutgoingSender:
             if self.logger:
                 self.logger.log_info(f"OUTGOING SEND SHED chat_id={chat_id} pri={pri} pending={self._normal_pending()}")
             return False
-        q = self._queue_for(chat_id, pri)
-        if q.qsize() >= self.max_per_chat:
+        q = self._queue_for(chat_id, pri, channel)
+        queue_cap = (
+            self.notice_max_per_chat
+            if qkey[1] == "notice" else self.max_per_chat
+        )
+        if q.qsize() >= queue_cap:
             self.stats["dropped"] += 1
             try:
                 from modules.observability import MetricsCollector
@@ -283,12 +331,20 @@ class OutgoingSender:
                 self.logger.log_info(f"OUTGOING SEND DROP chat_id={chat_id} qsize={q.qsize()} kind={qkey[1]}")
             return False
         self._seq += 1
-        q.put_nowait((pri, self._seq, chat_id, coro_factory, on_done, time.perf_counter()))
+        q.put_nowait((pri, self._seq, chat_id, coro_factory, on_done,
+                      time.perf_counter(), channel))
         self.stats["enqueued"] += 1
         self._start_worker_if_needed(qkey, chat_id, q)
         return True
 
-    def enqueue_reply(self, event, text, *, priority=1, on_done=None, **kwargs):
+    def enqueue_notice(self, chat_id, coro_factory, *, priority=1,
+                       on_done=None):
+        """Cosmetic auto-notice: own lane, own gate, own governor bucket."""
+        return self.enqueue(chat_id, coro_factory, priority=priority,
+                            on_done=on_done, channel="notice")
+
+    def enqueue_reply(self, event, text, *, priority=1, on_done=None,
+                      channel="main", **kwargs):
         chat_id = getattr(event, "chat_id", None)
         # Capture event and args at enqueue time
         def factory():
@@ -303,9 +359,17 @@ class OutgoingSender:
                 return factory()
             finally:
                 _DISPATCH_ACTIVE.reset(token)
-        return self.enqueue(chat_id, wrapped, priority=priority, on_done=on_done)
+        return self.enqueue(chat_id, wrapped, priority=priority,
+                            on_done=on_done, channel=channel)
 
-    def enqueue_send(self, chat_id, text, *, priority=1, on_done=None, **kwargs):
+    def enqueue_reply_notice(self, event, text, *, priority=1, on_done=None,
+                             **kwargs):
+        """Convenience wrapper for the many cosmetic moderation notices."""
+        return self.enqueue_reply(event, text, priority=priority,
+                                  on_done=on_done, channel="notice", **kwargs)
+
+    def enqueue_send(self, chat_id, text, *, priority=1, on_done=None,
+                     channel="main", **kwargs):
         def factory():
             return self.client.send_message(chat_id, text, **kwargs)
         def wrapped():
@@ -314,7 +378,8 @@ class OutgoingSender:
                 return factory()
             finally:
                 _DISPATCH_ACTIVE.reset(token)
-        return self.enqueue(chat_id, wrapped, priority=priority, on_done=on_done)
+        return self.enqueue(chat_id, wrapped, priority=priority,
+                            on_done=on_done, channel=channel)
 
     async def _worker(self, qkey, chat_id, queue):
         key = qkey
@@ -327,14 +392,21 @@ class OutgoingSender:
                 except asyncio.QueueEmpty:
                     return
                 try:
-                    # Support both old (5-tuple) and new (6-tuple with chat_id) formats
-                    if len(item) == 6:
+                    # 5-tuple (legacy tests), 6-tuple (chat_id) and 7-tuple
+                    # (chat_id + channel) are all accepted.
+                    channel = "main"
+                    if len(item) == 7:
+                        (priority, seq, orig_chat_id, factory, on_done,
+                         enqueued_at, channel) = item
+                        channel = "notice" if channel == "notice" else "main"
+                    elif len(item) == 6:
                         priority, seq, orig_chat_id, factory, on_done, enqueued_at = item
-                        # Use orig_chat_id for logging if different from worker's chat_id
-                        if orig_chat_id is not None:
-                            chat_id = orig_chat_id
                     else:
                         priority, seq, factory, on_done, enqueued_at = item
+                        orig_chat_id = None
+                    if len(item) >= 6 and orig_chat_id is not None:
+                        # Use orig_chat_id for logging if different from worker's chat_id
+                        chat_id = orig_chat_id
                 except asyncio.CancelledError:
                     raise
                 queue_wait_ms = (time.perf_counter() - enqueued_at) * 1000
@@ -369,6 +441,7 @@ class OutgoingSender:
                     # ثانیه ثبت نمی‌شد (خطای NOTICE CLEANUP ID MISSING).
                     _token = _DISPATCH_ACTIVE.set(False)
                     _priority_token = _SEND_PRIORITY.set(int(priority))
+                    _channel_token = _SEND_CHANNEL.set(channel)
                     try:
                         coro = factory()
                         if inspect.isawaitable(coro):
@@ -376,6 +449,7 @@ class OutgoingSender:
                         else:
                             result = coro
                     finally:
+                        _SEND_CHANNEL.reset(_channel_token)
                         _SEND_PRIORITY.reset(_priority_token)
                         _DISPATCH_ACTIVE.reset(_token)
                     self.stats["sent"] += 1
@@ -578,9 +652,10 @@ def install_event_wrapper(event, sender):
 def _wrap_call_with_gate(client, logger, governor=None):
     """Install the outermost per-chat gate and global RPC governor.
 
-    ``orig`` already contains the profiler and 60-second network timeout.
-    Waiting here therefore cannot consume that timeout. No request is dropped:
-    every waiter either receives a permit or is cancelled by its own caller.
+    ``orig`` already contains the profiler and the per-request deadline from
+    ``RpcPolicy``.  Waiting here therefore cannot consume that deadline. No
+    request is dropped: every waiter either receives a permit or is cancelled
+    by its own caller.
     """
     orig = getattr(client, "_call", None)
     if orig is None or getattr(orig, "_patched_gate", False):
@@ -629,6 +704,9 @@ def _wrap_call_with_gate(client, logger, governor=None):
                 pass
         send_priority = _SEND_PRIORITY.get()
         dispatch_priority = _DISPATCH_ACTIVE.get()
+        channel = _SEND_CHANNEL.get() or "main"
+        if channel != "notice":
+            channel = "main"
         urgent_send = send_priority == 0
         critical_context = bool(
             dispatch_priority is not False
@@ -636,7 +714,12 @@ def _wrap_call_with_gate(client, logger, governor=None):
             and not isinstance(dispatch_priority, bool)
             and int(dispatch_priority) == 0
         )
-        is_low = name in _LOW and not urgent_send
+        # Notice lane always takes its own dedicated single-slot gate.  Main
+        # lane keeps the historical priority-0 bypass.  Either way a notice
+        # can never take a slot from a user-facing reply.
+        is_low = name in _LOW and (
+            channel == "notice" or not urgent_send
+        )
         chat_for_gate = _request_chat(request)
         gate_wait = 0.0
         gate = None
@@ -658,7 +741,11 @@ def _wrap_call_with_gate(client, logger, governor=None):
 
         try:
             if is_low:
-                gate = _gate_for_chat(chat_for_gate)
+                gate = (
+                    _gate_for_notice(chat_for_gate)
+                    if channel == "notice"
+                    else _gate_for_chat(chat_for_gate)
+                )
                 gate_wait = await gate.acquire()
                 gate_acquired = True
                 try:
@@ -681,6 +768,7 @@ def _wrap_call_with_gate(client, logger, governor=None):
                     request,
                     urgent_send=urgent_send,
                     critical_context=critical_context,
+                    channel=channel,
                 )
                 gov_started = time.perf_counter()
                 permit = await governor.acquire(admission)
@@ -713,7 +801,10 @@ def _wrap_call_with_gate(client, logger, governor=None):
             if permit is not None:
                 permit.release()
             if is_low and gate is not None and gate_acquired:
-                _release_chat_gate(chat_for_gate, gate)
+                if channel == "notice":
+                    _release_notice_gate(chat_for_gate, gate)
+                else:
+                    _release_chat_gate(chat_for_gate, gate)
             if phase_token is not None:
                 try:
                     from modules.outgoing_profiler import end_rpc_phases
@@ -749,7 +840,9 @@ def install(client, bot, logger=None):
                 f"noncritical={governor.noncritical_limit} "
                 f"delete={governor.class_limits['delete']} "
                 f"send={governor.class_limits['send']} "
-                f"heavy={governor.class_limits['heavy']}"
+                f"notice={governor.class_limits['notice']} "
+                f"heavy={governor.class_limits['heavy']} "
+                f"critical_reserve={governor.critical_reserve}"
             )
 
     sender = OutgoingSender(client, effective_logger)
@@ -760,6 +853,18 @@ def install(client, bot, logger=None):
         pass
     _wrap_send_message(client, sender)
     _wrap_call_with_gate(client, effective_logger, governor)
+    # OUTERMOST wrapper on purpose: on FloodWait it retries by re-entering the
+    # gate/governor wrapper, so no permit is held during the backoff sleep.
+    controller = install_rpc_resilience(
+        client,
+        logger=effective_logger,
+        policy=getattr(bot, "rpc_policy", None),
+        controller=getattr(bot, "rpc_flood_controller", None),
+    )
+    try:
+        bot.rpc_flood_controller = controller
+    except Exception:
+        pass
     # Also store bot reference for event patching
     try:
         client._outgoing_sender_bot = bot

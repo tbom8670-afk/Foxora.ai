@@ -349,7 +349,13 @@ class ModerationQueue:
                 raise
             except Exception as error:
                 wait_seconds = flood_wait_seconds(error)
-                if wait_seconds is None or attempt >= _MAX_FLOOD_WAIT_RETRIES:
+                # One shared cap across all layers (rpc_resilience retries
+                # first; this is only the final, per-worker safety net).
+                from modules.rpc_policy import RpcPolicy
+                cap = RpcPolicy.from_environment().flood_wait_cap_s
+                if (wait_seconds is None
+                        or attempt >= _MAX_FLOOD_WAIT_RETRIES
+                        or wait_seconds > cap):
                     raise
                 self.logger.log_info(
                     "MODERATION FLOOD WAIT "

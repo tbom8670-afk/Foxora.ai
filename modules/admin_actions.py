@@ -586,7 +586,7 @@ class AdminActions:
                         cl.schedule(chat_id, sent)
                 # Warnings are cosmetic background notices. They must never
                 # occupy the critical lane ahead of delete/ban/owner commands.
-                sender.enqueue(chat_id, lambda: self.client.send_message(chat_id, msg, reply_to=reply_to, formatting_entities=entities), priority=1, on_done=_on_done_warn)
+                sender.enqueue_notice(chat_id, lambda: self.client.send_message(chat_id, msg, reply_to=reply_to, formatting_entities=entities), priority=1, on_done=_on_done_warn)
             else:
                 sent = await self.client.send_message(
                     chat_id, msg, reply_to=reply_to, formatting_entities=entities)
@@ -630,7 +630,7 @@ class AdminActions:
                             cl = getattr(self, "notice_cleanup", None)
                             if cl is not None and sent is not None:
                                 cl.schedule(chat_id, sent)
-                        sender2.enqueue(chat_id, lambda: self.client.send_message(chat_id, txt_mute), priority=0, on_done=_on_done_mute)
+                        sender2.enqueue_notice(chat_id, lambda: self.client.send_message(chat_id, txt_mute), priority=0, on_done=_on_done_mute)
                     else:
                         sent = await self.client.send_message(
                             chat_id,
@@ -656,7 +656,7 @@ class AdminActions:
                             cl = getattr(self, "notice_cleanup", None)
                             if cl is not None and sent is not None:
                                 cl.schedule(chat_id, sent)
-                        sender3.enqueue(chat_id, lambda: self.client.send_message(chat_id, txt_ban), priority=0, on_done=_on_done_ban)
+                        sender3.enqueue_notice(chat_id, lambda: self.client.send_message(chat_id, txt_ban), priority=0, on_done=_on_done_ban)
                     else:
                         sent = await self.client.send_message(
                             chat_id,

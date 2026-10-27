@@ -14,6 +14,55 @@ import os
 import sys
 import time
 
+from modules.rpc_policy import (
+    RPC_ATTEMPT,
+    RPC_REQUEST_ID,
+    RpcPolicy,
+    classify_outcome,
+    new_request_id,
+)
+
+
+# The single policy object shared by tracing, deadlines and the watchdog.
+# ``configure_rpc_policy`` is called once at bot startup (after .env is loaded);
+# the lazy fallback keeps standalone tests and tools working.
+_POLICY = None
+
+
+def configure_rpc_policy(policy):
+    global _POLICY
+    _POLICY = policy or RpcPolicy.from_environment()
+
+
+def _rpc_policy():
+    global _POLICY
+    if _POLICY is None:
+        _POLICY = RpcPolicy.from_environment()
+    return _POLICY
+
+
+# request_id -> the dedicated inner task created by connection_guard's
+# wait_for.  Cancelling THIS task (never the caller's worker task) is safe.
+_CANCEL_TARGETS = {}
+
+
+def attach_cancel_target(request_id, task):
+    if request_id:
+        _CANCEL_TARGETS[request_id] = task
+
+
+def detach_cancel_target(request_id):
+    if request_id:
+        _CANCEL_TARGETS.pop(request_id, None)
+
+
+def cancel_target(request_id):
+    task = _CANCEL_TARGETS.get(request_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
 
 _RESPONSE_RPC_MS = contextvars.ContextVar("response_rpc_ms", default=0.0)
 _RPC_DEPTH = contextvars.ContextVar("outgoing_rpc_depth", default=0)
@@ -418,6 +467,7 @@ def _register_inflight(request, record):
     if request is None:
         return None
     key = id(request)
+    record.setdefault("orphan_reported", False)
     _INFLIGHT_RPCS[key] = record
     return key
 
@@ -425,6 +475,83 @@ def _register_inflight(request, record):
 def _unregister_inflight(key):
     if key is not None:
         _INFLIGHT_RPCS.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+#  Orphan-await watchdog
+# ---------------------------------------------------------------------------
+# The guarantee: every "CONN TRACE AWAIT START" is paired with exactly one
+# terminal line.  If a terminal never arrives (wrapper missing, a swallowed
+# CancelledError, a library bug), this loop reports it AFTER the request's own
+# deadline + grace and cancels the inner RPC task.  It never cancels the
+# caller's long-lived queue worker.
+_WATCHDOG_TASK = None
+
+
+async def _orphan_watchdog_loop(logger, policy):
+    while True:
+        await asyncio.sleep(policy.watchdog_interval_s)
+        now = time.perf_counter()
+        for record in list(_INFLIGHT_RPCS.values()):
+            deadline = record.get("deadline")
+            if deadline is None or now < deadline or record.get("orphan_reported"):
+                continue
+            record["orphan_reported"] = True
+            request_id = record.get("request_id") or "-"
+            age_ms = (now - float(record.get("started") or now)) * 1000.0
+            line = (
+                f"request={record.get('request') or 'unknown'} "
+                f"request_id={request_id} "
+                f"operation={record.get('operation') or '-'} "
+                f"chat_id={record.get('chat_id')} "
+                f"age_ms={age_ms:.0f} "
+                f"deadline_s={record.get('timeout_s')} "
+                f"inflight={len(_INFLIGHT_RPCS)}"
+            )
+            _log_conn_trace(logger, "ORPHAN", extra=line)
+            try:
+                if logger is not None:
+                    logger.log_error(f"ORPHAN RPC AWAIT {line}")
+            except Exception:
+                pass
+            cancelled = False
+            if policy.watchdog_cancel:
+                cancelled = cancel_target(request_id)
+            if cancelled:
+                _log_conn_trace(
+                    logger, "ORPHAN CANCEL",
+                    request=record.get("request") or "unknown",
+                    request_id=request_id,
+                    action="cancel_inner_task",
+                )
+
+
+def start_orphan_watchdog(logger, policy=None):
+    """Start one process-wide watchdog task.  Safe to call twice."""
+    global _WATCHDOG_TASK
+    policy = policy or _rpc_policy()
+    configure_rpc_policy(policy)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if (_WATCHDOG_TASK is not None and not _WATCHDOG_TASK.done()
+            and _WATCHDOG_TASK.get_loop() is loop):
+        return _WATCHDOG_TASK
+    _WATCHDOG_TASK = loop.create_task(
+        _orphan_watchdog_loop(logger, policy),
+        name="rpc-orphan-watchdog",
+    )
+    return _WATCHDOG_TASK
+
+
+def stop_orphan_watchdog():
+    global _WATCHDOG_TASK
+    task = _WATCHDOG_TASK
+    _WATCHDOG_TASK = None
+    if task is not None and not task.done():
+        task.cancel()
+    return task
 
 
 def _chat_id(owner, args, kwargs):
@@ -1120,14 +1247,23 @@ def _wrap_call(client, logger):
         chat_id = None if op_state is None else op_state.get("chat_id")
         if chat_id is None:
             chat_id = _request_chat_id(request)
-        request_id = None if op_state is None else op_state.get("request_id")
+        # The resilience wrapper owns the id for each attempt; fall back to
+        # the high-level operation id (or a fresh one) when it is not installed.
+        request_id = RPC_REQUEST_ID.get()
         if not request_id:
-            request_id = f"{id(asyncio.current_task()):x}-{time.monotonic_ns():x}"
+            request_id = None if op_state is None else op_state.get("request_id")
+        if not request_id:
+            request_id = new_request_id()
+        attempt = RPC_ATTEMPT.get()
+        op_id = None if op_state is None else op_state.get("request_id")
         request_name = _request_name(request)
+        policy = _rpc_policy()
+        timeout_s = policy.timeout_for(request)
         gen_at_start = _RECONNECT_GEN
+        started_at = time.perf_counter()
         call = {
             "send_started": None,
-            "queued": time.perf_counter(),
+            "queued": started_at,
             "logger": logger,
             "request_name": request_name,
             "request_id": request_id,
@@ -1139,10 +1275,13 @@ def _wrap_call(client, logger):
             "operation": operation or request_name,
             "chat_id": chat_id,
             "request": request_name,
-            "started": time.perf_counter(),
+            "started": started_at,
+            "timeout_s": timeout_s,
+            "deadline": started_at + timeout_s + policy.watchdog_grace_s,
         })
         _note_rpc_activity()
         result = "success"
+        outcome_error = None
         sender = None
         if args:
             sender = args[0]
@@ -1155,15 +1294,18 @@ def _wrap_call(client, logger):
                 request=request_name,
                 request_id=request_id,
                 chat_id=chat_id,
+                attempt=attempt,
+                op_id=op_id,
+                timeout_s=timeout_s,
                 reconnect_gen=gen_at_start,
                 pending=_pending_trace(sender)["text"],
             )
             return await original(*args, **kwargs)
-        except asyncio.CancelledError:
-            result = "cancelled"
+        except asyncio.CancelledError as error:
+            outcome_error = error
             raise
         except Exception as error:
-            result = f"failed:{error.__class__.__name__}"
+            outcome_error = error
             raise
         finally:
             returned = time.perf_counter()
@@ -1180,13 +1322,30 @@ def _wrap_call(client, logger):
             reconnect_ms = 0.0
             if reconnects and _LAST_RECONNECT.get("elapsed_ms"):
                 reconnect_ms = float(_LAST_RECONNECT.get("elapsed_ms") or 0.0)
-            if _should_trace(request_name) or reconnects or rpc_wait_ms >= 2000:
+            # ROOT-CAUSE FIX (observability): previously a terminal line was
+            # emitted only for GetDifference/GetChannelDifference, the 20s
+            # window after a reconnect, or RPCs slower than 2s.  A successful
+            # SendMessageRequest (70ms) or a fast FloodWaitError therefore
+            # looked like an "orphan await" forever, even when nothing hung.
+            # Now EVERY AWAIT START gets exactly one terminal line, carrying
+            # the same request_id, its outcome and its timings.
+            event, result = classify_outcome(outcome_error)
+            trace_needed = (
+                policy.trace_all
+                or _should_trace(request_name)
+                or reconnects
+                or rpc_wait_ms >= 2000
+                or event != "RESPONSE"
+            )
+            if trace_needed:
                 _log_conn_trace(
                     logger,
-                    "RESPONSE" if not str(result).startswith("failed") and result != "cancelled" else "AWAIT END",
+                    event,
                     request=request_name,
                     request_id=request_id,
                     result=result,
+                    attempt=attempt,
+                    op_id=op_id,
                     await_ms=total_rpc_ms,
                     socket_wait_ms=connection_wait_ms,
                     rpc_await_ms=rpc_wait_ms,
@@ -1196,6 +1355,7 @@ def _wrap_call(client, logger):
                     socket_sent=int(send_started is not None),
                 )
             _CALL_STATE.reset(token)
+            detach_cancel_target(request_id)
             _unregister_inflight(inflight_key)
             if result == "success":
                 _note_rpc_ok()
@@ -1354,10 +1514,17 @@ def _wrap(owner, attribute, operation, logger):
         return False
 
 
-def instrument_client(client, logger):
-    """یک بار پس از ساخت client فراخوانی می‌شود."""
+def instrument_client(client, logger, policy=None):
+    """یک بار پس از ساخت client فراخوانی می‌شود.
+
+    ``policy`` از سمت core (بعد از load شدن .env) پاس داده می‌شود تا تمام
+    لایه‌ها یک مهلت/سیاست واحد داشته باشند؛ در تست‌ها همان fallback
+    محیطی استفاده می‌شود.
+    """
     if getattr(client, "_outgoing_profiler_installed", False):
         return
+    if policy is not None:
+        configure_rpc_policy(policy)
     _wrap_call(client, logger)
     for attribute, operation in (
         ("send_message", "send_message"),

@@ -164,11 +164,12 @@ def _env_bool(name, default):
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _env_int(name, default, minimum=1):
+def _env_int(name, default, minimum=1, maximum=None):
     try:
-        return max(int(minimum), int(os.getenv(name, str(default))))
+        value = max(int(minimum), int(os.getenv(name, str(default))))
     except (TypeError, ValueError):
-        return int(default)
+        value = int(default)
+    return min(maximum, value) if maximum is not None else value
 
 
 def _env_float(name, default, minimum=0.0):
@@ -234,8 +235,14 @@ def _stable_chat_key(value):
             return "global"
 
 
-def classify_request(request, *, urgent_send=False, critical_context=False):
-    """Classify a SPlusthon TL request using names stable across versions."""
+def classify_request(request, *, urgent_send=False, critical_context=False,
+                     channel="main"):
+    """Classify a SPlusthon TL request using names stable across versions.
+
+    ``channel="notice"`` puts cosmetic auto-notices in their own bucket: they
+    are still sends on the same socket, but they can no longer consume the
+    (single) ordinary ``send`` slot that user-facing replies need.
+    """
     names = [type(item).__name__ for item in _unwrap_requests(request)]
     if not names:
         names = [type(request).__name__]
@@ -251,7 +258,10 @@ def classify_request(request, *, urgent_send=False, critical_context=False):
     elif name_set.intersection(_SEND_REQUESTS):
         # A delayed notice is preferable to starving EditBanned/connection
         # synchronization.  Even an admin reply is a send, never a P0 RPC.
-        priority, bucket = P2_SEND, "send"
+        # Notices get a dedicated bucket so they cannot head-block the main
+        # send lane (architecture decision: separate lanes, one socket).
+        priority = P2_SEND
+        bucket = "notice" if channel == "notice" else "send"
     # Reads are never promoted by a command's dispatch context.  A native
     # admin lookup (GetParticipants/GetFullChannel) is expensive and was
     # filling every P0 slot ahead of the actual mute/ban RPC.
@@ -289,6 +299,8 @@ class RpcGovernor:
         delete_limit=None,
         send_limit=None,
         heavy_limit=None,
+        notice_limit=None,
+        critical_reserve=0,
         enabled=True,
         shadow=False,
         logger=None,
@@ -315,8 +327,14 @@ class RpcGovernor:
             "delete": max(1, int(delete_limit)),
             "send": max(1, int(send_limit)),
             "heavy": max(1, int(heavy_limit)),
+            "notice": max(1, int(notice_limit or 1)),
             "other": 1,
         }
+        # Optional extra slot usable ONLY by P0 moderation/connection RPCs.
+        # Default 0 keeps the historical peak in flight; set
+        # BOT_RPC_CRITICAL_RESERVE=1 on very busy deployments so a slow send
+        # never makes EditBanned wait for a permit.
+        self.critical_reserve = max(0, int(critical_reserve))
         if isolated_default:
             # Send and delete each have their own cap. They share the
             # connection budget, not one mutex.
@@ -332,6 +350,8 @@ class RpcGovernor:
         self.logger = logger
         self.wait_log_ms = max(0.0, float(wait_log_ms))
         self.max_send_waiters = max(0, int(max_send_waiters))
+        # Cosmetic notices are shed earlier than user-facing replies.
+        self.max_notice_waiters = max(4, self.max_send_waiters // 2)
         # Preserved Foxora pacing feature (RPC_MIN_INTERVAL_SECONDS): optional
         # minimum spacing between RPC call starts. 0.0 keeps the B2 behavior
         # bit-for-bit; a positive value serializes starts like the Foxora
@@ -385,6 +405,8 @@ class RpcGovernor:
             wait_log_ms=_env_float("BOT_RPC_WAIT_LOG_MS", 20.0),
             # Bounded send queue allows public commands and help replies to wait
             # without letting cosmetic/game flooding starve moderation.
+            notice_limit=min(2, max(1, _env_int("BOT_RPC_NOTICE_LIMIT", 1))),
+            critical_reserve=_env_int("BOT_RPC_CRITICAL_RESERVE", 0, 0, 2),
             max_send_waiters=max(8, _env_int("BOT_RPC_MAX_SEND_WAITERS", 32)),
             # فاصلهٔ اختیاری بین شروع RPCها؛ knob محفوظ Foxora
             # (RPC_MIN_INTERVAL_SECONDS، پیش‌فرض off تا رفتار B2 حفظ شود).
@@ -412,7 +434,10 @@ class RpcGovernor:
         return False
 
     def _eligible(self, priority, bucket):
-        if self._active_total >= self.total_limit:
+        limit = self.total_limit
+        if priority == P0_CRITICAL:
+            limit += self.critical_reserve
+        if self._active_total >= limit:
             return False
         if priority == P0_CRITICAL:
             return True
@@ -468,7 +493,8 @@ class RpcGovernor:
         return parts
 
     def format_active_by_bucket(self):
-        buckets = {"critical": 0, "delete": 0, "send": 0, "heavy": 0, "other": 0}
+        buckets = {"critical": 0, "delete": 0, "send": 0, "heavy": 0,
+                   "notice": 0, "other": 0}
         buckets.update(dict(self._active_by_bucket))
         return ",".join(f"{name}:{int(count)}" for name, count in buckets.items() if count)
 
@@ -529,7 +555,10 @@ class RpcGovernor:
         try:
             if not self.enabled or self.shadow:
                 return
-            while self._active_total < self.total_limit:
+            while True:
+                # _pop_next -> _eligible already enforces total_limit (plus
+                # the P0-only reserve).  Looping on eligibility instead of a
+                # raw counter keeps the reserve usable after it is enabled.
                 waiter = self._pop_next()
                 if waiter is None:
                     return
@@ -559,10 +588,15 @@ class RpcGovernor:
         # Only shed ordinary/background sends. Command and moderation replies
         # are P0 and must remain deliverable even while normal notifications
         # have already filled the send backlog.
-        if (not self.shadow and admission.bucket == "send"
-                and admission.priority != P0_CRITICAL
-                and self._waiting >= self.max_send_waiters):
-            raise RpcOverloadError("outgoing send backlog is full")
+        if (not self.shadow and admission.bucket in ("send", "notice")
+                and admission.priority != P0_CRITICAL):
+            cap = (
+                self.max_notice_waiters
+                if admission.bucket == "notice"
+                else self.max_send_waiters
+            )
+            if self._waiting >= cap:
+                raise RpcOverloadError("outgoing send backlog is full")
 
         if not self.enabled and not self.shadow:
             # Wrapper normally bypasses this mode. Keep direct use harmless.
@@ -671,7 +705,8 @@ class RpcGovernor:
 
     def format_waiting_by_bucket(self):
         counts = {
-            "critical": 0, "delete": 0, "send": 0, "heavy": 0, "other": 0,
+            "critical": 0, "delete": 0, "send": 0, "heavy": 0,
+            "notice": 0, "other": 0,
         }
         for groups in self._queues.values():
             for group in groups.values():
@@ -682,7 +717,8 @@ class RpcGovernor:
                     counts[bucket] = counts.get(bucket, 0) + 1
         return ",".join(
             f"{name}:{counts[name]}"
-            for name in ("critical", "delete", "send", "heavy", "other")
+            for name in ("critical", "delete", "send", "heavy", "notice",
+                         "other")
             if counts.get(name)
         )
 
@@ -845,7 +881,8 @@ class RpcGovernor:
     def snapshot(self):
         waiting_by_priority = {}
         waiting_by_bucket = {
-            "critical": 0, "delete": 0, "send": 0, "heavy": 0, "other": 0,
+            "critical": 0, "delete": 0, "send": 0, "heavy": 0,
+            "notice": 0, "other": 0,
         }
         for priority, groups in self._queues.items():
             waiting_by_priority[_PRIORITY_LABELS[priority]] = sum(

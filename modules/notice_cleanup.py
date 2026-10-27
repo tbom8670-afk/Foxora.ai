@@ -189,6 +189,8 @@ class NoticeCleanup:
         self._events = {}
         self._dirty = False
         self._started = False
+        self._persist_lock = None
+        self._persist_loop = None
         self._load()
 
     def bind_delete_queue(self, queue):
@@ -430,7 +432,7 @@ class NoticeCleanup:
                 # If the process dies while the RPC is in flight, the due IDs
                 # therefore remain available for recovery after restart.
                 if self._dirty:
-                    self._persist()
+                    await self._persist_async()
                 now = time.time()
                 # Use the original stored chat ID (full -100... form) for RPC.
                 # Due rows remain in memory and on disk until the result is
@@ -496,7 +498,7 @@ class NoticeCleanup:
                             chat_id, due_rows, remaining, now=time.time(),
                         )
                     if self._dirty:
-                        self._persist()
+                        await self._persist_async()
                     continue
                 next_at = self.next_expiry(chat_id)
                 if next_at is None:
@@ -545,7 +547,27 @@ class NoticeCleanup:
         except OSError:
             pass
 
+    def _write_persist_payload(self, path, payload):
+        """Pure file I/O, safe to run in an executor thread."""
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        handle, tmp_path = tempfile.mkstemp(
+            prefix="notice_cleanup.", suffix=".tmp", dir=directory
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+                json.dump(payload, tmp, ensure_ascii=False)
+                tmp.write("\n")
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _persist(self):
+        """Synchronous persist (shutdown / tests / direct callers)."""
         path = self.persist_path
         if not path:
             self._dirty = False
@@ -553,26 +575,51 @@ class NoticeCleanup:
         payload = {
             key: list(rows) for key, rows in self._items.items() if rows
         }
-        directory = os.path.dirname(path) or "."
         try:
-            os.makedirs(directory, exist_ok=True)
-            handle, tmp_path = tempfile.mkstemp(
-                prefix="notice_cleanup.", suffix=".tmp", dir=directory
-            )
-            try:
-                with os.fdopen(handle, "w", encoding="utf-8") as tmp:
-                    json.dump(payload, tmp, ensure_ascii=False)
-                    tmp.write("\n")
-                os.replace(tmp_path, path)
-                self._dirty = False
-            except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
+            self._write_persist_payload(path, payload)
+            self._dirty = False
         except Exception as error:
-            if self.logger is not None:
+            self._log_persist_error(error)
+
+    async def _persist_async(self):
+        """Keep the auto-notice timer off the event loop's disk I/O path.
+
+        With many active groups the old synchronous ``json.dump`` +
+        ``os.replace`` of the *entire* pending map ran once per worker wake-up,
+        directly on the event loop.  Snapshotting stays on the loop (cheap,
+        race-free); the blocking write moves to the default executor and is
+        serialized so two groups cannot interleave temp-file replacements.
+        """
+        path = self.persist_path
+        if not path:
+            self._dirty = False
+            return
+        loop = asyncio.get_running_loop()
+        if (self._persist_lock is None
+                or getattr(self, "_persist_loop", None) is not loop):
+            # Tests and client rebuilds may run this object on a fresh loop.
+            self._persist_lock = asyncio.Lock()
+            self._persist_loop = loop
+        payload = {
+            key: list(rows) for key, rows in self._items.items() if rows
+        }
+        # A schedule() during the write sets the flag again, so the next
+        # worker iteration flushes the newer state.
+        self._dirty = False
+        try:
+            async with self._persist_lock:
+                await loop.run_in_executor(
+                    None, self._write_persist_payload, path, payload
+                )
+        except Exception as error:
+            self._dirty = True
+            self._log_persist_error(error)
+
+    def _log_persist_error(self, error):
+        if self.logger is not None:
+            try:
                 self.logger.log_error(
                     f"NOTICE CLEANUP SAVE FAILED error={error!r}"
                 )
+            except Exception:
+                pass

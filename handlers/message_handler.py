@@ -620,7 +620,7 @@ async def _send_moderation_notification_once(
             # Capture after real send completes, still via sender's worker
             def _on_done1(sent):
                 capture_sent(bot, chat_id, sent)
-            sender.enqueue(chat_id, _factory1, priority=1, on_done=_on_done1)
+            sender.enqueue_notice(chat_id, _factory1, priority=1, on_done=_on_done1)
             return True
         sent = await bot.client.send_message(
             chat_id, text, formatting_entities=formatting_entities
@@ -1730,7 +1730,7 @@ def _schedule_auto_spam_cleanup(bot, event, chat_id, user_id, seed_ids, *, annou
                 notice_event = incident.get("event") or event
                 sender2 = getattr(bot, "outgoing_sender", None)
                 if sender2 is not None:
-                    sender2.enqueue_reply(notice_event, f"🗑 {_fullwidth_digits(incident['deleted'])} پیام هرزنامه پاک شد", on_done=lambda sent: capture_sent(bot, chat_id, sent))
+                    sender2.enqueue_reply_notice(notice_event, f"🗑 {_fullwidth_digits(incident['deleted'])} پیام هرزنامه پاک شد", on_done=lambda sent: capture_sent(bot, chat_id, sent))
                     getattr(bot, "_spam_cleanup_incidents", {}).pop(key, None)
                 else:
                     sent = await notice_event.reply(
@@ -3586,9 +3586,9 @@ async def handle_new_message(bot, event):
                                     MessageEntityBold(offset=0, length=bold_len),
                                     MessageEntityBlockquote(offset=name_start, length=name_len),
                                 ]
-                                sender3.enqueue_reply(event, notice, formatting_entities=entities, on_done=lambda sent: capture_sent(bot, chat_id, sent))
+                                sender3.enqueue_reply_notice(event, notice, formatting_entities=entities, on_done=lambda sent: capture_sent(bot, chat_id, sent))
                             except Exception:
-                                sender3.enqueue_reply(event, notice, on_done=lambda sent: capture_sent(bot, chat_id, sent))
+                                sender3.enqueue_reply_notice(event, notice, on_done=lambda sent: capture_sent(bot, chat_id, sent))
                         else:
                             try:
                                 name_start = len("⚠️ کاربر\n".encode("utf-16-le")) // 2
@@ -3749,14 +3749,14 @@ async def handle_new_message(bot, event):
                         ]
                         if sender3 is not None:
                             try:
-                                sender3.enqueue_reply(
+                                sender3.enqueue_reply_notice(
                                     event,
                                     fn_notice,
                                     formatting_entities=entities,
                                     on_done=lambda sent: capture_sent(bot, chat_id, sent),
                                 )
                             except Exception:
-                                sender3.enqueue_reply(
+                                sender3.enqueue_reply_notice(
                                     event,
                                     fn_notice,
                                     on_done=lambda sent: capture_sent(bot, chat_id, sent),
@@ -4119,7 +4119,7 @@ async def handle_new_message(bot, event):
                         raise RuntimeError("bot_disabled_groups.json persistence verification failed")
                     sender4 = getattr(bot, "outgoing_sender", None)
                     if sender4 is not None:
-                        sender4.enqueue_reply(event, "🤖 ربات دیگری در این گروه فعال است.\nبه دلیل فعال بودن این ربات، روباه در این گروه خاموش شد.", on_done=lambda sent: capture_sent(bot, chat_id, sent))
+                        sender4.enqueue_reply_notice(event, "🤖 ربات دیگری در این گروه فعال است.\nبه دلیل فعال بودن این ربات، روباه در این گروه خاموش شد.", on_done=lambda sent: capture_sent(bot, chat_id, sent))
                     else:
                         sent = await event.reply(
                             "🤖 ربات دیگری در این گروه فعال است.\n"
@@ -7734,14 +7734,14 @@ async def handle_new_message(bot, event):
                             f"♻️ کاربر آزاد شد ᯓ⁪⁮ [ {format_user(_u)} ]")
                         _sender_ok = getattr(_b, "outgoing_sender", None)
                         if _sender_ok is not None:
-                            _sender_ok.enqueue_reply(_ev, _release_notice)
+                            _sender_ok.enqueue_reply_notice(_ev, _release_notice)
                         else:
                             await _ev.reply(_release_notice)
                     except Exception as e:
                         try:
                             _sender_ok2 = getattr(_b, "outgoing_sender", None)
                             if _sender_ok2 is not None:
-                                _sender_ok2.enqueue_reply(_ev, f"❌ خطا در آزاد کردن:\n{e}")
+                                _sender_ok2.enqueue_reply_notice(_ev, f"❌ خطا در آزاد کردن:\n{e}")
                             else:
                                 await _ev.reply(f"❌ خطا در آزاد کردن:\n{e}")
                         except Exception:
@@ -7751,7 +7751,7 @@ async def handle_new_message(bot, event):
                     try:
                         _sender_ok = getattr(_b, "outgoing_sender", None)
                         if _sender_ok is not None:
-                            _sender_ok.enqueue_reply(_ev, "❌ آزاد کردن انجام نشد")
+                            _sender_ok.enqueue_reply_notice(_ev, "❌ آزاد کردن انجام نشد")
                         else:
                             await _ev.reply("❌ آزاد کردن انجام نشد")
                     except Exception:
@@ -7768,7 +7768,7 @@ async def handle_new_message(bot, event):
                             "ریپلای کنید و بنویسید: رفع سکوت"
                         )
                         if _mm_sender is not None:
-                            _mm_sender.enqueue_reply(_ev, _mm_notice)
+                            _mm_sender.enqueue_reply_notice(_ev, _mm_notice)
                         else:
                             await _ev.reply(_mm_notice)
                         return
@@ -7789,7 +7789,7 @@ async def handle_new_message(bot, event):
             except Exception as e:
                 _sender_err = getattr(bot, "outgoing_sender", None)
                 if _sender_err is not None:
-                    _sender_err.enqueue_reply(event, f"❌ خطا در آزاد کردن:\n{e}")
+                    _sender_err.enqueue_reply_notice(event, f"❌ خطا در آزاد کردن:\n{e}")
                 else:
                     await event.reply(f"❌ خطا در آزاد کردن:\n{e}")
                     # === FIX: robust clearing for already_punished / is_repeat / spam_history after unban ===
@@ -8750,7 +8750,7 @@ async def handle_new_message(bot, event):
                 if bot.acquire_delete_notice_lock(chat_id):
                     sender5 = getattr(bot, "outgoing_sender", None)
                     if sender5 is not None:
-                        sender5.enqueue_reply(event, "پیام‌های پشت سر هم حذف شدند", on_done=lambda sent: capture_sent(bot, chat_id, sent))
+                        sender5.enqueue_reply_notice(event, "پیام‌های پشت سر هم حذف شدند", on_done=lambda sent: capture_sent(bot, chat_id, sent))
                     else:
                         sent = await event.reply("پیام‌های پشت سر هم حذف شدند")
                         capture_sent(bot, chat_id, sent)
