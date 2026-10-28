@@ -14,6 +14,7 @@ from modules.rpc_governor import (
     P2_SEND,
     P3_HEAVY,
     RpcAdmission,
+    RpcAdmissionTimeoutError,
     RpcGovernor,
     classify_request,
     is_keepalive_request,
@@ -789,7 +790,7 @@ def test_heavy_not_admitted_while_delete_waiting_at_cap():
     assert after["active"] == 0
 
 
-def test_p1_not_blocked_by_heavy_occupying_noncritical():
+def test_p1_and_send_are_not_blocked_by_heavy_read_when_global_slot_is_free():
     async def scenario():
         governor = RpcGovernor(
             total_limit=3,
@@ -803,21 +804,178 @@ def test_p1_not_blocked_by_heavy_occupying_noncritical():
             governor.acquire(admission(P1_DELETE, "delete", "antispam")),
             timeout=0.05,
         )
-        snap = governor.snapshot()
-        extra_send = asyncio.create_task(
-            governor.acquire(admission(P2_SEND, "send", "notice"))
+        send = await asyncio.wait_for(
+            governor.acquire(admission(P2_SEND, "send", "reply")),
+            timeout=0.05,
         )
-        await asyncio.sleep(0)
-        send_blocked = not extra_send.done()
-        extra_send.cancel()
-        await asyncio.gather(extra_send, return_exceptions=True)
-        heavy.release()
-        delete.release()
-        return snap, send_blocked, governor.snapshot()
+        snap = governor.snapshot()
+        for permit in (send, delete, heavy):
+            permit.release()
+        return snap, governor.snapshot()
 
-    snap, send_blocked, after = asyncio.run(scenario())
-    assert snap["active_by_bucket"].get("heavy") == 1
-    assert snap["active_by_bucket"].get("delete") == 1
-    assert send_blocked
+    during, after = asyncio.run(scenario())
+    assert during["active_by_bucket"].get("heavy") == 1
+    assert during["active_by_bucket"].get("delete") == 1
+    assert during["active_by_bucket"].get("send") == 1
     assert after["active"] == 0
 
+
+def test_resolve_username_has_its_own_bucket_and_does_not_starve_important_lanes():
+    class ResolveUsernameRequest:
+        pass
+
+    resolved = classify_request(ResolveUsernameRequest())
+    assert resolved.priority == P3_HEAVY
+    assert resolved.bucket == "resolve"
+
+    async def scenario():
+        governor = RpcGovernor(
+            total_limit=3,
+            # Even a minimal background budget must not make a held username
+            # resolution block the distinct send/delete lanes.
+            noncritical_limit=1,
+            delete_limit=1,
+            send_limit=1,
+            heavy_limit=1,
+            resolve_limit=1,
+            critical_reserve=1,
+            resolve_timeout_seconds=0,
+            watchdog_timeout_seconds=0,
+        )
+        resolve = await governor.acquire(resolved)
+        send = await governor.acquire(
+            admission(P2_SEND, "send", "user-facing")
+        )
+        delete = await governor.acquire(
+            admission(P1_DELETE, "delete", "cleanup")
+        )
+        critical = await governor.acquire(
+            admission(P0_CRITICAL, "critical", "ban")
+        )
+        snapshot = governor.snapshot()
+        assert snapshot["active_by_bucket"]["resolve"] == 1
+        assert snapshot["active_by_bucket"]["send"] == 1
+        assert snapshot["active_by_bucket"]["delete"] == 1
+        assert snapshot["active_by_bucket"]["critical"] == 1
+        for permit in (critical, delete, send, resolve):
+            permit.release()
+        return governor.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert snapshot["active"] == 0
+    assert snapshot["waiting"] == 0
+
+
+def test_full_resolve_bucket_does_not_head_block_heavy_in_same_priority_chat():
+    async def scenario():
+        governor = RpcGovernor(
+            total_limit=3,
+            noncritical_limit=3,
+            resolve_limit=1,
+            heavy_limit=1,
+            resolve_timeout_seconds=0,
+            watchdog_timeout_seconds=0,
+        )
+        held_resolve = await governor.acquire(
+            admission(P3_HEAVY, "resolve", "global")
+        )
+        blocked_resolve = asyncio.create_task(
+            governor.acquire(admission(P3_HEAVY, "resolve", "global"))
+        )
+        await asyncio.sleep(0)
+        assert governor.snapshot()["waiting_by_bucket"]["resolve"] == 1
+
+        # This is the same priority and chat-key but a different bucket. It
+        # must pass the blocked resolve waiter instead of sitting behind it.
+        heavy = await asyncio.wait_for(
+            governor.acquire(admission(P3_HEAVY, "heavy", "global")),
+            timeout=0.05,
+        )
+        assert heavy.bucket == "heavy"
+        heavy.release()
+        blocked_resolve.cancel()
+        result = await asyncio.gather(blocked_resolve, return_exceptions=True)
+        assert isinstance(result[0], asyncio.CancelledError)
+        held_resolve.release()
+        return governor.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert snapshot["active"] == 0
+    assert snapshot["waiting"] == 0
+
+
+def test_resolve_waiter_expires_and_is_removed_from_governor_queue():
+    async def scenario():
+        governor = RpcGovernor(
+            total_limit=1,
+            noncritical_limit=1,
+            send_limit=1,
+            resolve_timeout_seconds=0.02,
+            watchdog_timeout_seconds=0,
+        )
+        held_send = await governor.acquire(
+            admission(P2_SEND, "send", "held")
+        )
+        try:
+            await governor.acquire(
+                admission(P3_HEAVY, "resolve", "global")
+            )
+        except RpcAdmissionTimeoutError:
+            pass
+        else:
+            raise AssertionError("ResolveUsername should have expired in queue")
+        snapshot = governor.snapshot()
+        assert snapshot["waiting"] == 0
+        assert snapshot["stats"]["expired_waiters"] == 1
+        held_send.release()
+        return governor.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert snapshot["active"] == 0
+    assert snapshot["waiting"] == 0
+
+
+def test_governor_watchdog_cancels_stuck_owner_and_force_releases_permit():
+    async def scenario():
+        governor = RpcGovernor(
+            total_limit=1,
+            noncritical_limit=1,
+            resolve_timeout_seconds=0.02,
+            watchdog_timeout_seconds=0,
+            watchdog_grace_seconds=0.01,
+        )
+        let_stubborn_finish = asyncio.Event()
+
+        async def stuck_resolve():
+            permit = await governor.acquire(
+                admission(P3_HEAVY, "resolve", "global")
+            )
+            try:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # Model a library call which does not finish promptly when
+                    # cancelled. The watchdog must still free its accounting.
+                    await let_stubborn_finish.wait()
+            finally:
+                permit.release()
+
+        task = asyncio.create_task(stuck_resolve())
+        await asyncio.sleep(0.07)
+        after_watchdog = governor.snapshot()
+        assert after_watchdog["active"] == 0
+        assert after_watchdog["stats"]["watchdog_cancelled"] == 1
+        assert after_watchdog["stats"]["watchdog_forced_releases"] == 1
+
+        send = await asyncio.wait_for(
+            governor.acquire(admission(P2_SEND, "send", "other-chat")),
+            timeout=0.05,
+        )
+        let_stubborn_finish.set()
+        await asyncio.wait_for(task, timeout=0.05)
+        send.release()
+        return governor.snapshot()
+
+    snapshot = asyncio.run(scenario())
+    assert snapshot["active"] == 0
+    assert snapshot["waiting"] == 0

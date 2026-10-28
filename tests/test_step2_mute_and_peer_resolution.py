@@ -168,10 +168,11 @@ def test_circuit_breaker_resilience_to_non_permission_errors():
             raise ChatAdminRequiredError("Admin rights required")
         client.side_effect = mock_fail_admin
 
-        # Permission failure -> trips breaker
+        # ChatAdminRequired is logged/cancelled for this mute only; unrelated
+        # moderation/commands for the same chat remain eligible.
         res1 = await admin.mute_user(1001, 5001)
         assert res1 is False
-        assert cb.can_execute(1001, "mute") is False
+        assert cb.can_execute(1001, "mute") is True
 
     asyncio.run(scenario())
 
@@ -206,9 +207,10 @@ def test_concurrent_multi_group_mute_isolation():
         assert results[1] is True   # Group 2 succeeded
         assert results[2] is False  # Group 999 failed
 
-        # Group 1 and 2 circuit breakers remain open to requests
+        # All chats remain eligible; the ChatAdminRequired failure is scoped
+        # to the failed operation and is not recorded in the breaker.
         assert cb.can_execute(1, "mute") is True
         assert cb.can_execute(2, "mute") is True
-        assert cb.can_execute(999, "mute") is False
+        assert cb.can_execute(999, "mute") is True
 
     asyncio.run(scenario())

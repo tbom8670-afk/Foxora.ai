@@ -381,51 +381,54 @@ def test_tracker_leftover_timeout_does_not_reconnect():
 def test_governor_limits_and_p0_p1_order():
     async def scenario():
         governor = RpcGovernor.from_environment()
-        assert governor.total_limit == 2
+        assert governor.total_limit == 3
         assert governor.class_limits["delete"] == 1
         assert governor.class_limits["send"] == 1
+        assert governor.critical_reserve >= 1
+
+        # A stuck heavy/resolve bucket cannot consume delete's reserved path.
         heavy = await governor.acquire(
             RpcAdmission(P3_HEAVY, "heavy", "GetParticipantsRequest", "g1")
+        )
+        send = await governor.acquire(
+            RpcAdmission(P2_SEND, "send", "SendMessageRequest", "g2")
         )
         started = time.perf_counter()
         delete = await asyncio.wait_for(
             governor.acquire(
-                RpcAdmission(P1_DELETE, "delete", "DeleteMessagesRequest", "g2")
+                RpcAdmission(P1_DELETE, "delete", "DeleteMessagesRequest", "g3")
             ),
             timeout=0.05,
         )
         p1_wait_ms = (time.perf_counter() - started) * 1000.0
+
+        # The normal capacity is full (heavy + send + delete), but P0 has one
+        # explicit reserve and still runs immediately.
+        critical = await asyncio.wait_for(
+            governor.acquire(
+                RpcAdmission(P0_CRITICAL, "critical", "EditBannedRequest", "g4")
+            ),
+            timeout=0.05,
+        )
         p3_task = asyncio.create_task(
             governor.acquire(
-                RpcAdmission(P3_HEAVY, "heavy", "GetHistoryRequest", "g4")
-            )
-        )
-        p0_task = asyncio.create_task(
-            governor.acquire(
-                RpcAdmission(P0_CRITICAL, "critical", "GetChannelDifferenceRequest", "g5")
+                RpcAdmission(P3_HEAVY, "heavy", "GetHistoryRequest", "g5")
             )
         )
         await asyncio.sleep(0.01)
-        p0_waiting = not p0_task.done()
         p3_waiting = not p3_task.done()
-        heavy.release()
-        p0 = await asyncio.wait_for(p0_task, timeout=0.05)
-        still_p3 = not p3_task.done()
-        p0.release()
-        delete.release()
-        p3_task.cancel()
-        try:
-            await p3_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        return p1_wait_ms, p0_waiting, p3_waiting, still_p3, governor.snapshot()
 
-    p1_wait_ms, p0_waiting, p3_waiting, still_p3, snap = asyncio.run(scenario())
+        for permit in (critical, delete, send, heavy):
+            permit.release()
+        p3 = await asyncio.wait_for(p3_task, timeout=0.05)
+        p3.release()
+        return p1_wait_ms, p3_waiting, governor.snapshot()
+
+    p1_wait_ms, p3_waiting, snap = asyncio.run(scenario())
     assert p1_wait_ms < 50.0, p1_wait_ms
-    assert p0_waiting is True
     assert p3_waiting is True
-    assert still_p3 is True
     assert snap["active"] == 0
+    assert snap["waiting"] == 0
 
 
 def test_keepalive_bypasses_governor():

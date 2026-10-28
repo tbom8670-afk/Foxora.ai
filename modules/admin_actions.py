@@ -5,7 +5,11 @@ import asyncio
 import re
 from modules.group_stats import add_deleted
 from modules.group_id import normalize_group_id
-from modules.cache_manager import PermissionCircuitBreaker, TtlCache
+from modules.cache_manager import (
+    PermissionCircuitBreaker,
+    TtlCache,
+    is_chat_admin_required_error,
+)
 from datetime import timedelta
 
 try:
@@ -73,6 +77,18 @@ class AdminActions:
         self.bot_account_id = bot_account_id
         self.circuit_breaker = circuit_breaker or PermissionCircuitBreaker.get_default(self.logger)
         self.entity_cache = TtlCache(default_ttl=300.0, max_size=3000)
+
+    def _record_permission_failure(self, chat_id, error):
+        """Record only chat-wide permission failures, not ChatAdminRequired.
+
+        ChatAdminRequired is expected for one attempted action in a group
+        without admin rights. The caller logs that failure and returns False;
+        it must not close the breaker for other independent operations.
+        """
+        if is_chat_admin_required_error(error):
+            return False
+        self.circuit_breaker.record_failure(chat_id, error)
+        return True
 
     def bind_runtime_context(self, *, peer_cache=None, bot_account_id=None):
         if peer_cache is not None:
@@ -186,13 +202,13 @@ class AdminActions:
                 self.circuit_breaker.record_success(chat_id)
                 return True
         except (ChatAdminRequiredError, UserAdminInvalidError) as e:
-            self.circuit_breaker.record_failure(chat_id, e)
+            self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"❌ دسترسی ادمین برای حذف پیام در {chat_id} ندارید: {e}")
             return False
         except Exception as e:
             from modules.cache_manager import is_permission_error
             if is_permission_error(e):
-                self.circuit_breaker.record_failure(chat_id, e)
+                self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در حذف پیام {message_id} در {chat_id}: {e}")
             return False
         return False
@@ -285,7 +301,7 @@ class AdminActions:
             return True
 
         except (ChatAdminRequiredError, UserAdminInvalidError) as e:
-            self.circuit_breaker.record_failure(chat_id, e)
+            self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در سکوت کاربر (عدم دسترسی ادمین): {e}")
             return False
         except Exception as e:
@@ -293,7 +309,7 @@ class AdminActions:
                 raise
             from modules.cache_manager import is_permission_error
             if is_permission_error(e):
-                self.circuit_breaker.record_failure(chat_id, e)
+                self._record_permission_failure(chat_id, e)
             print("MUTE ERROR:", repr(e))
             self.logger.log_error(f"خطا در سکوت کاربر: {e}")
             return False
@@ -373,7 +389,7 @@ class AdminActions:
             return True
 
         except (ChatAdminRequiredError, UserAdminInvalidError) as e:
-            self.circuit_breaker.record_failure(chat_id, e)
+            self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در unmute {user_id} (عدم دسترسی ادمین): {e}")
             return False
         except Exception as e:
@@ -381,7 +397,7 @@ class AdminActions:
                 raise
             from modules.cache_manager import is_permission_error
             if is_permission_error(e):
-                self.circuit_breaker.record_failure(chat_id, e)
+                self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در unmute {user_id}: {e}")
             return False
 
@@ -490,7 +506,7 @@ class AdminActions:
             return True
 
         except (ChatAdminRequiredError, UserAdminInvalidError) as e:
-            self.circuit_breaker.record_failure(chat_id, e)
+            self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در بن دائمی {user_id} (عدم دسترسی ادمین): {e}")
             return False
         except Exception as e:
@@ -498,7 +514,7 @@ class AdminActions:
                 raise
             from modules.cache_manager import is_permission_error
             if is_permission_error(e):
-                self.circuit_breaker.record_failure(chat_id, e)
+                self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در بن دائمی {user_id}: {e}")
             return False
 
@@ -753,7 +769,7 @@ class AdminActions:
             return True
 
         except (ChatAdminRequiredError, UserAdminInvalidError) as e:
-            self.circuit_breaker.record_failure(chat_id, e)
+            self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در unban {user_id} (عدم دسترسی ادمین): {e}")
             return False
         except Exception as e:
@@ -761,6 +777,6 @@ class AdminActions:
                 raise
             from modules.cache_manager import is_permission_error
             if is_permission_error(e):
-                self.circuit_breaker.record_failure(chat_id, e)
+                self._record_permission_failure(chat_id, e)
             self.logger.log_error(f"خطا در unban {user_id}: {e}")
             return False

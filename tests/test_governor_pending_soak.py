@@ -168,6 +168,6 @@ def test_isolated_governor_under_held_delete():
         return wait_ms, governor.noncritical_limit, governor.total_limit
 
     wait_ms, nc, total = asyncio.run(scenario())
-    assert total == 2
+    assert total == 3
     assert nc >= 2
     assert wait_ms < 50.0, wait_ms

@@ -122,7 +122,7 @@ class TtlCache:
 
 
 STATE_CLOSED = "CLOSED"      # Normal operation: bot has admin rights
-STATE_OPEN = "OPEN"          # Tripped: bot lacks admin rights; block RPCs
+STATE_OPEN = "OPEN"          # Other confirmed permission failures; fail fast per chat
 STATE_HALF_OPEN = "HALF_OPEN"  # Testing: allow 1 probe operation
 
 
@@ -166,6 +166,36 @@ def is_permission_error(error) -> bool:
     return False
 
 
+def is_chat_admin_required_error(error) -> bool:
+    """True when an RPC says this bot lacks admin rights in the chat.
+
+    This is an expected, operation-local failure (for example, a ban in a
+    group where the bot is not an admin). It must be logged and returned to
+    that caller, not used to open a chat-wide breaker that suppresses unrelated
+    work such as sends, reads, or commands.
+    """
+    seen = set()
+    current = error
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        name = current.__class__.__name__.lower()
+        text = str(current).lower()
+        if (
+            "chatadminrequired" in name
+            or "chat_admin_required" in name
+            or "chat admin required" in text
+            or "chat_admin_required" in text
+            or "chatadminrequired" in text
+        ):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(
+            current, "__context__", None
+        )
+    return False
+
+
 @dataclass
 class BreakerRecord:
     state: str = STATE_CLOSED
@@ -179,8 +209,10 @@ class BreakerRecord:
 class PermissionCircuitBreaker:
     """Circuit breaker per chat to prevent continuous failed admin RPCs.
 
-    When ``ChatAdminRequiredError`` or user admin invalidation occurs in a group,
-    this breaker trips to ``OPEN`` state for ``cooldown_seconds`` (default: 180s).
+    Confirmed permission errors other than ``ChatAdminRequiredError`` may trip
+    this breaker to ``OPEN`` for ``cooldown_seconds`` (default: 180s).
+    ``ChatAdminRequiredError`` is deliberately operation-local and never opens
+    this breaker.
     During this window, subsequent moderation and deletion RPCs for that group
     fail-fast locally (0ms) instead of wasting 150-400ms on doomed network calls.
     """
@@ -274,7 +306,19 @@ class PermissionCircuitBreaker:
     def record_failure(
         self, chat_id, error=None, cooldown: Optional[float] = None
     ) -> None:
-        """Trip circuit breaker to OPEN upon genuine permission failure only."""
+        """Trip only on permission failures that justify chat-wide suppression.
+
+        ChatAdminRequiredError is deliberately excluded: the caller logs and
+        cancels that one operation, while independent RPC buckets keep running.
+        """
+        if is_chat_admin_required_error(error):
+            if self.logger:
+                self.logger.log_info(
+                    "CIRCUIT BREAKER SKIP CHAT_ADMIN_REQUIRED "
+                    f"chat_id={_safe_chat_key(chat_id)} "
+                    "scope=operation_only; unrelated_rpc_allowed=True"
+                )
+            return
         if error is not None and not is_permission_error(error):
             if self.logger:
                 self.logger.log_info(

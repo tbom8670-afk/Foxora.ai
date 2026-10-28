@@ -139,6 +139,8 @@ class RpcPolicy:
     send_timeout_s: float = 15.0
     moderation_timeout_s: float = 20.0
     read_timeout_s: float = 20.0
+    # Username resolution is a separate, short-lived network operation.
+    resolve_timeout_s: float = 8.0
     default_timeout_s: float = 60.0
 
     # 0 => SPlusthon never sleeps inside _call; FloodWaitError is raised at
@@ -170,6 +172,9 @@ class RpcPolicy:
             ),
             read_timeout_s=_env_float(
                 "BOT_RPC_READ_TIMEOUT_S", 20.0, 1.0, 300.0
+            ),
+            resolve_timeout_s=_env_float(
+                "BOT_RPC_RESOLVE_TIMEOUT_S", 8.0, 1.0, 60.0
             ),
             default_timeout_s=_env_float(
                 "BOT_RPC_TIMEOUT_S", 60.0, 1.0, 600.0
@@ -219,6 +224,7 @@ class RpcPolicy:
             "critical": self.moderation_timeout_s,
             "delete": self.moderation_timeout_s,
             "heavy": self.read_timeout_s,
+            "resolve": self.resolve_timeout_s,
         }.get(bucket, self.default_timeout_s)
 
     def describe(self) -> str:
@@ -226,6 +232,7 @@ class RpcPolicy:
             f"send={self.send_timeout_s:g}s "
             f"moderation={self.moderation_timeout_s:g}s "
             f"read={self.read_timeout_s:g}s "
+            f"resolve={self.resolve_timeout_s:g}s "
             f"default={self.default_timeout_s:g}s "
             f"flood_threshold={self.flood_sleep_threshold_s:g}s "
             f"flood_retries={self.flood_max_retries} "

@@ -427,3 +427,37 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_dispatcher_job_timeout_recovers_the_lane():
+    async def scenario():
+        logger = Logger()
+        dispatcher = GroupDispatcher(
+            logger=logger, job_timeout_seconds=0.02,
+        )
+        ran = []
+        cancelled = []
+        forever = asyncio.Event()
+
+        async def stalled_admin_job():
+            try:
+                await forever.wait()
+            finally:
+                cancelled.append(True)
+
+        dispatcher.submit(
+            901, stalled_admin_job, priority=PRIORITY_ADMIN, kind="admin"
+        )
+        dispatcher.submit(
+            901, lambda: ran.append("next-admin-job"),
+            priority=PRIORITY_ADMIN, kind="admin",
+        )
+        assert await dispatcher.join(timeout=0.5)
+        return dispatcher, logger, ran, cancelled
+
+    dispatcher, logger, ran, cancelled = asyncio.run(scenario())
+    assert ran == ["next-admin-job"]
+    assert cancelled == [True]
+    assert dispatcher.stats["timed_out"] == 1
+    assert dispatcher.stats["failed"] == 0
+    assert any("GROUP DISPATCH JOB TIMEOUT" in line for line in logger.errors)

@@ -118,8 +118,16 @@ def test_permission_circuit_breaker_lifecycle():
     assert cb.can_execute(chat_id) is True
     assert not cb.is_open(chat_id)
 
-    # 2. Trip on failure -> OPEN
-    cb.record_failure(chat_id, ChatAdminRequiredError(None))  # splusthon>=1.1 requires the request arg
+    # ChatAdminRequired is operation-local: it must not open the chat breaker.
+    cb.record_failure(chat_id, ChatAdminRequiredError(None))
+    assert cb.is_open(chat_id) is False
+    assert cb.can_execute(chat_id) is True
+
+    # Other confirmed admin/permission failures retain the breaker behavior.
+    class UserAdminInvalidError(Exception):
+        pass
+
+    cb.record_failure(chat_id, UserAdminInvalidError("USER_ADMIN_INVALID"))
     assert cb.is_open(chat_id) is True
     assert cb.can_execute(chat_id) is False  # Blocked fast!
 
@@ -134,7 +142,7 @@ def test_permission_circuit_breaker_lifecycle():
     assert cb.can_execute(chat_id) is True
 
     # 5. Manual reset
-    cb.record_failure(chat_id, ChatAdminRequiredError(None))  # splusthon>=1.1 requires the request arg
+    cb.record_failure(chat_id, UserAdminInvalidError("USER_ADMIN_INVALID"))
     assert cb.is_open(chat_id) is True
     cb.reset(chat_id)
     assert cb.is_open(chat_id) is False
@@ -155,24 +163,20 @@ def test_admin_actions_circuit_breaker_and_entity_cache():
         assert ok1 is True
         assert client.delete_calls == 1
 
-        # Now simulate bot losing admin rights
+        # ChatAdminRequired fails only this operation; it must not open the
+        # per-chat circuit breaker and suppress unrelated work for 180 seconds.
         client.should_fail_admin = True
         ok2 = await admin.delete_message(101, 2)
         assert ok2 is False
         assert client.delete_calls == 2
-        assert cb.is_open(101) is True
+        assert cb.is_open(101) is False
 
-        # Next 50 delete calls should be blocked locally without calling client.delete_messages!
-        t_start = time.perf_counter()
-        for msg_id in range(3, 53):
-            blocked = await admin.delete_message(101, msg_id)
-            assert blocked is False
-        elapsed_ms = (time.perf_counter() - t_start) * 1000
-
-        # Delete calls on client remain exactly 2 (50 calls avoided!)
-        assert client.delete_calls == 2
-        # Elapsed time for 50 blocked calls is sub-millisecond (not 50 * 5ms = 250ms)
-        assert elapsed_ms < 20.0
+        # A later independent operation is still allowed to run (and is logged
+        # as its own permission failure), rather than being locally locked out.
+        ok3 = await admin.delete_message(101, 3)
+        assert ok3 is False
+        assert client.delete_calls == 3
+        assert cb.can_execute(101, "delete") is True
 
         # Entity resolution caching
         client.should_fail_admin = False
@@ -181,7 +185,7 @@ def test_admin_actions_circuit_breaker_and_entity_cache():
         assert ent1 is ent2
         assert client.get_entity_calls == 1  # 2nd call was served from cache!
 
-        print(f"AdminActions integration test passed! 50 doomed RPCs skipped in {elapsed_ms:.2f}ms")
+        print("AdminActions operation-local permission handling passed")
 
     asyncio.run(scenario())
 

@@ -6,9 +6,9 @@ connection-wide budget dozens of independent chats can still create a large
 ``_pending_state`` at once.  ``RpcGovernor`` applies backpressure immediately
 before the active low-level ``client._call`` and never drops a request/result.
 
-The governor deliberately sits *outside* the existing 60-second RPC timeout:
+The governor deliberately sits *outside* the per-request RPC timeout:
 time spent waiting for admission is reported separately and does not consume
-network response time.  A permit is released by the caller's ``finally`` on
+network response time. A permit is released by the caller's ``finally`` on
 success, error, timeout or cancellation.  Retry/FloodWait sleeps performed by
 our queues happen after ``_call`` has returned/raised and therefore hold no
 permit.
@@ -81,6 +81,10 @@ _HEAVY_REQUESTS = frozenset({
     "GetChatsRequest",
     "GetUsersRequest",
 })
+# Username resolution can touch the network and is particularly prone to
+# hanging when a username is stale/unreachable. Keep it in its own lane so a
+# stuck ResolveUsernameRequest cannot head-block a different P3 bucket.
+_RESOLVE_REQUESTS = frozenset({"ResolveUsernameRequest"})
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,7 @@ class _Waiter:
     enqueued_at: float
     sequence: int
     admitted: bool = False
+    owner_task: object = None
 
 
 @dataclass
@@ -112,6 +117,10 @@ class _Holder:
     acquired_at: float
     sequence: int
     watch: object = None
+    watchdog: object = None
+    owner_task: object = None
+    watchdog_after: float = 0.0
+    permit: object = None
 
 
 KEEPALIVE_REQUESTS = frozenset({
@@ -126,6 +135,10 @@ GOVERNOR_BLOCKED_MS = 500.0
 
 class RpcOverloadError(RuntimeError):
     """A disposable low-priority RPC was rejected before it could backlog."""
+
+
+class RpcAdmissionTimeoutError(asyncio.TimeoutError):
+    """A ResolveUsername request expired while waiting for a governor permit."""
 
 
 class RpcPermit:
@@ -262,6 +275,10 @@ def classify_request(request, *, urgent_send=False, critical_context=False,
         # send lane (architecture decision: separate lanes, one socket).
         priority = P2_SEND
         bucket = "notice" if channel == "notice" else "send"
+    # Name lookup has its own bounded lane and timeout: it should not occupy
+    # the generic heavy-read slot or block another request in the same class.
+    elif name_set.intersection(_RESOLVE_REQUESTS):
+        priority, bucket = P3_HEAVY, "resolve"
     # Reads are never promoted by a command's dispatch context.  A native
     # admin lookup (GetParticipants/GetFullChannel) is expensive and was
     # filling every P0 slot ahead of the actual mute/ban RPC.
@@ -300,7 +317,11 @@ class RpcGovernor:
         send_limit=None,
         heavy_limit=None,
         notice_limit=None,
+        resolve_limit=1,
         critical_reserve=0,
+        resolve_timeout_seconds=8.0,
+        watchdog_timeout_seconds=90.0,
+        watchdog_grace_seconds=0.25,
         enabled=True,
         shadow=False,
         logger=None,
@@ -327,14 +348,26 @@ class RpcGovernor:
             "delete": max(1, int(delete_limit)),
             "send": max(1, int(send_limit)),
             "heavy": max(1, int(heavy_limit)),
+            "resolve": max(1, int(resolve_limit)),
             "notice": max(1, int(notice_limit or 1)),
             "other": 1,
         }
         # Optional extra slot usable ONLY by P0 moderation/connection RPCs.
-        # Default 0 keeps the historical peak in flight; set
-        # BOT_RPC_CRITICAL_RESERVE=1 on very busy deployments so a slow send
-        # never makes EditBanned wait for a permit.
+        # Direct construction defaults to 0; from_environment defaults to 1
+        # so a slow send/read wave cannot make EditBanned wait for a permit.
         self.critical_reserve = max(0, int(critical_reserve))
+        # Resolve requests get both a short queue-admission deadline and a
+        # short hold watchdog. The ordinary watchdog is a last-resort safety
+        # net for RPCs whose normal connection timeout was not installed.
+        self.resolve_timeout_seconds = max(
+            0.0, min(60.0, float(resolve_timeout_seconds))
+        )
+        self.watchdog_timeout_seconds = max(
+            0.0, min(600.0, float(watchdog_timeout_seconds))
+        )
+        self.watchdog_grace_seconds = max(
+            0.0, min(5.0, float(watchdog_grace_seconds))
+        )
         if isolated_default:
             # Send and delete each have their own cap. They share the
             # connection budget, not one mutex.
@@ -376,13 +409,18 @@ class RpcGovernor:
             "released": 0,
             "waited": 0,
             "cancelled_waiters": 0,
+            "expired_waiters": 0,
+            "watchdog_cancelled": 0,
+            "watchdog_forced_releases": 0,
             "shadow_would_wait": 0,
         }
 
     @classmethod
     def from_environment(cls, logger=None):
         """Build conservative fixed limits after the project's .env is loaded."""
-        total_limit = min(3, max(2, _env_int("BOT_RPC_TOTAL_LIMIT", 2)))
+        # Three normal slots let one slow resolve, one user-facing send and
+        # one delete coexist. P0 gets its own small reserve below.
+        total_limit = min(3, max(2, _env_int("BOT_RPC_TOTAL_LIMIT", 3)))
         delete_limit = min(2, max(1, _env_int("BOT_RPC_DELETE_LIMIT", 1)))
         send_limit = min(2, max(1, _env_int("BOT_RPC_SEND_LIMIT", 1)))
         heavy_limit = min(1, max(1, _env_int("BOT_RPC_HEAVY_LIMIT", 1)))
@@ -406,7 +444,19 @@ class RpcGovernor:
             # Bounded send queue allows public commands and help replies to wait
             # without letting cosmetic/game flooding starve moderation.
             notice_limit=min(2, max(1, _env_int("BOT_RPC_NOTICE_LIMIT", 1))),
-            critical_reserve=_env_int("BOT_RPC_CRITICAL_RESERVE", 0, 0, 2),
+            resolve_limit=min(2, max(1, _env_int("BOT_RPC_RESOLVE_LIMIT", 1))),
+            # Reserve one extra slot for moderation/connection-critical work;
+            # a stuck lookup or send wave must never starve a ban/sync RPC.
+            critical_reserve=_env_int("BOT_RPC_CRITICAL_RESERVE", 1, 0, 2),
+            resolve_timeout_seconds=min(
+                60.0, _env_float("BOT_RPC_RESOLVE_TIMEOUT_S", 8.0)
+            ),
+            watchdog_timeout_seconds=min(
+                600.0, _env_float("BOT_RPC_GOVERNOR_WATCHDOG_S", 90.0)
+            ),
+            watchdog_grace_seconds=min(
+                5.0, _env_float("BOT_RPC_GOVERNOR_WATCHDOG_GRACE_S", 0.25)
+            ),
             max_send_waiters=max(8, _env_int("BOT_RPC_MAX_SEND_WAITERS", 32)),
             # فاصلهٔ اختیاری بین شروع RPCها؛ knob محفوظ Foxora
             # (RPC_MIN_INTERVAL_SECONDS، پیش‌فرض off تا رفتار B2 حفظ شود).
@@ -433,6 +483,24 @@ class RpcGovernor:
                         return True
         return False
 
+    def _queue_timeout_for(self, admission):
+        """Resolve lookups must not remain queued indefinitely."""
+        if (admission.bucket == "resolve"
+                and self.resolve_timeout_seconds > 0.0):
+            return self.resolve_timeout_seconds
+        return None
+
+    def _hold_timeout_for(self, bucket):
+        """Return a fallback cancellation deadline for an admitted RPC."""
+        if bucket == "resolve":
+            if self.resolve_timeout_seconds <= 0.0:
+                return 0.0
+            # Normally connection_guard raises at exactly resolve_timeout;
+            # this slightly-later timer is a fallback if that wrapper was not
+            # installed or the library swallowed its timeout.
+            return self.resolve_timeout_seconds + self.watchdog_grace_seconds
+        return self.watchdog_timeout_seconds
+
     def _eligible(self, priority, bucket):
         limit = self.total_limit
         if priority == P0_CRITICAL:
@@ -444,20 +512,29 @@ class RpcGovernor:
         cap = self.class_limits.get(bucket)
         if cap is not None and self._active_by_bucket[bucket] >= cap:
             return False
-        if priority <= P1_DELETE:
-            # Heavy occupancy must not stall delete/antispam. Send+delete
-            # still share noncritical_limit; total_limit and class caps stay.
-            occupied = self._active_noncritical - int(
-                self._active_by_bucket.get("heavy") or 0
-            )
-            return occupied < self.noncritical_limit
+        # Long reads/lookups are accounted as noncritical for background
+        # backpressure, but do not consume the admission budget reserved for a
+        # user-facing send or delete. Keep the configured total_limit as the
+        # final hard ceiling (P0 has its own reserve).
+        read_active = (
+            int(self._active_by_bucket.get("heavy") or 0)
+            + int(self._active_by_bucket.get("resolve") or 0)
+        )
+        nonread_occupied = max(0, self._active_noncritical - read_active)
+        if priority <= P1_DELETE or (
+            priority == P2_SEND and bucket == "send"
+        ):
+            return nonread_occupied < (self.noncritical_limit + read_active)
         if self._active_noncritical >= self.noncritical_limit:
             return False
         if priority >= P3_HEAVY and self._urgent_waiting():
             return False
         return True
 
-    def _increment_active(self, priority, bucket, *, request_name="?", chat_key="?", sequence=0):
+    def _increment_active(
+        self, priority, bucket, *, request_name="?", chat_key="?", sequence=0,
+        owner_task=None, watchdog_after=0.0,
+    ):
         self._active_total += 1
         if priority != P0_CRITICAL:
             self._active_noncritical += 1
@@ -470,15 +547,24 @@ class RpcGovernor:
             priority=int(priority),
             acquired_at=time.perf_counter(),
             sequence=int(sequence or 0),
+            owner_task=owner_task,
+            watchdog_after=max(0.0, float(watchdog_after or 0.0)),
         )
         self._holders.append(holder)
-        if self.logger is not None and self.enabled and not self.shadow:
+        if self.enabled and not self.shadow:
             try:
-                holder.watch = asyncio.get_running_loop().create_task(
-                    self._emit_hold_if_slow(holder)
-                )
+                loop = asyncio.get_running_loop()
+                if self.logger is not None:
+                    holder.watch = loop.create_task(
+                        self._emit_hold_if_slow(holder)
+                    )
+                if holder.watchdog_after > 0.0:
+                    holder.watchdog = loop.create_task(
+                        self._watch_stuck_holder(holder)
+                    )
             except RuntimeError:
                 holder.watch = None
+                holder.watchdog = None
         return holder
 
     def format_holders(self, now=None):
@@ -489,12 +575,13 @@ class RpcGovernor:
             parts.append(
                 f"{holder.bucket}:{holder.request_name}"
                 f":chat={holder.chat_key}:held_ms={held_ms:.0f}"
+                f":watchdog_s={holder.watchdog_after:g}"
             )
         return parts
 
     def format_active_by_bucket(self):
         buckets = {"critical": 0, "delete": 0, "send": 0, "heavy": 0,
-                   "notice": 0, "other": 0}
+                   "resolve": 0, "notice": 0, "other": 0}
         buckets.update(dict(self._active_by_bucket))
         return ",".join(f"{name}:{int(count)}" for name, count in buckets.items() if count)
 
@@ -514,7 +601,13 @@ class RpcGovernor:
             self._burst_max_waiting = max(self._burst_max_waiting, self._waiting)
 
     def _pop_priority(self, priority):
-        """Pop one eligible waiter, round-robin between chats of a class."""
+        """Pop one eligible waiter, round-robin between chats and buckets.
+
+        A full ``resolve`` bucket must not leave a ResolveUsername waiter at
+        the head of the same-chat P3 deque and block an eligible ``heavy`` read.
+        Preserve FIFO within a bucket, but skip a head waiter whose own bucket
+        is full so independent buckets can make progress.
+        """
         rounds = self._chat_rounds[priority]
         groups = self._queues[priority]
         checks = len(rounds)
@@ -523,17 +616,31 @@ class RpcGovernor:
             group = groups.get(chat_key)
             if group is None:
                 continue
-            while group and group[0].future.done():
-                group.popleft()
-                self._waiting = max(0, self._waiting - 1)
+
+            # Remove cancelled/timed-out waiters anywhere in this chat's lane;
+            # otherwise a cancelled waiter behind a blocked head could keep the
+            # waiting counter and deque alive indefinitely.
+            live = [waiter for waiter in group if not waiter.future.done()]
+            removed = len(group) - len(live)
+            if removed:
+                group.clear()
+                group.extend(live)
+                self._waiting = max(0, self._waiting - removed)
             if not group:
                 groups.pop(chat_key, None)
                 continue
-            waiter = group[0]
-            if not self._eligible(waiter.priority, waiter.bucket):
+
+            eligible_index = None
+            for index, waiter in enumerate(group):
+                if self._eligible(waiter.priority, waiter.bucket):
+                    eligible_index = index
+                    break
+            if eligible_index is None:
                 rounds.append(chat_key)
                 continue
-            group.popleft()
+
+            waiter = group[eligible_index]
+            del group[eligible_index]
             self._waiting = max(0, self._waiting - 1)
             if group:
                 rounds.append(chat_key)
@@ -571,10 +678,13 @@ class RpcGovernor:
                     request_name=waiter.request_name,
                     chat_key=waiter.chat_key,
                     sequence=waiter.sequence,
+                    owner_task=waiter.owner_task,
+                    watchdog_after=self._hold_timeout_for(waiter.bucket),
                 )
                 permit = RpcPermit(
                     self, waiter.priority, waiter.bucket, holder=holder
                 )
+                holder.permit = permit
                 waiter.future.set_result(permit)
         finally:
             self._emit_drain_if_cleared(previous_waiting)
@@ -633,6 +743,7 @@ class RpcGovernor:
             future=loop.create_future(),
             enqueued_at=time.perf_counter(),
             sequence=self._sequence,
+            owner_task=asyncio.current_task(),
         )
         self._enqueue(waiter)
         self._drain()
@@ -641,8 +752,44 @@ class RpcGovernor:
             watch = asyncio.create_task(
                 self._emit_blocked_if_waiting(admission, waiter)
             )
+        queue_timeout = self._queue_timeout_for(admission)
         try:
-            permit = await waiter.future
+            if queue_timeout is None:
+                permit = await waiter.future
+            else:
+                # shield keeps wait_for from cancelling the future before we
+                # can account for an admission/timeout race below.
+                permit = await asyncio.wait_for(
+                    asyncio.shield(waiter.future), timeout=queue_timeout
+                )
+        except asyncio.TimeoutError:
+            self.stats["expired_waiters"] += 1
+            if waiter.admitted:
+                # Admission may win on the same event-loop tick as the queue
+                # deadline. Never leak the transferred permit in that race.
+                try:
+                    waiter.future.result().release()
+                except Exception:
+                    pass
+            else:
+                if not waiter.future.done():
+                    waiter.future.cancel()
+                self._drain()
+            if self.logger is not None:
+                try:
+                    self.logger.log_error(
+                        "RPC GOVERNOR QUEUE TIMEOUT "
+                        f"request={admission.request_name} "
+                        f"bucket={admission.bucket} "
+                        f"timeout_s={queue_timeout:g} "
+                        f"chat={admission.chat_key}"
+                    )
+                except Exception:
+                    pass
+            raise RpcAdmissionTimeoutError(
+                f"{admission.request_name} expired waiting for governor admission "
+                f"after {queue_timeout:g}s"
+            ) from None
         except asyncio.CancelledError:
             self.stats["cancelled_waiters"] += 1
             if waiter.admitted:
@@ -652,7 +799,8 @@ class RpcGovernor:
                     waiter.future.result().release()
                 except Exception:
                     pass
-            # A cancelled future is lazily removed by the next drain.
+            elif not waiter.future.done():
+                waiter.future.cancel()
             self._drain()
             raise
         finally:
@@ -706,7 +854,7 @@ class RpcGovernor:
     def format_waiting_by_bucket(self):
         counts = {
             "critical": 0, "delete": 0, "send": 0, "heavy": 0,
-            "notice": 0, "other": 0,
+            "resolve": 0, "notice": 0, "other": 0,
         }
         for groups in self._queues.values():
             for group in groups.values():
@@ -717,8 +865,8 @@ class RpcGovernor:
                     counts[bucket] = counts.get(bucket, 0) + 1
         return ",".join(
             f"{name}:{counts[name]}"
-            for name in ("critical", "delete", "send", "heavy", "notice",
-                         "other")
+            for name in ("critical", "delete", "send", "heavy", "resolve",
+                         "notice", "other")
             if counts.get(name)
         )
 
@@ -746,16 +894,21 @@ class RpcGovernor:
 
     def _bucket_limit(self, priority, bucket):
         if priority == P0_CRITICAL:
-            return self.total_limit
+            return self.total_limit + self.critical_reserve
         return self.class_limits.get(bucket, self.noncritical_limit)
 
     def _cancel_holder_watch(self, holder):
-        watch = getattr(holder, "watch", None) if holder is not None else None
-        if watch is None:
+        if holder is None:
             return
-        holder.watch = None
-        if not watch.done():
-            watch.cancel()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        for attribute in ("watch", "watchdog"):
+            task = getattr(holder, attribute, None)
+            setattr(holder, attribute, None)
+            if task is not None and not task.done() and task is not current:
+                task.cancel()
 
     def _emit_drain_if_cleared(self, previous_waiting):
         if self._waiting != 0:
@@ -810,6 +963,79 @@ class RpcGovernor:
         except Exception:
             pass
 
+    async def _watch_stuck_holder(self, holder):
+        """Cancel a hung owner task, then release its permit as a last resort.
+
+        Normal RPC timeouts should fire first. This is a safety net for a
+        missing/ineffective network timeout, not a substitute for cancelling
+        the underlying request. Permit.release() is idempotent, so the owner's
+        ``finally`` can still run after the watchdog.
+        """
+        try:
+            deadline = max(0.001, float(holder.watchdog_after or 0.0))
+            await asyncio.sleep(deadline)
+            if holder not in self._holders:
+                return
+
+            held_ms = max(
+                0.0, (time.perf_counter() - holder.acquired_at) * 1000.0
+            )
+            self.stats["watchdog_cancelled"] += 1
+            if self.logger is not None:
+                try:
+                    self.logger.log_error(
+                        "GOVERNOR WATCHDOG TIMEOUT "
+                        f"bucket={holder.bucket} request={holder.request_name} "
+                        f"chat={holder.chat_key} held_ms={held_ms:.1f} "
+                        f"timeout_s={deadline:g} action=cancel_owner_task"
+                    )
+                except Exception:
+                    pass
+
+            owner = holder.owner_task
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if owner is not None and owner is not current and not owner.done():
+                owner.cancel()
+
+            if self.watchdog_grace_seconds > 0.0:
+                await asyncio.sleep(self.watchdog_grace_seconds)
+            if holder not in self._holders:
+                return
+
+            # The owner ignored cancellation or did not execute its finally.
+            # Free the accounting slot exactly once and make the event visible.
+            self.stats["watchdog_forced_releases"] += 1
+            if self.logger is not None:
+                try:
+                    self.logger.log_error(
+                        "GOVERNOR WATCHDOG FORCE RELEASE "
+                        f"bucket={holder.bucket} request={holder.request_name} "
+                        f"chat={holder.chat_key} held_ms="
+                        f"{(time.perf_counter() - holder.acquired_at) * 1000.0:.1f} "
+                        "action=release_permit"
+                    )
+                except Exception:
+                    pass
+            permit = holder.permit
+            if permit is not None:
+                permit.release()
+            else:
+                self._release(holder.priority, holder.bucket, holder=holder)
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            if self.logger is not None:
+                try:
+                    self.logger.log_error(
+                        "GOVERNOR WATCHDOG FAILED "
+                        f"request={holder.request_name} error={error!r}"
+                    )
+                except Exception:
+                    pass
+
     async def _emit_blocked_if_waiting(self, admission, waiter):
         try:
             await asyncio.sleep(GOVERNOR_BLOCKED_MS / 1000.0)
@@ -839,50 +1065,52 @@ class RpcGovernor:
         )
 
     def _release(self, priority, bucket, holder=None):
-        hold_ms = 0.0
-        if holder is not None:
-            hold_ms = max(0.0, (time.perf_counter() - holder.acquired_at) * 1000.0)
-            self._cancel_holder_watch(holder)
-            try:
-                self._holders.remove(holder)
-            except ValueError:
-                holder = None
+        # Release one concrete holder only. Falling back to another permit in
+        # the same bucket after a stale/double release corrupts the counters and
+        # can leave a live request without a slot.
         if holder is None:
-            for item in list(self._holders):
-                if item.priority == priority and item.bucket == bucket:
-                    hold_ms = max(
-                        0.0, (time.perf_counter() - item.acquired_at) * 1000.0
-                    )
-                    self._cancel_holder_watch(item)
-                    self._holders.remove(item)
-                    holder = item
-                    break
-        if self._active_total > 0:
-            self._active_total -= 1
-        if priority != P0_CRITICAL and self._active_noncritical > 0:
-            self._active_noncritical -= 1
+            holder = next((
+                item for item in self._holders
+                if item.priority == priority and item.bucket == bucket
+            ), None)
+        if holder is None or holder not in self._holders:
+            return False
+
+        priority = holder.priority
+        bucket = holder.bucket
+        hold_ms = max(
+            0.0, (time.perf_counter() - holder.acquired_at) * 1000.0
+        )
+        self._cancel_holder_watch(holder)
+        self._holders.remove(holder)
+        self._active_total = max(0, self._active_total - 1)
+        if priority != P0_CRITICAL:
+            self._active_noncritical = max(0, self._active_noncritical - 1)
         if self._active_by_bucket.get(bucket, 0) > 0:
             self._active_by_bucket[bucket] -= 1
         self.stats["released"] += 1
         if hold_ms >= GOVERNOR_BLOCKED_MS and self.logger is not None:
-            name = holder.request_name if holder is not None else "?"
-            ping_age, sender_pending, by_type = self._pending_brief()
-            self.logger.log_info(
-                "GOVERNOR RELEASE "
-                f"request={name} bucket={bucket} "
-                f"hold_ms={hold_ms:.1f} reason=rpc_in_flight "
-                f"active={self._active_total} waiting={self._waiting} "
-                f"waiting_by_bucket={self.format_waiting_by_bucket() or '-'} "
-                f"sender_pending={sender_pending} ping_age_ms={ping_age:.0f} "
-                f"pending_by_type={by_type}"
-            )
+            try:
+                ping_age, sender_pending, by_type = self._pending_brief()
+                self.logger.log_info(
+                    "GOVERNOR RELEASE "
+                    f"request={holder.request_name} bucket={bucket} "
+                    f"hold_ms={hold_ms:.1f} reason=rpc_in_flight "
+                    f"active={self._active_total} waiting={self._waiting} "
+                    f"waiting_by_bucket={self.format_waiting_by_bucket() or '-'} "
+                    f"sender_pending={sender_pending} ping_age_ms={ping_age:.0f} "
+                    f"pending_by_type={by_type}"
+                )
+            except Exception:
+                pass
         self._drain()
+        return True
 
     def snapshot(self):
         waiting_by_priority = {}
         waiting_by_bucket = {
             "critical": 0, "delete": 0, "send": 0, "heavy": 0,
-            "notice": 0, "other": 0,
+            "resolve": 0, "notice": 0, "other": 0,
         }
         for priority, groups in self._queues.items():
             waiting_by_priority[_PRIORITY_LABELS[priority]] = sum(
@@ -899,6 +1127,9 @@ class RpcGovernor:
             "enabled": self.enabled,
             "shadow": self.shadow,
             "total_limit": self.total_limit,
+            "critical_reserve": self.critical_reserve,
+            "resolve_timeout_seconds": self.resolve_timeout_seconds,
+            "watchdog_timeout_seconds": self.watchdog_timeout_seconds,
             "noncritical_limit": self.noncritical_limit,
             "active": self._active_total,
             "active_noncritical": self._active_noncritical,

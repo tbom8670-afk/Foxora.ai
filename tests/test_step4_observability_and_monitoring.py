@@ -117,7 +117,10 @@ def test_system_snapshot_and_diagnostic_formatting():
     # Circuit breaker
     cb = PermissionCircuitBreaker.get_default()
     cb.reset_all_for_tests() if hasattr(cb, "reset_all_for_tests") else getattr(cb, "_breakers", {}).clear()
-    cb.record_failure(999, PermissionError("ChatAdminRequiredError"))
+    class UserAdminInvalidError(Exception):
+        pass
+
+    cb.record_failure(999, UserAdminInvalidError("USER_ADMIN_INVALID"))
 
     snap = collector.get_system_snapshot(bot)
     assert snap["rss_mb"] >= 0.0

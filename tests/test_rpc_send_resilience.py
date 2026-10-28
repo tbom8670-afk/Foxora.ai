@@ -51,6 +51,10 @@ class GetDifferenceRequest:
     pass
 
 
+class ResolveUsernameRequest:
+    pass
+
+
 class FloodWaitError(Exception):
     """Same shape as splusthon.errors.FloodWaitError (has .seconds)."""
 
@@ -148,12 +152,41 @@ def test_getdifference_still_traced_and_policy_is_per_class():
                        read_timeout_s=21, default_timeout_s=60)
     assert policy.timeout_for(SendMessageRequest()) == 15
     assert policy.timeout_for(GetDifferenceRequest()) == 20
+    assert policy.timeout_for(ResolveUsernameRequest()) == 8.0
+    short_resolve = RpcPolicy(resolve_timeout_s=2.5)
+    assert short_resolve.timeout_for(ResolveUsernameRequest()) == 2.5
 
 
 # ---------------------------------------------------------------------------
 # 2) Execution: FloodWait is raised by the library, backoff happens OUTSIDE
 #    the gate/governor, and the event loop keeps running.
 # ---------------------------------------------------------------------------
+def test_resolve_username_network_call_uses_its_short_deadline():
+    class Client(BaseClient):
+        async def _call(self, sender, request, ordered=False,
+                        flood_sleep_threshold=None):
+            await asyncio.Event().wait()
+
+    async def scenario():
+        logger = Logger()
+        client = Client()
+        policy = RpcPolicy(resolve_timeout_s=0.02, watchdog_grace_s=0)
+        assert cg.install_rpc_timeout(client, policy=policy, logger=logger)
+        try:
+            await client._call(client._sender, ResolveUsernameRequest())
+        except cg.RpcTimeout as error:
+            assert "ResolveUsernameRequest" in str(error)
+        else:
+            raise AssertionError("ResolveUsernameRequest did not time out")
+        return logger
+
+    logger = asyncio.run(scenario())
+    assert any(
+        "request=ResolveUsernameRequest" in line and "after_s=0.02" in line
+        for line in logger.errors + logger.infos
+    ), logger.text()
+
+
 def test_flood_wait_requeue_releases_governor_and_does_not_block_loop():
     class Client(BaseClient):
         async def _call(self, sender, request, ordered=False,
