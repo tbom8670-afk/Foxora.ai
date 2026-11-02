@@ -156,6 +156,9 @@ MAX_PENDING_CHECKS = _env_int("FORCE_JOIN_MAX_PENDING", 200, 10, 5000)
 _group_cache: dict = {}
 #: کلید گروه → زمان آخرین خواندن از دیتابیس (شامل کش منفی)
 _group_cache_at: dict = {}
+#: channel_id → کلیدهای گروه‌هایی که این کانال را اجباری کرده‌اند
+_channel_index: dict = {}
+_index_at: float = 0.0
 #: مدت اعتبار «این گروه کانال اجباری ندارد» تا مسیر پیام SQLite نزند.
 _NEGATIVE_CACHE_TTL = 60.0
 
@@ -232,6 +235,17 @@ def _safe_int(value, default=0):
 # کش تنظیمات گروه
 # ---------------------------------------------------------------------------
 
+def _rebuild_channel_index() -> None:
+    """ایندکس کانال → گروه‌ها تا رویدادهای کانال به دیتابیس نزنند."""
+    global _index_at
+    index = {}
+    for key, record in _group_cache.items():
+        index.setdefault(int(record["channel_id"]), []).append(key)
+    _channel_index.clear()
+    _channel_index.update(index)
+    _index_at = time.time()
+
+
 def refresh_group_cache(group_id=None) -> Optional[dict]:
     """رکورد کانال را از SQLite در کش حافظه تازه می‌کند."""
     if group_id is None:
@@ -241,6 +255,7 @@ def refresh_group_cache(group_id=None) -> Optional[dict]:
             key = str(record["group_id"])
             _group_cache[key] = record
             _group_cache_at[key] = time.time()
+        _rebuild_channel_index()
         return None
     key = canonical_group_key_str(group_id)
     record = storage.get_group(key)
@@ -250,7 +265,23 @@ def refresh_group_cache(group_id=None) -> Optional[dict]:
         _group_cache[key] = record
     # حتی «ندارد» هم کش می‌شود تا مسیر هر پیام SQLite نخواند.
     _group_cache_at[key] = time.time()
+    _rebuild_channel_index()
     return record
+
+
+def groups_cached_for_channel(channel_id) -> list:
+    """گروه‌های این کانال از حافظه (بدون I/O در مسیر رویداد)."""
+    cid = channel_key(channel_id)
+    keys = _channel_index.get(cid)
+    if keys is None and (time.time() - _index_at) > _NEGATIVE_CACHE_TTL:
+        try:
+            refresh_group_cache()
+        except Exception:
+            keys = None
+        keys = _channel_index.get(cid)
+    if not keys:
+        return []
+    return [_group_cache[key] for key in keys if key in _group_cache]
 
 
 def cached_group(group_id) -> Optional[dict]:
@@ -990,7 +1021,8 @@ async def handle_chat_action(bot, event) -> None:
             return
 
         cid = channel_key(chat_id)
-        groups = storage.groups_for_channel(cid) if cid else []
+        # ایندکس حافظه اول؛ SQLite فقط اگر ایندکس کهنه باشد.
+        groups = groups_cached_for_channel(cid) if cid else []
         if groups:
             await _handle_channel_membership(bot, event, groups, user_ids)
             return
@@ -1412,9 +1444,11 @@ def format_runtime_stats(chat_id=None) -> str:
 
 def reset_runtime_state() -> None:
     """پاک کردن وضعیت درون‌حافظه (فقط تست)."""
-    global _semaphore
+    global _semaphore, _index_at
+    _index_at = 0.0
     _group_cache.clear()
     _group_cache_at.clear()
+    _channel_index.clear()
     _member_cache.clear()
     _inflight.clear()
     _notice_sent.clear()
