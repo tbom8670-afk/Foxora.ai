@@ -480,6 +480,32 @@ def set_members_bulk(channel_id, rows: Iterable, *, source=SOURCE_SNAPSHOT,
     return len(payload)
 
 
+def set_member_access_hash(channel_id, user_id, access_hash) -> bool:
+    """فقط ``access_hash`` کاربر را ذخیره می‌کند؛ وضعیت عضویت دست‌نخورده می‌ماند.
+
+    این همان چیزی است که «بررسی بعدی = یک فراخوانی» را تضمین می‌کند، حتی
+    وقتی رویداد/پیام ``access_hash`` نداشته باشد.
+    """
+    cid = channel_key(channel_id)
+    try:
+        uid = int(user_id)
+        access = int(access_hash)
+    except (TypeError, ValueError):
+        return False
+    if not cid or not uid or not access:
+        return False
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO force_join_members "
+            "(user_id, channel_id, membership_status, last_verified_at, source, "
+            " access_hash) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(user_id, channel_id) DO UPDATE SET "
+            "  access_hash=excluded.access_hash",
+            (uid, cid, STATUS_UNKNOWN, None, None, access),
+        )
+    return True
+
+
 def members_with_status(channel_id, status: str = STATUS_MEMBER) -> list:
     cid = channel_key(channel_id)
     if not cid:

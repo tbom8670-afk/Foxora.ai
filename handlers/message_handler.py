@@ -3850,6 +3850,64 @@ async def handle_new_message(bot, event):
                             chat_id, sender, "وضعیت کانال (عضویت اجباری)"
                         )
                         return
+                    if force_join_action == "diagnose":
+                        # «تست عضویت»: ادمین/مالک گروه، با ریپلای یا با
+                        # @یوزرنیم/آیدی. خروجی، مسیر واقعی تصمیم را نشان
+                        # می‌دهد تا هیچ‌چیز بی‌صدا شکسته نشود.
+                        if not _has_group_management_permission(
+                            bot, chat_id, user_id,
+                            getattr(sender, "username", None)
+                        ):
+                            await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
+                            return
+                        target_id = None
+                        target_entity = None
+                        raw_arg = (force_join_arg or "").strip()
+                        if raw_arg:
+                            if raw_arg.lstrip("-").isdigit():
+                                target_id = int(raw_arg)
+                            else:
+                                try:
+                                    target_entity = await bot.client.get_entity(
+                                        raw_arg
+                                    )
+                                    target_id = getattr(target_entity, "id", None)
+                                except Exception:
+                                    target_id = None
+                            if not target_id:
+                                await event.reply(
+                                    "❌ کاربر پیدا نشد. آیدی عددی یا @یوزرنیم "
+                                    "بدهید یا روی پیام کاربر ریپلای کنید."
+                                )
+                                return
+                        elif getattr(event, "reply_to_msg_id", None):
+                            try:
+                                replied = await event.get_reply_message()
+                                if replied is not None:
+                                    target_id = getattr(
+                                        replied, "sender_id", None
+                                    )
+                                    if target_id is None:
+                                        replied_sender = await replied.get_sender()
+                                        target_id = getattr(
+                                            replied_sender, "id", None
+                                        )
+                                    else:
+                                        try:
+                                            target_entity = await replied.get_sender()
+                                        except Exception:
+                                            target_entity = None
+                            except Exception:
+                                target_id = None
+                        await event.reply(
+                            await force_join_service.diagnose(
+                                bot, chat_id, target_id, target_entity
+                            )
+                        )
+                        admin_tools.log_action(
+                            chat_id, sender, "تست عضویت کانال"
+                        )
+                        return
                     if not is_global_owner(user_id) and str(user_id) != str(
                         get_group_owner(chat_id)
                     ):

@@ -366,32 +366,124 @@ async def ensure_channel_input(bot, record, *, allow_resolve: bool = True):
     return api.input_channel(channel_id, access_hash)
 
 
-async def ensure_user_input(bot, user_id, user_entity=None,
-                            stored_hash=None):
-    """``InputPeerUser`` برای بررسی تک‌کاربره.
+def _peer_hash_ok(peer) -> bool:
+    """آیا این InputPeer شناسهٔ قابل‌استفاده دارد؟ (``access_hash`` صفر بی‌فایده است)"""
+    value = getattr(peer, "access_hash", None)
+    try:
+        return value is not None and int(value) != 0
+    except (TypeError, ValueError):
+        return False
 
-    ترتیب: آبجکت همراه پیام (بدون RPC) → ``access_hash`` ذخیره‌شده →
-    ``client.get_input_entity`` (یک RPC، سپس کش پایدار).
+
+def _search_queries(user_entity) -> list:
+    """عبارت‌های جست‌وجو برای پیدا کردن آبجکت کامل کاربر در گروه."""
+    queries = []
+    username = getattr(user_entity, "username", None)
+    if username:
+        queries.append(str(username).lstrip("@"))
+    first = (getattr(user_entity, "first_name", None) or "").strip()
+    last = (getattr(user_entity, "last_name", None) or "").strip()
+    if first:
+        queries.append(first)
+    if first and last:
+        queries.append(f"{first} {last}")
+    return [q for q in queries if q]
+
+
+async def resolve_user_input(bot, group_chat_id, user_id, user_entity=None,
+                             stored_hash=None):
+    """``InputPeerUser`` کاربر با زنجیرهٔ لایه‌ای — خروجی ``(peer, source)``.
+
+    ترتیب (ارزان‌ترین اول):
+
+    1. آبجکت همراه پیام/رویداد (بدون هیچ RPC)
+    2. ``access_hash`` ذخیره‌شده در SQLite (بدون RPC)
+    3. کش entity خود کلاینت
+    4. **جست‌وجوی هدفمند با limit کوچک** در همان گروه (چون کاربر در گروه
+       هست و پیام داده) — تنها راه وقتی رویداد، ``access_hash`` نداده باشد
+    5. ``client.get_entity`` به‌عنوان آخرین تلاش
+
+    خروجی ``(None, "unresolved")`` یعنی بررسی ممکن نیست (⇒ unknown ⇒
+    fail-open و پیام حذف نمی‌شود)، نه «عضو نیست».
     """
     peer = api.input_user(user_entity)
-    if peer is not None:
-        return peer
+    if peer is not None and _peer_hash_ok(peer):
+        return peer, "message_object"
     if stored_hash:
         peer = api.input_user_parts(user_id, stored_hash)
-        if peer is not None:
-            return peer
+        if peer is not None and _peer_hash_ok(peer):
+            return peer, "db_access_hash"
+
     client = getattr(bot, "client", None)
     if client is None:
-        return None
+        return None, "no_client"
+
     try:
-        peer = await asyncio.wait_for(
+        cached = await asyncio.wait_for(
             client.get_input_entity(int(user_id)), timeout=resolve_timeout()
         )
     except asyncio.CancelledError:
         raise
     except Exception:
+        cached = None
+    cached_peer = api.input_user(cached) if cached is not None else None
+    if cached_peer is not None and _peer_hash_ok(cached_peer):
+        return cached_peer, "client_cache"
+
+    # جست‌وجوی هدفمند در گروه (سقف کوچک) برای گرفتن access_hash واقعی
+    queries = _search_queries(user_entity)
+    if queries:
+        group_input = await _group_input_peer(bot, group_chat_id)
+        if group_input is not None:
+            for query in queries[:2]:
+                found = await api.search_participants(
+                    client, group_input, query, user_id, limit=20,
+                    timeout=api_timeout(),
+                )
+                user = found.get("user")
+                if user is not None:
+                    peer = api.input_user(user)
+                    if peer is not None and _peer_hash_ok(peer):
+                        return peer, "group_search"
+
+    try:
+        entity = await asyncio.wait_for(
+            client.get_entity(int(user_id)), timeout=resolve_timeout()
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        entity = None
+    peer = api.input_user(entity) if entity is not None else None
+    if peer is not None and _peer_hash_ok(peer):
+        return peer, "get_entity"
+    return None, "unresolved"
+
+
+async def _group_input_peer(bot, chat_id):
+    """``InputChannel``/``InputPeer`` همان گروه — از کش، بدون RPC در حالت گرم."""
+    cache = getattr(bot, "reply_input_peer_cache", None) or {}
+    for candidate in (chat_id, canonical_group_key(chat_id),
+                      channel_key(chat_id)):
+        try:
+            peer = cache.get(candidate)
+        except Exception:
+            peer = None
+        if peer is not None:
+            return peer
+    client = getattr(bot, "client", None)
+    if client is None:
         return None
-    return api.input_user(peer) or peer
+    for candidate in (canonical_group_key(chat_id), chat_id):
+        try:
+            return await asyncio.wait_for(
+                client.get_input_entity(candidate), timeout=resolve_timeout()
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -412,56 +504,143 @@ def forget_user(channel_id, user_id) -> None:
 
 
 async def _api_check(bot, record, user_id, user_entity=None):
-    """یک فراخوانی ``channels.getParticipant`` + ثبت پایدار نتیجه."""
+    """یک فراخوانی ``channels.getParticipant`` + ثبت پایدار نتیجه.
+
+    همهٔ جزئیات (منبع ``InputPeer``، متن خطا، زمان) در ``_last_diag`` نگه
+    داشته می‌شود تا فرمان «تست عضویت» بتواند دقیقاً بگوید کجای زنجیره
+    شکسته است — نه اینکه بی‌صدا fail-open شود.
+    """
     channel_id = record["channel_id"]
     STATS["api_checks"] += 1
+    diag = {
+        "at": time.time(),
+        "user_id": user_id,
+        "channel_id": channel_id,
+        "group_id": record["group_id"],
+        "input_source": None,
+        "channel_input": False,
+        "state": None,
+        "error": None,
+    }
     channel_input = await ensure_channel_input(bot, record)
+    diag["channel_input"] = channel_input is not None
     if channel_input is None:
         STATS["api_errors"] += 1
+        diag.update(state="error", error="channel_unresolved")
+        _record_last_error(channel_id, "channel_unresolved")
+        _last_diag[(channel_key(channel_id), _safe_int(user_id))] = diag
         return storage.STATUS_UNKNOWN, api.RESULT_ERROR, None
+
     stored = storage.get_member(channel_id, user_id)
-    user_input = await ensure_user_input(
-        bot, user_id, user_entity,
+    user_input, source = await resolve_user_input(
+        bot, record["group_id"], user_id, user_entity,
         stored_hash=(stored or {}).get("access_hash"),
     )
+    diag["input_source"] = source
     if user_input is None:
         STATS["api_errors"] += 1
+        diag.update(state="error", error="user_input_unresolved")
+        _record_last_error(channel_id, "user_input_unresolved")
+        _last_diag[(channel_key(channel_id), _safe_int(user_id))] = diag
+        _log(bot, f"USER INPUT UNRESOLVED user_id={user_id} "
+                  f"channel_id={channel_id} (fail-open)", error=True)
         return storage.STATUS_UNKNOWN, api.RESULT_ERROR, None
+
+    # کش پایدار access_hash همان کاربر برای بررسی‌های بعدی (یک فراخوانی)
+    found_hash = getattr(user_input, "access_hash", None)
+    if found_hash:
+        try:
+            storage.set_member_access_hash(channel_id, user_id, found_hash)
+        except Exception:
+            pass
+
     result = await api.get_participant(
         getattr(bot, "client", None), channel_input, user_input,
         timeout=api_timeout(),
     )
     state = result["state"]
+    diag["state"] = state
+    _last_diag[(channel_key(channel_id), _safe_int(user_id))] = diag
+
     if state == api.RESULT_MEMBER:
         storage.set_member(
             channel_id, user_id, storage.STATUS_MEMBER, source=storage.SOURCE_RPC,
-            access_hash=getattr(user_entity, "access_hash", None),
+            access_hash=found_hash or getattr(user_entity, "access_hash", None),
             join_date=result.get("join_date"),
         )
         _remember(channel_id, user_id, storage.STATUS_MEMBER, time.time())
+        _record_decision(record["group_id"], user_id, "member", "api", source)
         return storage.STATUS_MEMBER, state, result
+
     if state == api.RESULT_NOT_MEMBER:
         storage.set_member(
             channel_id, user_id, storage.STATUS_NOT_MEMBER,
             source=storage.SOURCE_RPC,
-            access_hash=getattr(user_entity, "access_hash", None),
+            access_hash=found_hash or getattr(user_entity, "access_hash", None),
         )
         _remember(channel_id, user_id, storage.STATUS_NOT_MEMBER, time.time())
+        _record_decision(record["group_id"], user_id, "not_member", "api", source)
         return storage.STATUS_NOT_MEMBER, state, result
+
+    error = result.get("error")
+    diag["error"] = f"{type(error).__name__}: {error}" if error else state
+    _record_last_error(channel_id, diag["error"])
     if state == api.RESULT_FLOOD:
         seconds = result.get("seconds") or 60.0
         _flood_until[channel_id] = time.time() + float(seconds)
         _log(bot, f"FLOOD channel_id={channel_id} seconds={seconds:g}",
              error=True)
     elif state == api.RESULT_NO_ACCESS:
-        _log(bot, f"NO_ACCESS channel_id={channel_id} "
-                  f"(کانال فهرست اعضا را مخفی کرده یا ادمین نیستیم)",
+        _log(bot, f"NO ACCESS user_id={user_id} channel_id={channel_id} "
+                  "(فهرست اعضا مخفی است یا حساب در کانال ادمین/عضو نیست)",
              error=True)
     else:
-        _log(bot, f"API ERROR channel_id={channel_id} "
-                  f"error={type(result.get('error')).__name__}", error=True)
+        _log(bot, f"CHECK ERROR user_id={user_id} channel_id={channel_id} "
+                  f"error={diag['error']}", error=True)
     STATS["api_errors"] += 1
+    _record_decision(record["group_id"], user_id, "unknown", "api", diag["error"])
     return storage.STATUS_UNKNOWN, state, result
+
+
+#: آخرین تصمیم‌ها برای گزارش «وضعیت کانال» (حلقهٔ کران‌دار)
+_recent_decisions: list = []
+#: channel_id → آخرین متن خطای بررسی (برای نمایش به مالک)
+_last_error: dict = {}
+#: (channel_id, user_id) → جزئیات آخرین تلاش API (برای «تست عضویت»)
+_last_diag: dict = {}
+_RECENT_LIMIT = 25
+
+
+def _record_decision(group_id, user_id, status, layer, detail=None) -> None:
+    try:
+        _recent_decisions.append({
+            "at": time.time(),
+            "group_id": group_id,
+            "user_id": _safe_int(user_id),
+            "status": status,
+            "layer": layer,
+            "detail": detail,
+        })
+        if len(_recent_decisions) > _RECENT_LIMIT:
+            del _recent_decisions[:-_RECENT_LIMIT]
+    except Exception:
+        pass
+
+
+def _record_last_error(channel_id, text) -> None:
+    _last_error[channel_key(channel_id)] = (time.time(), str(text)[:180])
+
+
+def recent_decisions(group_id=None, limit: int = 5) -> list:
+    rows = [
+        row for row in _recent_decisions
+        if group_id is None or str(row["group_id"]) == str(canonical_group_key(group_id))
+    ]
+    return list(reversed(rows))[:limit]
+
+
+def last_error(channel_id):
+    return _last_error.get(channel_key(channel_id))
 
 
 async def _single_flight_check(bot, record, user_id, user_entity=None):
@@ -505,6 +684,7 @@ async def resolve_status(bot, record, user_id, user_entity=None):
         status, verified_at = entry
         if now - verified_at <= _ttl_for(status):
             STATS["cache_hits"] += 1
+            _record_decision(record["group_id"], user_id, status, "memory")
             return status, "memory", None
         _member_cache.pop((channel_id, user_id), None)
 
@@ -515,6 +695,8 @@ async def resolve_status(bot, record, user_id, user_entity=None):
             STATS["db_hits"] += 1
             _remember(channel_id, user_id, stored["membership_status"],
                       float(stored["last_verified_at"]))
+            _record_decision(record["group_id"], user_id,
+                             stored["membership_status"], "db")
             return stored["membership_status"], "db", stored
         # وضعیت کهنه ولی معلوم: برای سیاست grace نگه داشته می‌شود.
     else:
@@ -1035,8 +1217,24 @@ async def handle_chat_action(bot, event) -> None:
             return
         if not check_on_group_join():
             return
+        # آبجکت واقعی کاربر (همراه access_hash) گرفته می‌شود؛ پیش‌تر خودِ
+        # event پاس داده می‌شد که access_hash نداشت و بررسی بعدی بی‌نتیجه
+        # می‌ماند.
+        users = {}
+        try:
+            entity = await event.get_user()
+            if entity is not None:
+                users[_safe_int(getattr(entity, "id", 0))] = entity
+        except Exception:
+            pass
+        if not users:
+            try:
+                for entity in await event.get_users():
+                    users[_safe_int(getattr(entity, "id", 0))] = entity
+            except Exception:
+                pass
         for user_id in user_ids:
-            schedule_prefetch(bot, record, user_id, event)
+            schedule_prefetch(bot, record, user_id, users.get(user_id))
     except asyncio.CancelledError:
         raise
     except Exception as error:
@@ -1054,10 +1252,21 @@ async def _handle_channel_membership(bot, event, groups, user_ids) -> None:
     status = storage.STATUS_MEMBER if joined else storage.STATUS_NOT_MEMBER
     source = (storage.SOURCE_EVENT_JOIN if joined
               else storage.SOURCE_EVENT_LEAVE)
+    event_users = {}
+    try:
+        entity = await event.get_user()
+        if entity is not None:
+            event_users[_safe_int(getattr(entity, "id", 0))] = entity
+    except Exception:
+        pass
     for record in groups:
         channel_id = record["channel_id"]
         for user_id in user_ids:
-            storage.set_member(channel_id, user_id, status, source=source)
+            access_hash = getattr(event_users.get(user_id), "access_hash", None)
+            if access_hash:
+                storage.set_member_access_hash(channel_id, user_id, access_hash)
+            storage.set_member(channel_id, user_id, status, source=source,
+                               access_hash=access_hash)
             # باطل‌سازی **هم دیتابیس و هم کش حافظه** (الزام پرامپت)
             forget_user(channel_id, user_id)
             _remember(channel_id, user_id, status, time.time())
@@ -1253,6 +1462,106 @@ def _prune_caches() -> None:
 
 
 # ---------------------------------------------------------------------------
+# تشخیص عیب (برای مالک)
+# ---------------------------------------------------------------------------
+
+def _status_label(status) -> str:
+    return {
+        storage.STATUS_MEMBER: "عضو است ✅",
+        storage.STATUS_NOT_MEMBER: "عضو نیست ⛔️",
+        storage.STATUS_UNKNOWN: "نامعلوم ❓ (پیام حذف نمی‌شود)",
+    }.get(status, str(status))
+
+
+async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
+    """گزارش دقیق «چرا حذف شد / چرا نشد» برای یک کاربر.
+
+    هیچ حدسی در خروجی نیست: منبع ``InputPeer``، پاسخ واقعی
+    ``getParticipant``، متن خطا و حکم نهایی نوشته می‌شود.
+    """
+    record = cached_group(chat_id) or storage.get_group(chat_id)
+    if record is None:
+        return ("ℹ️ برای این گروه کانال اجباری ثبت نشده است. "
+                "اول «کانال من <لینک یا آیدی>» را بزنید.")
+    lines = ["🧪 تشخیص عضویت اجباری کانال"]
+    lines.append(f"کانال: {record.get('channel_title') or '—'}")
+    lines.append(f"شناسهٔ کانال: {_digits(record['channel_id'])}")
+    lines.append(f"حالت همگام‌سازی: {record.get('sync_mode')}")
+    lines.append(f"وضعیت قابلیت: {'روشن ✅' if record.get('force_join_enabled') else 'خاموش ⛔️'}")
+    lines.append(f"access_hash کانال: "
+                 f"{'دارد' if record.get('channel_access_hash') else 'ندارد ❗️'}")
+
+    if not user_id:
+        target = recent_decisions(chat_id, limit=5)
+        if not target:
+            lines.append("")
+            lines.append("هنوز هیچ تصمیمی در این گروه ثبت نشده است. "
+                         "روی پیام کاربر ریپلای کنید و «تست عضویت» را بزنید.")
+            return "\n".join(lines)
+        lines.append("")
+        lines.append("آخرین تصمیم‌ها:")
+        for row in target:
+            age = max(0, int(time.time() - row["at"]))
+            lines.append(
+                f"• {_digits(row['user_id'])} — {_status_label(row['status'])} "
+                f"(لایه: {row['layer']}، {_digits(age)} ثانیه پیش)"
+                + (f" — {row['detail']}" if row.get("detail") else "")
+            )
+        return "\n".join(lines)
+
+    # اگر با آیدی عددی صدا زده شدیم، آبجکت کاربر را می‌گیریم تا جست‌وجوی
+    # هدفمند (برای access_hash) هم قابل انجام باشد.
+    if user_id and user_entity is None:
+        client = getattr(bot, "client", None)
+        if client is not None:
+            try:
+                user_entity = await asyncio.wait_for(
+                    client.get_entity(int(user_id)), timeout=resolve_timeout()
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                user_entity = None
+
+    # بررسی واقعی همین حالا
+    status, layer, stored = await resolve_status(
+        bot, record, user_id, user_entity
+    )
+    diag = _last_diag.get((channel_key(record["channel_id"]), _safe_int(user_id)))
+    exempt = local_exemption(bot, chat_id, user_id, user_entity)
+    lines.append("")
+    lines.append(f"کاربر: {_digits(user_id)}")
+    lines.append(f"معافیت: {exempt or 'ندارد'}")
+    if exempt:
+        lines.append("نتیجه: این کاربر معاف است و پیامش هرگز حذف نمی‌شود.")
+        return "\n".join(lines)
+    lines.append(f"InputPeer: {getattr(user_entity, 'access_hash', None) or '—'}")
+    lines.append(f"حکم: {_status_label(status)} (لایه: {layer})")
+    if stored:
+        ago = int(time.time() - float(stored.get("last_verified_at") or 0))
+        lines.append(f"آخرین تأیید در دیتابیس: {_digits(ago)} ثانیه پیش "
+                     f"(منبع: {stored.get('source') or '—'})")
+    if diag:
+        lines.append(f"منبع InputPeer در آخرین تلاش: {diag.get('input_source')}")
+        lines.append(f"پاسخ getParticipant: {diag.get('state')}")
+        if diag.get("error"):
+            lines.append(f"خطا: {diag['error']}")
+    error = last_error(record["channel_id"])
+    if error:
+        lines.append(f"آخرین خطای ثبت‌شده: {error[1]}")
+    lines.append("")
+    if status == storage.STATUS_NOT_MEMBER:
+        lines.append("پیام این کاربر حذف می‌شود و پیام راهنما ارسال خواهد شد.")
+    elif status == storage.STATUS_MEMBER:
+        lines.append("پیام این کاربر آزاد است.")
+    else:
+        lines.append("چون وضعیت نامعلوم است، پیام حذف نمی‌شود (سیاست fail-safe).")
+        lines.append("اگر این حالت تکرار شد، حساب ربات را در کانال ادمین کنید "
+                     "یا فهرست اعضای کانال را از حالت مخفی خارج کنید.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ثبت و راه‌اندازی
 # ---------------------------------------------------------------------------
 
@@ -1302,6 +1611,9 @@ _COMMAND_SPECS = (
     ("تنظیم عضویت اجباری", "enable"),
     ("لغو عضویت اجباری", "disable"),
     ("وضعیت کانال", "status"),
+    ("تست عضویت کانال", "diagnose"),
+    ("تشخیص عضویت", "diagnose"),
+    ("تست عضویت", "diagnose"),
     ("کانال من", "register"),
 )
 
@@ -1350,7 +1662,7 @@ def match_command(text: str):
     for phrase, action in _COMMAND_SPECS:
         if value == phrase:
             return action, ""
-        if action == "register" and value.startswith(phrase + " "):
+        if action in ("register", "diagnose") and value.startswith(phrase + " "):
             return action, value[len(phrase):].strip()
     return None
 
@@ -1408,6 +1720,22 @@ def status_text(chat_id) -> str:
             f"{'کامل' if cursor.get('complete') else 'ناقص'}"
             f" ({_digits(cursor.get('members') or 0)} عضو)"
         )
+    error = last_error(record["channel_id"])
+    if error:
+        ago = max(0, int(time.time() - error[0]))
+        lines.append(f"⚠️ آخرین خطای بررسی ({_digits(ago)} ثانیه پیش): {error[1]}")
+    recent = recent_decisions(chat_id, limit=3)
+    if recent:
+        lines.append("")
+        lines.append("آخرین تصمیم‌ها:")
+        for row in recent:
+            lines.append(
+                f"• {_digits(row['user_id'])} — {_status_label(row['status'])} "
+                f"({row['layer']})"
+            )
+    lines.append("")
+    lines.append("برای بررسی دقیق یک کاربر: روی پیامش ریپلای کنید و "
+                 "«تست عضویت» را بزنید.")
     return "\n".join(lines)
 
 
@@ -1456,6 +1784,9 @@ def reset_runtime_state() -> None:
     _flood_until.clear()
     _sync_locks.clear()
     _pending_prefetch.clear()
+    _recent_decisions.clear()
+    _last_error.clear()
+    _last_diag.clear()
     _semaphore = None
     _registered_bots.clear()
     for key in STATS:

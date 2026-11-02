@@ -107,7 +107,8 @@ python3 -m pytest tests/ -q
 
 - دستورها (فقط مالک گروه/مالک ربات؛ «وضعیت کانال» برای همه):
   `کانال من <لینک یا آیدی>` ، `حذف کانال من` ، `وضعیت کانال` ،
-  `تنظیم عضویت اجباری` ، `لغو عضویت اجباری`
+  `تنظیم عضویت اجباری` ، `لغو عضویت اجباری` ،
+  `تست عضویت` (با ریپلای روی پیام کاربر: گزارش دقیق چرا حذف شد/نشد)
 - هنگام ثبت، ربات واقعاً دسترسی به کانال را می‌سنجد
   (`can_view_participants` / `participants_hidden` / نقش ادمین و یک
   `getParticipant` واقعی). اگر بررسی ممکن نباشد، قابلیت **فعال نمی‌شود** و
@@ -124,7 +125,7 @@ python3 -m pytest tests/ -q
 صادقانه): [`docs/FORCE_JOIN.md`](docs/FORCE_JOIN.md)
 
 ```bash
-python3 -m pytest tests/test_force_join.py -q    # ۳۲ تست
+python3 -m pytest tests/test_force_join.py -q    # ۳۷ تست
 python3 tools/bench_force_join.py --messages 1000
 ```
 

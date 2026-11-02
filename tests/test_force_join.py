@@ -128,8 +128,14 @@ class FakeClient:
     """
 
     def __init__(self, members=None, *, mode="ok", self_is_admin=True,
-                 participants=None, full_count=None):
+                 participants=None, full_count=None, group_members=None,
+                 group_search_mode=None):
         self.members = set(members or ())
+        self.group_members = list(group_members or [])
+        # شناسه‌هایی که کلاینت از قبل می‌شناسد (شبیه کش entity واقعی)
+        self.known_user_ids = set()
+        self.group_search_mode = group_search_mode
+        self.search_calls = 0
         self.mode = mode          # ok | admin_required | outage | flood
         self.self_is_admin = self_is_admin
         self.participants = participants
@@ -146,15 +152,31 @@ class FakeClient:
         self.resolve_calls += 1
         if self.mode == "outage":
             raise RuntimeError("connection lost")
+        if isinstance(entity, (int, str)) and str(entity).lstrip("-").isdigit():
+            number = int(entity)
+            if number not in (CHANNEL_ID, channel_key(CHAT_ID), -CHANNEL_ID) \
+                    and abs(number) != CHANNEL_ID:
+                raise ValueError(f"Could not find the input entity for {number}")
         return _fake_channel()
 
     async def get_input_entity(self, entity):
         if isinstance(entity, str) and entity == "me":
             return types.InputPeerUser(self.self_id, 1)
-        value = getattr(entity, "id", entity)
-        if int(value) in (5, self.self_id):
-            return types.InputPeerUser(int(value), getattr(entity, "access_hash", 1) or 1)
-        return types.InputPeerUser(int(value), getattr(entity, "access_hash", 1) or 1)
+        value = getattr(entity, "id", getattr(entity, "channel_id", entity))
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return types.InputPeerUser(int(getattr(entity, "id", 0)) or 1, 1)
+        if number < 0:
+            # گروه/سوپرگروه: کلید بدون علامت → InputPeerChannel
+            return types.InputPeerChannel(channel_id=channel_key(number),
+                                          access_hash=1)
+        if number == channel_key(CHAT_ID):
+            return types.InputPeerChannel(channel_id=number, access_hash=1)
+        if number != self.self_id and number not in self.known_user_ids:
+            # کلاینت واقعی برای کاربری که هرگز ندیده، خطا می‌دهد
+            raise ValueError(f"Could not find the input entity for {number}")
+        return types.InputPeerUser(number, getattr(entity, "access_hash", 1) or 1)
 
     async def get_me(self, input_peer=False):
         user = types.User(id=self.self_id, user_type=None, first_name="bot",
@@ -204,6 +226,29 @@ class FakeClient:
                         user_id=user_id, date=None))
                 raise errors.UserNotParticipantError(request=request)
             if isinstance(request, functions.channels.GetParticipantsRequest):
+                channel_peer = request.channel
+                peer_channel_id = getattr(channel_peer, "channel_id", None)
+                if peer_channel_id == channel_key(CHAT_ID):
+                    # جست‌وجوی هدفمند در گروه (برای گرفتن access_hash کاربر)
+                    self.search_calls += 1
+                    if self.group_search_mode == "outage":
+                        raise RuntimeError("connection lost")
+                    if self.group_search_mode == "admin_required":
+                        raise errors.ChatAdminRequiredError(request=request)
+                    query = getattr(request.filter, "q", "") or ""
+                    matched = [
+                        user for user in self.group_members
+                        if query and (
+                            query.lower() in (getattr(user, "first_name", "") or "").lower()
+                            or query.lower() == (getattr(user, "username", "") or "").lower()
+                        )
+                    ]
+                    return tl_channels.ChannelParticipants(
+                        count=len(matched), participants=[
+                            types.ChannelParticipant(user_id=user.id, date=None)
+                            for user in matched
+                        ], chats=[], users=matched,
+                    )
                 self.get_participants_calls += 1
                 if self.mode == "outage":
                     raise RuntimeError("connection lost")
@@ -690,7 +735,9 @@ def test_api_outage_never_deletes_without_evidence(tmp_path, monkeypatch):
         await asyncio.sleep(0.05)
         assert deleted == [], "در قطعی API هیچ پیامی نباید حذف شود"
         assert event.replies == []
-        assert storage.get_member(CHANNEL_ID, 999) is None
+        # ممکن است فقط access_hash ذخیره شده باشد؛ وضعیت نباید تأیید شود
+        stored = storage.get_member(CHANNEL_ID, 999)
+        assert stored is None or stored["membership_status"] == "unknown"
 
     asyncio.run(scenario())
 
@@ -819,9 +866,9 @@ def test_snapshot_diff_marks_silent_leavers(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def _user_with_hash(user_id, access_hash=99):
+def _user_with_hash(user_id, access_hash=99, first_name=None):
     return types.User(id=user_id, user_type=None, access_hash=access_hash,
-                      first_name=f"u{user_id}")
+                      first_name=first_name or f"u{user_id}")
 
 
 def test_partial_snapshot_never_removes_members(tmp_path, monkeypatch):
@@ -931,6 +978,157 @@ def test_disable_and_remove_stop_enforcement(tmp_path, monkeypatch):
             bot, FakeEvent(CHAT_ID, owner, "حذف کانال من", msg_id=33))
         assert storage.get_group(CHAT_ID) is None
         assert storage.get_member(CHANNEL_ID, 2222) is None
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# ۱۱.۵) کاربر بدون access_hash — ریشهٔ اصلی «پیام حذف نشد»
+# ---------------------------------------------------------------------------
+
+def _hashless_user(user_id, *, username=None, first_name="ملیکا"):
+    return SimpleNamespace(id=user_id, access_hash=None, username=username,
+                           first_name=first_name, last_name=None, bot=False)
+
+
+def test_missing_access_hash_is_resolved_from_group_search(tmp_path, monkeypatch):
+    """اگر رویداد access_hash نداد، با جست‌وجوی هدفمند در گروه پیدا می‌شود."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(
+        members={555},
+        group_members=[_user_with_hash(555, access_hash=987654,
+                                       first_name="ملیکا")],
+    )
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    sender = _hashless_user(555, first_name="ملیکا")
+
+    async def scenario():
+        await handle_new_message(bot, FakeEvent(CHAT_ID, sender, "سلام", msg_id=77))
+        await asyncio.sleep(0.02)
+        assert client.search_calls == 1              # یک جست‌وجوی هدفمند
+        assert deleted == []                         # عضو است → حذف نمی‌شود
+        stored = storage.get_member(CHANNEL_ID, 555)
+        assert stored["access_hash"] == 987654       # کش پایدار access_hash
+        assert stored["membership_status"] == "member"
+
+        # پیام بعدی: بدون جست‌وجوی دوباره و بدون RPC
+        await handle_new_message(bot, FakeEvent(CHAT_ID, sender, "سلام ۲", msg_id=78))
+        await asyncio.sleep(0.02)
+        assert client.search_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_missing_access_hash_non_member_is_deleted(tmp_path, monkeypatch):
+    """همان مسیر، ولی کاربر واقعاً عضو کانال نیست → حذف + راهنما."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(
+        members=set(),
+        group_members=[_user_with_hash(666, access_hash=555111,
+                                       first_name="ملیکا")],
+    )
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    sender = _hashless_user(666, first_name="ملیکا")
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, sender, "سلام", msg_id=79)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        assert (CHAT_ID, [79]) in deleted
+        assert event.replies and "splus.ir/testchannel" in event.replies[0][0]
+
+    asyncio.run(scenario())
+
+
+def test_unresolvable_user_fails_open_and_is_visible(tmp_path, monkeypatch):
+    """اگر access_hash به هیچ راهی پیدا نشود: حذف نمی‌کنیم ولی خطا ثبت و دیده می‌شود."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members=set(), group_members=[])
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    sender = _hashless_user(1234, first_name="ناشناس")
+
+    async def scenario():
+        await handle_new_message(bot, FakeEvent(CHAT_ID, sender, "سلام", msg_id=80))
+        await asyncio.sleep(0.02)
+        assert deleted == []
+        assert service.last_error(CHANNEL_ID) is not None
+        text = service.status_text(CHAT_ID)
+        assert "آخرین خطای بررسی" in text
+
+        report = await service.diagnose(bot, CHAT_ID, 1234, sender)
+        assert "نامعلوم" in report
+        assert "fail-safe" in report
+
+    asyncio.run(scenario())
+
+
+def test_join_event_passes_real_user_object(tmp_path, monkeypatch):
+    """ورود به گروه: آبجکت واقعی کاربر (با access_hash) به پیش‌بررسی می‌رسد."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members={4321})
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    join_user = _user_with_hash(4321, access_hash=24680)
+
+    class JoinEvent:
+        chat_id = CHAT_ID
+        user_joined = True
+        user_added = False
+        user_left = False
+        user_kicked = False
+        user_ids = [4321]
+        user_id = 4321
+
+        async def get_user(self):
+            return join_user
+
+        async def get_users(self):
+            return [join_user]
+
+    async def scenario():
+        await service.handle_chat_action(bot, JoinEvent())
+        await asyncio.sleep(0.15)
+        stored = storage.get_member(CHANNEL_ID, 4321)
+        assert stored is not None
+        assert stored["access_hash"] == 24680
+        assert stored["membership_status"] == "member"
+        # پیام بعدی: صفر فراخوانی
+        before = client.get_participant_calls
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(4321), "سلام", msg_id=90))
+        await asyncio.sleep(0.02)
+        assert client.get_participant_calls == before
+        assert deleted == []
+
+    asyncio.run(scenario())
+
+
+def test_diagnose_command_reports_verdict(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members=set(),
+                        group_members=[_user_with_hash(777, access_hash=11,
+                                                       first_name="ملیکا")])
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    owner = _user(GROUP_OWNER_ID)
+
+    async def scenario():
+        client.known_user_ids.add(777)
+        event = FakeEvent(CHAT_ID, owner, "تست عضویت 777", msg_id=95)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.02)
+        text = event.replies[0][0]
+        assert "تشخیص عضویت" in text
+        assert "عضو نیست" in text          # کاربر 777 واقعاً عضو کانال نیست
+        assert "حذف می‌شود" in text
 
     asyncio.run(scenario())
 

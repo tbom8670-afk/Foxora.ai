@@ -423,6 +423,55 @@ async def get_participant(client, channel_input, user_input, *,
     return {"state": state, "participant": participant, "join_date": join_date}
 
 
+async def search_participants(client, channel_input, query, target_user_id,
+                              *, limit: int = 20, timeout: float = 15.0) -> dict:
+    """جست‌وجوی **هدفمند** در فهرست اعضا با ``limit`` کوچک.
+
+    این مسیر فقط برای یک کار استفاده می‌شود: وقتی ``access_hash`` کاربر را
+    نداریم و می‌خواهیم آبجکت کامل ``User`` را از همان گروه/کانال بگیریم
+    (چون در آن گروه عضو است و پیام داده). هرگز برای «کل فهرست» صدا زده
+    نمی‌شود و سقف پیش‌فرض ۲۰ نفر است.
+
+    خروجی: ``{"state": "found"|"absent"|"no_access"|"error"|"flood",
+    "user": <User|None>}``.
+    """
+    result = {"state": "absent", "user": None}
+    if not LIBRARY_AVAILABLE or channel_input is None:
+        result["state"] = RESULT_ERROR
+        return result
+    text = str(query or "").strip().lstrip("@")
+    if not text:
+        return result
+    CALL_COUNTER["search_participants"] = CALL_COUNTER.get("search_participants", 0) + 1
+    try:
+        from splusthon.tl.types import ChannelParticipantsSearch
+        page = await asyncio.wait_for(
+            client(GetParticipantsRequest(
+                channel=channel_input,
+                filter=ChannelParticipantsSearch(text),
+                offset=0,
+                limit=max(1, min(int(limit), 50)),
+                hash=0,
+            )),
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        result["state"] = classify_error(error)
+        result["error"] = error
+        return result
+    users = list(getattr(page, "users", None) or ())
+    for user in users:
+        if target_user_id and int(getattr(user, "id", 0)) == int(target_user_id):
+            result["state"] = "found"
+            result["user"] = user
+            return result
+    result["state"] = "absent"
+    result["users_seen"] = len(users)
+    return result
+
+
 async def iter_members(client, channel_input, *, limit: Optional[int] = None,
                        budget_seconds: float = 60.0,
                        delay: float = 0.35, page_size: int = 200) -> dict:
