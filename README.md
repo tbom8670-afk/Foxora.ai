@@ -139,7 +139,7 @@ python3 -m pytest tests/ -q
 صادقانه): [`docs/FORCE_JOIN.md`](docs/FORCE_JOIN.md)
 
 ```bash
-python3 -m pytest tests/test_force_join.py -q    # ۷۷ تست
+python3 -m pytest tests/test_force_join.py -q    # ۸۳ تست
 python3 tools/bench_force_join.py --messages 1000
 
 # سنجش زنده: با این حساب کدام روش بررسی عضویت روی سروش جواب می‌دهد؟

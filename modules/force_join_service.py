@@ -536,6 +536,7 @@ STATS = {
     "events_leave": 0,
     "scans": 0,
     "snapshot_decisions": 0,
+    "deferred": 0,
 }
 
 
@@ -1450,6 +1451,93 @@ def local_exemption(bot, chat_id, user_id, user_entity=None):
     return None
 
 
+def _event_sender(event):
+    """فرستندهٔ رویداد (اگر هندلر آن را پاس نداده باشد)."""
+    for attr in ("sender", "_sender"):
+        value = getattr(event, attr, None)
+        if value is not None:
+            return value
+    try:
+        return getattr(getattr(event, "from_id", None), "user_id", None)
+    except Exception:
+        return None
+
+
+def moderation_reason(bot, chat_id, user_id, text, sender=None):
+    """آیا این پیام «تخلف» است؟ اگر بله، عضویت اجباری نباید دخالت کند.
+
+    دلیل: کاربری که نام تبلیغاتی، کلمهٔ فیلترشده، آگهی یا هر تخلف دیگری
+    دارد باید مسیر عادی مجازات (اخطار/سکوت/اخراج) را ببیند، نه پیام
+    «اول عضو کانال شوید». این کاربران اغلب ربات‌های تبلیغاتی‌اند و
+    فرستادن راهنمای عضویت برایشان هم بی‌فایده است هم گروه را شلوغ می‌کند.
+
+    خروجی: رشتهٔ دلیل (برای لاگ) یا ``None``. هیچ RPC‌ای انجام نمی‌شود؛
+    فقط بررسی‌های محلی و ارزان.
+    """
+    text = str(text or "")
+    # ۱) نام تبلیغاتی کاربر (همان سنجه‌ای که مسیر بنِ نام آگهی استفاده می‌کند)
+    if sender is not None:
+        try:
+            from modules import ad_name_detector
+            if ad_name_detector.reason(sender):
+                return "ad_name"
+        except Exception:
+            pass
+        # ۲) نام فیلترشدهٔ خود گروه («فیلتر اسم …»)
+        try:
+            from modules.group_names_storage import find_matching_filtered_name
+            if find_matching_filtered_name(sender, group_id=chat_id):
+                return "filtered_name"
+        except Exception:
+            pass
+    # ۳) کلمهٔ فیلترشدهٔ گروه («فیلتر …»)
+    try:
+        from modules.group_words_storage import (
+            find_matching_filter_word,
+            get_words,
+        )
+        if find_matching_filter_word(text, get_words(chat_id)):
+            return "filter_word"
+    except Exception:
+        pass
+    # ۴) کلمات ممنوعهٔ سراسری (حالت سخت‌گیرانه) — همان تشخیص spam_detector
+    try:
+        detector = getattr(bot, "detector", None)
+        check = getattr(detector, "check_banned_words", None)
+        if callable(check):
+            hit = check(text, chat_id)
+            if isinstance(hit, tuple):
+                hit = hit[0]
+            if hit:
+                return "banned_word"
+    except Exception:
+        pass
+    # ۵) متن تبلیغاتی/آگهی
+    try:
+        from modules import big_spam
+        if big_spam.looks_promotional(text):
+            return "promotional"
+    except Exception:
+        pass
+    # ۶) کاربر از قبل بن یا سکوت‌شده است (پیامش حذف/مجازات می‌شود)
+    try:
+        from modules.banned_storage import is_banned as storage_is_banned
+        username = getattr(sender, "username", None) if sender is not None else None
+        if storage_is_banned(chat_id, user_id, username):
+            return "banned"
+    except Exception:
+        pass
+    try:
+        tracker = getattr(bot, "tracker", None)
+        for name in ("is_banned", "is_muted"):
+            check = getattr(tracker, name, None)
+            if callable(check) and check(chat_id, user_id):
+                return name.lstrip("is_").lower()
+    except Exception:
+        pass
+    return None
+
+
 async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
                        exempt: bool = False) -> bool:
     """آیا پیام این کاربر باید حذف شود؟
@@ -1497,7 +1585,25 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
             # ولی «اجازهٔ بی‌صدا» ممنوع: کاربر راهنما می‌گیرد (بدون حذف)
             # فقط اگر مالک سیاست سخت‌گیرانه را روشن کرده باشد.
             if _env_flag("FORCE_JOIN_STRICT_UNKNOWN", False):
-                _maybe_send_notice(bot, event, chat_id, record, user_id)
+                _strict_reason = moderation_reason(
+                    bot, chat_id, user_id, text,
+                    user_entity if user_entity is not None else _event_sender(event),
+                )
+                if not _strict_reason:
+                    _maybe_send_notice(bot, event, chat_id, record, user_id)
+            return False
+
+        # تخلف (نام تبلیغاتی/کلمهٔ فیلتر/آگهی/بن‌شده) اول به مسیر مجازات
+        # می‌رود: به چنین کاربری «اول عضو کانال شوید» نمی‌گوییم و پیامش را
+        # هم به‌عنوان غیرعضو حذف نمی‌کنیم؛ خودِ ماژول‌های تنبیه تصمیم می‌گیرند.
+        reason = moderation_reason(
+            bot, chat_id, user_id, text,
+            user_entity if user_entity is not None else _event_sender(event),
+        )
+        if reason:
+            STATS["deferred"] += 1
+            _log(bot, f"GATE deferred to moderation chat_id={chat_id} "
+                      f"user_id={user_id} reason={reason}")
             return False
 
         STATS["blocked"] += 1

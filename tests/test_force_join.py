@@ -2093,3 +2093,134 @@ def test_gate_uses_short_timeout_not_the_long_budget():
     assert service.gate_await_timeout() <= 5.0
     assert service.gate_scan_budget() < service.gate_await_timeout()
     assert service.scan_budget() > service.gate_scan_budget()
+
+
+# ---------------------------------------------------------------------------
+# ۱۸) تخلف‌کار هرگز «اول عضو کانال شوید» نمی‌شنود
+# ---------------------------------------------------------------------------
+
+def _join_notice_sent(event) -> bool:
+    """آیا پیام راهنمای عضویت (با لینک کانال) ارسال شد؟"""
+    for reply in getattr(event, "replies", []):
+        text = reply[0] if isinstance(reply, tuple) else str(reply)
+        if "https://splus.ir/testchannel" in text:
+            return True
+        if "اول عضو کانال زیر شوید" in text:
+            return True
+    return False
+
+
+def test_moderation_reason_categories(tmp_path, monkeypatch):
+    """هر دستهٔ تخلف دلیل درست را برمی‌گرداند و پیام سالم هیچ دلیلی ندارد."""
+    _setup_group(tmp_path, monkeypatch)
+    bot = SimpleNamespace(detector=None, tracker=None, logger=None)
+
+    assert service.moderation_reason(
+        bot, CHAT_ID, 5, "سلام دوستان خوبید", _user(5)) is None
+    assert service.moderation_reason(
+        bot, CHAT_ID, 6, "سلام", _user(6, first_name="بیو چک رایگان")) == "ad_name"
+    assert service.moderation_reason(
+        bot, CHAT_ID, 7, "بیا پیوی فیلم گذاشتم", _user(7)) == "promotional"
+
+    from modules import group_words_storage
+    group_words_storage.add_word(CHAT_ID, "کلاهبرداری")
+    assert service.moderation_reason(
+        bot, CHAT_ID, 8, "کلاهبرداری بزرگ", _user(8)) == "filter_word"
+
+    from modules import group_names_storage
+    group_names_storage.add_name(CHAT_ID, "تبلیغاتی")
+    assert service.moderation_reason(
+        bot, CHAT_ID, 9, "سلام", _user(9, first_name="تبلیغاتی")) == "filtered_name"
+
+
+def test_non_member_with_ad_name_gets_no_join_notice(tmp_path, monkeypatch):
+    """کاربر با نام تبلیغاتی: نه راهنمای عضویت، نه حذف توسط عضویت اجباری."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members=set())
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    user = _user(771, first_name="بیو چک رایگان")
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, user, "سلام", msg_id=71)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        assert not _join_notice_sent(event), \
+            "به کاربر با نام تبلیغاتی نباید پیام عضویت داده شود"
+        assert service.STATS["deferred"] >= 1
+
+    asyncio.run(scenario())
+
+
+def test_non_member_with_promotional_text_gets_no_join_notice(tmp_path, monkeypatch):
+    """متن تبلیغاتی از غیرعضو: مسیر مجازات، نه «عضو شوید»."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members=set())
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, _user(772), "بیا پیوی فیلم گذاشتم", msg_id=72)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        assert not _join_notice_sent(event)
+
+    asyncio.run(scenario())
+
+
+def test_non_member_with_banned_word_gets_no_join_notice(tmp_path, monkeypatch):
+    """کلمهٔ فیلترشدهٔ گروه: اول مجازات، بعد هر چیز دیگری."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    from modules import group_words_storage
+    group_words_storage.add_word(CHAT_ID, "کلاهبرداری")
+    client = FakeClient(members=set())
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, _user(773), "کلاهبرداری میکنم", msg_id=73)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        assert not _join_notice_sent(event)
+
+    asyncio.run(scenario())
+
+
+def test_banned_user_is_not_asked_to_join(tmp_path, monkeypatch):
+    """کاربر از قبل بن‌شده: پیام بن/سکوت، نه راهنمای عضویت."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    from modules import banned_storage
+    banned_storage.add_banned(CHAT_ID, 774, reason="تست")
+    client = FakeClient(members=set())
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, _user(774), "سلام", msg_id=74)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        assert not _join_notice_sent(event)
+
+    asyncio.run(scenario())
+
+
+def test_clean_non_member_still_gets_join_notice(tmp_path, monkeypatch):
+    """پسرفت‌آزمون: پیام سالم غیرعضو همان راهنمای عضویت را می‌گیرد."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members=set())
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, _user(775), "سلام به همه", msg_id=75)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        assert _join_notice_sent(event)
+        assert (CHAT_ID, [75]) in deleted
+
+    asyncio.run(scenario())
