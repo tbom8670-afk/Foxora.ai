@@ -102,6 +102,9 @@ RESULT_NOT_MEMBER = "not_member"
 RESULT_NO_ACCESS = "no_access"
 RESULT_FLOOD = "flood_wait"
 RESULT_ERROR = "error"
+#: سرور این متد را پیاده نکرده است (سروش: ``422 NOT_SUPPORTED``) — نه
+#: «عضو نیست» و نه «دسترسی نداریم»؛ باید مسیر دیگری امتحان شود.
+RESULT_NOT_SUPPORTED = "not_supported"
 
 #: شرکت‌کننده‌هایی که «عضو بودن» را ثابت می‌کنند.
 _MEMBER_TYPES = tuple(
@@ -134,6 +137,28 @@ def call_stats() -> dict:
     return dict(CALL_COUNTER)
 
 
+NOT_SUPPORTED_MARKERS = ("not_supported", "not supported", "notsupported",
+                         "not_implemented", "notimplemented", "unsupported")
+
+
+def is_not_supported(error) -> bool:
+    """آیا سرور می‌گوید «این متد را ندارم»؟
+
+    سروش پلاس برای بعضی متدهای موجود در TL Schema خطای
+    ``RPCError 422: NOT_SUPPORTED`` می‌دهد (مثلاً ``channels.getParticipant``).
+    این حالت با «عضو نیست» و «دسترسی نداریم» یکی نیست و نباید آن‌ها را
+    جایگزین کند.
+    """
+    if error is None:
+        return False
+    name = type(error).__name__.lower()
+    text = str(error).lower()
+    if "notsupported" in name or "not_supported" in name or \
+            "unimplemented" in name:
+        return True
+    return any(marker in text for marker in NOT_SUPPORTED_MARKERS)
+
+
 def classify_error(error) -> str:
     """خطای RPC را به یکی از حالت‌های تصمیم‌گیری تبدیل می‌کند.
 
@@ -142,6 +167,10 @@ def classify_error(error) -> str:
     """
     if error is None:
         return RESULT_ERROR
+    if is_not_supported(error):
+        # باید **قبل** از بقیه بررسی شود: متن خطای سروش شامل کلمهٔ NOT_SUPPORTED
+        # است و اگر دیرتر بررسی شود، به‌اشتباه «خطای عمومی» یا «دسترسی» می‌شود.
+        return RESULT_NOT_SUPPORTED
     if isinstance(error, UserNotParticipantError):
         return RESULT_NOT_MEMBER
     if isinstance(error, (ChatAdminRequiredError, ChannelPrivateError,
@@ -421,6 +450,182 @@ async def get_participant(client, channel_input, user_input, *,
     except (TypeError, ValueError):
         join_date = None
     return {"state": state, "participant": participant, "join_date": join_date}
+
+
+# ---------------------------------------------------------------------------
+# مسیر رسمی Bot API: getChatMember (همان روشی که ربات‌های تلگرامی استفاده
+# می‌کنند). ربات رسمی باید ادمین همان کانال باشد.
+# ---------------------------------------------------------------------------
+
+BOT_API_BASES = ("https://bot.splus.ir/v2/{}", "https://bot.splus.ir/{}")
+
+_BOT_API_MEMBER_STATES = {"member", "administrator", "creator", "restricted"}
+_BOT_API_LEFT_STATES = {"left", "kicked"}
+
+
+def _bot_api_call_sync(token, method, payload, timeout):
+    """POST فرم‌محور به Bot API (همگام؛ در thread جدا اجرا می‌شود)."""
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    last_error = None
+    for base in BOT_API_BASES:
+        url = base.format(token) + "/" + method
+        data = urllib.parse.urlencode(payload).encode()
+        request = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return {"ok": True, "payload": _json.loads(response.read().decode())}
+        except urllib.error.HTTPError as error:
+            try:
+                body = error.read().decode()
+            except Exception:
+                body = ""
+            try:
+                parsed = _json.loads(body) if body else {}
+            except Exception:
+                parsed = {}
+            return {"ok": False, "http": error.code, "payload": parsed,
+                    "text": str(parsed.get("description") or body)[:200]}
+        except Exception as error:  # شبکه/تایم‌اوت/دامنه
+            last_error = error
+            continue
+    return {"ok": False, "http": 0, "text": type(last_error).__name__}
+
+
+async def bot_api_get_chat_member(token, chat_id, user_id, *,
+                                  timeout: float = 10.0) -> dict:
+    """``getChatMember`` رسمی — یک درخواست HTTP، بدون پیمایش فهرست.
+
+    خروجی: ``{"state": member|not_member|no_access|error|unsupported,
+    "status": str|None, "text": str|None}``.
+    """
+    if not token or chat_id is None or not user_id:
+        return {"state": "unsupported", "status": None, "text": "no_token"}
+    CALL_COUNTER["bot_api_get_chat_member"] = (
+        CALL_COUNTER.get("bot_api_get_chat_member", 0) + 1
+    )
+    payload = {"chat_id": str(chat_id), "user_id": str(user_id)}
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(_bot_api_call_sync, token, "getChatMember",
+                              payload, timeout),
+            timeout=timeout + 2.0,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        return {"state": "error", "status": None,
+                "text": type(error).__name__}
+    if not raw.get("ok"):
+        text = (raw.get("text") or "").lower()
+        if "not_found" in text or "not found" in text or \
+                "participant_id_invalid" in text or "user not found" in text:
+            return {"state": "not_member", "status": None, "text": text}
+        if "not enough rights" in text or "chat_admin_required" in text or \
+                "not a member" in text or "forbidden" in text:
+            return {"state": "no_access", "status": None, "text": text}
+        if any(marker in text for marker in NOT_SUPPORTED_MARKERS) or \
+                raw.get("http") == 404:
+            return {"state": "unsupported", "status": None, "text": text}
+        return {"state": "error", "status": None, "text": text}
+
+    body = raw.get("payload") or {}
+    if not body.get("ok"):
+        text = str(body.get("description") or "").lower()
+        if "not found" in text or "participant_id_invalid" in text:
+            return {"state": "not_member", "status": None, "text": text}
+        if "rights" in text or "admin" in text or "forbidden" in text:
+            return {"state": "no_access", "status": None, "text": text}
+        return {"state": "error", "status": None, "text": text}
+    member = body.get("result") or {}
+    status = str(member.get("status") or "").lower()
+    if status in _BOT_API_MEMBER_STATES:
+        if status == "restricted" and member.get("is_member") is False:
+            return {"state": "not_member", "status": status, "text": None}
+        return {"state": "member", "status": status, "text": None}
+    if status in _BOT_API_LEFT_STATES:
+        return {"state": "not_member", "status": status, "text": None}
+    return {"state": "error", "status": status or None,
+            "text": "unknown_status"}
+
+
+async def list_admins(client, channel_input, *, limit: int = 100,
+                      timeout: float = 15.0) -> dict:
+    """فهرست **ادمین‌های** کانال (``ChannelParticipantsAdmins``).
+
+    برای تشخیص «آیا حساب ما ادمین است؟» بدون ``getParticipant`` — چون آن متد
+    روی سروش پشتیبانی نمی‌شود. یک صفحه، حداقل هزینه.
+    """
+    result = {"state": RESULT_ERROR, "user_ids": [], "error": None}
+    if not LIBRARY_AVAILABLE or channel_input is None:
+        return result
+    CALL_COUNTER["list_admins"] = CALL_COUNTER.get("list_admins", 0) + 1
+    try:
+        from splusthon.tl.types import ChannelParticipantsAdmins
+        page = await asyncio.wait_for(
+            client(GetParticipantsRequest(
+                channel=channel_input,
+                filter=ChannelParticipantsAdmins(),
+                offset=0,
+                limit=max(1, min(int(limit), 200)),
+                hash=0,
+            )),
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        result["error"] = error
+        result["state"] = classify_error(error)
+        return result
+    result["user_ids"] = [
+        int(getattr(user, "id", 0)) for user in (getattr(page, "users", None) or ())
+        if getattr(user, "id", None)
+    ]
+    result["state"] = "ok"
+    return result
+
+
+async def list_probe(client, channel_input, *, timeout: float = 15.0) -> dict:
+    """سنجش ارزانِ «آیا این حساب می‌تواند فهرست اعضا را ببیند؟»
+
+    فقط **یک** درخواست با ``limit=1`` (بدون پیمایش)؛ خروجی:
+
+    ``{"state": "ok"|"empty"|"no_access"|"not_supported"|"flood"|"error",
+    "count": int, "error": Exception|None, "seconds": float|None}``
+    """
+    result = {"state": RESULT_ERROR, "count": 0, "error": None, "seconds": None}
+    if not LIBRARY_AVAILABLE or channel_input is None:
+        return result
+    CALL_COUNTER["list_probe"] = CALL_COUNTER.get("list_probe", 0) + 1
+    try:
+        page = await asyncio.wait_for(
+            client(GetParticipantsRequest(
+                channel=channel_input,
+                filter=ChannelParticipantsRecent(),
+                offset=0,
+                limit=1,
+                hash=0,
+            )),
+            timeout=timeout,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        result["error"] = error
+        result["state"] = classify_error(error)
+        result["seconds"] = flood_seconds(error, 0.0) or None
+        return result
+    users = list(getattr(page, "users", None) or ())
+    result["count"] = len(users)
+    result["state"] = "ok" if users else "empty"
+    return result
 
 
 async def search_participants(client, channel_input, query, target_user_id,

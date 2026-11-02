@@ -1,6 +1,6 @@
 # 🔒 عضویت اجباری کانال (Force Join) — گزارش فنی، کد و اعداد
 
-نسخه: ۱.۰ — پیاده‌سازی‌شده و آزموده‌شده روی همین مخزن (Foxora)
+نسخه: ۱.۲ — پیاده‌سازی‌شده و آزموده‌شده روی همین مخزن (Foxora)
 تاریخ: ۲۰۲۵/۱۱/۰۲
 
 این سند سه بخش اصلی دارد: **گزارش فنی سورس‌محور** (چه چیزی واقعاً وجود دارد)،
@@ -18,7 +18,9 @@
 | فراخوانی پس از ری‌استارت | **صفر** (کش `access_hash` از SQLite بازسازی می‌شود) |
 | روش ممنوع (کل اعضا در هر پیام) | ۱۲ فراخوانی و ~۱٬۴۹۳ms در هر پیام برای کانال ۲٬۰۰۰ نفره |
 | در قطعی API | عضویت تأیید نمی‌شود و پیام حذف نمی‌شود (fail-open) |
-| تست‌ها | ۳۷ تست در `tests/test_force_join.py` — همه پاس (کل پروژه: ۱۴۹۴ پاس) |
+| **مهم‌ترین یافتهٔ میدانی (۲ آذر)** | `channels.getParticipant` روی سرور سروش **پیاده نشده است**: `RPCError 422: NOT_SUPPORTED`. پس بررسی عضویت **چندمسیره** شد (§۶.۶) |
+| مسیرهای بررسی (به ترتیب هزینه) | `getParticipant` → Bot API `getChatMember` → جست‌وجوی هدفمند عضو → اسنپ‌شات کامل اعضا |
+| تست‌ها | ۴۸ تست در `tests/test_force_join.py` — همه پاس |
 
 ---
 
@@ -45,12 +47,12 @@
 |---|---|---|
 | ۱ | فهرست اعضای کانال | `functions.channels.GetParticipantsRequest(channel: InputChannel, filter: TypeChannelParticipantsFilter, offset: int, limit: int, hash: int)` → `channels.ChannelParticipants(count, participants, chats, users)` یا `channels.ChannelParticipantsNotModified`. سقف صفحه در خود کتابخانه: `_MAX_PARTICIPANTS_CHUNK_SIZE = 200` (`client/chats.py:17`). |
 | ۲ | اطلاعات یک عضو مشخص با شناسه | همان `GetParticipantsRequest` با `filter=ChannelParticipantsSearch(q='')` (جست‌وجوی هدفمند) **یا بهتر**: `GetParticipantRequest` (ردیف ۳). |
-| ۳ | **API مستقیم بررسی عضویت یک کاربر** | `functions.channels.GetParticipantRequest(channel: InputChannel, participant: InputPeer)` → `channels.ChannelParticipant(participant, chats, users)` که `participant` آن یکی از `ChannelParticipant` / `ChannelParticipantAdmin` / `ChannelParticipantCreator` / `ChannelParticipantSelf` (عضو) یا `ChannelParticipantLeft` / `ChannelParticipantBanned` (غیرعضو) است. **نیازمند `access_hash` کاربر** (`participant: TypeInputPeer`) — که `splusthon.utils.get_input_user(user)` بدون RPC می‌دهد. خطای «عضو نیست»: `errors.UserNotParticipantError`. |
+| ۳ | **API مستقیم بررسی عضویت یک کاربر** | `functions.channels.GetParticipantRequest(channel: InputChannel, participant: InputPeer)` → `channels.ChannelParticipant(participant, chats, users)` که `participant` آن یکی از `ChannelParticipant` / `ChannelParticipantAdmin` / `ChannelParticipantCreator` / `ChannelParticipantSelf` (عضو) یا `ChannelParticipantLeft` / `ChannelParticipantBanned` (غیرعضو) است. **نیازمند `access_hash` کاربر** (`participant: TypeInputPeer`) — که `splusthon.utils.get_input_user(user)` بدون RPC می‌دهد. خطای «عضو نیست»: `errors.UserNotParticipantError`. **⚠️ تصحیح ۱.۲:** این متد در Schema هست ولی **سرور سروش آن را پیاده نکرده** و `422 NOT_SUPPORTED` می‌دهد (§۶.۶) — پس «در دسترس بودن در کتابخانه» ≠ «کار کردن روی سرور». |
 | ۴ | رویداد ورود عضو جدید به کانال | `types.UpdateChannelParticipant(channel_id, date, actor_id, user_id, qts, prev_participant, new_participant)`؛ `events.ChatAction.build` آن را می‌شناسد (`events/chataction.py`): `new_participant` بدون `prev_participant` ⇒ `user_added`/`user_joined`. |
 | ۵ | رویداد خروج عضو | همان `UpdateChannelParticipant`؛ `prev_participant` بدون `new_participant` ⇒ `user_left` (وقتی `actor_id == user_id`) یا `user_kicked`. |
 | ۶ | فقط اعضای تغییرکرده از آخرین بررسی | **وجود ندارد.** نه پارامتر زمانی دارد، نه کرسر. تنها «فقط تغییرات» = رویداد ردیف ۴/۵ (شرط: ادمین بودن در کانال). |
 | ۷ | Delta / Incremental Updates | **وجود ندارد.** `channels.getAdminLog` در TL Schema سروش نیست (زیر `functions.channels` هیچ `GetAdminLogRequest` نیست؛ `hasattr` روی هر سه کتابخانه `False`). بنابراین `client.iter_admin_log(...)` در عمل با `AttributeError` می‌شکند — با تست `test_schema_evidence_about_library_capabilities` قابل بازتولید است. جایگزین: اسنپ‌شات + diff محلی (بخش ۲.۴). |
-| ۸ | تفاوت ربات رسمی و حساب کاربری | حساب کاربری (User-Bot) که **ادمین کانال** باشد هم `getParticipant` می‌گیرد هم `UpdateChannelParticipant`. حساب غیرادمین با کانالِ `participants_hidden=True` به `ChatAdminRequired` می‌خورد. Bot API رسمی (نگاه کنید به `SplusLib.BotClient` و `bot_api_mode.py` همین پروژه) دسترسی به فهرست اعضا **ندارد**؛ تنها `getChatMember` سطحی و `chat_member` update برای ربات‌های ادمین. (پیاده‌سازی نسخهٔ Bot API: **آزموده نشده**.) |
+| ۸ | تفاوت ربات رسمی و حساب کاربری | حساب کاربری (User-Bot) که **ادمین کانال** باشد هم `getParticipant` می‌گیرد هم `UpdateChannelParticipant`. حساب غیرادمین با کانالِ `participants_hidden=True` به `ChatAdminRequired` می‌خورد. Bot API رسمی (نگاه کنید به `SplusLib.BotClient` و `bot_api_mode.py` همین پروژه) دسترسی به فهرست اعضا **ندارد**؛ تنها `getChatMember` سطحی و `chat_member` update برای ربات‌های ادمین. (پیاده‌سازی نسخهٔ Bot API در این پروژه اضافه شد: `bot_api_get_chat_member`؛ پشتیبانی سرور سروش **آزموده نشده** — با `tools/soroush_membership_probe.py` روی حساب خودتان یک‌بار سنجیده می‌شود.) |
 | ۹ | آیا ادمین بودن کافی است؟ | برای دریافت رویدادهای اعضا: **بله، ادمین بودن کانال لازم و کافی است** (سمت سرور، آزموده نشده). برای `getParticipant` روی کانال مخفی: بودن در فهرست ادمین‌ها لازم است. برای فهرست اعضا: `ChannelFull.can_view_participants` و `ChannelFull.participants_hidden` تعیین‌کننده‌اند — هر دو فیلد در `types.ChannelFull` این نسخه وجود دارند (تأیید با `__init__.__code__.co_varnames`). |
 
 ### ۱.۳ یافته‌های پیش‌تأییدشده: تأیید یا رد
@@ -176,17 +178,23 @@ snapshot_started_at` باشند؛ بنابراین رویداد ورودِ تا�
 فرمان «کانال من …» این کارها را می‌کند:
 
 1. resolve با `get_entity` (یک RPC) و گرفتن `access_hash` + عنوان + لینک.
-2. `GetFullChannelRequest` → `can_view_participants`، `participants_hidden`، `participants_count`.
-3. `GetParticipantRequest` روی **حساب خودمان** — این تست تعیین‌کننده است:
-   * `UserNotParticipant` ⇒ متد کار می‌کند ⇒ بررسی تک‌کاربره معتبر است؛
-   * `ChatAdminRequired` ⇒ بررسی تک‌کاربره هم ممکن نیست ⇒ **قابلیت فعال نمی‌شود** و به مالک صریح گفته می‌شود.
-4. انتخاب `sync_mode`:
-   * ادمین کانال ⇒ `event` (رویدادمحور، هزینهٔ صفر)
-   * غیرادمین ولی فهرست اعضا خواندنی ⇒ `snapshot`
-   * فهرست مخفی ⇒ `probe` (فقط بررسی لحظهٔ پیام؛ با هشدار)
-5. حتی فرمان «تنظیم عضویت اجباری» در حالت `probe` یک سنجش دوباره انجام
-   می‌دهد و اگر تأیید ممکن نباشد، فعال‌سازی را رد می‌کند
-   (`enable_channel` → `probe_access`).
+2. `GetFullChannelRequest` → `can_view_participants`، `participants_hidden`،
+   `participants_count`.
+3. سنجش **هر چهار مسیر** (`probe_access`، جدول §۶.۶):
+   * `getParticipant` روی حساب خودمان؛
+   * Bot API `getChatMember` (اگر `BOT_TOKEN` هست)؛
+   * `getParticipants(recent, limit=1)` — آزمون خواندنی بودن فهرست؛
+   * `getParticipants(ChannelParticipantsAdmins)` — تشخیص ادمین بودن حساب
+     **بدون** `getParticipant` (چون آن متد روی سروش نیست).
+4. ذخیرهٔ نتیجهٔ سنجش در کرسر گروه (`routes`) — بررسی بعدی هیچ‌گاه مسیر
+   مرده را دوباره صدا نمی‌زند.
+5. انتخاب `sync_mode`:
+   * ادمین + فهرست خواندنی ⇒ `event` (رویدادمحور، هزینهٔ صفر)
+   * غیرادمین + فهرست خواندنی ⇒ `snapshot`
+   * فقط Bot API ⇒ `bot_api`
+   * هیچ مسیری ⇒ `probe` و **قابلیت فعال نمی‌شود** (با پیام صریح)
+6. «تنظیم عضویت اجباری» هم اگر مسیری نداشته باشد، سنجش دوباره می‌کند و در
+   نبود مسیر، فعال‌سازی را رد می‌کند (`enable_channel` → `probe_access`).
 
 ### ۲.۶ فرمان‌ها
 
@@ -208,7 +216,9 @@ snapshot_started_at` باشند؛ بنابراین رویداد ورودِ تا�
 ## ۳. اعداد بنچمارک (واقعی، اجراشده)
 
 ```
-python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30 --member-count 2000
+python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30
+# سنجش زندهٔ مسیرهای بررسی عضویت روی حساب واقعی (ربات باید خاموش باشد)
+./foxora stop && python3 -m tools.soroush_membership_probe --channel @mychannel && ./foxora --member-count 2000
 ```
 
 پیکربندی: کانال ۲٬۰۰۰ نفره، تأخیر مصنوعی شبکه **۱۲۰ms** برای هر RPC
@@ -237,6 +247,23 @@ python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30 --memb
 
 > صداقت: اعداد تأخیر «منطق تصمیم» است با شبکهٔ شبیه‌سازی‌شده. تأخیر واقعی
 > سروش پلاس اندازه‌گیری نشده (نیازمند حساب و کانال واقعی است).
+
+---
+
+### ۳.۱ هزینهٔ نگهداری اسنپ‌شات (حالت `snapshot`)
+
+در حالتی که `getParticipant` و Bot API هر دو در دسترس نیستند، تنها منبع
+حکم، اسنپ‌شات است. هزینهٔ آن ساده و قابل محاسبه است (سقف صفحه = ۲۰۰ نفر):
+
+| اعضای کانال | RPC هر تازه‌سازی | بازهٔ تازه‌سازی | RPC در ساعت |
+|---|---|---|---|
+| ۵۰۰ | ۳ | ۳۰۰ ثانیه | ۳۶ |
+| ۲٬۰۰۰ | ۱۰ | ۳۰۰ ثانیه | ۱۲۰ |
+| ۱۰٬۰۰۰ | ۵۰ | ۹۰۰ ثانیه | ۲۰۰ |
+| ۵۰٬۰۰۰ | ۲۵۰ | ۳٬۶۰۰ ثانیه | ۲۵۰ |
+
+یعنی حتی در حالت بد، هزینه **در واحد دقیقه/ساعت** است نه «در هر پیام».
+مسیر پیام در همین حالت هم صفر RPC است (کش + SQLite).
 
 ---
 
@@ -344,6 +371,79 @@ python3 -m pytest tests/test_force_join.py -q      # ۳۷ passed
 > نسخهٔ ۱.۱ همچنین `access_hash` را در هر تأیید موفق در دیتابیس نگه می‌دارد،
 > پس «بررسی بعدی = یک فراخوانی» حتی برای کاربری که کلاینت هنوز نمی‌شناسد.
 
+## ۶.۶ یافتهٔ میدانی: `channels.getParticipant` روی سروش **نیست** — و چهار مسیر جایگزین
+
+روی حساب واقعی این پروژه، `channels.getParticipant` همیشه این را برمی‌گرداند:
+
+```
+RPCError 422: NOT_SUPPORTED (caused by GetParticipantRequest)
+```
+
+یعنی متد در TL Schema هست و کتابخانه هم می‌فرستد، ولی **سرور سروش پیاده
+نکرده است**. بنابراین طراحی «یک متد برای بررسی عضویت» غلط بود: هر پیام به
+«نامعلوم» می‌رسید و سیاست fail-safe آن را نگه می‌داشت (لینک هم نمی‌آمد).
+اصلاح ۱.۲: بررسی عضویت **زنجیره‌ای** شد؛ اولین مسیری که پاسخ قطعی بدهد
+برنده است و مسیرهای مرده برای همیشه کنار گذاشته می‌شوند.
+
+| # | مسیر | متد واقعی | حکم «عضو نیست» می‌دهد؟ | هزینه | وضعیت روی سروش |
+|---|---|---|---|---|---|
+| A | `channels.getParticipant` | `GetParticipantRequest(channel, participant)` | بله (`UserNotParticipant`) | ۱ RPC | ⛔️ `422 NOT_SUPPORTED` (اندازه‌گیری‌شده) |
+| B | جست‌وجوی هدفمند عضو | `GetParticipantsRequest(filter=ChannelParticipantsSearch(q), limit≤50)` | **نه** — فقط «پیدا شد» قطعی است | ۱ RPC کوچک | پشتیبانی نامعلوم (وابسته به خواندنی بودن فهرست) |
+| C | اسنپ‌شات کامل + diff | `GetParticipantsRequest(ChannelParticipantsRecent, offset, limit≤200)` | بله، **اگر** اسنپ‌شات کامل و تازه باشد | `⌈N/200⌉` RPC هر بازه | با ادمین بودن یا فهرست باز کار می‌کند |
+| D | **روش ربات‌های تلگرامی** | Bot API: `POST https://bot.splus.ir/v2/{token}/getChatMember` با `chat_id`,`user_id` | بله (`left`/`kicked`) | ۱ درخواست HTTP | در `spluslib/bot_client.py:1469` هست؛ پشتیبانی سرور **آزموده نشده** |
+| E | رویداد | `UpdateChannelParticipant` | بله (`user_left`/`user_kicked`) | ۰ (فقط ادمین) | کار می‌کند |
+
+نکتهٔ مهم دربارهٔ D: توکن ربات باید **ادمین همان کانال** باشد؛ وگرنه
+`no_access` می‌دهد. این همان مسیری است که ربات‌های تلگرامی برای
+«عضو اجباری» استفاده می‌کنند (یک درخواست، بدون پیمایش فهرست).
+
+### سنجش یک‌دستوری روی سرور خودتان
+
+```bash
+./foxora stop
+python3 -m tools.soroush_membership_probe --channel @mychannel --user 32441922
+./foxora
+```
+
+خروجی، جدول «مسیر → نتیجه» است (`OK` / `NOT_SUPPORTED` / `NO_ACCESS` /
+`FLOOD`) و در پایان می‌گوید با این حساب کدام مسیرها قابل استفاده‌اند.
+ابزار **فقط می‌خواند** (هیچ حذف/ارسال/تغییر عضویتی ندارد) و باید وقتی ربات
+خاموش است اجرا شود (دو پروس با یک session string هم‌زمان کار نمی‌کنند).
+
+> وضعیت: کدِ ابزار با تست آفلاین `test_probe_tool_reports_which_routes_work`
+> آزموده شده؛ **اجرای آن روی سرور سروش آزموده نشده** (در این محیط دسترسی
+> شبکه به سروش نیست).
+
+### رفتار عملی در هر حالت
+
+| آنچه روی سرور جواب می‌دهد | `sync_mode` | دقت تصمیم | هزینهٔ هر پیام |
+|---|---|---|---|
+| رویداد + ادمین | `event` | لحظه‌ای | ۰ |
+| Bot API `getChatMember` | `bot_api` | لحظه‌ای (۱ HTTP) | ۰ تا زمان انقضای TTL |
+| اسنپ‌شات | `snapshot` | تا اندازهٔ `FORCE_JOIN_SNAPSHOT_TRUST` (پیش‌فرض ۲× بازهٔ تازه‌سازی) | ۰ (کش) + بازه‌های تازه‌سازی |
+| هیچ‌کدام | `probe` | نامعلوم ⇒ پیام **حذف نمی‌شود** | ۰ |
+
+**پنجرهٔ خطای شناخته‌شدهٔ حالت snapshot:** کاربری که تازه عضو کانال شده و
+اسنپ‌شات هنوز تازه‌سازی نشده، ممکن است «غیرعضو» دیده شود. برای همین:
+* بازهٔ تازه‌سازی پله‌ای است (`snapshot_interval_for`): تا ۲٬۰۰۰ عضو = ۳۰۰
+  ثانیه، تا ۱۰٬۰۰۰ = ۹۰۰ ثانیه، تا ۵۰٬۰۰۰ = ۱ ساعت، بیشتر = ۶ ساعت؛
+* حکم «غیرعضو» فقط تا `FORCE_JOIN_SNAPSHOT_TRUST` ثانیه (پیش‌فرض ۶۰۰)
+  پذیرفته می‌شود؛ بعد از آن «نامعلوم» است؛
+* اسنپ‌شات **ناقص** هرگز حکم «خروج» نمی‌دهد (قرارداد قبلی حفظ شده)؛
+* اگر `join_date` کاربر بعد از شروع اسنپ‌شات باشد، «عضو» در نظر گرفته می‌شود.
+
+برای همین روی کانال بزرگ، مسیر D (ربات ادمین + `getChatMember`) توصیهٔ اول
+است، بعد C.
+
+### دیده شدن خطا (بدون حذف بی‌شاهد)
+
+* هر شکست در `_record_last_error` ثبت می‌شود و در «وضعیت کانال» و
+  «تست عضویت» دیده می‌شود.
+* `diagnose` حالا ترتیب مسیرها، نتیجهٔ هر مسیر و «مسیر برنده» را چاپ می‌کند.
+* اگر هیچ مسیری نباشد، پیام **حذف نمی‌شود** ولی خطای `no_route` ثبت می‌شود.
+* سیاست اختیاری: `FORCE_JOIN_STRICT_UNKNOWN=1` ⇒ در حالت «نامعلوم» پیام
+  حذف نمی‌شود ولی راهنمای لینک (با محدودیت نرخ) ارسال می‌شود.
+
 ## ۷. تنظیمات (همه از محیط)
 
 | متغیر | پیش‌فرض | معنا |
@@ -362,6 +462,11 @@ python3 -m pytest tests/test_force_join.py -q      # ۳۷ passed
 | `FORCE_JOIN_SYNC_BUDGET` | ۹۰ | بودجهٔ زمانی هر اسنپ‌شات (ثانیه) |
 | `FORCE_JOIN_PREFETCH_ON_JOIN` | ۱ | پیش‌بررسی عضویت کانال هنگام ورود به گروه |
 | `FORCE_JOIN_EXEMPT_BOTS` | ۱ | معاف بودن ربات‌ها |
+| `FORCE_JOIN_SNAPSHOT_REFRESH` | ۳۰۰ | بازهٔ پایهٔ تازه‌سازی اسنپ‌شات (پله‌ای می‌شود) |
+| `FORCE_JOIN_SNAPSHOT_TRUST` | ۶۰۰ | حداکثر سن اسنپ‌شات برای حکم «غیرعضو» |
+| `FORCE_JOIN_BACKGROUND_REFRESH` | ۱ | تازه‌سازی اسنپ‌شات در پس‌زمینه هنگام تصمیم |
+| `FORCE_JOIN_STRICT_UNKNOWN` | ۰ | در «نامعلوم» راهنمای لینک بفرست (حذف نمی‌کند) |
+| `SOROUSH_BOT_TOKEN` / `BOT_TOKEN` | — | توکن ربات رسمی برای مسیر `getChatMember` |
 
 ---
 
@@ -373,5 +478,6 @@ python3 -m pytest tests/test_force_join.py -q
 python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30
 ```
 
-> وضعیت تست کل پروژه در همین محیط: **۱۵۲۰ تست، ۱۴۸۹ پاس، ۰ شکست**
-> (پایهٔ قبل از این تغییر ۱۴۵۷ پاس بود؛ ۳۲ تست تازه اضافه شده است).
+> وضعیت تست در همین محیط (اجراشده): `tests/test_force_join.py` →
+> **۴۸ پاس، ۰ شکست**؛ کل پروژه → **۱۵۰۵ پاس، ۰ شکست**
+> (۱۵۰۵ = ۱۴۹۴ پایه + ۱۱ تست تازهٔ زنجیرهٔ مسیرها و ابزار پروب).

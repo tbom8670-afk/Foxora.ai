@@ -42,10 +42,17 @@ SOURCE_EVENT_JOIN = "event_join"
 SOURCE_EVENT_LEAVE = "event_leave"
 SOURCE_RPC = "rpc"
 SOURCE_SNAPSHOT = "snapshot"
+#: مسیر رسمی Bot API (``getChatMember``) — همان روشی که ربات‌های تلگرامی
+#: استفاده می‌کنند؛ دقیق و مستقل از پیمایش فهرست اعضا.
+SOURCE_BOT_API = "bot_api"
+#: جست‌وجوی هدفمند نام کاربر در فهرست اعضا (``ChannelParticipantsSearch``)
+SOURCE_SEARCH = "search"
 
 SYNC_MODE_EVENT = "event"
 SYNC_MODE_SNAPSHOT = "snapshot"
 SYNC_MODE_PROBE = "probe"
+#: بررسی تک‌کاربره از راه رسمی Bot API (getChatMember)
+SYNC_MODE_BOT_API = "bot_api"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS force_join_groups (

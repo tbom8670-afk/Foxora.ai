@@ -97,6 +97,10 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setenv("FORCE_JOIN_GATE_TIMEOUT", "2")
     monkeypatch.setenv("FORCE_JOIN_SYNC_RPC_DELAY", "0")
     monkeypatch.setenv("FORCE_JOIN_START_DELAY", "3600")
+    # تست هرگز نباید به Bot API واقعی درخواست بزند؛ توکن‌ها پاک می‌شوند.
+    for name in ("SOROUSH_BOT_TOKEN", "BOT_TOKEN", "FOXORA_BOT_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FORCE_JOIN_BACKGROUND_REFRESH", "0")
 
 
 def _setup_group(tmp_path, monkeypatch, chat_id=CHAT_ID, owner_id=GROUP_OWNER_ID):
@@ -120,6 +124,14 @@ def _register_channel(chat_id=CHAT_ID, *, enabled=True,
     return record
 
 
+class _NotSupportedError(Exception):
+    """همان چیزی که سرور سروش برای متد پیاده‌نشده برمی‌گرداند."""
+
+    def __str__(self):
+        return ("RPCError 422: NOT_SUPPORTED "
+                "(caused by GetParticipantRequest)")
+
+
 class FakeClient:
     """کلاینت جعلی که فقط لایهٔ شبکه را جایگزین می‌کند.
 
@@ -136,7 +148,7 @@ class FakeClient:
         self.known_user_ids = set()
         self.group_search_mode = group_search_mode
         self.search_calls = 0
-        self.mode = mode          # ok | admin_required | outage | flood
+        self.mode = mode          # ok|admin_required|outage|flood|not_supported
         self.self_is_admin = self_is_admin
         self.participants = participants
         self.full_count = full_count
@@ -212,6 +224,8 @@ class FakeClient:
                     raise errors.FloodWaitError(request=request, capture=30)
                 if self.mode == "admin_required":
                     raise errors.ChatAdminRequiredError(request=request)
+                if self.mode == "not_supported":
+                    raise _NotSupportedError()
                 user_id = getattr(request.participant, "user_id", None)
                 if user_id is None:
                     raise errors.UserNotParticipantError(request=request)
@@ -252,6 +266,19 @@ class FakeClient:
                 self.get_participants_calls += 1
                 if self.mode == "outage":
                     raise RuntimeError("connection lost")
+                if type(request.filter).__name__ == "ChannelParticipantsAdmins":
+                    admins = [_user_with_hash(self.self_id)] if self.self_is_admin else []
+                    return tl_channels.ChannelParticipants(
+                        count=len(admins),
+                        participants=[types.ChannelParticipantAdmin(
+                            user_id=self.self_id, promoted_by=1, date=None,
+                            admin_rights=None) for _ in admins],
+                        chats=[], users=admins,
+                    )
+                if self.mode == "admin_required":
+                    # کانالی که ادمین آن نیستیم و فهرستش مخفی است:
+                    # getParticipants هم ChatAdminRequired می‌دهد.
+                    raise errors.ChatAdminRequiredError(request=request)
                 users = list(self.participants or [])
                 page = users[request.offset: request.offset + request.limit]
                 self._page_users = page
@@ -1191,3 +1218,219 @@ def test_no_get_participants_in_message_path(tmp_path, monkeypatch):
         assert client.get_participant_calls == 3   # یک‌به‌ازای هر کاربر، نه بیشتر
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# ۱۲) زنجیرهٔ مسیرها: «getParticipant پشتیبانی نمی‌شود» نباید یعنی «رها کن»
+# ---------------------------------------------------------------------------
+# واقعیت اندازه‌گیری‌شده روی سروش پلاس:
+#   channels.getParticipant → RPCError 422: NOT_SUPPORTED
+# پس سرویس باید مسیر بعدی را امتحان کند و اگر هیچ مسیری نبود، هیچ‌وقت
+# ادعای «غیرعضو» نکند.
+
+def test_classify_error_separates_not_supported_from_access_errors():
+    from modules import force_join_api as api
+
+    unsupported = Exception(
+        "RPCError 422: NOT_SUPPORTED (caused by GetParticipantRequest)"
+    )
+    assert api.classify_error(unsupported) == api.RESULT_NOT_SUPPORTED
+    assert api.is_not_supported(unsupported) is True
+    assert api.classify_error(RuntimeError("connection lost")) == api.RESULT_ERROR
+    assert api.is_not_supported(RuntimeError("connection lost")) is False
+    # خطای دسترسی هرگز نباید NOT_SUPPORTED تلقی شود
+    assert api.classify_error(
+        errors.ChatAdminRequiredError(request=None)
+    ) == api.RESULT_NO_ACCESS
+
+
+def test_chain_falls_back_to_bot_api_when_participant_unsupported(
+        tmp_path, monkeypatch):
+    """مسیر دوم (getChatMember) حکم می‌دهد و پیام غیرعضو حذف می‌شود."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    monkeypatch.setattr(service, "bot_api_token", lambda: "123:TOKEN")
+    calls = []
+
+    async def fake_member(token, chat_id, user_id, *, timeout=10.0):
+        calls.append((token, chat_id, user_id))
+        return {"state": "not_member", "status": "left", "text": None}
+
+    monkeypatch.setattr(service.api, "bot_api_get_chat_member", fake_member)
+    client = FakeClient(members=set(), mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await handle_new_message(bot, FakeEvent(CHAT_ID, _user(4242), "سلام", msg_id=71))
+        await asyncio.sleep(0.05)
+        return
+
+    asyncio.run(scenario())
+    assert deleted != [], "مسیر Bot API گفت غیرعضو است → پیام باید حذف شود"
+    assert calls and calls[0][1] == CHANNEL_ID
+    record = storage.get_group(CHAT_ID)
+    routes = (record.get("last_update_cursor") or {}).get("routes") or {}
+    assert routes.get(service.ROUTE_PARTICIPANT) is False, \
+        "مسیر NOT_SUPPORTED باید برای همیشه کنار گذاشته شود"
+    assert storage.get_member(CHANNEL_ID, 4242)["membership_status"] == "not_member"
+
+
+def test_unsupported_route_is_not_retried_on_every_message(tmp_path, monkeypatch):
+    """یک بار NOT_SUPPORTED کافی است؛ هر پیام نباید همان RPC بی‌فایده را بزند."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members=set(), mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await handle_new_message(bot, FakeEvent(CHAT_ID, _user(501), "اول", msg_id=72))
+        await asyncio.sleep(0.02)
+        await handle_new_message(bot, FakeEvent(CHAT_ID, _user(502), "دوم", msg_id=73))
+        await asyncio.sleep(0.02)
+
+    asyncio.run(scenario())
+    assert client.get_participant_calls == 1
+    assert deleted == [], "بدون مسیر قطعی، هیچ پیامی حذف نمی‌شود (fail-safe)"
+
+
+def test_snapshot_route_decides_membership_with_zero_rpc(tmp_path, monkeypatch):
+    """وقتی اسنپ‌شات کامل و تازه است، تصمیم بدون هیچ RPC گرفته می‌شود."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, {
+        service.ROUTE_PARTICIPANT: False,
+        service.ROUTE_BOT_API: False,
+        service.ROUTE_SEARCH: False,
+        service.ROUTE_SNAPSHOT: True,
+    })
+    client = FakeClient(participants=[_user_with_hash(6001)])
+    bot = _bot(client)
+
+    async def scenario():
+        summary = await service.snapshot_sync(bot, CHAT_ID)
+        assert summary["complete"] is True
+        record = storage.get_group(CHAT_ID)
+        member, layer, _ = await service.resolve_status(bot, record, 6001)
+        assert (member, layer) == ("member", "db")  # کش دیتابیس، صفر RPC
+        outsider, layer2, _ = await service.resolve_status(bot, record, 7777)
+        assert outsider == "not_member"
+        assert layer2 in ("snapshot", "db")
+        return client.get_participant_calls, client.get_participants_calls
+
+    _gp, _gps = asyncio.run(scenario())
+    assert _gp == 0, "مسیر ناموجود نباید صدا زده شود"
+
+
+def test_stale_snapshot_is_never_conclusive(tmp_path, monkeypatch):
+    """اسنپ‌شات کهنه → «نامعلوم»، نه «غیرعضو»."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    old = int(time.time()) - 10 * 86400
+    storage.set_sync_state(CHAT_ID, cursor={
+        "snapshot_started_at": old, "snapshot_completed_at": old,
+        "complete": True, "members": 1,
+        "routes": {service.ROUTE_SNAPSHOT: True},
+    })
+    service.refresh_group_cache(CHAT_ID)
+    record = storage.get_group(CHAT_ID)
+    status, reason = service.snapshot_membership(record, 12345)
+    assert status is None and reason == "snapshot_stale"
+
+
+def test_partial_snapshot_is_never_conclusive(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    storage.set_sync_state(CHAT_ID, cursor={
+        "snapshot_started_at": int(time.time()), "complete": False,
+        "routes": {service.ROUTE_SNAPSHOT: True},
+    })
+    service.refresh_group_cache(CHAT_ID)
+    record = storage.get_group(CHAT_ID)
+    status, reason = service.snapshot_membership(record, 12345)
+    assert status is None and reason == "snapshot_incomplete"
+
+
+def test_register_enables_when_snapshot_route_works_without_participant(
+        tmp_path, monkeypatch):
+    """روی سروش getParticipant نیست؛ ثبت باید با مسیر اسنپ‌شات فعال شود."""
+    _setup_group(tmp_path, monkeypatch)
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot = _bot(client)
+
+    ok, message, record = asyncio.run(
+        service.register_channel(bot, CHAT_ID, "@testchannel")
+    )
+    assert ok is True, message
+    routes = (record.get("last_update_cursor") or {}).get("routes") or {}
+    assert routes.get(service.ROUTE_PARTICIPANT) is False
+    assert routes.get(service.ROUTE_SNAPSHOT) is True
+    assert record["sync_mode"] == storage.SYNC_MODE_EVENT  # حساب ادمین است
+
+
+def test_register_reports_no_route_loudly_and_stays_off(tmp_path, monkeypatch):
+    """هیچ مسیری جواب نداد → فعال نمی‌شود و پیام صریح می‌دهد."""
+    _setup_group(tmp_path, monkeypatch)
+    client = FakeClient(members={555}, mode="admin_required",
+                        group_search_mode="admin_required")
+    bot = _bot(client)
+    ok, message, record = asyncio.run(
+        service.register_channel(bot, CHAT_ID, "@testchannel")
+    )
+    assert ok is False
+    assert record["force_join_enabled"] is False
+    assert "هیچ مسیری" in message or "فعال نشد" in message
+    routes = (record.get("last_update_cursor") or {}).get("routes") or {}
+    assert not any(routes.get(route) for route in service.ROUTE_DECIDES_ABSENCE)
+
+
+def test_no_route_is_reported_not_silently_allowed(tmp_path, monkeypatch):
+    """کانال بدون هیچ مسیر سالم: پیام حذف نمی‌شود ولی خطا ثبت و دیده می‌شود."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, {
+        service.ROUTE_PARTICIPANT: False, service.ROUTE_BOT_API: False,
+        service.ROUTE_SEARCH: False, service.ROUTE_SNAPSHOT: False,
+    })
+    client = FakeClient(members=set())
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await handle_new_message(bot, FakeEvent(CHAT_ID, _user(808), "سلام", msg_id=74))
+        await asyncio.sleep(0.02)
+
+    asyncio.run(scenario())
+    assert deleted == []
+    assert service.last_error(CHANNEL_ID) is not None
+    assert "no_route" in str(service.last_error(CHANNEL_ID)[1])
+
+
+def test_probe_tool_reports_which_routes_work():
+    """ابزار پروب باید مسیرهای سالم را از NOT_SUPPORTED جدا کند."""
+    from tools import soroush_membership_probe as probe
+
+    report = {"routes": {
+        "getParticipant(self)": "not_supported",
+        "getParticipants(recent,limit=1)": "ok",
+        "getParticipants(search,limit=20)": "absent",
+        "botApi.getChatMember": "no_token",
+    }}
+    text = "\n".join(probe._verdict(report))
+    assert "channels.getParticipants" in text
+    assert "NOT_SUPPORTED" in text          # علت، نه سکوت
+    assert "Bot API" not in text            # توکن نبود → ادعا نکن
+    assert probe._label("not_supported").startswith("⛔️")
+    assert probe._label("member").startswith("✅")
+
+
+def test_bot_api_route_is_used_only_when_token_exists(tmp_path, monkeypatch):
+    """بدون توکن، مسیر Bot API نباید در زنجیره بیاید (و نباید RPC اضافه بزند)."""
+    _setup_group(tmp_path, monkeypatch)   # توکن‌ها پاک شده‌اند
+    record = _register_channel()
+    routes = service.channel_routes(record)
+    assert routes[service.ROUTE_BOT_API] is False
+    monkeypatch.setattr(service, "bot_api_token", lambda: "1:abc")
+    routes = service.channel_routes(storage.get_group(CHAT_ID))
+    assert routes[service.ROUTE_BOT_API] is True

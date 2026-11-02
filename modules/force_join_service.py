@@ -146,6 +146,198 @@ def start_delay() -> float:
     return _env_float("FORCE_JOIN_START_DELAY", 180.0, 0.0, 3600.0)
 
 
+# ---------------------------------------------------------------------------
+# زنجیرهٔ مسیرهای بررسی عضویت (Route chain)
+# ---------------------------------------------------------------------------
+# واقعیتِ اندازه‌گیری‌شده روی سروش پلاس: ``channels.getParticipant`` برای این
+# حساب ``RPCError 422: NOT_SUPPORTED`` می‌دهد، یعنی سرور این متد را پیاده
+# نکرده است. پس «یک راه» نداریم؛ چند مسیر داریم و هر کدام که سرور جواب داد
+# استفاده می‌شود. ترتیب = ارزان‌ترین/دقیق‌ترین اول:
+#
+#   1) get_participant : channels.getParticipant  — ارزان‌ترین (اگر پشتیبانی شود)
+#   2) bot_api         : getChatMember در Bot API — همان روش ربات‌های تلگرامی
+#   3) search          : ChannelParticipantsSearch هدفمند (فقط «پیدا شد» قطعی است)
+#   4) snapshot        : اسنپ‌شات کامل اعضا + diff (فقط وقتی تازه و کامل است)
+
+ROUTE_PARTICIPANT = "get_participant"
+ROUTE_BOT_API = "bot_api"
+ROUTE_SEARCH = "search"
+ROUTE_SNAPSHOT = "snapshot"
+
+ROUTE_LABELS = {
+    ROUTE_PARTICIPANT: "channels.getParticipant",
+    ROUTE_BOT_API: "Bot API getChatMember",
+    ROUTE_SEARCH: "جست‌وجوی هدفمند عضو",
+    ROUTE_SNAPSHOT: "اسنپ‌شات کامل اعضا",
+}
+
+#: مسیرهایی که «عضو نیست» را هم قطعی اعلام می‌کنند (بقیه فقط تأیید می‌کنند)
+ROUTE_DECIDES_ABSENCE = (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SNAPSHOT)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def bot_api_token() -> Optional[str]:
+    """توکن ربات رسمی سروش (همان ``BOT_TOKEN`` پروژه).
+
+    این ربات باید **ادمین همان کانال** باشد؛ وگرنه ``getChatMember``
+    دسترسی نمی‌دهد.
+    """
+    for name in ("SOROUSH_BOT_TOKEN", "BOT_TOKEN", "FOXORA_BOT_TOKEN"):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    try:
+        from config import config_manager  # type: ignore
+        for key in ("soroush_bot_token", "bot_token", "BOT_TOKEN"):
+            value = (config_manager.get(key) or "").strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return None
+
+
+def channel_routes(record) -> dict:
+    """مسیرهای فعالِ این کانال (ذخیره‌شده در زمان ثبت/سنجش)."""
+    cursor = record.get("last_update_cursor") or {}
+    stored = cursor.get("routes") if isinstance(cursor, dict) else None
+    routes = {
+        ROUTE_PARTICIPANT: bool((stored or {}).get(ROUTE_PARTICIPANT)),
+        ROUTE_BOT_API: bool((stored or {}).get(ROUTE_BOT_API)),
+        ROUTE_SEARCH: bool((stored or {}).get(ROUTE_SEARCH)),
+        ROUTE_SNAPSHOT: bool((stored or {}).get(ROUTE_SNAPSHOT)),
+    }
+    if stored is None:
+        # رکوردهای قدیمی (پیش از این نسخه) هرگز سنجیده نشده‌اند و فقط بر پایهٔ
+        # getParticipant کار می‌کردند. اگر آن جواب نداد، اولین فراخوانی خودش
+        # این مسیر را **برای همیشه** غیرفعال می‌کند (وگرنه هر پیام دوباره
+        # همان RPC بی‌فایده را می‌فرستاد).
+        routes[ROUTE_PARTICIPANT] = bool(record.get("force_join_enabled"))
+        routes[ROUTE_BOT_API] = bool(bot_api_token())
+    return routes
+
+
+def route_order(routes) -> list:
+    order = []
+    for route in (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SEARCH, ROUTE_SNAPSHOT):
+        if routes.get(route):
+            order.append(route)
+    return order
+
+
+def merge_cursor(group_id, extra: dict, *, merge: bool = True) -> dict:
+    """به‌روزرسانی امن کرسر JSON (کلیدهای دیگر مثل ``routes`` حفظ می‌شوند).
+
+    باگ واقعی: نوشتن کرسر با یک dict تازه، ``routes`` را پاک می‌کرد و
+    کانال بی‌دلیل «بدون مسیر» می‌شد.
+    """
+    record = storage.get_group(group_id)
+    if record is None:
+        return {}
+    cursor = dict(record.get("last_update_cursor") or {})
+    cursor.update(extra or {})
+    try:
+        storage.set_sync_state(group_id, cursor=cursor)
+    except Exception:
+        return cursor
+    return cursor
+
+
+def save_channel_routes(group_id, routes: dict, *, merge: bool = True) -> None:
+    """ثبت پایدار مسیرهای سالم یک گروه (کرسر JSON محلی)."""
+    record = storage.get_group(group_id)
+    if record is None:
+        return
+    cursor = dict(record.get("last_update_cursor") or {})
+    current = dict(cursor.get("routes") or {}) if merge else {}
+    for route in (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SEARCH, ROUTE_SNAPSHOT):
+        if route in routes:
+            current[route] = bool(routes[route])
+    merge_cursor(group_id, {"routes": current})
+    refresh_group_cache(group_id)
+
+
+def disable_route(bot, record, route, reason) -> None:
+    """مسیری که سرور جواب نمی‌دهد را برای همیشه کنار می‌گذاریم — با اعلام."""
+    routes = channel_routes(record)
+    if not routes.get(route):
+        return
+    routes[route] = False
+    save_channel_routes(record["group_id"], routes)
+    _log(bot, f"ROUTE DISABLED {ROUTE_LABELS.get(route, route)} "
+              f"group_id={record['group_id']} reason={reason}", error=True)
+
+
+# --- تنظیمات اسنپ‌شات -------------------------------------------------------
+
+def snapshot_base_interval() -> int:
+    return _env_int("FORCE_JOIN_SNAPSHOT_REFRESH", 300, 60, 86400)
+
+
+def snapshot_interval_for(size) -> int:
+    """فاصلهٔ تازه‌سازی اسنپ‌شات بر اساس تعداد اعضا (پله‌ای)."""
+    base = snapshot_base_interval()
+    size = _safe_int(size)
+    if size <= 2000:
+        return base
+    if size <= 10000:
+        return max(base, 900)
+    if size <= 50000:
+        return max(base, 3600)
+    return max(base, 6 * 3600)
+
+
+def snapshot_trust_seconds() -> int:
+    """تا این سن، اسنپ‌شاتِ کامل برای «عضو نیست» معتبر است."""
+    return _env_int("FORCE_JOIN_SNAPSHOT_TRUST",
+                    max(600, 2 * snapshot_base_interval()), 60, 86400)
+
+
+def snapshot_state(record) -> dict:
+    cursor = record.get("last_update_cursor") or {}
+    if not isinstance(cursor, dict):
+        cursor = {}
+    completed = cursor.get("snapshot_completed_at")
+    started = cursor.get("snapshot_started_at")
+    complete = bool(cursor.get("complete")) and bool(completed)
+    age = (time.time() - float(completed)) if complete else None
+    return {
+        "complete": complete,
+        "completed_at": float(completed) if completed else None,
+        "started_at": float(started) if started else None,
+        "age": age,
+        "members": _safe_int(cursor.get("members")),
+        "reason": cursor.get("reason"),
+    }
+
+
+def snapshot_membership(record, user_id):
+    """حکم بر پایهٔ اسنپ‌شات کامل و تازه. ``(status|None, reason)``."""
+    state = snapshot_state(record)
+    if not state["complete"]:
+        return None, "snapshot_incomplete"
+    if state["age"] is None or state["age"] > snapshot_trust_seconds():
+        return None, "snapshot_stale"
+    stored = storage.get_member(record["channel_id"], user_id)
+    verified = float((stored or {}).get("last_verified_at") or 0)
+    if stored and stored.get("membership_status") == storage.STATUS_MEMBER \
+            and state["started_at"] and verified >= state["started_at"]:
+        return storage.STATUS_MEMBER, "snapshot"
+    if stored and float((stored or {}).get("join_date") or 0) and \
+            float(stored.get("join_date") or 0) >= (state["started_at"] or 0):
+        # ورود بعد از شروع اسنپ‌شات → در فهرست نیست ولی عضو است.
+        return storage.STATUS_MEMBER, "snapshot_join_date"
+    if not stored or stored.get("membership_status") != storage.STATUS_MEMBER:
+        return storage.STATUS_NOT_MEMBER, "snapshot"
+    return None, "snapshot_conflict"
+
+
 MAX_PENDING_CHECKS = _env_int("FORCE_JOIN_MAX_PENDING", 200, 10, 5000)
 
 # ---------------------------------------------------------------------------
@@ -585,6 +777,13 @@ async def _api_check(bot, record, user_id, user_entity=None):
     error = result.get("error")
     diag["error"] = f"{type(error).__name__}: {error}" if error else state
     _record_last_error(channel_id, diag["error"])
+    if state == api.RESULT_NOT_SUPPORTED:
+        # سروش این متد را ندارد؛ نه خطای شبکه است نه مشکل access_hash.
+        _log(bot, f"NOT SUPPORTED channels.getParticipant "
+                  f"channel_id={channel_id} (مسیر بعدی امتحان می‌شود)")
+        _record_decision(record["group_id"], user_id, "unknown", "api",
+                         "not_supported")
+        return storage.STATUS_UNKNOWN, state, result
     if state == api.RESULT_FLOOD:
         seconds = result.get("seconds") or 60.0
         _flood_until[channel_id] = time.time() + float(seconds)
@@ -600,6 +799,236 @@ async def _api_check(bot, record, user_id, user_entity=None):
     STATS["api_errors"] += 1
     _record_decision(record["group_id"], user_id, "unknown", "api", diag["error"])
     return storage.STATUS_UNKNOWN, state, result
+
+
+# ---------------------------------------------------------------------------
+# اجرای زنجیرهٔ مسیرها
+# ---------------------------------------------------------------------------
+
+#: group_key → Task تازه‌سازی اسنپ‌شات در پس‌زمینه
+_refresh_tasks: dict = {}
+
+
+def _store_verdict(record, user_id, status, source, *, access_hash=None,
+                   join_date=None, layer="api", detail=None) -> None:
+    storage.set_member(
+        record["channel_id"], user_id, status, source=source,
+        access_hash=access_hash, join_date=join_date,
+    )
+    _remember(record["channel_id"], user_id, status, time.time())
+    _record_decision(record["group_id"], user_id, status, layer, detail)
+
+
+async def _bot_api_route(record, user_id):
+    """مسیر ``getChatMember`` (Bot API) — یک درخواست HTTP، بدون پیمایش."""
+    result = await api.bot_api_get_chat_member(
+        bot_api_token(), record["channel_id"], user_id, timeout=api_timeout(),
+    )
+    state = result.get("state")
+    if state == "member":
+        return storage.STATUS_MEMBER, "member", result
+    if state == "not_member":
+        return storage.STATUS_NOT_MEMBER, "not_member", result
+    return storage.STATUS_UNKNOWN, state or "error", result
+
+
+def _search_query(user_entity) -> Optional[str]:
+    if user_entity is None:
+        return None
+    for attr in ("username", "usernames", "first_name", "last_name"):
+        value = getattr(user_entity, attr, None)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if hasattr(value, "username"):
+            value = getattr(value, "username", None)
+        text = str(value or "").strip().lstrip("@")
+        if text and len(text) <= 32:
+            return text
+    return None
+
+
+async def _search_route(bot, record, user_id, user_entity=None):
+    """جست‌وجوی هدفمند نام کاربر.
+
+    فقط «پیدا شد» قطعی است (کاربر عضو است). «پیدا نشد» **نیست**، چون
+    نتیجه ممکن است وارد صفحهٔ اول نشده باشد.
+    """
+    query = _search_query(user_entity)
+    if not query:
+        return storage.STATUS_UNKNOWN, "no_query", None
+    channel_input = await ensure_channel_input(bot, record)
+    client = getattr(bot, "client", None)
+    if client is None or channel_input is None:
+        return storage.STATUS_UNKNOWN, "no_access", None
+    found = await api.search_participants(
+        client, channel_input, query, user_id, limit=20,
+        timeout=api_timeout(),
+    )
+    state = found.get("state")
+    if state == "found":
+        user = found.get("user")
+        return storage.STATUS_MEMBER, state, {
+            "user": user,
+            "access_hash": getattr(user, "access_hash", None),
+        }
+    if state in (api.RESULT_NO_ACCESS,):
+        return storage.STATUS_UNKNOWN, state, None
+    return storage.STATUS_UNKNOWN, state or "absent", None
+
+
+def _snapshot_route(bot, record, user_id):
+    status, reason = snapshot_membership(record, user_id)
+    if status is not None:
+        return status, reason, None
+    _schedule_snapshot_refresh(bot, record)
+    return storage.STATUS_UNKNOWN, reason, None
+
+
+def _schedule_snapshot_refresh(bot, record) -> bool:
+    """تازه‌سازی اسنپ‌شات در پس‌زمینه (بی‌مسدودسازی مسیر پیام)."""
+    if not _env_flag("FORCE_JOIN_BACKGROUND_REFRESH", True):
+        return False
+    if not channel_routes(record).get(ROUTE_SNAPSHOT):
+        return False
+    key = str(record["group_id"])
+    running = _refresh_tasks.get(key)
+    if running is not None and not running.done():
+        return False
+    if not needs_sync(record):
+        return False
+
+    async def runner():
+        try:
+            await snapshot_sync(bot, record["group_id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log(bot, f"SNAPSHOT REFRESH FAILED group_id={key} "
+                      f"error={type(error).__name__}", error=True)
+
+    try:
+        task = asyncio.ensure_future(runner())
+    except Exception:
+        return False
+    _refresh_tasks[key] = task
+    return True
+
+
+async def _routed_check(bot, record, user_id, user_entity=None):
+    """زنجیرهٔ مسیرها: اولین پاسخ قطعی برنده است؛ هر شکست دیده می‌شود.
+
+    خروجی: ``(status, layer, diag)``
+    """
+    channel_id = record["channel_id"]
+    routes = channel_routes(record)
+    order = route_order(routes)
+    diag = {
+        "at": time.time(),
+        "user_id": user_id,
+        "channel_id": channel_id,
+        "group_id": record["group_id"],
+        "routes": order,
+        "trace": [],
+        "state": None,
+        "route": None,
+        "error": None,
+    }
+    key = (channel_key(channel_id), _safe_int(user_id))
+
+    if not order:
+        diag.update(state="no_route", error="no_route")
+        _last_diag[key] = diag
+        _record_last_error(
+            channel_id,
+            "no_route: هیچ مسیر سالمی برای بررسی عضویت ثبت نشده است "
+            "(«تست عضویت» را اجرا کنید)",
+        )
+        _log(bot, f"NO ROUTE user_id={user_id} channel_id={channel_id}",
+             error=True)
+        return storage.STATUS_UNKNOWN, "no_route", diag
+
+    STATS["api_checks"] += 1
+    for route in order:
+        try:
+            if route == ROUTE_PARTICIPANT:
+                status, raw_state, detail = await _single_flight_check(
+                    bot, record, user_id, user_entity
+                )
+                diag["trace"].append({route: raw_state})
+                if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
+                    diag.update(route=route, state=raw_state)
+                    _last_diag[key] = diag
+                    return status, "api", diag
+                error = detail.get("error") if isinstance(detail, dict) else None
+                if api.is_not_supported(error) or \
+                        raw_state == api.RESULT_NOT_SUPPORTED:
+                    disable_route(bot, record, route, "NOT_SUPPORTED")
+                    record = storage.get_group(record["group_id"]) or record
+                continue
+
+            if route == ROUTE_BOT_API:
+                status, outcome, payload = await _bot_api_route(record, user_id)
+                diag["trace"].append({route: outcome})
+                if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
+                    _store_verdict(record, user_id, status,
+                                   storage.SOURCE_BOT_API, layer="bot_api",
+                                   detail=outcome)
+                    diag.update(route=route, state=outcome)
+                    _last_diag[key] = diag
+                    return status, "bot_api", diag
+                if outcome == "unsupported":
+                    disable_route(bot, record, route, "NOT_SUPPORTED")
+                    record = storage.get_group(record["group_id"]) or record
+                elif outcome == "no_access":
+                    _record_last_error(
+                        channel_id,
+                        "bot_api_no_access: رباتِ BOT_TOKEN ادمین این کانال نیست",
+                    )
+                continue
+
+            if route == ROUTE_SEARCH:
+                status, outcome, payload = await _search_route(
+                    bot, record, user_id, user_entity
+                )
+                diag["trace"].append({route: outcome})
+                if status == storage.STATUS_MEMBER:
+                    _store_verdict(
+                        record, user_id, status, storage.SOURCE_SEARCH,
+                        access_hash=(payload or {}).get("access_hash"),
+                        layer="search", detail=outcome,
+                    )
+                    diag.update(route=route, state=outcome)
+                    _last_diag[key] = diag
+                    return status, "search", diag
+                if outcome == api.RESULT_NO_ACCESS:
+                    disable_route(bot, record, route, "NO_ACCESS")
+                    record = storage.get_group(record["group_id"]) or record
+                continue
+
+            if route == ROUTE_SNAPSHOT:
+                status, outcome, _ = _snapshot_route(bot, record, user_id)
+                diag["trace"].append({route: outcome})
+                if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
+                    _store_verdict(record, user_id, status,
+                                   storage.SOURCE_SNAPSHOT,
+                                   layer="snapshot", detail=outcome)
+                    diag.update(route=route, state=outcome)
+                    _last_diag[key] = diag
+                    return status, "snapshot", diag
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # یک مسیر خراب، کل زنجیره را نمی‌شکند
+            diag["trace"].append({route: f"exception:{type(error).__name__}"})
+            continue
+
+    diag.update(state="exhausted", error="no_route_conclusive")
+    _last_diag[key] = diag
+    _record_last_error(channel_id, "no_route_conclusive: هیچ مسیری پاسخ قطعی نداد")
+    STATS["api_errors"] += 1
+    _record_decision(record["group_id"], user_id, "unknown", "chain",
+                     diag["trace"][-1] if diag["trace"] else "no_route")
+    return storage.STATUS_UNKNOWN, "exhausted", diag
 
 
 #: آخرین تصمیم‌ها برای گزارش «وضعیت کانال» (حلقهٔ کران‌دار)
@@ -707,8 +1136,8 @@ async def resolve_status(bot, record, user_id, user_entity=None):
         return _grace_decision(stored, age), "grace", stored
 
     try:
-        status, raw_state, detail = await asyncio.wait_for(
-            _single_flight_check(bot, record, user_id, user_entity),
+        status, layer, detail = await asyncio.wait_for(
+            _routed_check(bot, record, user_id, user_entity),
             timeout=gate_await_timeout(),
         )
     except asyncio.TimeoutError:
@@ -726,7 +1155,7 @@ async def resolve_status(bot, record, user_id, user_entity=None):
 
     if status == storage.STATUS_UNKNOWN:
         return _grace_decision(stored, age), "grace", detail
-    return status, "api", detail
+    return status, layer or "api", detail
 
 
 def _grace_decision(stored, age):
@@ -822,6 +1251,10 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
             STATS["unknown_allowed"] += 1
             _log(bot, f"GATE unknown -> allow chat_id={chat_id} "
                       f"user_id={user_id} layer={layer}")
+            # ولی «اجازهٔ بی‌صدا» ممنوع: کاربر راهنما می‌گیرد (بدون حذف)
+            # فقط اگر مالک سیاست سخت‌گیرانه را روشن کرده باشد.
+            if _env_flag("FORCE_JOIN_STRICT_UNKNOWN", False):
+                _maybe_send_notice(bot, event, chat_id, record, user_id)
             return False
 
         STATS["blocked"] += 1
@@ -972,15 +1405,17 @@ def _participant_is_admin(participant) -> bool:
 
 
 async def probe_access(bot, channel_id, access_hash) -> dict:
-    """آیا واقعاً می‌توان عضویت را بررسی کرد؟ (سنجش، نه حدس)
+    """سنجش **واقعی** اینکه کدام مسیرهای بررسی عضویت روی این سرور جواب می‌دهند.
 
-    معیارهای واقعی که خوانده می‌شوند:
-      * ``ChannelFull.can_view_participants``
-      * ``ChannelFull.participants_hidden``
-      * نقش حساب ما در کانال (``ChannelParticipantAdmin``/``Creator``)
-      * یک ``channels.getParticipant`` واقعی روی حساب خودمان: اگر
-        ``UserNotParticipant`` برگرداند یعنی این متد کار می‌کند؛ اگر
-        ``ChatAdminRequired`` بدهد یعنی بررسی تک‌کاربره هم ممکن نیست.
+    چهار مسیر جداگانه امتحان می‌شوند و نتیجهٔ هرکدام ثبت می‌شود:
+
+    * ``get_participant`` — ``channels.getParticipant`` (سروش: NOT_SUPPORTED)
+    * ``bot_api`` — ``getChatMember`` در Bot API (روش ربات‌های تلگرامی)
+    * ``search`` — ``channels.getParticipants`` (پیش‌نیاز جست‌وجوی هدفمند)
+    * ``snapshot`` — پیمایش کامل فهرست اعضا برای diff دوره‌ای
+
+    هیچ‌چیز حدس زده نمی‌شود: هر مسیر یا پاسخ واقعی داده یا کنار گذاشته
+    می‌شود، و دلیلش در ``warnings`` می‌آید.
     """
     result = {
         "ok": False,
@@ -992,6 +1427,13 @@ async def probe_access(bot, channel_id, access_hash) -> dict:
         "is_member": None,
         "per_user_check": False,
         "snapshot_check": False,
+        "routes": {
+            ROUTE_PARTICIPANT: False,
+            ROUTE_BOT_API: False,
+            ROUTE_SEARCH: False,
+            ROUTE_SNAPSHOT: False,
+        },
+        "route_notes": {},
         "sync_mode": storage.SYNC_MODE_PROBE,
         "warnings": [],
     }
@@ -1016,43 +1458,106 @@ async def probe_access(bot, channel_id, access_hash) -> dict:
             )
 
     me = await self_input_peer(bot)
+    my_id = getattr(me, "user_id", None) or getattr(me, "user_id", None)
+    if my_id is None and me is not None:
+        my_id = getattr(getattr(me, "peer", None), "user_id", None) or \
+            getattr(me, "id", None)
+
+    # ---- مسیر ۱: channels.getParticipant ----
     if me is not None:
         mine = await api.get_participant(client, channel_input, me,
                                          timeout=api_timeout())
         state = mine.get("state")
         if state in (api.RESULT_MEMBER, api.RESULT_NOT_MEMBER):
-            # متد تک‌کاربره واقعاً پاسخ می‌دهد → لایهٔ اصلی بررسی معتبر است.
             result["per_user_check"] = True
+            result["routes"][ROUTE_PARTICIPANT] = True
             result["is_member"] = state == api.RESULT_MEMBER
             result["is_admin"] = _participant_is_admin(mine.get("participant"))
+            result["route_notes"][ROUTE_PARTICIPANT] = state
         else:
-            result["per_user_check"] = False
+            result["route_notes"][ROUTE_PARTICIPANT] = state
+            if state == api.RESULT_NOT_SUPPORTED:
+                result["warnings"].append(
+                    "سرور سروش «channels.getParticipant» را پیاده نکرده است "
+                    "(422 NOT_SUPPORTED)؛ مسیر جایگزین فعال می‌شود."
+                )
+            else:
+                result["warnings"].append(
+                    f"channels.getParticipant پاسخ نداد ({state})."
+                )
+
+    # ---- مسیر ۲: Bot API getChatMember ----
+    token = bot_api_token()
+    if not token:
+        result["route_notes"][ROUTE_BOT_API] = "no_token"
+    elif not my_id:
+        result["route_notes"][ROUTE_BOT_API] = "no_self_id"
+    else:
+        probe_member = await api.bot_api_get_chat_member(
+            token, channel_id, my_id, timeout=api_timeout()
+        )
+        state = probe_member.get("state")
+        result["route_notes"][ROUTE_BOT_API] = state
+        if state in ("member", "not_member"):
+            result["routes"][ROUTE_BOT_API] = True
+        elif state == "no_access":
             result["warnings"].append(
-                "channels.getParticipant پاسخ نداد "
-                f"({state})؛ بررسی تک‌کاربره ممکن نیست."
+                "رباتِ BOT_TOKEN ادمین این کانال نیست یا به کانال دسترسی "
+                "ندارد؛ getChatMember جواب نداد."
             )
+        elif state in ("unsupported", "error"):
+            result["warnings"].append(
+                f"Bot API getChatMember روی سروش جواب نداد ({state})."
+            )
+
+    # ---- مسیر ۳/۴: پیمایش فهرست اعضا ----
+    listing = await api.list_probe(client, channel_input,
+                                   timeout=resolve_timeout())
+    list_state = listing.get("state")
+    result["route_notes"][ROUTE_SNAPSHOT] = list_state
+    list_ok = list_state in ("ok", "empty")
+    if list_ok:
+        result["routes"][ROUTE_SEARCH] = True
+    elif list_state == api.RESULT_NOT_SUPPORTED:
+        result["warnings"].append(
+            "channels.getParticipants هم پشتیبانی نمی‌شود؛ اسنپ‌شات ممکن نیست."
+        )
+    elif list_state == api.RESULT_NO_ACCESS:
+        result["warnings"].append(
+            "فهرست اعضای کانال قابل خواندن نیست (ChatAdminRequired یا مخفی)."
+        )
+
+    # ---- تشخیص ادمین بودن بدون getParticipant ----
+    if not result["is_admin"] and list_ok and my_id:
+        admins = await api.list_admins(client, channel_input,
+                                       timeout=resolve_timeout())
+        if admins.get("state") == "ok" and int(my_id) in admins["user_ids"]:
+            result["is_admin"] = True
+            result["route_notes"]["is_admin"] = "admins_page"
 
     hidden = bool(result["participants_hidden"])
     can_view = result["can_view_participants"]
-    result["snapshot_check"] = bool(
-        result["per_user_check"] and (not hidden and can_view is not False)
+    admin_or_visible = bool(
+        result["is_admin"] or (can_view is not False and not hidden)
     )
+    result["routes"][ROUTE_SNAPSHOT] = bool(list_ok and admin_or_visible)
+    result["snapshot_check"] = result["routes"][ROUTE_SNAPSHOT]
 
-    if not result["per_user_check"]:
-        result["sync_mode"] = storage.SYNC_MODE_PROBE
-        result["warnings"].append(
-            "با این حساب نمی‌توان عضویت را تأیید کرد؛ قابلیت فعال نمی‌شود تا "
-            "پیام کاربران واقعی حذف نشود."
-        )
-    elif result["is_admin"]:
+    # ---- انتخاب حالت همگام‌سازی ----
+    routes = result["routes"]
+    if routes[ROUTE_SNAPSHOT] and result["is_admin"]:
         result["sync_mode"] = storage.SYNC_MODE_EVENT
-    elif result["snapshot_check"]:
+    elif routes[ROUTE_SNAPSHOT]:
         result["sync_mode"] = storage.SYNC_MODE_SNAPSHOT
+    elif routes[ROUTE_BOT_API]:
+        result["sync_mode"] = storage.SYNC_MODE_BOT_API
+    elif routes[ROUTE_PARTICIPANT]:
+        result["sync_mode"] = storage.SYNC_MODE_PROBE
     else:
         result["sync_mode"] = storage.SYNC_MODE_PROBE
         result["warnings"].append(
-            "رویداد ورود/خروج کانال فقط برای ادمین‌های کانال ارسال می‌شود و "
-            "فهرست اعضا هم مخفی است؛ بررسی فقط لحظهٔ پیام انجام می‌شود."
+            "هیچ مسیری برای بررسی عضویت جواب نداد؛ عضویت اجباری فعال نمی‌شود "
+            "تا پیام کاربران واقعی حذف نشود."
         )
     if result["is_member"] is False:
         result["warnings"].append(
@@ -1090,7 +1595,10 @@ async def register_channel(bot, chat_id, target):
                 "مطمئن شوید حساب ربات در کانال عضو است.", None)
 
     probe = await probe_access(bot, channel_id, access_hash)
-    enabled = bool(probe.get("per_user_check"))
+    routes = probe.get("routes") or {}
+    # کافی است **یک** مسیر بتواند حکم قطعی بدهد؛ لازم نیست getParticipant
+    # پشتیبانی شود (روی سروش نمی‌شود).
+    enabled = any(routes.get(route) for route in ROUTE_DECIDES_ABSENCE)
     record = storage.save_group(
         chat_id,
         channel_id=channel_id,
@@ -1100,7 +1608,8 @@ async def register_channel(bot, chat_id, target):
         enabled=enabled,
         sync_mode=probe.get("sync_mode") or storage.SYNC_MODE_PROBE,
     )
-    refresh_group_cache(record["group_id"])
+    save_channel_routes(record["group_id"], routes)
+    record = refresh_group_cache(record["group_id"]) or record
     try:
         from modules import group_storage
         group_storage.update_group_title(chat_id, resolved.get("title") or "")
@@ -1116,6 +1625,9 @@ async def register_channel(bot, chat_id, target):
     if resolved.get("link"):
         lines.append(f"🔗 {resolved['link']}")
     lines.append(f"🧭 حالت همگام‌سازی: {probe.get('sync_mode')}")
+    active = [ROUTE_LABELS[r] for r in ROUTE_LABELS if routes.get(r)]
+    lines.append("🛣 مسیرهای تأییدشده: " +
+                 ("، ".join(active) if active else "—"))
     if probe.get("participants_count") is not None:
         lines.append(f"👥 تعداد اعضای کانال: {_digits(probe['participants_count'])}")
     for warning in probe.get("warnings") or ():
@@ -1141,11 +1653,16 @@ async def enable_channel(bot, chat_id):
     if record["force_join_enabled"]:
         return True, "ℹ️ عضویت اجباری از قبل فعال بود."
 
-    if record.get("sync_mode") == storage.SYNC_MODE_PROBE or \
-            record.get("channel_access_hash") is None:
+    routes = channel_routes(record)
+    if record.get("channel_access_hash") is None or \
+            record.get("sync_mode") == storage.SYNC_MODE_PROBE or \
+            not any(routes.get(route) for route in ROUTE_DECIDES_ABSENCE):
         probe = await probe_access(bot, record["channel_id"],
                                    record.get("channel_access_hash"))
-        if not probe.get("per_user_check"):
+        routes = probe.get("routes") or {}
+        save_channel_routes(record["group_id"], routes)
+        record = storage.get_group(record["group_id"]) or record
+        if not any(routes.get(route) for route in ROUTE_DECIDES_ABSENCE):
             lines = ["❌ امکان بررسی عضویت برای این کانال وجود ندارد؛ "
                      "عضویت اجباری فعال نشد."]
             for warning in probe.get("warnings") or ():
@@ -1156,8 +1673,11 @@ async def enable_channel(bot, chat_id):
 
     storage.set_enabled(chat_id, True)
     record = refresh_group_cache(chat_id) or record
+    active = [ROUTE_LABELS[r] for r in ROUTE_LABELS
+              if channel_routes(record).get(r)]
     return True, ("✅ عضویت اجباری فعال شد.\n"
                   f"🧭 حالت همگام‌سازی: {record.get('sync_mode')}\n"
+                  f"🛣 مسیرها: {'، '.join(active) if active else '—'}\n"
                   f"👥 اعضای تأییدشده: "
                   f"{_digits(storage.member_count(record['channel_id']))}")
 
@@ -1345,8 +1865,9 @@ async def snapshot_sync(bot, group_id, *, force: bool = False) -> dict:
         channel_input = await ensure_channel_input(bot, record)
         if client is None or channel_input is None:
             summary["status"] = "no_access"
-            storage.set_sync_state(record["group_id"], last_sync_time=int(time.time()),
-                                   cursor={"status": "no_access"},
+            merge_cursor(record["group_id"], {"status": "no_access"})
+            storage.set_sync_state(record["group_id"],
+                                   last_sync_time=int(time.time()),
                                    sync_mode=record["sync_mode"])
             return summary
         started_at = int(time.time())
@@ -1394,11 +1915,11 @@ async def snapshot_sync(bot, group_id, *, force: bool = False) -> dict:
         }
         if not summary["complete"]:
             summary["status"] = page.get("reason") or "partial"
+        merge_cursor(record["group_id"], cursor)
         storage.set_sync_state(
             record["group_id"],
             last_sync_time=int(time.time()) if summary["complete"] else
             record["last_sync_time"],
-            cursor=cursor,
         )
         refresh_group_cache(record["group_id"])
         _log(bot, "SNAPSHOT "
@@ -1411,17 +1932,38 @@ async def snapshot_sync(bot, group_id, *, force: bool = False) -> dict:
 def needs_sync(record, now=None) -> bool:
     """آیا وقت اسنپ‌شات جبرانی رسیده است؟"""
     now = time.time() if now is None else now
-    interval = (event_snapshot_interval()
-                if record.get("sync_mode") == storage.SYNC_MODE_EVENT
-                else sync_interval())
+    if record.get("sync_mode") == storage.SYNC_MODE_EVENT:
+        interval = event_snapshot_interval()
+    elif channel_routes(record).get(ROUTE_SNAPSHOT) and \
+            not channel_routes(record).get(ROUTE_PARTICIPANT) and \
+            not channel_routes(record).get(ROUTE_BOT_API):
+        # اسنپ‌شات تنها منبع حکم است → تازه بماند (پله‌ای بر اساس اندازه).
+        state = snapshot_state(record)
+        interval = snapshot_interval_for(state.get("members"))
+    else:
+        interval = sync_interval()
     last = record.get("last_sync_time") or 0
     return (now - float(last)) >= interval
+
+
+def _has_unsynced_groups() -> bool:
+    """آیا گروهی هست که هنوز هیچ اسنپ‌شاتی ندارد؟ (برای شروع فوری ناظر)"""
+    try:
+        refresh_group_cache()
+    except Exception:
+        return False
+    for record in _group_cache.values():
+        if not record.get("force_join_enabled"):
+            continue
+        if not record.get("last_sync_time"):
+            return True
+    return False
 
 
 async def watcher(bot, *, logger=None) -> None:
     """ناظر سبک: اسنپ‌شات جبرانی دوره‌ای + پاک‌سازی کش‌های کهنه."""
     delay = start_delay()
-    if delay:
+    if delay and not _has_unsynced_groups():
         await asyncio.sleep(delay)
     while True:
         try:
@@ -1490,6 +2032,17 @@ async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
     lines.append(f"وضعیت قابلیت: {'روشن ✅' if record.get('force_join_enabled') else 'خاموش ⛔️'}")
     lines.append(f"access_hash کانال: "
                  f"{'دارد' if record.get('channel_access_hash') else 'ندارد ❗️'}")
+    routes = channel_routes(record)
+    active = [ROUTE_LABELS[r] for r in ROUTE_LABELS if routes.get(r)]
+    lines.append("مسیرهای سالم: " + ("، ".join(active) if active else "هیچ ❗️"))
+    state = snapshot_state(record)
+    if routes.get(ROUTE_SNAPSHOT):
+        if state["complete"]:
+            lines.append(f"اسنپ‌شات: کامل، {_digits(state['members'])} عضو، "
+                         f"{_digits(int(state['age'] or 0))} ثانیه پیش "
+                         f"(اعتبار {_digits(snapshot_trust_seconds())} ثانیه)")
+        else:
+            lines.append(f"اسنپ‌شات: ناقص/ندارد ({state.get('reason') or '—'})")
 
     if not user_id:
         target = recent_decisions(chat_id, limit=5)
@@ -1542,7 +2095,19 @@ async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
         lines.append(f"آخرین تأیید در دیتابیس: {_digits(ago)} ثانیه پیش "
                      f"(منبع: {stored.get('source') or '—'})")
     if diag:
-        lines.append(f"منبع InputPeer در آخرین تلاش: {diag.get('input_source')}")
+        if diag.get("routes"):
+            lines.append("ترتیب مسیرها: " +
+                         " → ".join(ROUTE_LABELS.get(r, r) for r in diag["routes"]))
+        if diag.get("trace"):
+            lines.append("نتیجهٔ هر مسیر: " + "، ".join(
+                f"{ROUTE_LABELS.get(list(item)[0], list(item)[0])}="
+                f"{list(item.values())[0]}" for item in diag["trace"]
+            )[:400])
+        if diag.get("route"):
+            lines.append("مسیر برنده: " +
+                         f"{ROUTE_LABELS.get(diag['route'], diag['route'])}")
+        if diag.get("input_source"):
+            lines.append(f"منبع InputPeer در آخرین تلاش: {diag['input_source']}")
         lines.append(f"پاسخ getParticipant: {diag.get('state')}")
         if diag.get("error"):
             lines.append(f"خطا: {diag['error']}")
@@ -1556,8 +2121,16 @@ async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
         lines.append("پیام این کاربر آزاد است.")
     else:
         lines.append("چون وضعیت نامعلوم است، پیام حذف نمی‌شود (سیاست fail-safe).")
-        lines.append("اگر این حالت تکرار شد، حساب ربات را در کانال ادمین کنید "
-                     "یا فهرست اعضای کانال را از حالت مخفی خارج کنید.")
+        if not active:
+            lines.append("هیچ مسیر بررسی سالمی نیست: دستور "
+                         "«python -m tools.soroush_membership_probe» را روی "
+                         "سرور اجرا کنید تا مسیرهای ممکنِ این حساب مشخص شود.")
+        elif routes.get(ROUTE_SNAPSHOT) and not state["complete"]:
+            lines.append("اسنپ‌شات اعضا کامل نشده؛ برای تشخیص فوری، ربات را "
+                         "ادمین کانال کنید یا فهرست اعضا را مخفی نگذارید.")
+        else:
+            lines.append("اگر این حالت تکرار شد، ربات رسمی را ادمین کانال کنید "
+                         "تا مسیر getChatMember هم فعال شود.")
     return "\n".join(lines)
 
 
@@ -1708,6 +2281,11 @@ def status_text(chat_id) -> str:
         f"لینک: {stats.get('channel_link') or '—'}",
         f"شناسهٔ کانال: {_digits(stats['channel_id'])}",
         f"حالت همگام‌سازی: {stats.get('sync_mode') or '—'}",
+        "مسیرهای تأیید: " + (
+            "، ".join(ROUTE_LABELS[r] for r in ROUTE_LABELS
+                      if channel_routes(storage.get_group(chat_id) or {}).get(r))
+            or "هیچ ❗️"),
+        f"اعتبار اسنپ‌شات: {_digits(snapshot_trust_seconds())} ثانیه",
         f"آخرین همگام‌سازی: {_human_age(stats.get('last_sync_age_seconds'))}",
         f"اعضای تأییدشده: {_digits(stats.get('members', 0))}",
         f"غیرعضوهای ثبت‌شده: {_digits(stats.get('not_members', 0))}",
