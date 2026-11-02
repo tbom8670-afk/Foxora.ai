@@ -47,6 +47,8 @@ SOURCE_SNAPSHOT = "snapshot"
 SOURCE_BOT_API = "bot_api"
 #: جست‌وجوی هدفمند نام کاربر در فهرست اعضا (``ChannelParticipantsSearch``)
 SOURCE_SEARCH = "search"
+#: پیمایش هدفمند فهرست اعضا برای همان یک کاربر (حکم قطعی با سقف)
+SOURCE_SCAN = "scan"
 
 SYNC_MODE_EVENT = "event"
 SYNC_MODE_SNAPSHOT = "snapshot"

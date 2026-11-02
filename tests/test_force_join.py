@@ -153,6 +153,7 @@ class FakeClient:
         self.participants = participants
         self.full_count = full_count
         self.calls = []
+        self.sent_messages = []
         self.get_participant_calls = 0
         self.get_participants_calls = 0
         self.get_full_calls = 0
@@ -189,6 +190,10 @@ class FakeClient:
             # کلاینت واقعی برای کاربری که هرگز ندیده، خطا می‌دهد
             raise ValueError(f"Could not find the input entity for {number}")
         return types.InputPeerUser(number, getattr(entity, "access_hash", 1) or 1)
+
+    async def send_message(self, chat_id, text, **_kwargs):
+        self.sent_messages.append((chat_id, text))
+        return SimpleNamespace(id=1000 + len(self.sent_messages))
 
     async def get_me(self, input_peer=False):
         user = types.User(id=self.self_id, user_type=None, first_name="bot",
@@ -1450,3 +1455,202 @@ def test_probe_tool_can_use_registered_channels(tmp_path, monkeypatch):
     assert len(found) == 1
     assert found[0]["channel_id"] == CHANNEL_ID
     assert found[0]["access_hash"] == CHANNEL_HASH
+
+
+# ---------------------------------------------------------------------------
+# ۱۳) مسیر «پیمایش هدفمند» — همان سناریویی که کاربر گزارش کرد
+# ---------------------------------------------------------------------------
+# روی سروش getParticipant نیست و ربات ادمین هم نیست، پس:
+#   جست‌وجو = absent (غیرقطعی)   +   اسنپ‌شات = کهنه
+# ⇒ نتیجه قبلی همیشه «نامعلوم» بود و هیچ چیز حذف نمی‌شد.
+# راه‌حل: پیمایش خودِ فهرست برای همان یک کاربر (با سقف) که حکم قطعی می‌دهد.
+
+_SCAN_ONLY = None
+
+
+def _scan_only_routes():
+    return {
+        service.ROUTE_PARTICIPANT: False,
+        service.ROUTE_BOT_API: False,
+        service.ROUTE_SEARCH: False,
+        service.ROUTE_SCAN: True,
+        service.ROUTE_SNAPSHOT: False,
+    }
+
+
+def test_scan_route_deletes_message_of_confirmed_non_member(tmp_path, monkeypatch):
+    """غیرعضوی که در فهرست اعضا نیست → حذف پیام + لینک (بدون اسنپ‌شات تازه)."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, _user(6002), "سلام", msg_id=91)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        return event
+
+    event = asyncio.run(scenario())
+    assert deleted != [], "کاربر در فهرست اعضا نیست → پیام باید حذف شود"
+    assert event.replies, "پیام راهنما با لینک کانال باید ارسال شود"
+    stored = storage.get_member(CHANNEL_ID, 6002)
+    assert stored["membership_status"] == "not_member"
+    assert stored["source"] == storage.SOURCE_SCAN
+
+
+def test_scan_route_leaves_message_of_member_alone(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(6001), "سلام", msg_id=92))
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    assert deleted == []
+    assert storage.get_member(CHANNEL_ID, 6001)["membership_status"] == "member"
+
+
+def test_partial_scan_never_deletes(tmp_path, monkeypatch):
+    """پیمایش ناقص (بودجه/سقف) → «نامعلوم» → پیام حذف نمی‌شود."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def fake_find(*_args, **_kwargs):
+        return {"state": "partial", "complete": False, "reason": "budget",
+                "scanned": 200, "pages": 1, "user": None}
+
+    monkeypatch.setattr(service.api, "find_member", fake_find)
+
+    async def scenario():
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(7001), "سلام", msg_id=93))
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    assert deleted == []
+
+
+def test_scan_route_respects_cooldown(tmp_path, monkeypatch):
+    """یک موج ورود، کانال را زیر پیمایش پیاپی نمی‌برد."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    monkeypatch.setenv("FORCE_JOIN_SCAN_COOLDOWN", "60")
+
+    async def scenario():
+        for index in range(3):
+            await handle_new_message(
+                bot, FakeEvent(CHAT_ID, _user(8000 + index), "سلام",
+                               msg_id=94 + index))
+            await asyncio.sleep(0.02)
+
+    asyncio.run(scenario())
+    # فقط یک پیمایش؛ بقیه در cooldown → نامعلوم → بدون حذف
+    assert client.get_participants_calls == 1
+
+
+def test_snapshot_is_kept_fresh_when_no_per_user_route(tmp_path, monkeypatch):
+    """باگ واقعی: بازهٔ تازه‌سازی ۱۲ ساعته ولی اعتبار اسنپ‌شات ۶۰۰ ثانیه."""
+    _setup_group(tmp_path, monkeypatch)
+    record = _register_channel()
+    # اول کرسر، بعد مسیرها — نوشتن کرسر، کلیدهای دیگر را می‌نویسد.
+    storage.set_sync_state(CHAT_ID, cursor={
+        "snapshot_started_at": int(time.time()) - 1900,
+        "snapshot_completed_at": int(time.time()) - 1864,
+        "complete": True, "members": 16,
+    })
+    storage.set_sync_state(CHAT_ID, last_sync_time=int(time.time()) - 1864)
+    service.save_channel_routes(CHAT_ID, {
+        service.ROUTE_PARTICIPANT: False, service.ROUTE_BOT_API: False,
+        service.ROUTE_SEARCH: True, service.ROUTE_SCAN: True,
+        service.ROUTE_SNAPSHOT: True,
+    })
+    service.refresh_group_cache(CHAT_ID)
+    record = storage.get_group(CHAT_ID)
+    assert service.needs_sync(record) is True, \
+        "بدون مسیر تک‌کاربره، اسنپ‌شات باید طبق بازهٔ کوتاه تازه شود"
+    # و اعتبار حکم هم خودکار بزرگ‌تر از بازه است (نه ۶۰۰ ثانیهٔ ثابت)
+    assert service.snapshot_trust_seconds(16) >= 600
+    # با مسیر تک‌کاربره، همان بازهٔ بلند قبلی برمی‌گردد
+    service.save_channel_routes(CHAT_ID, {service.ROUTE_PARTICIPANT: True})
+    service.refresh_group_cache(CHAT_ID)
+    assert service.needs_sync(storage.get_group(CHAT_ID)) is False
+
+
+# ---------------------------------------------------------------------------
+# ۱۴) اعلان هنگام ورود به گروه (نه فقط بعد از حذف پیام)
+# ---------------------------------------------------------------------------
+
+class _GroupJoin:
+    def __init__(self, user_id, user=None):
+        self.chat_id = CHAT_ID
+        self.user_joined = True
+        self.user_added = False
+        self.user_left = False
+        self.user_kicked = False
+        self.user_ids = [user_id]
+        self.user_id = user_id
+        self._user = user or _user(user_id)
+
+    async def get_user(self):
+        return self._user
+
+    async def get_users(self):
+        return [self._user]
+
+
+def test_new_group_member_gets_channel_link_immediately(tmp_path, monkeypatch):
+    """کاربر تازه‌وارد گروه، همان لحظه لینک کانال را می‌گیرد."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    asyncio.run(service.handle_chat_action(bot, _GroupJoin(9100)))
+    assert client.sent_messages, "لینک کانال باید در لحظهٔ ورود ارسال شود"
+    chat_id, text = client.sent_messages[0]
+    assert chat_id == CHAT_ID
+    assert "splus.ir/testchannel" in text
+
+
+def test_member_joining_group_gets_no_extra_notice(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    asyncio.run(service.handle_chat_action(bot, _GroupJoin(6001)))
+    assert client.sent_messages == [], "عضو کانال نباید پیام اضافه بگیرد"
+
+
+def test_notice_on_join_can_be_disabled(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    monkeypatch.setenv("FORCE_JOIN_NOTICE_ON_JOIN", "0")
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    asyncio.run(service.handle_chat_action(bot, _GroupJoin(9300)))
+    assert client.sent_messages == []

@@ -163,16 +163,21 @@ ROUTE_PARTICIPANT = "get_participant"
 ROUTE_BOT_API = "bot_api"
 ROUTE_SEARCH = "search"
 ROUTE_SNAPSHOT = "snapshot"
+#: پیمایش هدفمند فهرست اعضا تا پیدا شدنِ همان یک کاربر (حکم قطعی، سقف‌دار).
+#: روی سروش این تنها راه قطعی است چون ``getParticipant`` وجود ندارد.
+ROUTE_SCAN = "scan"
 
 ROUTE_LABELS = {
     ROUTE_PARTICIPANT: "channels.getParticipant",
     ROUTE_BOT_API: "Bot API getChatMember",
     ROUTE_SEARCH: "جست‌وجوی هدفمند عضو",
+    ROUTE_SCAN: "پیمایش هدفمند اعضا",
     ROUTE_SNAPSHOT: "اسنپ‌شات کامل اعضا",
 }
 
 #: مسیرهایی که «عضو نیست» را هم قطعی اعلام می‌کنند (بقیه فقط تأیید می‌کنند)
-ROUTE_DECIDES_ABSENCE = (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SNAPSHOT)
+ROUTE_DECIDES_ABSENCE = (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SCAN,
+                         ROUTE_SNAPSHOT)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -212,6 +217,7 @@ def channel_routes(record) -> dict:
         ROUTE_BOT_API: bool((stored or {}).get(ROUTE_BOT_API)),
         ROUTE_SEARCH: bool((stored or {}).get(ROUTE_SEARCH)),
         ROUTE_SNAPSHOT: bool((stored or {}).get(ROUTE_SNAPSHOT)),
+        ROUTE_SCAN: bool((stored or {}).get(ROUTE_SCAN)),
     }
     if stored is None:
         # رکوردهای قدیمی (پیش از این نسخه) هرگز سنجیده نشده‌اند و فقط بر پایهٔ
@@ -225,7 +231,11 @@ def channel_routes(record) -> dict:
 
 def route_order(routes) -> list:
     order = []
-    for route in (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SEARCH, ROUTE_SNAPSHOT):
+    # ترتیب = ارزان‌ترین/دقیق‌ترین اول. «پیمایش هدفمند» بعد از جست‌وجو و
+    # قبل از اسنپ‌شات است: مثل همان یک RPC برای کانال کوچک، ولی حکم قطعی
+    # («عضو نیست») هم می‌دهد.
+    for route in (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SEARCH, ROUTE_SCAN,
+                  ROUTE_SNAPSHOT):
         if routes.get(route):
             order.append(route)
     return order
@@ -256,7 +266,8 @@ def save_channel_routes(group_id, routes: dict, *, merge: bool = True) -> None:
         return
     cursor = dict(record.get("last_update_cursor") or {})
     current = dict(cursor.get("routes") or {}) if merge else {}
-    for route in (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SEARCH, ROUTE_SNAPSHOT):
+    for route in (ROUTE_PARTICIPANT, ROUTE_BOT_API, ROUTE_SEARCH, ROUTE_SCAN,
+                  ROUTE_SNAPSHOT):
         if route in routes:
             current[route] = bool(routes[route])
     merge_cursor(group_id, {"routes": current})
@@ -276,6 +287,28 @@ def disable_route(bot, record, route, reason) -> None:
 
 # --- تنظیمات اسنپ‌شات -------------------------------------------------------
 
+def scan_max_members() -> int:
+    """سقف تعداد عضوی که مسیر «پیمایش هدفمند» می‌بیند (۰ = بی‌سقف)."""
+    return _env_int("FORCE_JOIN_SCAN_MAX_MEMBERS", 5000, 0, 1_000_000)
+
+
+def scan_budget() -> float:
+    return _env_float("FORCE_JOIN_SCAN_BUDGET", 20.0, 1.0, 300.0)
+
+
+def scan_delay() -> float:
+    return _env_float("FORCE_JOIN_SCAN_DELAY", 0.1, 0.0, 5.0)
+
+
+def scan_cooldown() -> float:
+    """فاصلهٔ حداقلی دو پیمایش هدفمند روی یک کانال (ثانیه)."""
+    return _env_float("FORCE_JOIN_SCAN_COOLDOWN", 5.0, 0.0, 300.0)
+
+
+def notice_on_join() -> bool:
+    return _env_flag("FORCE_JOIN_NOTICE_ON_JOIN", True)
+
+
 def snapshot_base_interval() -> int:
     return _env_int("FORCE_JOIN_SNAPSHOT_REFRESH", 300, 60, 86400)
 
@@ -293,10 +326,18 @@ def snapshot_interval_for(size) -> int:
     return max(base, 6 * 3600)
 
 
-def snapshot_trust_seconds() -> int:
-    """تا این سن، اسنپ‌شاتِ کامل برای «عضو نیست» معتبر است."""
-    return _env_int("FORCE_JOIN_SNAPSHOT_TRUST",
-                    max(600, 2 * snapshot_base_interval()), 60, 86400)
+def snapshot_trust_seconds(members=None) -> int:
+    """تا این سن، اسنپ‌شاتِ کامل برای «عضو نیست» معتبر است.
+
+    اگر صریح تنظیم نشود **خودکار** از بازهٔ تازه‌سازی همان کانال حساب
+    می‌شود (۲× بازه + ۶۰ ثانیه). این باگ واقعی بود: بازهٔ تازه‌سازی در حالت
+    ``event`` دوازده ساعت بود ولی اعتبار اسنپ‌شات ۶۰۰ ثانیه، پس اسنپ‌شات
+    عملاً **همیشه کهنه** بود و زنجیره هر بار به «نامعلوم» می‌رسید.
+    """
+    explicit = _env_int("FORCE_JOIN_SNAPSHOT_TRUST", 0, 0, 86400)
+    if explicit:
+        return explicit
+    return max(600, 2 * snapshot_interval_for(members) + 60)
 
 
 def snapshot_state(record) -> dict:
@@ -322,7 +363,8 @@ def snapshot_membership(record, user_id):
     state = snapshot_state(record)
     if not state["complete"]:
         return None, "snapshot_incomplete"
-    if state["age"] is None or state["age"] > snapshot_trust_seconds():
+    if state["age"] is None or \
+            state["age"] > snapshot_trust_seconds(state.get("members")):
         return None, "snapshot_stale"
     stored = storage.get_member(record["channel_id"], user_id)
     verified = float((stored or {}).get("last_verified_at") or 0)
@@ -383,6 +425,8 @@ STATS = {
     "deletes": 0,
     "events_join": 0,
     "events_leave": 0,
+    "scans": 0,
+    "snapshot_decisions": 0,
 }
 
 
@@ -876,6 +920,42 @@ async def _search_route(bot, record, user_id, user_entity=None):
     return storage.STATUS_UNKNOWN, state or "absent", None
 
 
+async def _scan_route(bot, record, user_id):
+    """پیمایش هدفمند فهرست اعضا تا همین یک کاربر (حکم قطعی روی سروش).
+
+    محدودیت‌ها: سقف تعداد عضو، بودجهٔ زمانی کوتاه‌تر از سقف انتظار مسیر
+    پیام، و cooldown هر کانال (تا یک موج ورود، کانال را زیر پیمایش پیاپی
+    نبرد). اگر پیمایش کامل نشود «نامعلوم» است، نه «غیرعضو».
+    """
+    channel_id = record["channel_id"]
+    key = channel_key(channel_id)
+    now = time.time()
+    if now < _scan_until.get(key, 0.0):
+        return storage.STATUS_UNKNOWN, "cooldown", None
+    channel_input = await ensure_channel_input(bot, record)
+    client = getattr(bot, "client", None)
+    if client is None or channel_input is None:
+        return storage.STATUS_UNKNOWN, "no_access", None
+    # بودجه هرگز از سقف انتظار مسیر پیام بیشتر نشود (وگرنه درخواست لغو می‌شود).
+    budget = min(scan_budget(), max(2.0, gate_await_timeout() - 1.0))
+    _scan_until[key] = now + scan_cooldown()
+    STATS["scans"] += 1
+    found = await api.find_member(
+        client, channel_input, user_id,
+        max_members=scan_max_members(),
+        budget_seconds=budget,
+        delay=scan_delay(),
+    )
+    state = found.get("state")
+    if state == "found":
+        return storage.STATUS_MEMBER, state, found
+    if state == "absent" and found.get("complete"):
+        return storage.STATUS_NOT_MEMBER, state, found
+    # ناقص/خطا → اسنپ‌شات را در پس‌زمینه تازه کن تا پیام بعدی حکم بگیرد.
+    _schedule_snapshot_refresh(bot, record)
+    return storage.STATUS_UNKNOWN, state or found.get("reason") or "partial", found
+
+
 def _snapshot_route(bot, record, user_id):
     status, reason = snapshot_membership(record, user_id)
     if status is not None:
@@ -1005,6 +1085,26 @@ async def _routed_check(bot, record, user_id, user_entity=None):
                     record = storage.get_group(record["group_id"]) or record
                 continue
 
+            if route == ROUTE_SCAN:
+                status, outcome, payload = await _scan_route(
+                    bot, record, user_id
+                )
+                diag["trace"].append({route: outcome})
+                if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
+                    _store_verdict(
+                        record, user_id, status, storage.SOURCE_SCAN,
+                        access_hash=getattr((payload or {}).get("user"),
+                                            "access_hash", None),
+                        layer="scan", detail=outcome,
+                    )
+                    diag.update(route=route, state=outcome)
+                    _last_diag[key] = diag
+                    return status, "scan", diag
+                if outcome == api.RESULT_NO_ACCESS:
+                    disable_route(bot, record, route, "NO_ACCESS")
+                    record = storage.get_group(record["group_id"]) or record
+                continue
+
             if route == ROUTE_SNAPSHOT:
                 status, outcome, _ = _snapshot_route(bot, record, user_id)
                 diag["trace"].append({route: outcome})
@@ -1037,6 +1137,8 @@ _recent_decisions: list = []
 _last_error: dict = {}
 #: (channel_id, user_id) → جزئیات آخرین تلاش API (برای «تست عضویت»)
 _last_diag: dict = {}
+#: channel_key → زمان پایان ممنوعیت پیمایش هدفمند (ضد سیل)
+_scan_until: dict = {}
 _RECENT_LIMIT = 25
 
 
@@ -1344,6 +1446,85 @@ def _notice_allowed(chat_id, user_id) -> bool:
     return True
 
 
+async def send_notice(bot, chat_id, record, *, event=None) -> bool:
+    """ارسال پیام راهنما (لینک کانال) — با event یا مستقیماً به گروه.
+
+    ``notify_join`` از این استفاده می‌کند: کاربری که تازه عضو **گروه**
+    شده، همان لحظه لینک کانال را می‌بیند؛ لازم نیست اول پیام بفرستد و
+    پیامش حذف شود.
+    """
+    text = notice_text(record)
+    sender = getattr(bot, "outgoing_sender", None)
+
+    def capture(sent):
+        try:
+            from modules.notice_cleanup import capture_sent
+            capture_sent(bot, chat_id, sent)
+        except Exception:
+            pass
+
+    if event is not None and sender is not None:
+        try:
+            sender.enqueue_reply_notice(event, text, on_done=capture)
+            STATS["notices"] += 1
+            return True
+        except Exception:
+            pass
+    if event is not None:
+        try:
+            sent = await event.reply(text)
+            capture(sent)
+            STATS["notices"] += 1
+            return True
+        except Exception:
+            pass
+    client = getattr(bot, "client", None)
+    if client is None:
+        return False
+    try:
+        sent = await asyncio.wait_for(
+            client.send_message(chat_id, text), timeout=api_timeout()
+        )
+        capture(sent)
+        STATS["notices"] += 1
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        _log(bot, f"NOTICE FAILED chat_id={chat_id} "
+                  f"error={type(error).__name__}", error=True)
+        return False
+
+
+async def notify_join(bot, record, chat_id, user_id, user_entity=None) -> bool:
+    """کاربر تازه‌وارد گروه: اگر عضویت کانال تأیید نشد، لینک را بفرست.
+
+    این همان چیزی است که کاربر انتظار دارد: «به‌محض دیدن کاربرِ تازه، به
+    او بگو عضو کانال شود». بررسی هم با زنجیرهٔ مسیرها انجام می‌شود تا
+    کاربری که از قبل عضو کانال است پیام اضافه نگیرد.
+    """
+    if not notice_on_join():
+        return False
+    try:
+        status, layer, _ = await resolve_status(
+            bot, record, user_id, user_entity
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        status, layer = storage.STATUS_UNKNOWN, f"error:{type(error).__name__}"
+    if status == storage.STATUS_MEMBER:
+        _record_decision(record["group_id"], user_id, "member", "join_event")
+        return False
+    if not _notice_allowed(chat_id, user_id):
+        return False
+    sent = await send_notice(bot, chat_id, record)
+    _record_decision(record["group_id"], user_id, status, f"join_notice:{layer}")
+    _log(bot, f"JOIN NOTICE chat_id={chat_id} user_id={user_id} "
+              f"status={status} layer={layer} sent={sent}")
+    return sent
+
+
 def _maybe_send_notice(bot, event, chat_id, record, user_id) -> None:
     if not _notice_allowed(chat_id, user_id):
         return
@@ -1431,6 +1612,7 @@ async def probe_access(bot, channel_id, access_hash) -> dict:
             ROUTE_PARTICIPANT: False,
             ROUTE_BOT_API: False,
             ROUTE_SEARCH: False,
+            ROUTE_SCAN: False,
             ROUTE_SNAPSHOT: False,
         },
         "route_notes": {},
@@ -1541,6 +1723,9 @@ async def probe_access(bot, channel_id, access_hash) -> dict:
         result["is_admin"] or (can_view is not False and not hidden)
     )
     result["routes"][ROUTE_SNAPSHOT] = bool(list_ok and admin_or_visible)
+    # پیمایش هدفمند همان متد را با صفحه‌بندی می‌خواند؛ اگر یک صفحه جواب داد،
+    # این مسیر هم در دسترس است (و برخلاف اسنپ‌شات همیشه تازه است).
+    result["routes"][ROUTE_SCAN] = bool(list_ok)
     result["snapshot_check"] = result["routes"][ROUTE_SNAPSHOT]
 
     # ---- انتخاب حالت همگام‌سازی ----
@@ -1551,6 +1736,8 @@ async def probe_access(bot, channel_id, access_hash) -> dict:
         result["sync_mode"] = storage.SYNC_MODE_SNAPSHOT
     elif routes[ROUTE_BOT_API]:
         result["sync_mode"] = storage.SYNC_MODE_BOT_API
+    elif routes[ROUTE_SCAN] and not routes[ROUTE_SNAPSHOT]:
+        result["sync_mode"] = storage.SYNC_MODE_SNAPSHOT
     elif routes[ROUTE_PARTICIPANT]:
         result["sync_mode"] = storage.SYNC_MODE_PROBE
     else:
@@ -1755,6 +1942,16 @@ async def handle_chat_action(bot, event) -> None:
                 pass
         for user_id in user_ids:
             schedule_prefetch(bot, record, user_id, users.get(user_id))
+        if notice_on_join():
+            # همان لحظهٔ ورود، لینک کانال را بفرست (نه بعد از حذف پیام).
+            for user_id in user_ids:
+                try:
+                    await notify_join(bot, record, chat_id, user_id,
+                                      users.get(user_id))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
     except asyncio.CancelledError:
         raise
     except Exception as error:
@@ -1932,14 +2129,18 @@ async def snapshot_sync(bot, group_id, *, force: bool = False) -> dict:
 def needs_sync(record, now=None) -> bool:
     """آیا وقت اسنپ‌شات جبرانی رسیده است؟"""
     now = time.time() if now is None else now
-    if record.get("sync_mode") == storage.SYNC_MODE_EVENT:
-        interval = event_snapshot_interval()
-    elif channel_routes(record).get(ROUTE_SNAPSHOT) and \
-            not channel_routes(record).get(ROUTE_PARTICIPANT) and \
-            not channel_routes(record).get(ROUTE_BOT_API):
-        # اسنپ‌شات تنها منبع حکم است → تازه بماند (پله‌ای بر اساس اندازه).
+    routes = channel_routes(record)
+    per_user = routes.get(ROUTE_PARTICIPANT) or routes.get(ROUTE_BOT_API)
+    needs_fresh_snapshot = (not per_user) and (
+        routes.get(ROUTE_SCAN) or routes.get(ROUTE_SNAPSHOT)
+    )
+    if needs_fresh_snapshot:
+        # اسنپ‌شات (تقریباً) تنها منبع حکم است → باید تازه بماند؛ وگرنه
+        # «اعتبار ۶۰۰ ثانیه» با «تازه‌سازی ۱۲ ساعته» جمع نمی‌شد.
         state = snapshot_state(record)
         interval = snapshot_interval_for(state.get("members"))
+    elif record.get("sync_mode") == storage.SYNC_MODE_EVENT:
+        interval = event_snapshot_interval()
     else:
         interval = sync_interval()
     last = record.get("last_sync_time") or 0
@@ -2040,7 +2241,7 @@ async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
         if state["complete"]:
             lines.append(f"اسنپ‌شات: کامل، {_digits(state['members'])} عضو، "
                          f"{_digits(int(state['age'] or 0))} ثانیه پیش "
-                         f"(اعتبار {_digits(snapshot_trust_seconds())} ثانیه)")
+                         f"(اعتبار {_digits(snapshot_trust_seconds(state.get('members'))) } ثانیه)")
         else:
             lines.append(f"اسنپ‌شات: ناقص/ندارد ({state.get('reason') or '—'})")
 
@@ -2365,6 +2566,8 @@ def reset_runtime_state() -> None:
     _recent_decisions.clear()
     _last_error.clear()
     _last_diag.clear()
+    _scan_until.clear()
+    _refresh_tasks.clear()
     _semaphore = None
     _registered_bots.clear()
     for key in STATS:
