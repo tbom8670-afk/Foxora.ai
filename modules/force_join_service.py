@@ -121,7 +121,7 @@ def max_concurrency() -> int:
 
 def gate_await_timeout() -> float:
     """سقف انتظار تصمیم‌گیری در مسیر پیام؛ بیشتر از این = fail-open."""
-    return _env_float("FORCE_JOIN_GATE_TIMEOUT", 5.0, 0.5, 30.0)
+    return _env_float("FORCE_JOIN_GATE_TIMEOUT", 3.0, 0.5, 30.0)
 
 
 def notice_cooldown() -> int:
@@ -357,7 +357,65 @@ def confirm_interval() -> float:
 
 
 def confirm_first_delay() -> float:
-    return _env_float("FORCE_JOIN_CONFIRM_FIRST_DELAY", 12.0, 2.0, 600.0)
+    """اولین بررسی بعد از ارسال راهنما — کوتاه، تا تأیید فوری باشد."""
+    return _env_float("FORCE_JOIN_CONFIRM_FIRST_DELAY", 3.0, 1.0, 600.0)
+
+
+def confirm_tick() -> float:
+    """فاصلهٔ چرخهٔ ناظر تأیید (بیشتر از این، تأخید محسوس می‌شود)."""
+    return _env_float("FORCE_JOIN_CONFIRM_TICK", 2.0, 0.5, 60.0)
+
+
+#: زمان‌بندی تلاش‌ها (ثانیه) — سریع شروع می‌شود، بعد عقب می‌افتد.
+_CONFIRM_BACKOFF = (3.0, 4.0, 6.0, 8.0, 12.0, 20.0, 30.0, 45.0, 60.0, 90.0,
+                    120.0, 180.0, 300.0)
+
+
+def confirm_backoff(try_index: int) -> float:
+    index = max(0, min(int(try_index), len(_CONFIRM_BACKOFF) - 1))
+    return _CONFIRM_BACKOFF[index]
+
+
+# ---------------------------------------------------------------------------
+# 🛡 محافظ کارایی: هیچ بررسی‌ای نباید ربات را کند کند
+# ---------------------------------------------------------------------------
+
+def rpc_per_minute() -> int:
+    """سقف کل RPC ماژول در دقیقه (۰ = بی‌سقف). سهمیهٔ جدا از بقیهٔ ربات."""
+    return _env_int("FORCE_JOIN_RPC_PER_MINUTE", 120, 0, 100_000)
+
+
+def gate_scan_budget() -> float:
+    """سقف زمانی پیمایش در **مسیر پیام** — کوتاه تا پیام کاربر معطل نماند."""
+    return _env_float("FORCE_JOIN_GATE_SCAN_BUDGET", 1.5, 0.3, 10.0)
+
+
+def gate_poll_scan_max_members() -> int:
+    """در مسیر پیام، کانال بزرگ‌تر از این هرگز پیمایش نمی‌شود (می‌رود پس‌زمینه)."""
+    return _env_int("FORCE_JOIN_GATE_SCAN_MAX_MEMBERS", 3000, 0, 1_000_000)
+
+
+_rpc_window: list = []
+
+
+def _rpc_budget_allows(cost: int = 1) -> bool:
+    """token-bucket سادهٔ یک‌دقیقه‌ای؛ در نبود سهمیه، بررسی انجام **نمی‌شود**.
+
+    این همان تضمین «ربات کند نمی‌شود» است: حتی اگر هزار کاربر هم‌زمان
+    بیایند، سهمیهٔ این ماژول از بقیهٔ ربات جدا و محدود است.
+    """
+    limit = rpc_per_minute()
+    if not limit:
+        return True
+    now = time.time()
+    cutoff = now - 60.0
+    while _rpc_window and _rpc_window[0] < cutoff:
+        _rpc_window.pop(0)
+    if len(_rpc_window) + max(1, cost) > limit:
+        return False
+    for _ in range(max(1, cost)):
+        _rpc_window.append(now)
+    return True
 
 
 def snapshot_base_interval() -> int:
@@ -917,7 +975,8 @@ def _store_verdict(record, user_id, status, source, *, access_hash=None,
 async def _bot_api_route(record, user_id):
     """مسیر ``getChatMember`` (Bot API) — یک درخواست HTTP، بدون پیمایش."""
     result = await api.bot_api_get_chat_member(
-        bot_api_token(), record["channel_id"], user_id, timeout=api_timeout(),
+        bot_api_token(), record["channel_id"], user_id,
+        timeout=min(api_timeout(), max(2.0, gate_await_timeout() - 1.0)),
     )
     state = result.get("state")
     if state == "member":
@@ -971,24 +1030,33 @@ async def _search_route(bot, record, user_id, user_entity=None):
     return storage.STATUS_UNKNOWN, state or "absent", None
 
 
-async def _scan_route(bot, record, user_id):
+async def _scan_route(bot, record, user_id, *, inline=False):
     """پیمایش هدفمند فهرست اعضا تا همین یک کاربر (حکم قطعی روی سروش).
 
-    محدودیت‌ها: سقف تعداد عضو، بودجهٔ زمانی کوتاه‌تر از سقف انتظار مسیر
-    پیام، و cooldown هر کانال (تا یک موج ورود، کانال را زیر پیمایش پیاپی
-    نبرد). اگر پیمایش کامل نشود «نامعلوم» است، نه «غیرعضو».
+    محدودیت‌ها: سقف تعداد عضو، بودجهٔ زمانی، و cooldown هر کانال.
+    ``inline=True`` یعنی در **مسیر پیام** هستیم؛ پس بودجه کوتاه است
+    (۱٫۵ ثانیه) و کانال بزرگ هرگز همان‌جا پیمایش نمی‌شود تا پیام کاربر
+    معطل نماند. اگر پیمایش کامل نشود «نامعلوم» است، نه «غیرعضو».
     """
     channel_id = record["channel_id"]
     key = channel_key(channel_id)
     now = time.time()
     if now < _scan_until.get(key, 0.0):
         return storage.STATUS_UNKNOWN, "cooldown", None
+    if inline:
+        state = snapshot_state(record)
+        if state.get("members") and state["members"] > gate_poll_scan_max_members():
+            # کانال بزرگ: پیمایش در پس‌زمینه، نه در مسیر پیام
+            _schedule_snapshot_refresh(bot, record)
+            return storage.STATUS_UNKNOWN, "deferred_big_channel", None
+    if not _rpc_budget_allows(1):
+        return storage.STATUS_UNKNOWN, "budget_exhausted", None
     channel_input = await ensure_channel_input(bot, record)
     client = getattr(bot, "client", None)
     if client is None or channel_input is None:
         return storage.STATUS_UNKNOWN, "no_access", None
-    # بودجه هرگز از سقف انتظار مسیر پیام بیشتر نشود (وگرنه درخواست لغو می‌شود).
-    budget = min(scan_budget(), max(2.0, gate_await_timeout() - 1.0))
+    budget = (gate_scan_budget() if inline
+              else min(scan_budget(), max(2.0, gate_await_timeout() - 1.0)))
     _scan_until[key] = now + scan_cooldown()
     STATS["scans"] += 1
     found = await api.find_member(
@@ -1138,7 +1206,7 @@ async def _routed_check(bot, record, user_id, user_entity=None):
 
             if route == ROUTE_SCAN:
                 status, outcome, payload = await _scan_route(
-                    bot, record, user_id
+                    bot, record, user_id, inline=True
                 )
                 diag["trace"].append({route: outcome})
                 if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
@@ -1194,6 +1262,8 @@ _scan_until: dict = {}
 _awaiting_confirm: dict = {}
 #: پارامترهای تکرارِ بررسی برای همان انتظار
 _CONFIRM_MAX_ENTRIES = 2000
+#: channel_key → Task در حال پیمایش برای تأیید (یک پاس برای همهٔ منتظران)
+_confirm_inflight: dict = {}
 _RECENT_LIMIT = 25
 
 
@@ -1621,6 +1691,7 @@ def await_join_confirmation(record, chat_id, user_id, name=None) -> bool:
             _awaiting_confirm.pop(stale, None)
     now = time.time()
     _awaiting_confirm[(group_key, uid)] = {
+        "user_id": uid,
         "at": now,
         "next_at": now + confirm_first_delay(),
         "deadline": now + confirm_window(),
@@ -1675,49 +1746,137 @@ def _schedule_confirm(bot, chat_id, user_id, name=None) -> bool:
         return False
 
 
-async def confirm_pending(bot, *, limit: int = 5) -> int:
-    """یک دور بررسی صف انتظار (توسط ناظر صدا زده می‌شود)."""
+async def _confirm_batch(bot, channel_key_str, entries):
+    """یک پاس بررسی برای **همهٔ** منتظرانِ یک کانال (یک پیمایش، نه n پیمایش)."""
+    record = storage.get_group(entries[0][1].get("chat_id"))
+    if record is None or not record.get("force_join_enabled"):
+        for key, _entry in entries:
+            _awaiting_confirm.pop(key, None)
+        return 0
+
+    user_ids = [entry.get("user_id") or key[1] for key, entry in entries]
+    user_ids = [uid for uid in user_ids if uid]
+    member_ids = set()
+    layer = "scan"
+
+    # ۱) اگر توکن ربات هست: getChatMember برای همان کاربران (HTTP، بدون فهرست)
+    token = bot_api_token()
+    if token:
+        for uid in user_ids:
+            if not _rpc_budget_allows(1):
+                break
+            result = await api.bot_api_get_chat_member(
+                token, record["channel_id"], uid, timeout=api_timeout())
+            if result.get("state") == "member":
+                member_ids.add(int(uid))
+            layer = "bot_api"
+    else:
+        # ۲) وگرنه: یک پیمایش مشترک برای همهٔ منتظران
+        channel_input = await ensure_channel_input(bot, record)
+        client = getattr(bot, "client", None)
+        if client is not None and channel_input is not None and \
+                _rpc_budget_allows(1):
+            STATS["scans"] += 1
+            found = await api.find_members(
+                client, channel_input, user_ids,
+                max_members=scan_max_members(),
+                budget_seconds=scan_budget(),
+                delay=scan_delay(),
+            )
+            for uid, user in (found.get("found") or {}).items():
+                member_ids.add(int(uid))
+                storage.set_member_access_hash(
+                    record["channel_id"], uid,
+                    getattr(user, "access_hash", None))
+            if found.get("state") == api.RESULT_NO_ACCESS:
+                for key, _entry in entries:
+                    _awaiting_confirm.pop(key, None)
+                return 0
+
+    confirmed = 0
     now = time.time()
-    due = [(key, entry) for key, entry in list(_awaiting_confirm.items())
-           if now >= entry.get("next_at", 0)]
-    due.sort(key=lambda item: item[1].get("at", 0))
-    checked = 0
-    for key, entry in due[:max(1, limit)]:
-        group_key, user_id = key
+    for key, entry in entries:
+        uid = entry.get("user_id") or key[1]
+        if uid and int(uid) in member_ids:
+            storage.set_member(record["channel_id"], uid,
+                               storage.STATUS_MEMBER, source=storage.SOURCE_SCAN)
+            _remember(record["channel_id"], uid, storage.STATUS_MEMBER, now)
+            forget_user(record["channel_id"], uid)
+            await confirm_membership(bot, entry.get("chat_id"), uid,
+                                     name=entry.get("name"))
+            confirmed += 1
+            _log(bot, f"CONFIRM SENT chat_id={entry.get('chat_id')} "
+                      f"user_id={uid} layer={layer}")
+            continue
         if now > entry.get("deadline", 0) or \
                 entry.get("tries", 0) >= confirm_max_checks():
             _awaiting_confirm.pop(key, None)
             _log(bot, f"CONFIRM EXPIRED chat_id={entry.get('chat_id')} "
-                      f"user_id={user_id} tries={entry.get('tries')}")
-            continue
-        record = storage.get_group(entry.get("chat_id"))
-        if record is None or not record.get("force_join_enabled"):
-            _awaiting_confirm.pop(key, None)
+                      f"user_id={uid} tries={entry.get('tries')}")
             continue
         entry["tries"] = entry.get("tries", 0) + 1
+        entry["next_at"] = now + confirm_backoff(entry["tries"])
+    return confirmed
+
+
+def _schedule_confirm_poll(bot, channel_key_str, entries) -> bool:
+    """اجرای پاس تأیید در پس‌زمینه (هرگز مسیر پیام را بلاک نمی‌کند)."""
+    running = _confirm_inflight.get(channel_key_str)
+    if running is not None and not running.done():
+        return False
+
+    async def runner():
         try:
-            status, layer, _ = await resolve_status(bot, record, user_id,
-                                                    force=True)
+            async with _sem():
+                await _confirm_batch(bot, channel_key_str, entries)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            status, layer = storage.STATUS_UNKNOWN, "error"
-        checked += 1
-        if status == storage.STATUS_MEMBER:
-            await confirm_membership(bot, entry.get("chat_id"), user_id,
-                                     name=entry.get("name"))
-            _log(bot, f"CONFIRM SENT chat_id={entry.get('chat_id')} "
-                      f"user_id={user_id} layer={layer}")
+        except Exception as error:
+            _log(bot, f"CONFIRM BATCH FAILED channel={channel_key_str} "
+                      f"error={type(error).__name__}", error=True)
+        finally:
+            if _confirm_inflight.get(channel_key_str) is task:
+                _confirm_inflight.pop(channel_key_str, None)
+
+    task = None
+    try:
+        task = asyncio.ensure_future(runner())
+    except Exception:
+        return False
+    _confirm_inflight[channel_key_str] = task
+    return True
+
+
+async def confirm_pending(bot, *, limit: int = 0) -> int:
+    """یک دور بررسی صف انتظار — **گروه‌بندی‌شده بر اساس کانال**.
+
+    تأخیر تأیید از این‌جا می‌آید: اولین بررسی ۳ ثانیه بعد از ارسال راهنما و
+    ناظر هر ۲ ثانیه صف را می‌بیند ⇒ در عمل ۳ تا ۵ ثانیه. برای همهٔ منتظران
+    یک کانال فقط **یک** پیمایش انجام می‌شود.
+    """
+    now = time.time()
+    buckets: dict = {}
+    for key, entry in list(_awaiting_confirm.items()):
+        if now < entry.get("next_at", 0):
             continue
-        # هنوز عضو نشده (یا نامعلوم) → عقب‌اندازی نمایی تا سقف
-        backoff = min(confirm_interval() * entry["tries"], 300.0)
-        entry["next_at"] = time.time() + max(confirm_interval() * 0.5, backoff)
-    return checked
+        channel = channel_key(entry.get("channel_id") or entry.get("chat_id"))
+        buckets.setdefault(str(channel), []).append((key, entry))
+    total = 0
+    for channel_key_str, entries in buckets.items():
+        if limit and total >= limit:
+            break
+        # اگر پاسِ قبلی همین کانال در جریان است، به دور بعد واگذار می‌شود.
+        running = _confirm_inflight.get(channel_key_str)
+        if running is not None and not running.done():
+            continue
+        total += len(entries)
+        await _confirm_batch(bot, channel_key_str, entries)
+    return total
 
 
 async def confirm_watcher(bot, *, logger=None) -> None:
-    """ناظر تأیید عضویت — تنها راه اعلام «تأیید شد» بدون ادمین کانال."""
-    await asyncio.sleep(min(20.0, confirm_first_delay()))
+    """ناظر تأیید عضویت — سریع، سبک و مستقل از مسیر پیام."""
+    await asyncio.sleep(confirm_first_delay())
     while True:
         try:
             if _awaiting_confirm:
@@ -1727,7 +1886,7 @@ async def confirm_watcher(bot, *, logger=None) -> None:
         except Exception as error:
             _log(bot, f"CONFIRM WATCHER error={type(error).__name__}",
                  error=True)
-        await asyncio.sleep(10.0)
+        await asyncio.sleep(confirm_tick())
 
 
 async def send_notice(bot, chat_id, record, *, event=None, name=None) -> bool:
@@ -2827,6 +2986,8 @@ def runtime_stats() -> dict:
     payload["api"] = api.call_stats()
     payload["memory_entries"] = len(_member_cache)
     payload["awaiting_confirm"] = len(_awaiting_confirm)
+    payload["rpc_last_minute"] = len(_rpc_window)
+    payload["rpc_per_minute"] = rpc_per_minute()
     payload["groups"] = len(_group_cache)
     return payload
 
@@ -2873,6 +3034,8 @@ def reset_runtime_state() -> None:
     _scan_until.clear()
     _refresh_tasks.clear()
     _awaiting_confirm.clear()
+    _confirm_inflight.clear()
+    _rpc_window.clear()
     _semaphore = None
     _registered_bots.clear()
     for key in STATS:

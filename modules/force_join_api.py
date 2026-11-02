@@ -677,6 +677,84 @@ async def search_participants(client, channel_input, query, target_user_id,
     return result
 
 
+async def find_members(client, channel_input, user_ids, *,
+                       max_members: int = 5000,
+                       budget_seconds: float = 20.0,
+                       delay: float = 0.1,
+                       page_size: int = 200) -> dict:
+    """مثل ``find_member`` ولی برای **چند** کاربر با یک پیمایش.
+
+    چرا: تأیید عضویت چند کاربرِ در انتظار نباید چند بار فهرست را بخواند؛
+    یک پاس، همه را جواب می‌دهد (مصرف = همان یک پیمایش).
+    """
+    wanted = set()
+    for value in user_ids or ():
+        try:
+            wanted.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    summary = {"state": RESULT_ERROR, "found": {}, "scanned": 0, "pages": 0,
+               "complete": False, "reason": None}
+    if not wanted:
+        summary.update(state="absent", complete=True)
+        return summary
+    if not LIBRARY_AVAILABLE or channel_input is None:
+        summary["reason"] = "unavailable"
+        return summary
+
+    offset = 0
+    started = time.monotonic()
+    while True:
+        if max_members and offset >= max_members:
+            summary["reason"] = "cap"
+            return summary
+        if time.monotonic() - started > budget_seconds:
+            summary["reason"] = "budget"
+            return summary
+        CALL_COUNTER["get_participants"] += 1
+        try:
+            page = await asyncio.wait_for(
+                client(GetParticipantsRequest(
+                    channel=channel_input,
+                    filter=ChannelParticipantsRecent(),
+                    offset=offset,
+                    limit=page_size,
+                    hash=0,
+                )),
+                timeout=20.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            summary["state"] = classify_error(error)
+            summary["error"] = error
+            summary["reason"] = summary["state"]
+            return summary
+        summary["pages"] += 1
+        users = list(getattr(page, "users", None) or ())
+        participants = list(getattr(page, "participants", None) or ())
+        for index, user in enumerate(users):
+            participant = participants[index] if index < len(participants) else None
+            if participant is not None and \
+                    participant_state(participant) != RESULT_MEMBER:
+                continue
+            uid = int(getattr(user, "id", 0) or 0)
+            if uid in wanted:
+                summary["found"][uid] = user
+        step = len(users) if users else len(participants)
+        if not step:
+            summary.update(state="ok", complete=True, scanned=offset)
+            return summary
+        offset += step
+        total = getattr(page, "count", None)
+        if total is not None and offset >= int(total):
+            summary.update(state="ok", complete=True, scanned=offset)
+            return summary
+        if delay:
+            await asyncio.sleep(delay)
+    return summary
+
+
 async def find_member(client, channel_input, user_id, *,
                       max_members: int = 5000,
                       budget_seconds: float = 20.0,

@@ -1990,3 +1990,106 @@ def test_guides_are_readable_for_non_members(tmp_path, monkeypatch):
     event = asyncio.run(scenario())
     assert deleted == []
     assert any("راهنمای دستورات کانال من" in text for text, _kw in event.replies)
+
+
+# ---------------------------------------------------------------------------
+# ۱۷) تأیید فوری + تضمین «ربات کند نمی‌شود»
+# ---------------------------------------------------------------------------
+
+def test_confirmation_timing_is_fast():
+    """اولین بررسی ≤۳ ثانیه، چرخهٔ ناظر ≤۲ ثانیه (تأخیر محسوس نباشد)."""
+    assert service.confirm_first_delay() <= 3.0
+    assert service.confirm_tick() <= 2.0
+    assert service.confirm_backoff(0) <= 3.0
+    assert service.confirm_backoff(1) <= 4.0
+    # عقب‌اندازی صعودی و کران‌دار است (نه تأخیر ثابت بزرگ)
+    assert service.confirm_backoff(0) < service.confirm_backoff(5)
+    assert service.confirm_backoff(99) <= 300.0
+
+
+def test_confirmation_batches_all_waiting_users_in_one_scan(
+        tmp_path, monkeypatch):
+    """سه منتظرِ یک کانال → یک پیمایش، سه تأیید (نه سه پیمایش)."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    monkeypatch.setenv("FORCE_JOIN_SCAN_COOLDOWN", "0")
+    client = FakeClient(participants=[
+        _user_with_hash(7001), _user_with_hash(7002), _user_with_hash(7003)])
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    record = storage.get_group(CHAT_ID)
+    for uid in (7001, 7002, 7003):
+        service.await_join_confirmation(record, CHAT_ID, uid)
+        key = (service.canonical_group_key_str(CHAT_ID), uid)
+        service._awaiting_confirm[key]["next_at"] = 0
+
+    async def scenario():
+        await service.confirm_pending(bot)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    assert client.get_participants_calls == 1, "باید یک پیمایش مشترک باشد"
+    confirms = [text for _cid, text in client.sent_messages
+                if "عضو کانال شد" in text]
+    assert len(confirms) == 3
+    assert service._awaiting_confirm == {}
+
+
+def test_rpc_budget_protects_the_bot(tmp_path, monkeypatch):
+    """سهمیهٔ RPC ماژول تمام شود → هیچ بررسی‌ای انجام نمی‌شود (پیام می‌ماند)."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    monkeypatch.setenv("FORCE_JOIN_RPC_PER_MINUTE", "1")
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        # بررسی اول سهمیه را مصرف می‌کند
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(6001), "اول", msg_id=110))
+        await asyncio.sleep(0.05)
+        first_calls = client.get_participants_calls
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(6002), "دوم", msg_id=111))
+        await asyncio.sleep(0.05)
+        return first_calls
+
+    first_calls = asyncio.run(scenario())
+    assert first_calls == 1
+    assert client.get_participants_calls == 1, "سهمیه تمام شد → RPC اضافه ممنوع"
+    assert deleted == [], "بدون بررسی، حذف ممنوع است (fail-safe)"
+
+
+def test_inline_scan_never_runs_for_big_channels(tmp_path, monkeypatch):
+    """کانال بزرگ در مسیر پیام پیمایش نمی‌شود؛ می‌رود پس‌زمینه."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    storage.set_sync_state(CHAT_ID, cursor={
+        "snapshot_started_at": int(time.time()),
+        "snapshot_completed_at": int(time.time()),
+        "complete": True, "members": 50_000,
+    })
+    service.refresh_group_cache(CHAT_ID)
+    monkeypatch.setenv("FORCE_JOIN_GATE_SCAN_MAX_MEMBERS", "3000")
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(6100), "سلام", msg_id=112))
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+    assert client.get_participants_calls == 0, "کانال بزرگ: پیمایش inline ممنوع"
+    assert deleted == []
+
+
+def test_gate_uses_short_timeout_not_the_long_budget():
+    """سقف انتظار مسیر پیام کوچک است؛ بودجهٔ پیمایش هم از آن کمتر."""
+    assert service.gate_await_timeout() <= 5.0
+    assert service.gate_scan_budget() < service.gate_await_timeout()
+    assert service.scan_budget() > service.gate_scan_budget()
