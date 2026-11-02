@@ -3850,6 +3850,57 @@ async def handle_new_message(bot, event):
                             chat_id, sender, "وضعیت کانال (عضویت اجباری)"
                         )
                         return
+                    if force_join_action == "diagnose_short":
+                        # «تست عضویت»: فقط «عضو هست» یا «عضو نیست».
+                        if not _has_group_management_permission(
+                            bot, chat_id, user_id,
+                            getattr(sender, "username", None)
+                        ):
+                            await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
+                            return
+                        short_target = None
+                        short_entity = None
+                        short_arg = (force_join_arg or "").strip()
+                        if short_arg:
+                            if short_arg.lstrip("-").isdigit():
+                                short_target = int(short_arg)
+                            else:
+                                try:
+                                    short_entity = await bot.client.get_entity(
+                                        short_arg)
+                                    short_target = getattr(short_entity, "id", None)
+                                except Exception:
+                                    short_target = None
+                        elif getattr(event, "reply_to_msg_id", None):
+                            try:
+                                replied = await event.get_reply_message()
+                                if replied is not None:
+                                    short_target = getattr(
+                                        replied, "sender_id", None)
+                                    try:
+                                        short_entity = await replied.get_sender()
+                                    except Exception:
+                                        short_entity = None
+                                    if short_target is None:
+                                        short_target = getattr(
+                                            short_entity, "id", None)
+                            except Exception:
+                                short_target = None
+                        if not short_target:
+                            await event.reply(
+                                "❌ کاربر پیدا نشد. روی پیامش ریپلای کنید یا "
+                                "آیدی/یوزرنیم بدهید."
+                            )
+                            return
+                        await event.reply(
+                            await force_join_service.diagnose_short(
+                                bot, chat_id, short_target, short_entity
+                            )
+                        )
+                        admin_tools.log_action(
+                            chat_id, sender, "تست عضویت"
+                        )
+                        return
                     if force_join_action == "diagnose":
                         # «تست عضویت»: ادمین/مالک گروه، با ریپلای یا با
                         # @یوزرنیم/آیدی. خروجی، مسیر واقعی تصمیم را نشان
@@ -6305,6 +6356,27 @@ async def handle_new_message(bot, event):
                 games_text,
                 formatting_entities=entities
             )
+            return
+
+        # 📖 راهنمای کانال / 🚀 راهنمای اجرا — متن‌های ثابت با Bold و نقل‌قول
+        if clean_text.strip() in ("راهنمای کانال", "راهنمای اجرا"):
+            from modules.admin_help_builder import (
+                CHANNEL_GUIDE_ENTITIES,
+                CHANNEL_GUIDE_TEXT,
+                SETUP_GUIDE_ENTITIES,
+                SETUP_GUIDE_TEXT,
+            )
+            if clean_text.strip() == "راهنمای کانال":
+                guide_text, guide_entities = (
+                    CHANNEL_GUIDE_TEXT, CHANNEL_GUIDE_ENTITIES)
+            else:
+                guide_text, guide_entities = (
+                    SETUP_GUIDE_TEXT, SETUP_GUIDE_ENTITIES)
+            try:
+                await event.reply(guide_text,
+                                  formatting_entities=list(guide_entities))
+            except Exception:
+                await event.reply(guide_text)
             return
 
         # راهنمای ربات

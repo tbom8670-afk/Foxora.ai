@@ -1154,7 +1154,7 @@ def test_diagnose_command_reports_verdict(tmp_path, monkeypatch):
 
     async def scenario():
         client.known_user_ids.add(777)
-        event = FakeEvent(CHAT_ID, owner, "تست عضویت 777", msg_id=95)
+        event = FakeEvent(CHAT_ID, owner, "تشخیص عضویت 777", msg_id=95)
         await handle_new_message(bot, event)
         await asyncio.sleep(0.02)
         text = event.replies[0][0]
@@ -1163,6 +1163,30 @@ def test_diagnose_command_reports_verdict(tmp_path, monkeypatch):
         assert "حذف می‌شود" in text
 
     asyncio.run(scenario())
+
+
+def test_short_membership_test_answers_one_line(tmp_path, monkeypatch):
+    """«تست عضویت» فقط یک جمله می‌گوید: عضو هست یا نیست."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members={888}, group_members=[
+        _user_with_hash(888, access_hash=12, first_name="ملیکا")])
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    owner = _user(GROUP_OWNER_ID)
+
+    async def scenario():
+        client.known_user_ids.update({888, 999})
+        outside = FakeEvent(CHAT_ID, owner, "تست عضویت 999", msg_id=96)
+        await handle_new_message(bot, outside)
+        inside = FakeEvent(CHAT_ID, owner, "تست عضویت 888", msg_id=97)
+        await handle_new_message(bot, inside)
+        await asyncio.sleep(0.05)
+        return outside.replies[0][0], inside.replies[0][0]
+
+    not_member, member = asyncio.run(scenario())
+    assert not_member.strip() == "کاربر در کانال عضو نیست"
+    assert member.strip() == "کاربر در کانال عضو هست"
 
 
 # ---------------------------------------------------------------------------
@@ -1701,7 +1725,7 @@ def test_confirmation_is_sent_as_soon_as_membership_is_confirmed(
         assert service.is_awaiting_confirm(CHAT_ID, 9600)
         # در این لحظه هنوز عضو کانال نیست → تأییدی نمی‌آید
         await asyncio.sleep(0.02)
-        assert not any("تأیید شد" in text for _cid, text in client.sent_messages)
+        assert not any("عضو کانال شد" in text for _cid, text in client.sent_messages)
         # حالا عضو می‌شود (همان آیدی در فهرست اعضا ظاهر می‌شود)
         client.participants.append(_user_with_hash(9600))
         _due_now(CHAT_ID, 9600)
@@ -1709,9 +1733,10 @@ def test_confirmation_is_sent_as_soon_as_membership_is_confirmed(
         await asyncio.sleep(0.02)
 
     asyncio.run(scenario())
-    confirms = [text for _cid, text in client.sent_messages if "تأیید شد" in text]
-    assert confirms, "پیام «عضویت تأیید شد» باید ارسال شود"
-    assert "کانال تست" in confirms[0]      # نام کانال در متن می‌آید
+    confirms = [text for _cid, text in client.sent_messages
+                if "عضو کانال شد" in text]
+    assert confirms, "پیام تأیید عضویت باید ارسال شود"
+    assert confirms[0].startswith("💌 کاربر : ")   # قالب مصوب روباه
     assert service.is_awaiting_confirm(CHAT_ID, 9600) is False
     assert storage.get_member(CHANNEL_ID, 9600)["membership_status"] == "member"
 
@@ -1731,7 +1756,7 @@ def test_no_confirmation_while_user_is_still_not_member(tmp_path, monkeypatch):
         await service.confirm_pending(bot)
 
     asyncio.run(scenario())
-    assert not any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert not any("عضو کانال شد" in text for _cid, text in client.sent_messages)
     assert service.is_awaiting_confirm(CHAT_ID, 9700) is True   # هنوز منتظر
 
 
@@ -1749,7 +1774,7 @@ def test_confirmation_queue_expires_without_spam(tmp_path, monkeypatch):
         await service.confirm_pending(bot)
 
     asyncio.run(scenario())
-    assert not any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert not any("عضو کانال شد" in text for _cid, text in client.sent_messages)
     assert service.is_awaiting_confirm(CHAT_ID, 9800) is False
 
 
@@ -1770,7 +1795,7 @@ def test_member_message_after_joining_sends_confirmation(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert deleted == []
-    assert any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert any("عضو کانال شد" in text for _cid, text in client.sent_messages)
 
 
 def test_channel_join_event_confirms_immediately(tmp_path, monkeypatch):
@@ -1792,5 +1817,176 @@ def test_channel_join_event_confirms_immediately(tmp_path, monkeypatch):
         await asyncio.sleep(0.1)
 
     asyncio.run(scenario())
-    assert any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert any("عضو کانال شد" in text for _cid, text in client.sent_messages)
     assert service.is_awaiting_confirm(CHAT_ID, 6200) is False
+
+
+# ---------------------------------------------------------------------------
+# ۱۶) «راهنمای روباه»: بلوک کانال + دو متن راهنما (Bold و نقل‌قول)
+# ---------------------------------------------------------------------------
+
+def _slice_u16(text, entity):
+    """برش دقیق متن بر پایهٔ offset/length استاندارد (UTF-16)."""
+    data = text.encode("utf-16-le")
+    start = entity.offset * 2
+    end = (entity.offset + entity.length) * 2
+    return data[start:end].decode("utf-16-le")
+
+
+def test_admin_help_has_force_join_block_with_bold_single_quote():
+    from modules.admin_help_builder import ADMIN_HELP_ENTITIES, ADMIN_HELP_TEXT
+    from splusthon.tl.types import MessageEntityBlockquote, MessageEntityBold
+
+    assert "📣 اضافه کردن کانال من برای عضویت اجباری دستور" in ADMIN_HELP_TEXT
+    block = "راهنمای کانال\nراهنمای اجرا"
+    assert block in ADMIN_HELP_TEXT
+
+    start = ADMIN_HELP_TEXT.index(block)
+    start_u16 = len(ADMIN_HELP_TEXT[:start].encode("utf-16-le")) // 2
+    quotes = [e for e in ADMIN_HELP_ENTITIES
+              if isinstance(e, MessageEntityBlockquote)]
+    matching = [q for q in quotes
+                if q.offset == start_u16
+                and q.length == len(block.encode("utf-16-le")) // 2]
+    assert matching, "هر دو دستور باید داخل یک نقل‌قول سروش پلاس باشند"
+
+    bolds = {_slice_u16(ADMIN_HELP_TEXT, e)
+             for e in ADMIN_HELP_ENTITIES
+             if isinstance(e, MessageEntityBold)}
+    assert "راهنمای کانال" in bolds
+    assert "راهنمای اجرا" in bolds
+    assert "📣 اضافه کردن کانال من برای عضویت اجباری دستور" in bolds
+
+
+def test_channel_guide_text_and_bold_commands():
+    from modules.admin_help_builder import (CHANNEL_GUIDE_ENTITIES,
+                                            CHANNEL_GUIDE_TEXT)
+    from splusthon.tl.types import MessageEntityBold
+
+    assert CHANNEL_GUIDE_TEXT.startswith("راهنمای دستورات کانال من")
+    assert "» " in CHANNEL_GUIDE_TEXT
+    assert "« کانال من @euwoq »" in CHANNEL_GUIDE_TEXT
+    commands = {"کانال من", "تنظیم عضویت اجباری", "لغو عضویت اجباری", "تست عضویت"}
+    bolds = {_slice_u16(CHANNEL_GUIDE_TEXT, e)
+             for e in CHANNEL_GUIDE_ENTITIES
+             if isinstance(e, MessageEntityBold)}
+    assert commands <= bolds
+
+
+def test_setup_guide_quotes_support_bot_only():
+    from modules.admin_help_builder import (SETUP_GUIDE_ENTITIES,
+                                            SETUP_GUIDE_TEXT)
+    from splusthon.tl.types import MessageEntityBold, MessageEntityBlockquote
+
+    assert "@aifox_bot" in SETUP_GUIDE_TEXT
+    assert "کانال من @ai_fox" in SETUP_GUIDE_TEXT
+    quotes = [_slice_u16(SETUP_GUIDE_TEXT, e) for e in SETUP_GUIDE_ENTITIES
+              if isinstance(e, MessageEntityBlockquote)]
+    assert any("@aifox_bot" in q for q in quotes)
+    assert any("کانال من @ai_fox" in q for q in quotes)
+    # همهٔ متن Bold است (نه فقط تکه‌هایی از آن)
+    bolded = sum(e.length for e in SETUP_GUIDE_ENTITIES
+                 if isinstance(e, MessageEntityBold))
+    assert bolded >= len(SETUP_GUIDE_TEXT.encode("utf-16-le")) // 2 - 20
+
+
+def test_guide_commands_are_answered_in_group(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(members={GROUP_OWNER_ID})
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    owner = _user(GROUP_OWNER_ID)
+
+    async def scenario():
+        channel = FakeEvent(CHAT_ID, owner, "راهنمای کانال", msg_id=98)
+        await handle_new_message(bot, channel)
+        setup = FakeEvent(CHAT_ID, owner, "راهنمای اجرا", msg_id=99)
+        await handle_new_message(bot, setup)
+        await asyncio.sleep(0.02)
+        return channel.replies[0], setup.replies[0]
+
+    (channel_text, channel_kwargs), (setup_text, setup_kwargs) = asyncio.run(
+        scenario()
+    )
+    assert "راهنمای دستورات کانال من" in channel_text
+    assert channel_kwargs.get("formatting_entities"), "Bold/نقل‌قول لازم است"
+    assert "@aifox_bot" in setup_text
+    assert setup_kwargs.get("formatting_entities")
+
+
+def test_register_message_is_exactly_four_lines(tmp_path, monkeypatch):
+    """قالب مصوب: فقط عنوان، نام کانال، لینک و تعداد اعضا."""
+    _setup_group(tmp_path, monkeypatch)
+    client = FakeClient(participants=[_user_with_hash(6001)])
+    bot = _bot(client)
+    ok, message, _record = asyncio.run(
+        service.register_channel(bot, CHAT_ID, "@testchannel")
+    )
+    assert ok is True
+    lines = [line for line in message.splitlines()]
+    assert lines[0] == "✅ کانال اجباری ثبت شد."
+    assert lines[1] == "📢 کانال تست"
+    assert lines[2].startswith("🔗 ")
+    assert lines[3] == ""
+    assert lines[4].startswith("👥 تعداد اعضای کانال: ")
+    assert len(lines) == 5
+    assert "حالت همگام‌سازی" not in message
+    assert "مسیرهای تأییدشده" not in message
+
+
+def test_notice_matches_approved_format(tmp_path, monkeypatch):
+    """پیام راهنما: خط کاربر در نقل‌قول + لینک + جملهٔ پایان."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    from splusthon.tl.types import MessageEntityBlockquote
+    sender = _user(4242, username="osien", first_name="اوسین")
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, sender, "سلام", msg_id=100)
+        event.message.reply_to_msg_id = None
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        return event
+
+    event = asyncio.run(scenario())
+    text, kwargs = event.replies[0]
+    assert text.startswith("کاربر : @osien")           # یوزرنیم مقدم است
+    assert "ارسال پیام در این گروه مجاز نیست" in text
+    assert f"📢 لینک کانال : {storage.get_group(CHAT_ID)['channel_link']}" in text
+    assert text.rstrip().endswith("بعد از تایید عضویت میتوانید پیام بدهید")
+    entities = kwargs.get("formatting_entities") or []
+    assert any(isinstance(e, MessageEntityBlockquote) for e in entities)
+
+
+def test_notice_uses_display_name_when_username_missing(tmp_path, monkeypatch):
+    """بدون یوزرنیم، نام نمایشی نشان داده می‌شود."""
+    record = {"channel_link": "https://splus.ir/x", "channel_title": "x",
+              "group_id": 1, "channel_id": 2}
+    text = service.notice_text(record, service.user_label(
+        _user(555, username=None, first_name="علی"), 555))
+    assert text.startswith("کاربر : علی")
+
+
+def test_guides_are_readable_for_non_members(tmp_path, monkeypatch):
+    """غیرعضو هم می‌تواند «راهنمای کانال» را بخواند (پیامش حذف نمی‌شود)."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        event = FakeEvent(CHAT_ID, _user(777777), "راهنمای کانال", msg_id=101)
+        await handle_new_message(bot, event)
+        await asyncio.sleep(0.05)
+        return event
+
+    event = asyncio.run(scenario())
+    assert deleted == []
+    assert any("راهنمای دستورات کانال من" in text for text, _kw in event.replies)

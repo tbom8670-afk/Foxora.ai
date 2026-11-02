@@ -33,7 +33,7 @@ def build_admin_help():
     entities.append(MessageEntityBold(offset=0, length=_u16(header)))
     parts.append("\n\n")
 
-    def add_item(title, cmds):
+    def add_item(title, cmds, bold_cmds=False, quote=True):
         start_t = _u16("".join(parts))
         parts.append(title)
         entities.append(MessageEntityBold(offset=start_t, length=_u16(title)))
@@ -42,10 +42,24 @@ def build_admin_help():
         cmd_text = "\n".join(cmds)
         start_c = _u16("".join(parts))
         parts.append(cmd_text)
-        entities.append(MessageEntityBlockquote(offset=start_c, length=_u16(cmd_text)))
+        if quote:
+            entities.append(MessageEntityBlockquote(
+                offset=start_c, length=_u16(cmd_text)))
+        if bold_cmds:
+            # هر دستور جداگانه Bold می‌شود (نقل‌قول یکی است، دستورها جدا).
+            cursor = start_c
+            for line in cmds:
+                if line:
+                    entities.append(MessageEntityBold(
+                        offset=cursor, length=_u16(line)))
+                cursor += _u16(line) + 1
         parts.append("\n\n")
 
     blocks_before_vip = [
+        # 🔒 عضویت اجباری کانال — عنوان Bold و هر دو دستور Bold داخل **یک**
+        # نقل‌قول سروش پلاس (نه دو نقل‌قول جدا).
+        ("📣 اضافه کردن کانال من برای عضویت اجباری دستور",
+         ["راهنمای کانال", "راهنمای اجرا"]),
         ("👮‍♀دیدن لیست ادمین ها با دستور", ["لیست ادمین"]),
         ("🔒قفل کردن گروه با دستور", ["قفل"]),
         ("🔓باز کردن گروه با دستور", ["باز"]),
@@ -65,8 +79,9 @@ def build_admin_help():
         ("🗃برکناری ادمین ثبت شده ربات با دستور", ["با ریپلای : لغو ادمین | برکناری ادمین"]),
     ]
 
-    for title, cmds in blocks_before_vip:
-        add_item(title, cmds)
+    for index, (title, cmds) in enumerate(blocks_before_vip):
+        # فقط بلوک عضویت اجباری (اولین بلوک) دستورهایش Bold است.
+        add_item(title, cmds, bold_cmds=(index == 0))
 
     # بخش VIP
     vip_sub = [
@@ -149,3 +164,71 @@ def build_admin_help():
 
 
 ADMIN_HELP_TEXT, ADMIN_HELP_ENTITIES = build_admin_help()
+
+
+# ---------------------------------------------------------------------------
+# 📖 «راهنمای کانال» و «🚀 راهنمای اجرا» — دو متن راهنمای دستورهای کانال
+# ---------------------------------------------------------------------------
+# هر دو از یک تابع ساخته می‌شوند تا متن و entity هرگز از هم جدا نیفتند:
+# بُردار offset با طول UTF-16 حساب می‌شود (استاندارد سروش پلاس/تلگرام).
+
+CHANNEL_GUIDE_TITLE = "راهنمای دستورات کانال من"
+
+#: (دستور، توضیح) — دستور Bold می‌شود
+CHANNEL_GUIDE_ITEMS = (
+    ("کانال من",
+     "این دستور کانال رو به لیست خودش اضافه می‌کنه، اول باید کانال عمومی "
+     "باشه. به این صورت مثلا « کانال من @euwoq »"),
+    ("تنظیم عضویت اجباری", "برای فعال کردن عضویت اجباری"),
+    ("لغو عضویت اجباری", "برای خاموش کردن قابلیت"),
+    ("تست عضویت", "برای اینکه تست کنید یک کاربر عضو شده یا نه"),
+)
+
+SETUP_GUIDE_SUPPORT = "@aifox_bot"
+SETUP_GUIDE_EXAMPLE = "کانال من @ai_fox"
+
+def build_channel_guide():
+    """«راهنمای کانال»: فقط نام دستورها Bold، بدون نقل‌قول."""
+    parts = [CHANNEL_GUIDE_TITLE, "\n\n"]
+    entities = []
+    for command, description in CHANNEL_GUIDE_ITEMS:
+        parts.append("» ")
+        start = _u16("".join(parts))
+        parts.append(command)
+        entities.append(MessageEntityBold(offset=start, length=_u16(command)))
+        parts.append("\n" + description + "\n\n")
+    return "".join(parts).rstrip() + "\n", entities
+
+
+SETUP_GUIDE_LINES = (
+    ("bold",
+     "قابلیت کانال من برای عضویت اجباری کاربری می‌باشد که تازه عضو گروه "
+     "شده، شما باید اول از همه ربات رو عضو کانال کنید و اگه نتوانستید از "
+     "طریق"),
+    ("quote", f"ربات پشتیبانی : {SETUP_GUIDE_SUPPORT}"),
+    ("bold",
+     "لینک کانالتون بفرستید تا ربات عضو شود. در صورتی که فقط دارید از ربات "
+     "تو گروهتون استفاده می‌کنید، ربات رو ادمین می‌کنید در کانال و حتما "
+     "کانالتون عمومی باشه و دستور کانال من رو می‌نویسید به روش آیدی کانال"),
+    ("bold", "مثال"),
+    ("quote", SETUP_GUIDE_EXAMPLE),
+)
+
+
+def build_setup_guide():
+    """«راهنمای اجرا»: کل متن Bold؛ خط پشتیبانی و خط مثال داخل نقل‌قول."""
+    parts = []
+    entities = []
+    for kind, chunk in SETUP_GUIDE_LINES:
+        start = _u16("".join(parts))
+        parts.append(chunk)
+        entities.append(MessageEntityBold(offset=start, length=_u16(chunk)))
+        if kind == "quote":
+            entities.append(MessageEntityBlockquote(
+                offset=start, length=_u16(chunk)))
+        parts.append("\n\n")
+    return "".join(parts).rstrip() + "\n", entities
+
+
+CHANNEL_GUIDE_TEXT, CHANNEL_GUIDE_ENTITIES = build_channel_guide()
+SETUP_GUIDE_TEXT, SETUP_GUIDE_ENTITIES = build_setup_guide()

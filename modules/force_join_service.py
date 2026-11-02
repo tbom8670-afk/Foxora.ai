@@ -35,6 +35,35 @@ from modules import force_join_api as api
 from modules import force_join_storage as storage
 from modules.force_join_ids import canonical_group_key, canonical_group_key_str, channel_key
 
+try:  # entity های واقعی سروش پلاس (Bold / نقل‌قول شیشه‌ای)
+    from splusthon.tl.types import (  # type: ignore
+        MessageEntityBlockquote,
+        MessageEntityBold,
+    )
+except Exception:  # pragma: no cover - محیط بدون کتابخانه
+    class MessageEntityBold:  # type: ignore
+        def __init__(self, offset=0, length=0):
+            self.offset = offset
+            self.length = length
+
+    class MessageEntityBlockquote:  # type: ignore
+        def __init__(self, offset=0, length=0):
+            self.offset = offset
+            self.length = length
+
+
+def _u16(text: str) -> int:
+    """طول رشته به واحد UTF-16 (استاندارد offset در سروش پلاس/تلگرام)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def user_label(user_entity=None, user_id=None) -> str:
+    """«@یوزرنیم» و اگر نبود «نام نمایشی» و اگر آن هم نبود شناسهٔ عددی."""
+    label = _display_name(user_entity)
+    if label:
+        return label
+    return str(user_id) if user_id else "کاربر"
+
 # ---------------------------------------------------------------------------
 # تنظیمات (همه از محیط، بدون تغییر کد)
 # ---------------------------------------------------------------------------
@@ -1375,6 +1404,10 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
         matched = match_command(text)
         if matched is not None and matched[0] == "status":
             return False
+        # «راهنمای کانال» و «راهنمای اجرا» فقط متن راهنما هستند؛ غیرعضو هم
+        # باید بتواند بخواندشان (دقیقاً همان کسی که راهنما را لازم دارد).
+        if normalize_text(text) in ("راهنمای کانال", "راهنمای اجرا"):
+            return False
 
         STATS["decisions"] += 1
         status, layer, detail = await resolve_status(
@@ -1400,7 +1433,7 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
         STATS["blocked"] += 1
         _log(bot, f"GATE blocked chat_id={chat_id} user_id={user_id} "
                   f"layer={layer} channel_id={record['channel_id']}")
-        await _enforce(bot, event, chat_id, record, user_id)
+        await _enforce(bot, event, chat_id, record, user_id, user_entity)
         return True
     except asyncio.CancelledError:
         raise
@@ -1410,13 +1443,14 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
         return False
 
 
-async def _enforce(bot, event, chat_id, record, user_id) -> None:
+async def _enforce(bot, event, chat_id, record, user_id,
+                   user_entity=None) -> None:
     """حذف پیام کاربر غیرعضو + پیام راهنما با کنترل نرخ."""
     message = getattr(event, "message", None)
     message_id = getattr(message, "id", None)
     if message_id:
         _delete_message(bot, chat_id, message_id)
-    _maybe_send_notice(bot, event, chat_id, record, user_id)
+    _maybe_send_notice(bot, event, chat_id, record, user_id, user_entity)
 
 
 def _delete_message(bot, chat_id, message_id) -> None:
@@ -1446,20 +1480,49 @@ def _delete_message(bot, chat_id, message_id) -> None:
         pass
 
 
-def notice_text(record) -> str:
-    """متن پیام راهنما (لینک کانال + دستور عمل)."""
+def notice_text(record, name=None) -> str:
+    """متن پیام راهنما (لینک کانال) — قالب مصوبِ روباه."""
     link = record.get("channel_link") or ""
-    title = record.get("channel_title") or "کانال"
+    who = name or "کاربر"
     lines = [
-        "🔒 ارسال پیام در این گروه فقط برای اعضای کانال ممکن است.",
-        f"📢 کانال: {title}",
+        f"کاربر : {who}",
+        "",
+        "ارسال پیام در این گروه مجاز نیست، اول عضو کانال زیر شوید",
+        "",
+        f"📢 لینک کانال : {link}" if link else "📢 لینک کانال : از مدیر گروه بپرسید",
+        "",
+        "بعد از تایید عضویت میتوانید پیام بدهید",
     ]
-    if link:
-        lines.append(f"🔗 {link}")
-    else:
-        lines.append("🔗 لینک کانال را از مدیر گروه بپرسید.")
-    lines.append("پس از عضویت، پیام بعدی شما ارسال می‌شود.")
     return "\n".join(lines)
+
+
+def notice_entities(text, name=None) -> list:
+    """خط «کاربر : …» داخل نقل‌قول سروش پلاس."""
+    who = name or "کاربر"
+    line = f"کاربر : {who}"
+    if not text.startswith(line):
+        return []
+    return [MessageEntityBlockquote(offset=0, length=_u16(line))]
+
+
+def confirm_text(record, name=None) -> str:
+    """متن پیام «عضویت تأیید شد» — قالب مصوبِ روباه."""
+    who = name or "کاربر"
+    return (f"💌 کاربر : {who}\n"
+            "عضو کانال شد، میتوانید پیام ارسال کنید")
+
+
+def confirm_entities(text, name=None) -> list:
+    """خط کاربر در نقل‌قول، جملهٔ تأیید Bold."""
+    who = name or "کاربر"
+    first = f"💌 کاربر : {who}"
+    second = "عضو کانال شد، میتوانید پیام ارسال کنید"
+    entities = [MessageEntityBlockquote(offset=0, length=_u16(first))]
+    index = text.find(second)
+    if index >= 0:
+        entities.append(MessageEntityBold(offset=_u16(text[:index]),
+                                          length=_u16(second)))
+    return entities
 
 
 def _notice_allowed(chat_id, user_id) -> bool:
@@ -1484,18 +1547,11 @@ def _notice_allowed(chat_id, user_id) -> bool:
     return True
 
 
-def confirm_text(record, name=None) -> str:
-    """متن پیام «عضویت تأیید شد» (بعد از اینکه کاربر عضو کانال شد)."""
-    title = record.get("channel_title") or "کانال"
-    who = f"{name} عزیز، " if name else ""
-    return (f"✅ {who}عضویت شما در کانال تأیید شد.\n"
-            f"📢 کانال: {title}\n"
-            "از این پس پیام‌هایتان در گروه ارسال می‌شود.")
-
-
-async def _deliver_text(bot, chat_id, text, *, event=None) -> bool:
-    """ارسال یک متن به گروه (با اولویت صف خروجی، بعد کلاینت)."""
+async def _deliver_text(bot, chat_id, text, *, entities=None,
+                        event=None) -> bool:
+    """ارسال یک متن (با entity) به گروه — صف خروجی، بعد کلاینت."""
     sender = getattr(bot, "outgoing_sender", None)
+    extra = {"formatting_entities": list(entities)} if entities else {}
 
     def capture(sent):
         try:
@@ -1506,14 +1562,26 @@ async def _deliver_text(bot, chat_id, text, *, event=None) -> bool:
 
     if event is not None and sender is not None:
         try:
-            sender.enqueue_reply_notice(event, text, on_done=capture)
+            sender.enqueue_reply_notice(event, text, on_done=capture, **extra)
             return True
+        except TypeError:
+            try:   # امضای قدیمی بدون entity
+                sender.enqueue_reply_notice(event, text, on_done=capture)
+                return True
+            except Exception:
+                pass
         except Exception:
             pass
     if event is not None:
         try:
-            capture(await event.reply(text))
+            capture(await event.reply(text, **extra))
             return True
+        except TypeError:
+            try:
+                capture(await event.reply(text))
+                return True
+            except Exception:
+                pass
         except Exception:
             pass
     client = getattr(bot, "client", None)
@@ -1521,7 +1589,7 @@ async def _deliver_text(bot, chat_id, text, *, event=None) -> bool:
         return False
     try:
         capture(await asyncio.wait_for(
-            client.send_message(chat_id, text), timeout=api_timeout()))
+            client.send_message(chat_id, text, **extra), timeout=api_timeout()))
         return True
     except asyncio.CancelledError:
         raise
@@ -1572,8 +1640,10 @@ async def confirm_membership(bot, chat_id, user_id, *, name=None) -> bool:
     if entry is None:
         return False
     record = storage.get_group(chat_id) or {}
-    sent = await _deliver_text(bot, chat_id,
-                               confirm_text(record, name or entry.get("name")))
+    who = name or entry.get("name") or "کاربر"
+    text = confirm_text(record, who)
+    sent = await _deliver_text(bot, chat_id, text,
+                               entities=confirm_entities(text, who))
     _record_decision(record.get("group_id"), user_id, "member", "confirm_join")
     return sent
 
@@ -1660,9 +1730,13 @@ async def confirm_watcher(bot, *, logger=None) -> None:
         await asyncio.sleep(10.0)
 
 
-async def send_notice(bot, chat_id, record, *, event=None) -> bool:
+async def send_notice(bot, chat_id, record, *, event=None, name=None) -> bool:
     """ارسال پیام راهنما (لینک کانال) — با event یا مستقیماً به گروه."""
-    sent = await _deliver_text(bot, chat_id, notice_text(record), event=event)
+    who = name or "کاربر"
+    text = notice_text(record, who)
+    sent = await _deliver_text(bot, chat_id, text,
+                               entities=notice_entities(text, who),
+                               event=event)
     if sent:
         STATS["notices"] += 1
     return sent
@@ -1690,22 +1764,26 @@ async def notify_join(bot, record, chat_id, user_id, user_entity=None) -> bool:
         return False
     if not _notice_allowed(chat_id, user_id):
         return False
-    sent = await send_notice(bot, chat_id, record)
+    who = user_label(user_entity, user_id)
+    sent = await send_notice(bot, chat_id, record, name=who)
     if sent:
         # حالا منتظر می‌مانیم تا کاربر عضو کانال شود و «تأیید شد» را بگوییم.
-        await_join_confirmation(record, chat_id, user_id,
-                               _display_name(user_entity))
+        await_join_confirmation(record, chat_id, user_id, who)
     _record_decision(record["group_id"], user_id, status, f"join_notice:{layer}")
     _log(bot, f"JOIN NOTICE chat_id={chat_id} user_id={user_id} "
               f"status={status} layer={layer} sent={sent}")
     return sent
 
 
-def _maybe_send_notice(bot, event, chat_id, record, user_id) -> None:
+def _maybe_send_notice(bot, event, chat_id, record, user_id,
+                       user_entity=None) -> None:
     if not _notice_allowed(chat_id, user_id):
         return
-    text = notice_text(record)
+    who = user_label(user_entity, user_id)
+    text = notice_text(record, who)
+    entities = notice_entities(text, who)
     sender = getattr(bot, "outgoing_sender", None)
+    extra = {"formatting_entities": entities} if entities else {}
 
     def capture(sent):
         try:
@@ -1715,18 +1793,25 @@ def _maybe_send_notice(bot, event, chat_id, record, user_id) -> None:
             pass
 
     STATS["notices"] += 1
-    await_join_confirmation(record, chat_id, user_id)
+    await_join_confirmation(record, chat_id, user_id, who)
     try:
         if sender is not None:
+            sender.enqueue_reply_notice(event, text, on_done=capture, **extra)
+            return
+    except TypeError:
+        try:
             sender.enqueue_reply_notice(event, text, on_done=capture)
             return
+        except Exception:
+            pass
     except Exception:
         pass
 
     async def fallback():
         try:
-            sent = await event.reply(text)
-            capture(sent)
+            capture(await event.reply(text, **extra))
+        except TypeError:
+            capture(await event.reply(text))
         except Exception as error:
             _log(bot, f"NOTICE FAILED chat_id={chat_id} "
                       f"error={type(error).__name__}", error=True)
@@ -1737,10 +1822,6 @@ def _maybe_send_notice(bot, event, chat_id, record, user_id) -> None:
     except RuntimeError:
         pass
 
-
-# ---------------------------------------------------------------------------
-# ثبت کانال + سنجش واقعی دسترسی
-# ---------------------------------------------------------------------------
 
 async def self_input_peer(bot):
     """``InputPeerUser`` حساب خودمان بدون RPC (برای سنجش نقش در کانال)."""
@@ -1980,23 +2061,24 @@ async def register_channel(bot, chat_id, target):
     except Exception:
         pass
 
+    # قالب مصوبِ روباه: فقط چهار خط. جزئیات فنی (حالت همگام‌سازی و
+    # مسیرها) عمداً نمایش داده نمی‌شود؛ در «تست عضویت»/لاگ هست.
     lines = []
     if enabled:
         lines.append("✅ کانال اجباری ثبت شد.")
     else:
-        lines.append("⚠️ کانال ثبت شد ولی عضویت اجباری **فعال نشد**.")
+        lines.append("⚠️ کانال ثبت شد ولی عضویت اجباری فعال نشد.")
     lines.append(f"📢 {resolved.get('title') or '—'}")
     if resolved.get("link"):
         lines.append(f"🔗 {resolved['link']}")
-    lines.append(f"🧭 حالت همگام‌سازی: {probe.get('sync_mode')}")
-    active = [ROUTE_LABELS[r] for r in ROUTE_LABELS if routes.get(r)]
-    lines.append("🛣 مسیرهای تأییدشده: " +
-                 ("، ".join(active) if active else "—"))
+    lines.append("")
     if probe.get("participants_count") is not None:
-        lines.append(f"👥 تعداد اعضای کانال: {_digits(probe['participants_count'])}")
-    for warning in probe.get("warnings") or ():
-        lines.append(f"• {warning}")
-    if enabled:
+        lines.append(f"👥 تعداد اعضای کانال: "
+                     f"{_digits(probe['participants_count'])}")
+    if not enabled:
+        # فقط در حالت شکست، دلیل به مالک گفته می‌شود (بدون ادعای موفقیت).
+        for warning in probe.get("warnings") or ():
+            lines.append(f"• {warning}")
         lines.append("برای فعال/غیرفعال کردن: «تنظیم عضویت اجباری» / "
                      "«لغو عضویت اجباری»")
     _log(bot, f"REGISTER group_id={record['group_id']} channel_id={channel_id} "
@@ -2397,6 +2479,37 @@ def _status_label(status) -> str:
     }.get(status, str(status))
 
 
+async def diagnose_short(bot, chat_id, user_id=None,
+                         user_entity=None) -> str:
+    """پاسخ یک‌خطی «تست عضویت»: کاربر عضو هست یا نیست.
+
+    هیچ جزئیات فنی نشان داده نمی‌شود؛ گزارش کامل با «تشخیص عضویت» است.
+    """
+    record = cached_group(chat_id) or storage.get_group(chat_id)
+    if record is None:
+        return "ℹ️ برای این گروه کانالی ثبت نشده است."
+    if not user_id:
+        return "ℹ️ روی پیام کاربر ریپلای کنید یا @یوزرنیم/آیدی بدهید."
+    if user_entity is None:
+        client = getattr(bot, "client", None)
+        if client is not None:
+            try:
+                user_entity = await asyncio.wait_for(
+                    client.get_entity(int(user_id)), timeout=resolve_timeout())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                user_entity = None
+    status, _layer, _detail = await resolve_status(
+        bot, record, user_id, user_entity, force=True
+    )
+    if status == storage.STATUS_MEMBER:
+        return "کاربر در کانال عضو هست"
+    if status == storage.STATUS_NOT_MEMBER:
+        return "کاربر در کانال عضو نیست"
+    return "وضعیت عضویت این کاربر مشخص نشد."
+
+
 async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
     """گزارش دقیق «چرا حذف شد / چرا نشد» برای یک کاربر.
 
@@ -2572,7 +2685,8 @@ _COMMAND_SPECS = (
     ("وضعیت کانال", "status"),
     ("تست عضویت کانال", "diagnose"),
     ("تشخیص عضویت", "diagnose"),
-    ("تست عضویت", "diagnose"),
+    # «تست عضویت» عمداً کوتاه است: فقط «عضو هست» یا «عضو نیست».
+    ("تست عضویت", "diagnose_short"),
     ("کانال من", "register"),
 )
 
@@ -2613,7 +2727,7 @@ def match_command(text: str):
     """``(action, argument)`` یا ``None``.
 
     عمل‌ها: ``register`` (با آرگومان)، ``remove``، ``enable``، ``disable``،
-    ``status``.
+    ``status``، ``diagnose`` (گزارش کامل)، ``diagnose_short`` (یک‌خطی).
     """
     value = normalize_text(text)
     if not value:
@@ -2621,7 +2735,8 @@ def match_command(text: str):
     for phrase, action in _COMMAND_SPECS:
         if value == phrase:
             return action, ""
-        if action in ("register", "diagnose") and value.startswith(phrase + " "):
+        if action in ("register", "diagnose", "diagnose_short") and \
+                value.startswith(phrase + " "):
             return action, value[len(phrase):].strip()
     return None
 
