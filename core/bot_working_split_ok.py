@@ -58,6 +58,7 @@ from modules.light_spam_ingest import ingest_event
 from modules import connection_guard
 # 🖇 تشخیص لینک در بیوگرافی (سرویس مستقل، پایش دوره‌ای اعضا).
 from modules import bio_link_service
+from modules import force_join_service
 from modules import site_policy
 from modules.runtime_maintenance import run as run_runtime_maintenance
 from modules.watchdog_reporting import deliver_pending_reports
@@ -1348,6 +1349,16 @@ class SoroushAntiSpamBot:
 
         asyncio.create_task(bio_link_watcher_loop(), name="bio-link-watcher")
 
+        # 🔒 ناظر «عضویت اجباری کانال» — رویداد ورود/خروج کانال + اسنپ‌شات
+        # جبرانی. ثبت هندلر و راه‌اندازی ناظر کاملاً داخل خود ماژول انجام
+        # می‌شود تا هستهٔ ربات دست‌نخورده بماند.
+        try:
+            force_join_service.register(self, logger=self.logger)
+        except Exception as force_join_setup_error:
+            self.logger.log_error(
+                f"FORCE JOIN SETUP FAILED error={force_join_setup_error!r}"
+            )
+
         # 🌙 ناظر گزارش فعالیت کمترین ادمین در ساعت ۱۱ شب (۲۳:۰۰ به وقت تهران)
         async def daily_admin_report_loop():
             from modules.daily_admin_report import run_daily_admin_report_watcher
@@ -2596,7 +2607,9 @@ class SoroushAntiSpamBot:
 
             
                     # اجرای دستورات مدیریتی
-                    if text.startswith(("!", "/", ".")) and not bio_link_service.is_command(text):
+                    if text.startswith(("!", "/", ".")) and \
+                            not bio_link_service.is_command(text) and \
+                            not force_join_service.is_command(text):
                         try:
                             sender = await event.get_sender()
                             await handle_admin_commands(

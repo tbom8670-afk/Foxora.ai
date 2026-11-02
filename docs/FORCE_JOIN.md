@@ -1,0 +1,348 @@
+# 🔒 عضویت اجباری کانال (Force Join) — گزارش فنی، کد و اعداد
+
+نسخه: ۱.۰ — پیاده‌سازی‌شده و آزموده‌شده روی همین مخزن (Foxora)
+تاریخ: ۲۰۲۵/۱۱/۰۲
+
+این سند سه بخش اصلی دارد: **گزارش فنی سورس‌محور** (چه چیزی واقعاً وجود دارد)،
+**معماری و کدِ پیاده‌شده**، و **اعداد بنچمارک واقعی همراه با محدودیت‌های
+صادقانه**. هر جا چیزی آزموده نشده، صریح نوشته شده است «آزموده نشده».
+
+---
+
+## ۰. خلاصهٔ یک‌صفحه‌ای
+
+| پرسش | پاسخ |
+|---|---|
+| آیا می‌توان **فقط اعضای جدید و تغییرات عضویت** را گرفت؟ | **تا حد زیادی بله، ولی نه با «delta» سرور.** سروش پلاس نه `channels.getAdminLog` دارد و نه API افزایشی برای اعضا. تنها مسیر «فقط تغییرات» = رویداد `UpdateChannelParticipant` که **فقط برای ادمین کانال** ارسال می‌شود. اگر حساب ربات در کانال ادمین نباشد، کم‌هزینه‌ترین جایگزین: **اسنپ‌شات صفحه‌ای ۲۰۰ نفره + diff محلی** به‌همراه بررسی تک‌کاربرهٔ `channels.getParticipant` در لحظهٔ پیام (با کش پایدار). |
+| فراخوانی API در مسیر گرم (هر پیام) | **صفر** (اندازه‌گیری‌شده: ۱۰۰۰ پیام → ۰ فراخوانی) |
+| فراخوانی پس از ری‌استارت | **صفر** (کش `access_hash` از SQLite بازسازی می‌شود) |
+| روش ممنوع (کل اعضا در هر پیام) | ۱۲ فراخوانی و ~۱٬۴۹۳ms در هر پیام برای کانال ۲٬۰۰۰ نفره |
+| در قطعی API | عضویت تأیید نمی‌شود و پیام حذف نمی‌شود (fail-open) |
+| تست‌ها | ۳۲ تست در `tests/test_force_join.py` — همه پاس (کل پروژه: ۱۴۸۹ پاس) |
+
+---
+
+## ۱. گزارش فنی سورس‌محور
+
+### ۱.۱ کدام کتابخانه واقعاً نصب و بررسی شد
+
+همه با `pip install` واقعی نصب و سورسشان خوانده شد (نه README):
+
+| کتابخانه | نسخهٔ نصب‌شده | روش بررسی | نتیجه |
+|---|---|---|---|
+| **SPlusthon** | 1.1.4 | `pip install splusthon` + خواندن `tl/functions/channels.py`، `tl/types/channels.py`، `client/chats.py`، `events/chataction.py` | کتابخانهٔ فعلی ربات؛ همهٔ نیازها با سه متد TL پوشش داده می‌شود |
+| **NSplusthon** | 1.8.2 | نصب در `--target` جدا و grep روی `tl/functions/channels.py` | **همان اسکیمای TL**: `GetParticipant`/`GetParticipants`/`GetFullChannel` هست، `GetAdminLog` نیست |
+| **SplusLib** | 3.0.1 | نصب و خواندن `spluslib/client.py`، `bot_client.py` | لایهٔ سطح‌بالا (dict-based) + `BotClient` رسمی؛ `is_admin` آن **کل فهرست اعضا را پیمایش می‌کند** (گران)، پس برای مسیر پیام مناسب نیست |
+| **SplusPy** | 2.2.12 | نصب و بررسی `methods/chats/*` | همان اسکیمای TL؛ `get_participant` به‌عنوان متد کلاینت **ندارد**، فقط `get_permissions` |
+
+> برای همین، پیاده‌سازی روی **SPlusthon** می‌ماند و همهٔ تماس‌های کتابخانه در یک
+> فایل جدا (`modules/force_join_api.py`) ایزوله شده‌اند تا مهاجرت به NSplusthon
+> فقط همان یک فایل را لمس کند.
+
+### ۱.۲ پاسخ به ۹ پرسش الزامی (نام دقیق متد، پارامتر، خروجی، محدودیت)
+
+| # | نیاز | پاسخ واقعی از سورس |
+|---|---|---|
+| ۱ | فهرست اعضای کانال | `functions.channels.GetParticipantsRequest(channel: InputChannel, filter: TypeChannelParticipantsFilter, offset: int, limit: int, hash: int)` → `channels.ChannelParticipants(count, participants, chats, users)` یا `channels.ChannelParticipantsNotModified`. سقف صفحه در خود کتابخانه: `_MAX_PARTICIPANTS_CHUNK_SIZE = 200` (`client/chats.py:17`). |
+| ۲ | اطلاعات یک عضو مشخص با شناسه | همان `GetParticipantsRequest` با `filter=ChannelParticipantsSearch(q='')` (جست‌وجوی هدفمند) **یا بهتر**: `GetParticipantRequest` (ردیف ۳). |
+| ۳ | **API مستقیم بررسی عضویت یک کاربر** | `functions.channels.GetParticipantRequest(channel: InputChannel, participant: InputPeer)` → `channels.ChannelParticipant(participant, chats, users)` که `participant` آن یکی از `ChannelParticipant` / `ChannelParticipantAdmin` / `ChannelParticipantCreator` / `ChannelParticipantSelf` (عضو) یا `ChannelParticipantLeft` / `ChannelParticipantBanned` (غیرعضو) است. **نیازمند `access_hash` کاربر** (`participant: TypeInputPeer`) — که `splusthon.utils.get_input_user(user)` بدون RPC می‌دهد. خطای «عضو نیست»: `errors.UserNotParticipantError`. |
+| ۴ | رویداد ورود عضو جدید به کانال | `types.UpdateChannelParticipant(channel_id, date, actor_id, user_id, qts, prev_participant, new_participant)`؛ `events.ChatAction.build` آن را می‌شناسد (`events/chataction.py`): `new_participant` بدون `prev_participant` ⇒ `user_added`/`user_joined`. |
+| ۵ | رویداد خروج عضو | همان `UpdateChannelParticipant`؛ `prev_participant` بدون `new_participant` ⇒ `user_left` (وقتی `actor_id == user_id`) یا `user_kicked`. |
+| ۶ | فقط اعضای تغییرکرده از آخرین بررسی | **وجود ندارد.** نه پارامتر زمانی دارد، نه کرسر. تنها «فقط تغییرات» = رویداد ردیف ۴/۵ (شرط: ادمین بودن در کانال). |
+| ۷ | Delta / Incremental Updates | **وجود ندارد.** `channels.getAdminLog` در TL Schema سروش نیست (زیر `functions.channels` هیچ `GetAdminLogRequest` نیست؛ `hasattr` روی هر سه کتابخانه `False`). بنابراین `client.iter_admin_log(...)` در عمل با `AttributeError` می‌شکند — با تست `test_schema_evidence_about_library_capabilities` قابل بازتولید است. جایگزین: اسنپ‌شات + diff محلی (بخش ۲.۴). |
+| ۸ | تفاوت ربات رسمی و حساب کاربری | حساب کاربری (User-Bot) که **ادمین کانال** باشد هم `getParticipant` می‌گیرد هم `UpdateChannelParticipant`. حساب غیرادمین با کانالِ `participants_hidden=True` به `ChatAdminRequired` می‌خورد. Bot API رسمی (نگاه کنید به `SplusLib.BotClient` و `bot_api_mode.py` همین پروژه) دسترسی به فهرست اعضا **ندارد**؛ تنها `getChatMember` سطحی و `chat_member` update برای ربات‌های ادمین. (پیاده‌سازی نسخهٔ Bot API: **آزموده نشده**.) |
+| ۹ | آیا ادمین بودن کافی است؟ | برای دریافت رویدادهای اعضا: **بله، ادمین بودن کانال لازم و کافی است** (سمت سرور، آزموده نشده). برای `getParticipant` روی کانال مخفی: بودن در فهرست ادمین‌ها لازم است. برای فهرست اعضا: `ChannelFull.can_view_participants` و `ChannelFull.participants_hidden` تعیین‌کننده‌اند — هر دو فیلد در `types.ChannelFull` این نسخه وجود دارند (تأیید با `__init__.__code__.co_varnames`). |
+
+### ۱.۳ یافته‌های پیش‌تأییدشده: تأیید یا رد
+
+| یافتهٔ پرامپت | وضعیت | شاهد |
+|---|---|---|
+| `channels.getAdminLog` در schema نیست، پس `iter_admin_log` کار نمی‌کند | **تأیید** | `hasattr(functions.channels, "GetAdminLogRequest") is False`؛ `iter_admin_log` روی کلاینت هست ولی `_AdminLogIter._init` به `functions.channels.GetAdminLogRequest` ارجاع می‌دهد که وجود ندارد. در NSplusthon 1.8.2 و SplusPy 2.2.12 هم همین‌طور. |
+| `UpdateChannelParticipant` هم ورود و هم خروج را می‌دهد | **تأیید** | `events/chataction.py` دستهٔ `UpdateChannelParticipant` را می‌سازد؛ تست با آبجکت واقعی: `user_added` و `user_left` |
+| `channels.getParticipant` وجود دارد ولی `access_hash` می‌خواهد | **تأیید** | امضای `GetParticipantRequest(channel: TypeInputChannel, participant: TypeInputPeer)` |
+| `getParticipants` با صفحهٔ ۲۰۰ و `hash` پاسخ `ChannelParticipantsNotModified` می‌دهد | **نیمه‌تأیید** | صفحه ۲۰۰: تأیید (`_MAX_PARTICIPANTS_CHUNK_SIZE = 200`). نوع `ChannelParticipantsNotModified` وجود دارد **اما زیر `splusthon.tl.types.channels`** نه `splusthon.types`. همچنین `iter_participants` کتابخانه **همیشه `hash=0`** می‌فرستد، پس این کش عملاً استفاده نمی‌شود. ما هم به آن تکیه نمی‌کنیم. |
+| `UserNotParticipant` را از `ChatAdminRequired` جدا کن | **تأیید و پیاده شد** | `force_join_api.classify_error` این دو را به `not_member` و `no_access` نگاشت می‌کند |
+| `ChannelFull.can_view_participants` و `participants_hidden` | **تأیید** | در امضای `types.ChannelFull` |
+
+### ۱.۴ محدودیت‌هایی که از سورس بیرون آمد (و طراحی را تغییر داد)
+
+1. `client.get_permissions(channel, user)` هم همان `GetParticipant` است، ولی
+   قبلش `get_entity(entity)` و `get_input_entity(user)` صدا می‌زند
+   (`client/chats.py:1229-1245`) که می‌تواند RPC اضافه بسازد. ما مستقیم
+   `GetParticipantRequest` را با `InputChannel`/`InputPeerUser` **از کش
+   SQLite** می‌سازیم.
+2. `iter_participants` کتابخانه برای کانال‌های با فیلتر پیش‌فرض یک
+   `getParticipants` اضافه (limit=1) هم می‌زند تا `total` را بگیرد؛ ما
+   مسیر مستقل و صریح خودمان را داریم تا دقیقاً بدانیم چند فراخوانی
+   می‌شود.
+3. سقف `200` یعنی کانال ۱۰٬۰۰۰ نفره = ۵۰ فراخوانی برای یک اسنپ‌شات. این
+   کار فقط در ناظر دوره‌ای (نه در مسیر پیام) انجام می‌شود و با بودجهٔ
+   زمانی و فاصلهٔ RPC محدود است.
+
+---
+
+## ۲. معماری و کد پیاده‌شده
+
+### ۲.۱ فایل‌ها
+
+| فایل | نقش |
+|---|---|
+| `modules/force_join_ids.py` | قرارداد کانونیک شناسه (`-100…` ↔ بدون علامت) — تنها نقطهٔ تصمیم کلید دیتابیس |
+| `modules/force_join_storage.py` | SQLite/WAL، دو جدول مصوب، `access_hash` کانال و کاربر، بدون حذف دادهٔ موجود |
+| `modules/force_join_api.py` | **تنها** آداپتر SPlusthon (resolve، getParticipant، getParticipants، getFullChannel، دسته‌بندی خطاها) |
+| `modules/force_join_service.py` | منطق: کش لایه‌ای، single-flight، semaphore، TTL/grace، رویدادها، اسنپ‌شات+diff، ناظر، فرمان‌ها، گزارش |
+| `handlers/message_handler.py` | دو نقطهٔ اتصال: (الف) دروازهٔ عضویت در مسیر پیام (ب) بلوک فرمان‌ها |
+| `core/bot_working_split_ok.py` | سه خط: ایمپورت، `force_join_service.register(self)`، استثنای فرمان‌ها از مسیر «!» |
+| `modules/group_dispatch.py` | فرمان‌ها در لاین `admin` طبقه‌بندی می‌شوند (نه پیام عادی) |
+| `tests/test_force_join.py` | ۳۲ تست با آبجکت‌های واقعی کتابخانه |
+| `tools/bench_force_join.py` | بنچمارک قابل اجرا با خروجی JSON + جدول مارک‌داون |
+
+هیچ فایل موجودی بازنویسی نشد؛ تغییرات موجود فقط **افزودنی** و در چند خط است.
+
+### ۲.۲ دیتابیس (SQLite با WAL، از طریق `modules.runtime_db`)
+
+```sql
+force_join_groups(
+  group_id INTEGER PRIMARY KEY,      -- کلید کانونیک علامت‌دار
+  channel_id INTEGER NOT NULL,       -- بدون علامت
+  channel_access_hash INTEGER,       -- کش برای صفر-API شدن مسیر گرم/ری‌استارت
+  channel_link TEXT, channel_title TEXT,
+  force_join_enabled INTEGER DEFAULT 1,
+  last_sync_time INTEGER,
+  last_update_cursor TEXT,           -- JSON محلی (نه توکن سرور)
+  sync_mode TEXT,                    -- event | snapshot | probe
+  created_at INTEGER, updated_at INTEGER
+)
+
+force_join_members(
+  user_id INTEGER, channel_id INTEGER,
+  membership_status TEXT,            -- member | not_member | unknown (CHECK)
+  last_verified_at INTEGER,
+  source TEXT,                       -- event_join | event_leave | rpc | snapshot
+  join_date INTEGER, access_hash INTEGER,
+  PRIMARY KEY (user_id, channel_id)
+)
+```
+
+ایندکس‌ها: `(channel_id, membership_status)` و `(channel_id, last_verified_at)`.
+`journal_mode=WAL`، `synchronous=FULL`، `busy_timeout=10000`، هر تغییر در یک
+تراکنش `BEGIN IMMEDIATE`.
+
+### ۲.۳ مسیر پیام (تا حد امکان ارزان)
+
+```
+پیام گروهی می‌رسد
+ ├─ قابلیت برای گروه فعال است؟        → فقط dict lookup (کش منفی هم دارد)
+ ├─ فرستنده معاف است؟                  → مالک ربات/مالک گروه/ادمین ثبت‌شده/
+ │                                        ادمین واقعی/VIP/ربات/پست کانالی
+ ├─ پیام فقط‌رسانه‌ای هم از همین دروازه رد می‌شود (پس از معافیت‌ها)
+ ├─ کش حافظه (TTL عضو ۳۰د / غیرعضو ۵د) → تصمیم، صفر I/O
+ ├─ SQLite (همان TTL)                  → تصمیم، صفر RPC
+ └─ حداکثر یک RPC: channels.getParticipant
+        ├─ member      → پیام می‌ماند
+        ├─ not_member  → حذف + پیام راهنما (با محدودیت نرخ)
+        └─ unknown/خطا → **پیام حذف نمی‌شود** (fail-open) + لاگ
+```
+
+الزامات اجراشده:
+
+* **single-flight**: `_inflight[(channel,user)]` — همهٔ درخواست‌های هم‌زمانِ
+  یک کاربر یک Future مشترک را `await` می‌کنند (تست:
+  `test_single_flight_dedupes_identical_concurrent_requests`، ۲۵ درخواست
+  هم‌زمان → **۱** فراخوانی).
+* **سقف هم‌زمانی**: `asyncio.Semaphore(FORCE_JOIN_MAX_CONCURRENCY=2)`.
+* **fail-safe**: در `TimeoutError`/خطای شبکه/`ChatAdminRequired` وضعیت
+  `unknown` است و پیام حذف نمی‌شود.
+* **grace زمان‌دار**: شاهد تازهٔ «غیرعضو» (≤ ۶۰۰ ثانیه) در قطعی هم اجرا
+  می‌شود؛ «عضو» تا ۲۴ ساعت پذیرفته می‌شود؛ بعد از آن «نامعلوم» = آزاد.
+* **کنترل نرخ پیام راهنما**: cooldown ۶۰۰ ثانیه برای هر کاربر + سقف ۲۰ در
+  دقیقه برای هر گروه + حذف خودکار پیام راهنما با `notice_cleanup` موجود.
+
+### ۲.۴ لایه‌های جبرانی تشخیص خروج (چون کش می‌تواند کهنه شود)
+
+| لایه | چه چیزی را می‌گیرد | هزینه |
+|---|---|---|
+| رویداد `UpdateChannelParticipant` | خروج/اخراج فوری، باطل‌سازی **دیتابیس + کش حافظه** | صفر |
+| TTL کوتاه برای «غیرعضو» و TTL ۳۰ دقیقه‌ای برای «عضو» | خروج‌های بی‌رویداد در بازهٔ چند دقیقه | یک RPC برای هر کاربر در هر TTL |
+| اسنپ‌شات دوره‌ای + diff محلی | خروج‌های بی‌رویداد (مثلاً هنگام خاموش بودن ربات) | یک‌بار هر ۶–۱۲ ساعت، صفحه‌ای |
+| **قاعدهٔ سخت** | اگر اسنپ‌شات **ناقص** بماند (بودجه تمام شود/خطا/سقف)، هیچ عضوی «خارج‌شده» ثبت نمی‌شود | — |
+
+اسنپ‌شات فقط ردیف‌هایی را «خارج‌شده» می‌کند که `last_verified_at <=
+snapshot_started_at` باشند؛ بنابراین رویداد ورودِ تازه با دادهٔ کهنهٔ اسنپ‌شات
+باطل نمی‌شود.
+
+### ۲.۵ ثبت کانال = **سنجش واقعی**، نه حدس
+
+فرمان «کانال من …» این کارها را می‌کند:
+
+1. resolve با `get_entity` (یک RPC) و گرفتن `access_hash` + عنوان + لینک.
+2. `GetFullChannelRequest` → `can_view_participants`، `participants_hidden`، `participants_count`.
+3. `GetParticipantRequest` روی **حساب خودمان** — این تست تعیین‌کننده است:
+   * `UserNotParticipant` ⇒ متد کار می‌کند ⇒ بررسی تک‌کاربره معتبر است؛
+   * `ChatAdminRequired` ⇒ بررسی تک‌کاربره هم ممکن نیست ⇒ **قابلیت فعال نمی‌شود** و به مالک صریح گفته می‌شود.
+4. انتخاب `sync_mode`:
+   * ادمین کانال ⇒ `event` (رویدادمحور، هزینهٔ صفر)
+   * غیرادمین ولی فهرست اعضا خواندنی ⇒ `snapshot`
+   * فهرست مخفی ⇒ `probe` (فقط بررسی لحظهٔ پیام؛ با هشدار)
+5. حتی فرمان «تنظیم عضویت اجباری» در حالت `probe` یک سنجش دوباره انجام
+   می‌دهد و اگر تأیید ممکن نباشد، فعال‌سازی را رد می‌کند
+   (`enable_channel` → `probe_access`).
+
+### ۲.۶ فرمان‌ها
+
+| فرمان | مجوز | عملکرد |
+|---|---|---|
+| `کانال من <لینک یا @آیدی یا آیدی>` | فقط مالک گروه/مالک ربات | ثبت/تغییر + سنجش دسترسی |
+| `حذف کانال من` | فقط مالک | حذف کانال و وضعیت اعضا |
+| `وضعیت کانال` | همه (حتی غیرعضو) | وضعیت + آمار واقعی |
+| `تنظیم عضویت اجباری` | فقط مالک | فعال‌سازی |
+| `لغو عضویت اجباری` | فقط مالک | غیرفعال‌سازی |
+
+تحمل نوشتاری: «ي/ك» عربی، «ى/ئ»، نیم‌فاصله (`\u200c`)، فاصله‌های اضافه،
+نشانه‌های RTL/LTR، پیشوندهای `! / .` و منشن ربات در ابتدای پیام
+(`normalize_text`). تست‌شده در `test_command_parsing_tolerates_arabic_chars_and_mentions`.
+
+---
+
+## ۳. اعداد بنچمارک (واقعی، اجراشده)
+
+```
+python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30 --member-count 2000
+```
+
+پیکربندی: کانال ۲٬۰۰۰ نفره، تأخیر مصنوعی شبکه **۱۲۰ms** برای هر RPC
+(شبیه‌سازی؛ سرور واقعی سروش پلاس در این محیط در دسترس نیست).
+
+| سنجه | مسیر گرم (این پیاده‌سازی) | روش ممنوع (کل اعضا در هر پیام) |
+|---|---|---|
+| فراخوانی API به‌ازای هر پیام | **۰٫۰** | **۱۲٫۰** |
+| میانگین تأخیر تصمیم | **۰٫۰۹۸ ms** | ۱٬۴۹۳ ms |
+| میانه | ۰٫۰۷۹ ms | ۱٬۴۸۹ ms |
+| p95 | ۰٫۱۹۲ ms | ۱٬۵۱۷ ms |
+| بیشترین | ۲٫۹۶۹ ms | ۱٬۵۱۹ ms |
+| نرخ کش | **۱۰۰٪** | — |
+
+| سنجهٔ دیگر | عدد |
+|---|---|
+| نخستین تصمیم هر کاربر (سرد) | ۱۰ فراخوانی برای ۱۰ کاربر، میانگین **۱۲۳ ms** |
+| فراخوانی پس از ری‌استارت (۲۰ پیام) | **۰** |
+| فراخوانی `getParticipants` در مسیر پیام | **۰** (تست اختصاصی) |
+| هجوم ۴۰ کاربر هم‌زمان | دقیقاً **۴۰** فراخوانی (بدون تکرار) |
+| ۲۵ درخواست هم‌زمان برای یک کاربر | **۱** فراخوانی |
+
+مقایسهٔ صریح: برای کانال ۲٬۰۰۰ نفره، روش ممنوع در هر پیام ۱۲ فراخوانی و
+~۱٫۵ ثانیه هزینه دارد؛ مسیر گرم این پیاده‌سازی **صفر فراخوانی** و ~۰٫۱
+میلی‌ثانیه. یعنی در ۱٬۰۰۰ پیام: **۱۲٬۰۰۰ فراخوانی در برابر صفر**.
+
+> صداقت: اعداد تأخیر «منطق تصمیم» است با شبکهٔ شبیه‌سازی‌شده. تأخیر واقعی
+> سروش پلاس اندازه‌گیری نشده (نیازمند حساب و کانال واقعی است).
+
+---
+
+## ۴. تست‌ها (۸ سناریوی الزامی)
+
+```bash
+python3 -m pytest tests/test_force_join.py -q      # ۳۲ passed
+```
+
+| سناریوی پرامپت | تست |
+|---|---|
+| ۱. عضو قدیمی کانال وارد گروه می‌شود | `test_member_messages_are_allowed_and_hot_path_costs_zero_api` |
+| ۲. عضو جدید به کانال می‌پیوندد | `test_channel_join_event_makes_next_message_free` (با `UpdateChannelParticipant` واقعی) |
+| ۳. کاربر غیرعضو پیام می‌دهد | `test_non_member_message_is_deleted_with_one_notice` |
+| ۴. کاربر عضو پیام می‌دهد | همان تست ۱ (۱۰۰ پیام، صفر فراخوانی) |
+| ۵. کاربر از کانال خارج می‌شود | `test_leave_event_invalidates_db_and_memory` |
+| ۶. ربات ری‌استارت می‌شود | `test_restart_costs_zero_extra_calls` + `test_storage_survives_restart_with_access_hashes` |
+| ۷. قطعی ارتباط | `test_api_outage_never_deletes_without_evidence`، `test_access_error_is_not_treated_as_not_member` |
+| ۸. هجوم هم‌زمان | `test_concurrent_flood_makes_one_call_per_user`، `test_single_flight_dedupes_identical_concurrent_requests` |
+
+به‌علاوه: قرارداد شناسه، اسنپ‌شات کامل/ناقص، فرمان‌ها، بنچمارک، شاهد schema.
+
+---
+
+## ۵. چک‌لیست پذیرش (بخش ۳ پرامپت)
+
+| # | مورد | وضعیت |
+|---|---|---|
+| ۱ | گزارش فنی با نام دقیق متدها و پارامترها | ✅ بخش ۱.۲ |
+| ۲ | پاسخ صریح به «فقط تغییرات جدید ممکن است؟» | ✅ بخش ۰ و ۱.۲ ردیف ۶/۷: نه delta سرور؛ رویداد فقط برای ادمین، وگرنه اسنپ‌شات+diff |
+| ۳ | ادعا با شاهد schema/`hasattr` | ✅ `test_schema_evidence_about_library_capabilities` |
+| ۴ | مسیر گرم صفر فراخوانی (۱۰۰ پیام) | ✅ تست + بنچمارک (۱۰۰۰ پیام → ۰) |
+| ۵ | هیچ `getParticipants` در مسیر پیام | ✅ `test_no_get_participants_in_message_path` |
+| ۶ | ری‌استارت: صفر فراخوانی اضافه | ✅ تست + بنچمارک |
+| ۷ | تفکیک «عضو نیست» از «دسترسی نداریم» | ✅ `classify_error` + دو تست جداگانه |
+| ۸ | هجوم هم‌زمان: یک فراخوانی به‌ازای هر کاربر | ✅ تست |
+| ۹ | بنچمارک با مقایسهٔ روش ممنوع | ✅ بخش ۳ |
+| ۱۰ | فهرست محدودیت‌های صادقانه | ✅ بخش ۶ |
+
+---
+
+## ۶. محدودیت‌های صادقانه (چه چیزی کار نمی‌کند و چه هزینه‌ای دارد)
+
+1. **Delta سرور وجود ندارد.** بدون ادمین بودن در کانال، «تشخیص فوری خروج»
+   ممکن نیست و به TTL + اسنپ‌شات تکیه می‌کنیم. بدترین حالت: کاربری که خارج
+   شده تا TTL «عضو» (پیش‌فرض ۳۰ دقیقه) می‌تواند پیام بدهد. برای سخت‌گیری،
+   `FORCE_JOIN_MEMBER_TTL` را کم کنید (هزینه: RPC بیشتر).
+2. **رویدادهای اعضای کانال فقط به ادمین کانال می‌رسد.** اگر حساب ربات ادمین
+   نباشد، حالت به `snapshot` یا `probe` تنزل می‌کند (هزینهٔ بیشتر یا دقت کمتر).
+3. **کانال با فهرست اعضای مخفی** (`participants_hidden=true`) و بدون ادمین
+   بودن: `getParticipant` هم `ChatAdminRequired` می‌دهد؛ در این حالت قابلیت
+   **عمداً فعال نمی‌شود** تا پیام کاربران واقعی حذف نشود.
+4. **`access_hash` می‌تواند باطل شود** (تغییر اکانت، حذف/ساخت دوبارهٔ کانال).
+   در این حالت یک resolve خودکار انجام و کش نو می‌شود؛ اگر شکست بخورد
+   fail-open می‌شود.
+5. **`getParticipants` ۲۰۰ نفر در هر صفحه** است؛ کانال ۱۰٬۰۰۰ نفره = ۵۰
+   فراخوانی در هر اسنپ‌شات (فقط در ناظر، با فاصلهٔ ۰٫۳۵ ثانیه ≈ ۱۸ ثانیه).
+6. **اسنپ‌شات ناقص هیچ‌چیز را حذف نمی‌کند** (این یک انتخاب امن است، نه باگ):
+   اگر بودجه تمام شود، به‌روزرسانی «خارج‌شده» تا دور بعد عقب می‌افتد.
+7. **یک کانال اجباری برای هر گروه.** چندکاناله (فاز ۲ پرامپت) پیاده نشده است؛
+   ساختار دیتابیس با `channel_id` در کلید آمادهٔ آن است ولی منطق/فرمان‌ها
+   فقط یک کانال را مدیریت می‌کند.
+8. **پنل inline (فاز ۳)** پیاده نشده؛ فرمان‌های متنی کامل هستند.
+9. **نسخهٔ Bot API رسمی (فاز ۵)** پیاده و آزموده نشده است. Bot API سروش
+   دسترسی به فهرست اعضا نمی‌دهد؛ برای آن باید فقط روی رویداد
+   `chat_member`/`getChatMember` تکیه کرد.
+10. **بدون حساب واقعی آزموده نشده:** رفتار سرور سروش پلاس در این موارد
+    شبیه‌سازی/استنتاج از schema است: (الف) ارسال `UpdateChannelParticipant`
+    به ادمین (ب) `ChatAdminRequired` روی کانال مخفی (ج) نبود `getAdminLog`
+    در سرور (این یکی با schema تأیید شده است). همهٔ این‌ها در تست با
+    کلاینت جعلی و آبجکت‌های واقعی کتابخانه پوشش داده شده‌اند، نه با سرور واقعی.
+11. **کش تنظیمات عمداً در حافظهٔ پروسه است**؛ چند پروسهٔ هم‌زمان روی یک
+    دیتابیس پشتیبانی نمی‌شود (ربات تک‌پروسه است). ری‌استارت، کش را از
+    دیتابیس بازسازی می‌کند.
+12. مقایسهٔ کارایی با «روش ممنوع» بر پایهٔ تأخیر مصنوعی ۱۲۰ms است؛ عدد
+    مطلق تأخیر واقعی سروش اندازه‌گیری نشده — نسبت‌ها معنادار هستند، نه عدد مطلق.
+
+---
+
+## ۷. تنظیمات (همه از محیط)
+
+| متغیر | پیش‌فرض | معنا |
+|---|---|---|
+| `FORCE_JOIN_MEMBER_TTL` | ۱۸۰۰ | اعتبار وضعیت «عضو» (ثانیه) |
+| `FORCE_JOIN_NOT_MEMBER_TTL` | ۳۰۰ | اعتبار وضعیت «غیرعضو» |
+| `FORCE_JOIN_MEMBER_GRACE_SECONDS` | ۸۶۴۰۰ | پذیرش «عضو» در قطعی |
+| `FORCE_JOIN_NOT_MEMBER_GRACE_SECONDS` | ۶۰۰ | اجرای شاهد «غیرعضو» در قطعی |
+| `FORCE_JOIN_API_TIMEOUT` | ۸ | سقف هر RPC بررسی |
+| `FORCE_JOIN_GATE_TIMEOUT` | ۵ | سقف انتظار در مسیر پیام |
+| `FORCE_JOIN_MAX_CONCURRENCY` | ۲ | سقف هم‌زمانی RPC |
+| `FORCE_JOIN_NOTICE_COOLDOWN` | ۶۰۰ | فاصلهٔ پیام راهنما برای هر کاربر |
+| `FORCE_JOIN_NOTICE_PER_MINUTE` | ۲۰ | سقف پیام راهنما در دقیقه برای هر گروه |
+| `FORCE_JOIN_SYNC_INTERVAL` | ۲۱۶۰۰ | فاصلهٔ اسنپ‌شات جبرانی |
+| `FORCE_JOIN_EVENT_SNAPSHOT_INTERVAL` | ۴۳۲۰۰ | همان، در حالت رویدادمحور |
+| `FORCE_JOIN_SYNC_BUDGET` | ۹۰ | بودجهٔ زمانی هر اسنپ‌شات (ثانیه) |
+| `FORCE_JOIN_PREFETCH_ON_JOIN` | ۱ | پیش‌بررسی عضویت کانال هنگام ورود به گروه |
+| `FORCE_JOIN_EXEMPT_BOTS` | ۱ | معاف بودن ربات‌ها |
+
+---
+
+## ۸. بازتولید
+
+```bash
+pip install -r requirements.txt
+python3 -m pytest tests/test_force_join.py -q
+python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30
+```
+
+> وضعیت تست کل پروژه در همین محیط: **۱۵۲۰ تست، ۱۴۸۹ پاس، ۰ شکست**
+> (پایهٔ قبل از این تغییر ۱۴۵۷ پاس بود؛ ۳۲ تست تازه اضافه شده است).

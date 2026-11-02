@@ -159,6 +159,7 @@ from modules import punishment_mode
 from modules import bio_link
 from modules import bio_link_storage
 from modules import bio_link_service
+from modules import force_join_service
 from modules.user_display import format_user
 # 🧹 پاکسازی کامل پیام‌های یک کاربر («پاک کامل») — هستهٔ مستقل و خودکار.
 from modules import user_message_purge
@@ -3271,8 +3272,12 @@ async def handle_new_message(bot, event):
             _get_forward_metadata(event.message, event)
         )
         is_gif_media = is_gif_message(event.message)
-        if not has_text_content and not is_forwarded_media and not is_gif_media:
-            return
+        # پیامِ فقط‌رسانه‌ای هیچ مسیر متنی ندارد، ولی باید از دروازهٔ عضویت
+        # اجباری رد شود؛ بنابراین به‌جای return فوری، علامت می‌زنیم و بعد از
+        # دروازه (که معافیت ادمین/مالک را می‌داند) همان‌جا برمی‌گردیم.
+        _media_only_message = (
+            not has_text_content and not is_forwarded_media and not is_gif_media
+        )
 
         sender_username = (getattr(sender, "username", None) or "").lstrip("@").lower()
         is_vip_user = False
@@ -3330,6 +3335,37 @@ async def handle_new_message(bot, event):
             getattr(bot, "native_admin_state_cleared", set()).discard(
                 (normalize_group_id(chat_id), str(user_id))
             )
+
+        # ===== 🔒 عضویت اجباری کانال (Force Join) =====
+        # معاف: مالک ربات، مالک گروه، ادمین ثبت‌شده، ادمین واقعی گروه و VIP.
+        # مسیر گرم هیچ فراخوانی API ندارد: تصمیم از کش حافظه/دیتابیس گرفته
+        # می‌شود و فقط وضعیت کهنه یک بررسی تک‌کاربره می‌گیرد. در قطعی API
+        # پیام حذف نمی‌شود (fail-open). وقتی قابلیت برای گروه خاموش است،
+        # این بلوک فقط یک dict lookup است.
+        if (not event.is_private and user_id
+                and not (admin_bypass or native_admin_bypass or is_vip_user)
+                and force_join_service.is_enabled_cached(chat_id)):
+            try:
+                _force_join_blocked = await force_join_service.gate_message(
+                    bot, event, chat_id, user_id, sender
+                )
+            except Exception as force_join_error:
+                _force_join_blocked = False
+                bot.logger.log_error(
+                    "FORCE JOIN GATE ERROR (fail-open) "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"error={force_join_error!r}"
+                )
+            if _force_join_blocked:
+                _debug_log(bot,
+                    "FORCE JOIN BLOCKED "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"message_id={getattr(event.message, 'id', None)}")
+                return
+
+        if _media_only_message:
+            return
+
         _debug_log(bot,
             "ADMIN BYPASS CHECK "
             f"user_id={user_id} group_id={chat_id} "
@@ -3797,6 +3833,76 @@ async def handle_new_message(bot, event):
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
         # می‌بلعید و «راهنما»/«روباه» هیچ‌وقت به handler نمی‌رسیدند.
         clean_text = normalize_command(message_text)
+
+        # ===== 🔒 دستورهای عضویت اجباری کانال =====
+        # ثبت/تغییر/حذف/فعال‌سازی/غیرفعال‌سازی فقط با مالکِ گروه (یا مالک
+        # ربات) است؛ «وضعیت کانال» برای همه.
+        force_join_command = force_join_service.match_command(clean_text)
+        if force_join_command:
+            force_join_action, force_join_arg = force_join_command
+            if not event.is_private:
+                try:
+                    if force_join_action == "status":
+                        await event.reply(
+                            force_join_service.status_text(chat_id)
+                        )
+                        admin_tools.log_action(
+                            chat_id, sender, "وضعیت کانال (عضویت اجباری)"
+                        )
+                        return
+                    if not is_global_owner(user_id) and str(user_id) != str(
+                        get_group_owner(chat_id)
+                    ):
+                        await _owner_permission_denied_reply(bot, event, chat_id)
+                        return
+                    if force_join_action == "register":
+                        if not force_join_arg:
+                            await event.reply(
+                                "ℹ️ شکل درست دستور:\n"
+                                "کانال من https://splus.ir/yourchannel\n"
+                                "کانال من @yourchannel\n"
+                                "کانال من -1001234567890"
+                            )
+                            return
+                        await event.reply("⏳ در حال بررسی دسترسی به کانال…")
+                        _ok, message, _record = (
+                            await force_join_service.register_channel(
+                                bot, chat_id, force_join_arg
+                            )
+                        )
+                        await event.reply(message)
+                        admin_tools.log_action(
+                            chat_id, sender,
+                            f"ثبت کانال اجباری: {force_join_arg[:60]}"
+                        )
+                        return
+                    if force_join_action == "remove":
+                        _ok, message = force_join_service.remove_channel(chat_id)
+                    elif force_join_action == "enable":
+                        _ok, message = await force_join_service.enable_channel(
+                            bot, chat_id
+                        )
+                    elif force_join_action == "disable":
+                        _ok, message = force_join_service.disable_channel(chat_id)
+                    else:  # pragma: no cover - محافظ
+                        return
+                    await event.reply(message)
+                    admin_tools.log_action(
+                        chat_id, sender,
+                        f"عضویت اجباری: {force_join_action}"
+                    )
+                    return
+                except Exception as force_join_command_error:
+                    bot.logger.log_error(
+                        "FORCE JOIN COMMAND FAILED "
+                        f"chat_id={chat_id} action={force_join_action!r} "
+                        f"error={force_join_command_error!r}"
+                    )
+                    try:
+                        await event.reply("❌ خطا در اجرای دستور عضویت اجباری.")
+                    except Exception:
+                        pass
+                    return
 
         # ===== 🖇 فیلتر لینک بیوگرافی =====
         # مالک ربات/مالک گروه/ادمینِ ثبت‌شده تنها کسانی هستند که می‌توانند
