@@ -1434,3 +1434,19 @@ def test_bot_api_route_is_used_only_when_token_exists(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "bot_api_token", lambda: "1:abc")
     routes = service.channel_routes(storage.get_group(CHAT_ID))
     assert routes[service.ROUTE_BOT_API] is True
+
+
+def test_probe_tool_can_use_registered_channels(tmp_path, monkeypatch):
+    """بدون --channel، ابزار کانال‌های ثبت‌شده را از دیتابیس پیدا می‌کند."""
+    from tools import soroush_membership_probe as probe
+
+    _setup_group(tmp_path, monkeypatch)
+    assert probe.registered_channels() == []
+    # آرگومان --channel اختیاری است: بدون کانال، خطای argparse نمی‌دهد
+    # بلکه راهنمای عملی چاپ می‌کند و با کد ۲ خارج می‌شود.
+    assert probe.main([]) == 2
+    _register_channel()
+    found = probe.registered_channels()
+    assert len(found) == 1
+    assert found[0]["channel_id"] == CHANNEL_ID
+    assert found[0]["access_hash"] == CHANNEL_HASH

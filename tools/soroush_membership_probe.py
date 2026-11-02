@@ -18,16 +18,18 @@
 ⚠️ **قبل از اجرا ربات را ببندید:**
 
     ./foxora stop
-    python3 -m tools.soroush_membership_probe --channel @mychannel
+    python3 -m tools.soroush_membership_probe            # کانال‌های ثبت‌شده
+    python3 -m tools.soroush_membership_probe -c @mychannel
     ./foxora
 
 دو پروس با یک session string هم‌زمان کار نمی‌کنند (سرور آپدیت‌ها را فقط به
 یکی می‌دهد)؛ اجرای پروب روی رباتِ در حال اجرا، ربات را «بی‌تحرک» می‌کند.
 
 مثال‌ها:
+    python3 -m tools.soroush_membership_probe
     python3 -m tools.soroush_membership_probe --channel @mychannel
-    python3 -m tools.soroush_membership_probe --channel 24844874 --user 32441922
-    python3 -m tools.soroush_membership_probe --channel https://splus.ir/x --json
+    python3 -m tools.soroush_membership_probe -c 24844874 --user 32441922
+    python3 -m tools.soroush_membership_probe -c https://splus.ir/x --json
 """
 
 from __future__ import annotations
@@ -52,11 +54,34 @@ except Exception:  # pragma: no cover - dotenv همیشه در requirements هس
 
 from modules import force_join_api as api          # noqa: E402
 from modules import force_join_service as service  # noqa: E402
+from modules import force_join_storage as storage  # noqa: E402
 
 _OK = "✅ OK"
 _NO = "⛔️ NOT_SUPPORTED"
 _DENIED = "🚫 NO_ACCESS"
 _ERR = "⚠️ ERROR"
+
+#: کلاینتِ باز برای بستن تمیز در ``Ctrl+C``
+_CLIENT = None
+
+
+class _BotShell:
+    """آداپتور کوچک: ماژول سرویس فقط به ``bot.client`` نیاز دارد."""
+
+    def __init__(self, client):
+        self.client = client
+        self.bot_account_id = None
+        self.reply_input_peer_cache = {}
+        self.logger = None
+        self.message_delete_queue = None
+        self.outgoing_sender = None
+        self.notice_cleanup = None
+
+    def _noop(self, *_args, **_kwargs):
+        return None
+
+    log_info = _noop
+    log_error = _noop
 
 
 def _label(state: str) -> str:
@@ -72,7 +97,32 @@ def _label(state: str) -> str:
     }.get(state, state)
 
 
-async def _probe(channel_ref: str, user_id=None, *, limit: int = 20) -> dict:
+def registered_channels() -> list:
+    """کانال‌های ثبت‌شده در همین دیتابیس (برای وقتی ``--channel`` نمی‌دهیم)."""
+    try:
+        rows = storage.list_groups(enabled_only=True)
+        if not rows:
+            rows = storage.list_groups()
+    except Exception:
+        return []
+    seen, out = set(), []
+    for row in rows or ():
+        channel_id = row.get("channel_id")
+        if not channel_id or channel_id in seen:
+            continue
+        seen.add(channel_id)
+        out.append({
+            "channel_id": int(channel_id),
+            "access_hash": row.get("channel_access_hash"),
+            "title": row.get("channel_title") or row.get("title"),
+            "group_id": row.get("group_id"),
+            "enabled": bool(row.get("force_join_enabled")),
+        })
+    return out
+
+
+async def _probe(channel_ref, user_id=None, *, limit: int = 20,
+                 known: dict | None = None) -> dict:
     """همهٔ مسیرها را روی کلاینت واقعی امتحان می‌کند و گزارش می‌دهد."""
     from splusthon import SoroushClient  # noqa: WPS433 (همان کلاینت پروژه)
     from splusthon.sessions import StringSession
@@ -87,10 +137,12 @@ async def _probe(channel_ref: str, user_id=None, *, limit: int = 20) -> dict:
             "   این ابزار باید در همان مسیر ربات (کنار .env) اجرا شود."
         )
 
+    global _CLIENT
     client = SoroushClient(StringSession(session_string), int(api_id), api_hash)
+    _CLIENT = client
     report = {
         "at": int(time.time()),
-        "channel_ref": channel_ref,
+        "channel_ref": str(channel_ref),
         "channel_id": None,
         "channel_title": None,
         "target_user": user_id,
@@ -107,21 +159,24 @@ async def _probe(channel_ref: str, user_id=None, *, limit: int = 20) -> dict:
         if not await client.is_user_authorized():
             raise SystemExit("❌ نشست (session) معتبر نیست؛ دوباره لاگین کنید.")
 
-        resolved = await api.resolve_channel(client, channel_ref, timeout=20)
+        # اگر کانال از دیتابیس آمده، resolve لازم نیست (access_hash داریم).
+        resolved = {"ok": True, **known} if known else await api.resolve_channel(
+            client, channel_ref, timeout=20)
         if not resolved.get("ok"):
             report["notes"].append(
                 f"کانال حل نشد: {resolved.get('reason')} — لینک/آیدی را بررسی کنید.")
             return report
-        channel_id = resolved["channel_id"]
+        channel_id = int(resolved["channel_id"])
         access_hash = resolved.get("access_hash")
         report["channel_id"] = channel_id
-        report["channel_title"] = resolved.get("title")
+        report["channel_title"] = resolved.get("title") or (
+            (known or {}).get("title"))
         channel_input = api.input_channel(channel_id, access_hash)
         if channel_input is None:
             report["notes"].append("access_hash کانال خوانده نشد.")
             return report
 
-        me = await service.self_input_peer(client_bot(client))
+        me = await service.self_input_peer(_BotShell(client))
         my_id = getattr(me, "user_id", None) if me is not None else None
         report["self_user"] = my_id
 
@@ -146,9 +201,7 @@ async def _probe(channel_ref: str, user_id=None, *, limit: int = 20) -> dict:
                     client.get_entity(int(user_id)), timeout=15)
                 target_input = api.input_user(entity)
                 report["notes"].append(
-                    "InputPeer کاربر هدف از get_entity ساخته شد "
-                    f"(access_hash="
-                    f"{getattr(target_input, 'access_hash', None) is not None}).")
+                    "InputPeer کاربر هدف از get_entity ساخته شد.")
             except Exception as error:
                 report["notes"].append(
                     f"get_entity کاربر {user_id} نشد: {type(error).__name__} "
@@ -182,8 +235,7 @@ async def _probe(channel_ref: str, user_id=None, *, limit: int = 20) -> dict:
         report["routes"]["getParticipants(admins)"] = admins.get("state")
         if admins.get("state") == "ok" and my_id:
             report["is_admin"] = int(my_id) in admins.get("user_ids", [])
-        notes = admins.get("user_ids") or []
-        report["admins_found"] = len(notes)
+        report["admins_found"] = len(admins.get("user_ids") or [])
 
         await asyncio.sleep(0.5)  # ادب نسبت به سرور
 
@@ -205,30 +257,31 @@ async def _probe(channel_ref: str, user_id=None, *, limit: int = 20) -> dict:
                         "رباتِ BOT_TOKEN ادمین این کانال نیست؛ getChatMember "
                         "بدون ادمین بودن جواب نمی‌دهد.")
     finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await _disconnect()
     return report
 
 
-class client_bot:
-    """آداپتور کوچک: ماژول سرویس فقط به ``bot.client`` نیاز دارد."""
-
-    def __init__(self, client):
-        self.client = client
-        self.bot_account_id = None
-        self.reply_input_peer_cache = {}
-        self.logger = None
-        self.message_delete_queue = None
-        self.outgoing_sender = None
-        self.notice_cleanup = None
-
-    def _noop(self, *_args, **_kwargs):
-        return None
-
-    log_info = _noop
-    log_error = _noop
+async def _disconnect() -> None:
+    """بستن تمیز اتصال (و جلوگیری از هشدار Unclosed client session)."""
+    global _CLIENT
+    client = _CLIENT
+    _CLIENT = None
+    if client is None:
+        return
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    try:  # اگر کتابخانه سشن aiohttp خودش را نبست، خودمان ببندیم
+        breaker = getattr(client, "_sender", None)
+        session = getattr(breaker, "_connection", None) or getattr(
+            breaker, "session", None)
+        session = getattr(session, "session", session)
+        close = getattr(session, "close", None)
+        if callable(close):
+            await close()
+    except Exception:
+        pass
 
 
 def _verdict(report: dict) -> list:
@@ -257,12 +310,7 @@ def _verdict(report: dict) -> list:
     return lines
 
 
-async def main_async(args) -> int:
-    report = await _probe(args.channel, args.user, limit=args.limit)
-    if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0
-
+def _print_report(report: dict) -> None:
     print("🧪 پروب بررسی عضویت — سروش پلاس")
     print(f"کانال: {report.get('channel_title') or '—'} "
           f"(id={report.get('channel_id')})")
@@ -285,25 +333,86 @@ async def main_async(args) -> int:
         for note in report["notes"]:
             print(f"  • {note}")
     print("")
-    print("پس از پایان: ./foxora")
-    return 0
+
+
+async def _run_all(args, channels: list) -> list:
+    reports = []
+    for index, channel in enumerate(channels):
+        if index:
+            await asyncio.sleep(1.0)
+        print(f"\n=== کانال {index + 1} از {len(channels)}: "
+              f"{channel.get('title') or channel['channel_id']} ===")
+        try:
+            reports.append(await _probe(None, args.user, limit=args.limit,
+                                        known=channel))
+        except SystemExit:
+            raise
+        except Exception as error:
+            print(f"⚠️ خطا در سنجش این کانال: {type(error).__name__}: {error}")
+    return reports
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="سنجش روش‌های بررسی عضویت کانال روی سرور سروش پلاس")
-    parser.add_argument("--channel", "-c", required=True,
-                        help="@username یا لینک یا آیدی عددی کانال")
+        description="سنجش روش‌های بررسی عضویت کانال روی سرور سروش پلاس",
+        epilog="بدون --channel، کانال‌های ثبت‌شده در دیتابیس ربات سنجیده "
+               "می‌شوند. قبل از اجرا: ./foxora stop",
+    )
+    parser.add_argument("--channel", "-c", default=None,
+                        help="@username یا لینک یا آیدی عددی کانال "
+                             "(پیش‌فرض: کانال‌های ثبت‌شده)")
     parser.add_argument("--user", "-u", type=int, default=None,
                         help="آیدی عددی کاربر هدف (اختیاری)")
     parser.add_argument("--limit", type=int, default=20,
                         help="سقف صفحهٔ جست‌وجو (پیش‌فرض ۲۰، حداکثر ۵۰)")
     parser.add_argument("--json", action="store_true", help="خروجی JSON")
     args = parser.parse_args(argv)
+
+    known_channels = []
+    if not args.channel:
+        known_channels = registered_channels()
+        if not known_channels:
+            print("⚠️ هیچ کانالی در دیتابیس این ربات ثبت نشده است.")
+            print("  یا با «کانال من <لینک>» در گروه ثبت کنید، یا:")
+            print("  python3 -m tools.soroush_membership_probe -c @mychannel")
+            return 2
+        print("ℹ️ --channel داده نشد؛ کانال‌های ثبت‌شده سنجیده می‌شوند: "
+              + "، ".join(str(c["channel_id"]) for c in known_channels))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        return asyncio.run(main_async(args))
+        if known_channels:
+            reports = loop.run_until_complete(_run_all(args, known_channels))
+        else:
+            reports = [loop.run_until_complete(
+                _probe(args.channel, args.user, limit=args.limit))]
     except KeyboardInterrupt:
+        print("\n⏹ متوقف شد؛ بستن اتصال…")
+        try:
+            loop.run_until_complete(_disconnect())
+        except Exception:
+            pass
         return 130
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+    reports = [r for r in reports if r]
+    if args.json:
+        print(json.dumps(reports if known_channels else reports[0],
+                         ensure_ascii=False, indent=2))
+        return 0
+    for report in reports:
+        _print_report(report)
+    print("پس از پایان: ./foxora")
+    return 0
 
 
 if __name__ == "__main__":

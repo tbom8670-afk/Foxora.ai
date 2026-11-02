@@ -20,7 +20,7 @@
 | در قطعی API | عضویت تأیید نمی‌شود و پیام حذف نمی‌شود (fail-open) |
 | **مهم‌ترین یافتهٔ میدانی (۲ آذر)** | `channels.getParticipant` روی سرور سروش **پیاده نشده است**: `RPCError 422: NOT_SUPPORTED`. پس بررسی عضویت **چندمسیره** شد (§۶.۶) |
 | مسیرهای بررسی (به ترتیب هزینه) | `getParticipant` → Bot API `getChatMember` → جست‌وجوی هدفمند عضو → اسنپ‌شات کامل اعضا |
-| تست‌ها | ۴۸ تست در `tests/test_force_join.py` — همه پاس |
+| تست‌ها | ۴۹ تست در `tests/test_force_join.py` — همه پاس |
 
 ---
 
@@ -401,17 +401,23 @@ RPCError 422: NOT_SUPPORTED (caused by GetParticipantRequest)
 
 ```bash
 ./foxora stop
-python3 -m tools.soroush_membership_probe --channel @mychannel --user 32441922
+python3 -m tools.soroush_membership_probe                 # کانال‌های ثبت‌شده
+python3 -m tools.soroush_membership_probe -c @mychannel --user 32441922
 ./foxora
 ```
+
+بدون `--channel`، همهٔ کانال‌های ثبت‌شده در دیتابیس ربات سنجیده می‌شوند
+(`access_hash` از دیتابیس، بدون resolve). `Ctrl+C` هم اتصال را تمیز می‌بندد
+(هشدار `Unclosed client session` نمی‌ماند).
 
 خروجی، جدول «مسیر → نتیجه» است (`OK` / `NOT_SUPPORTED` / `NO_ACCESS` /
 `FLOOD`) و در پایان می‌گوید با این حساب کدام مسیرها قابل استفاده‌اند.
 ابزار **فقط می‌خواند** (هیچ حذف/ارسال/تغییر عضویتی ندارد) و باید وقتی ربات
 خاموش است اجرا شود (دو پروس با یک session string هم‌زمان کار نمی‌کنند).
 
-> وضعیت: کدِ ابزار با تست آفلاین `test_probe_tool_reports_which_routes_work`
-> آزموده شده؛ **اجرای آن روی سرور سروش آزموده نشده** (در این محیط دسترسی
+> وضعیت: کدِ ابزار با تست آفلاین
+> `test_probe_tool_reports_which_routes_work` و
+> `test_probe_tool_can_use_registered_channels` آزموده شده؛ **اجرای آن روی سرور سروش آزموده نشده** (در این محیط دسترسی
 > شبکه به سروش نیست).
 
 ### رفتار عملی در هر حالت
@@ -479,5 +485,5 @@ python3 tools/bench_force_join.py --messages 1000 --forbidden-messages 30
 ```
 
 > وضعیت تست در همین محیط (اجراشده): `tests/test_force_join.py` →
-> **۴۸ پاس، ۰ شکست**؛ کل پروژه → **۱۵۰۵ پاس، ۰ شکست**
-> (۱۵۰۵ = ۱۴۹۴ پایه + ۱۱ تست تازهٔ زنجیرهٔ مسیرها و ابزار پروب).
+> **۴۹ پاس، ۰ شکست**؛ کل پروژه → **۱۵۰۶ پاس، ۰ شکست**
+> (۱۵۰۶ = ۱۴۹۴ پایه + ۱۲ تست تازهٔ زنجیرهٔ مسیرها و ابزار پروب).
