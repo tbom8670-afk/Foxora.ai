@@ -309,6 +309,28 @@ def notice_on_join() -> bool:
     return _env_flag("FORCE_JOIN_NOTICE_ON_JOIN", True)
 
 
+def confirm_on_join() -> bool:
+    """آیا پس از عضویتِ کاربر در کانال، پیام «تأیید شد» فرستاده شود؟"""
+    return _env_flag("FORCE_JOIN_CONFIRM_JOIN", True)
+
+
+def confirm_window() -> int:
+    """چند ثانیه بعد از راهنما، منتظر عضویت کاربر بمانیم؟"""
+    return _env_int("FORCE_JOIN_CONFIRM_WINDOW", 1800, 30, 86400)
+
+
+def confirm_max_checks() -> int:
+    return _env_int("FORCE_JOIN_CONFIRM_MAX_CHECKS", 20, 1, 200)
+
+
+def confirm_interval() -> float:
+    return _env_float("FORCE_JOIN_CONFIRM_INTERVAL", 30.0, 5.0, 3600.0)
+
+
+def confirm_first_delay() -> float:
+    return _env_float("FORCE_JOIN_CONFIRM_FIRST_DELAY", 12.0, 2.0, 600.0)
+
+
 def snapshot_base_interval() -> int:
     return _env_int("FORCE_JOIN_SNAPSHOT_REFRESH", 300, 60, 86400)
 
@@ -1139,6 +1161,10 @@ _last_error: dict = {}
 _last_diag: dict = {}
 #: channel_key → زمان پایان ممنوعیت پیمایش هدفمند (ضد سیل)
 _scan_until: dict = {}
+#: (group_key, user_id) → انتظار «تأیید عضویت» بعد از ارسال راهنما
+_awaiting_confirm: dict = {}
+#: پارامترهای تکرارِ بررسی برای همان انتظار
+_CONFIRM_MAX_ENTRIES = 2000
 _RECENT_LIMIT = 25
 
 
@@ -1200,8 +1226,14 @@ async def _single_flight_check(bot, record, user_id, user_entity=None):
             _inflight.pop(key, None)
 
 
-async def resolve_status(bot, record, user_id, user_entity=None):
+async def resolve_status(bot, record, user_id, user_entity=None, *,
+                         force: bool = False):
     """تصمیم عضویت با ارزان‌ترین لایهٔ ممکن.
+
+    ``force=True`` یعنی کش حافظه/دیتابیس **نادیده** گرفته شود و همین حالا
+    بررسی تازه انجام شود. برای «تأیید عضویت» و «تست عضویت» لازم است؛
+    وگرنه حکمِ «غیرعضو» تا ۵ دقیقه در کش می‌ماند و کاربری که همین حالا
+    عضو کانال شده، تأیید نمی‌گیرد.
 
     خروجی: ``(status, layer, detail)`` که ``status`` یکی از
     ``member`` / ``not_member`` / ``unknown`` و ``layer`` یکی از
@@ -1210,7 +1242,10 @@ async def resolve_status(bot, record, user_id, user_entity=None):
     channel_id = record["channel_id"]
     now = time.time()
 
-    entry = _member_cache.get((channel_id, user_id))
+    if force:
+        _member_cache.pop((channel_id, user_id), None)
+
+    entry = None if force else _member_cache.get((channel_id, user_id))
     if entry is not None:
         status, verified_at = entry
         if now - verified_at <= _ttl_for(status):
@@ -1220,7 +1255,7 @@ async def resolve_status(bot, record, user_id, user_entity=None):
         _member_cache.pop((channel_id, user_id), None)
 
     stored = storage.get_member(channel_id, user_id)
-    if stored and stored.get("last_verified_at"):
+    if stored and stored.get("last_verified_at") and not force:
         age = now - float(stored["last_verified_at"])
         if age <= _ttl_for(stored["membership_status"]):
             STATS["db_hits"] += 1
@@ -1347,6 +1382,9 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
         )
         if status == storage.STATUS_MEMBER:
             STATS["allowed"] += 1
+            if is_awaiting_confirm(chat_id, user_id):
+                # کاربری که راهنما گرفته بود حالا عضو است → «تأیید شد»
+                _schedule_confirm(bot, chat_id, user_id)
             return False
         if status != storage.STATUS_NOT_MEMBER:
             # نامعلوم → اجازه بده (fail-open)؛ حذف بدون شاهد ممنوع است.
@@ -1446,14 +1484,17 @@ def _notice_allowed(chat_id, user_id) -> bool:
     return True
 
 
-async def send_notice(bot, chat_id, record, *, event=None) -> bool:
-    """ارسال پیام راهنما (لینک کانال) — با event یا مستقیماً به گروه.
+def confirm_text(record, name=None) -> str:
+    """متن پیام «عضویت تأیید شد» (بعد از اینکه کاربر عضو کانال شد)."""
+    title = record.get("channel_title") or "کانال"
+    who = f"{name} عزیز، " if name else ""
+    return (f"✅ {who}عضویت شما در کانال تأیید شد.\n"
+            f"📢 کانال: {title}\n"
+            "از این پس پیام‌هایتان در گروه ارسال می‌شود.")
 
-    ``notify_join`` از این استفاده می‌کند: کاربری که تازه عضو **گروه**
-    شده، همان لحظه لینک کانال را می‌بیند؛ لازم نیست اول پیام بفرستد و
-    پیامش حذف شود.
-    """
-    text = notice_text(record)
+
+async def _deliver_text(bot, chat_id, text, *, event=None) -> bool:
+    """ارسال یک متن به گروه (با اولویت صف خروجی، بعد کلاینت)."""
     sender = getattr(bot, "outgoing_sender", None)
 
     def capture(sent):
@@ -1466,15 +1507,12 @@ async def send_notice(bot, chat_id, record, *, event=None) -> bool:
     if event is not None and sender is not None:
         try:
             sender.enqueue_reply_notice(event, text, on_done=capture)
-            STATS["notices"] += 1
             return True
         except Exception:
             pass
     if event is not None:
         try:
-            sent = await event.reply(text)
-            capture(sent)
-            STATS["notices"] += 1
+            capture(await event.reply(text))
             return True
         except Exception:
             pass
@@ -1482,18 +1520,152 @@ async def send_notice(bot, chat_id, record, *, event=None) -> bool:
     if client is None:
         return False
     try:
-        sent = await asyncio.wait_for(
-            client.send_message(chat_id, text), timeout=api_timeout()
-        )
-        capture(sent)
-        STATS["notices"] += 1
+        capture(await asyncio.wait_for(
+            client.send_message(chat_id, text), timeout=api_timeout()))
         return True
     except asyncio.CancelledError:
         raise
     except Exception as error:
-        _log(bot, f"NOTICE FAILED chat_id={chat_id} "
+        _log(bot, f"DELIVER FAILED chat_id={chat_id} "
                   f"error={type(error).__name__}", error=True)
         return False
+
+
+def await_join_confirmation(record, chat_id, user_id, name=None) -> bool:
+    """ثبت انتظارِ «تأیید عضویت» برای کاربری که راهنما گرفته است.
+
+    چرا لازم است: رویداد ``UpdateChannelParticipant`` فقط به **ادمین**
+    کانال می‌رسد؛ پس وقتی حساب ادمین نیست، هیچ‌کس خبر نمی‌دهد که کاربر
+    عضو شد. این صف، همان کاربر را تا `FORCE_JOIN_CONFIRM_WINDOW` ثانیه
+    دوره‌ای با زنجیرهٔ مسیرها بررسی می‌کند و به‌محض تأیید، پیام «تأیید
+    شد» را در گروه می‌فرستد.
+    """
+    if not confirm_on_join():
+        return False
+    group_key = canonical_group_key_str(chat_id)
+    uid = _safe_int(user_id)
+    if not group_key or not uid:
+        return False
+    if len(_awaiting_confirm) >= _CONFIRM_MAX_ENTRIES:
+        # قدیمی‌ترها را دور بریز تا حافظه بی‌نهایت رشد نکند
+        for stale in sorted(_awaiting_confirm,
+                            key=lambda k: _awaiting_confirm[k]["at"])[:200]:
+            _awaiting_confirm.pop(stale, None)
+    now = time.time()
+    _awaiting_confirm[(group_key, uid)] = {
+        "at": now,
+        "next_at": now + confirm_first_delay(),
+        "deadline": now + confirm_window(),
+        "tries": 0,
+        "chat_id": chat_id,
+        "group_id": record.get("group_id"),
+        "channel_id": record.get("channel_id"),
+        "name": name,
+    }
+    return True
+
+
+async def confirm_membership(bot, chat_id, user_id, *, name=None) -> bool:
+    """ارسال فوری پیام «عضویت تأیید شد» و حذف از صف انتظار."""
+    key = (canonical_group_key_str(chat_id), _safe_int(user_id))
+    entry = _awaiting_confirm.pop(key, None)
+    if entry is None:
+        return False
+    record = storage.get_group(chat_id) or {}
+    sent = await _deliver_text(bot, chat_id,
+                               confirm_text(record, name or entry.get("name")))
+    _record_decision(record.get("group_id"), user_id, "member", "confirm_join")
+    return sent
+
+
+def is_awaiting_confirm(chat_id, user_id) -> bool:
+    return (canonical_group_key_str(chat_id), _safe_int(user_id)) in \
+        _awaiting_confirm
+
+
+def _schedule_confirm(bot, chat_id, user_id, name=None) -> bool:
+    """نسخهٔ غیرمسدودساز برای مسیر پیام (fire-and-forget)."""
+    key = (canonical_group_key_str(chat_id), _safe_int(user_id))
+    if key not in _awaiting_confirm:
+        return False
+
+    async def runner():
+        try:
+            await confirm_membership(bot, chat_id, user_id, name=name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    try:
+        asyncio.get_running_loop().create_task(runner(),
+                                              name="force-join-confirm")
+        return True
+    except RuntimeError:
+        return False
+
+
+async def confirm_pending(bot, *, limit: int = 5) -> int:
+    """یک دور بررسی صف انتظار (توسط ناظر صدا زده می‌شود)."""
+    now = time.time()
+    due = [(key, entry) for key, entry in list(_awaiting_confirm.items())
+           if now >= entry.get("next_at", 0)]
+    due.sort(key=lambda item: item[1].get("at", 0))
+    checked = 0
+    for key, entry in due[:max(1, limit)]:
+        group_key, user_id = key
+        if now > entry.get("deadline", 0) or \
+                entry.get("tries", 0) >= confirm_max_checks():
+            _awaiting_confirm.pop(key, None)
+            _log(bot, f"CONFIRM EXPIRED chat_id={entry.get('chat_id')} "
+                      f"user_id={user_id} tries={entry.get('tries')}")
+            continue
+        record = storage.get_group(entry.get("chat_id"))
+        if record is None or not record.get("force_join_enabled"):
+            _awaiting_confirm.pop(key, None)
+            continue
+        entry["tries"] = entry.get("tries", 0) + 1
+        try:
+            status, layer, _ = await resolve_status(bot, record, user_id,
+                                                    force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            status, layer = storage.STATUS_UNKNOWN, "error"
+        checked += 1
+        if status == storage.STATUS_MEMBER:
+            await confirm_membership(bot, entry.get("chat_id"), user_id,
+                                     name=entry.get("name"))
+            _log(bot, f"CONFIRM SENT chat_id={entry.get('chat_id')} "
+                      f"user_id={user_id} layer={layer}")
+            continue
+        # هنوز عضو نشده (یا نامعلوم) → عقب‌اندازی نمایی تا سقف
+        backoff = min(confirm_interval() * entry["tries"], 300.0)
+        entry["next_at"] = time.time() + max(confirm_interval() * 0.5, backoff)
+    return checked
+
+
+async def confirm_watcher(bot, *, logger=None) -> None:
+    """ناظر تأیید عضویت — تنها راه اعلام «تأیید شد» بدون ادمین کانال."""
+    await asyncio.sleep(min(20.0, confirm_first_delay()))
+    while True:
+        try:
+            if _awaiting_confirm:
+                await confirm_pending(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _log(bot, f"CONFIRM WATCHER error={type(error).__name__}",
+                 error=True)
+        await asyncio.sleep(10.0)
+
+
+async def send_notice(bot, chat_id, record, *, event=None) -> bool:
+    """ارسال پیام راهنما (لینک کانال) — با event یا مستقیماً به گروه."""
+    sent = await _deliver_text(bot, chat_id, notice_text(record), event=event)
+    if sent:
+        STATS["notices"] += 1
+    return sent
 
 
 async def notify_join(bot, record, chat_id, user_id, user_entity=None) -> bool:
@@ -1507,7 +1679,7 @@ async def notify_join(bot, record, chat_id, user_id, user_entity=None) -> bool:
         return False
     try:
         status, layer, _ = await resolve_status(
-            bot, record, user_id, user_entity
+            bot, record, user_id, user_entity, force=True
         )
     except asyncio.CancelledError:
         raise
@@ -1519,6 +1691,10 @@ async def notify_join(bot, record, chat_id, user_id, user_entity=None) -> bool:
     if not _notice_allowed(chat_id, user_id):
         return False
     sent = await send_notice(bot, chat_id, record)
+    if sent:
+        # حالا منتظر می‌مانیم تا کاربر عضو کانال شود و «تأیید شد» را بگوییم.
+        await_join_confirmation(record, chat_id, user_id,
+                               _display_name(user_entity))
     _record_decision(record["group_id"], user_id, status, f"join_notice:{layer}")
     _log(bot, f"JOIN NOTICE chat_id={chat_id} user_id={user_id} "
               f"status={status} layer={layer} sent={sent}")
@@ -1539,6 +1715,7 @@ def _maybe_send_notice(bot, event, chat_id, record, user_id) -> None:
             pass
 
     STATS["notices"] += 1
+    await_join_confirmation(record, chat_id, user_id)
     try:
         if sender is not None:
             sender.enqueue_reply_notice(event, text, on_done=capture)
@@ -1989,6 +2166,10 @@ async def _handle_channel_membership(bot, event, groups, user_ids) -> None:
             _remember(channel_id, user_id, status, time.time())
         if joined:
             STATS["events_join"] += len(user_ids)
+            # اگر همین کاربر راهنمای عضویت گرفته بود، فوراً «تأیید شد» را بگو
+            for user_id in user_ids:
+                if is_awaiting_confirm(record["group_id"], user_id):
+                    _schedule_confirm(bot, record["group_id"], user_id)
         else:
             STATS["events_leave"] += len(user_ids)
         _log(bot, f"EVENT {'join' if joined else 'leave'} "
@@ -2279,7 +2460,7 @@ async def diagnose(bot, chat_id, user_id=None, user_entity=None) -> str:
 
     # بررسی واقعی همین حالا
     status, layer, stored = await resolve_status(
-        bot, record, user_id, user_entity
+        bot, record, user_id, user_entity, force=True
     )
     diag = _last_diag.get((channel_key(record["channel_id"]), _safe_int(user_id)))
     exempt = local_exemption(bot, chat_id, user_id, user_entity)
@@ -2366,9 +2547,13 @@ def register(bot, *, logger=None, start_watcher: bool = True) -> bool:
 
     if start_watcher:
         try:
-            asyncio.get_running_loop().create_task(
-                watcher(bot, logger=logger), name="force-join-watcher"
-            )
+            loop = asyncio.get_running_loop()
+            loop.create_task(watcher(bot, logger=logger),
+                             name="force-join-watcher")
+            if confirm_on_join():
+                # «تأیید عضویت» بدون نیاز به رویداد ادمینِ کانال
+                loop.create_task(confirm_watcher(bot, logger=logger),
+                                 name="force-join-confirm")
         except RuntimeError:
             pass
     _log(bot, f"REGISTERED groups={len(_group_cache)}")
@@ -2499,6 +2684,9 @@ def status_text(chat_id) -> str:
             f"{'کامل' if cursor.get('complete') else 'ناقص'}"
             f" ({_digits(cursor.get('members') or 0)} عضو)"
         )
+    awaiting = len(_awaiting_confirm)
+    if awaiting:
+        lines.append(f"در انتظار تأیید عضویت: {_digits(awaiting)} نفر")
     error = last_error(record["channel_id"])
     if error:
         ago = max(0, int(time.time() - error[0]))
@@ -2523,6 +2711,7 @@ def runtime_stats() -> dict:
     payload = dict(STATS)
     payload["api"] = api.call_stats()
     payload["memory_entries"] = len(_member_cache)
+    payload["awaiting_confirm"] = len(_awaiting_confirm)
     payload["groups"] = len(_group_cache)
     return payload
 
@@ -2568,6 +2757,7 @@ def reset_runtime_state() -> None:
     _last_diag.clear()
     _scan_until.clear()
     _refresh_tasks.clear()
+    _awaiting_confirm.clear()
     _semaphore = None
     _registered_bots.clear()
     for key in STATS:

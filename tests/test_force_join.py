@@ -1654,3 +1654,143 @@ def test_notice_on_join_can_be_disabled(tmp_path, monkeypatch):
 
     asyncio.run(service.handle_chat_action(bot, _GroupJoin(9300)))
     assert client.sent_messages == []
+
+
+# ---------------------------------------------------------------------------
+# ۱۵) «عضویت شما تأیید شد» — بدون نیاز به رویداد ادمینِ کانال
+# ---------------------------------------------------------------------------
+# گزارش کاربر: راهنما ارسال شد، کاربر عضو کانال شد، ولی هیچ تأییدی نیامد.
+# دلیل: UpdateChannelParticipant فقط به ادمین کانال می‌رسد. پس صف انتظار
+# ساخته شد که همان کاربر را دوره‌ای با زنجیرهٔ مسیرها بررسی می‌کند.
+
+def _due_now(chat_id, user_id):
+    """صف انتظار را «سررسید» می‌کند تا تست منتظر زمان‌بندی نماند."""
+    key = (service.canonical_group_key_str(chat_id), user_id)
+    entry = service._awaiting_confirm.get(key)
+    assert entry is not None, "کاربر باید در صف انتظار تأیید باشد"
+    entry["next_at"] = 0
+    return key
+
+
+def test_join_notice_puts_user_in_confirmation_queue(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    asyncio.run(service.handle_chat_action(bot, _GroupJoin(9500)))
+    assert client.sent_messages, "راهنمای لینک باید ارسال شده باشد"
+    assert service.is_awaiting_confirm(CHAT_ID, 9500) is True
+
+
+def test_confirmation_is_sent_as_soon_as_membership_is_confirmed(
+        tmp_path, monkeypatch):
+    """کاربر عضو کانال می‌شود → ناظر تأیید، پیام «تأیید شد» را می‌فرستد."""
+    _setup_group(tmp_path, monkeypatch)
+    monkeypatch.setenv("FORCE_JOIN_SCAN_COOLDOWN", "0")
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await service.handle_chat_action(bot, _GroupJoin(9600))
+        assert service.is_awaiting_confirm(CHAT_ID, 9600)
+        # در این لحظه هنوز عضو کانال نیست → تأییدی نمی‌آید
+        await asyncio.sleep(0.02)
+        assert not any("تأیید شد" in text for _cid, text in client.sent_messages)
+        # حالا عضو می‌شود (همان آیدی در فهرست اعضا ظاهر می‌شود)
+        client.participants.append(_user_with_hash(9600))
+        _due_now(CHAT_ID, 9600)
+        await service.confirm_pending(bot)
+        await asyncio.sleep(0.02)
+
+    asyncio.run(scenario())
+    confirms = [text for _cid, text in client.sent_messages if "تأیید شد" in text]
+    assert confirms, "پیام «عضویت تأیید شد» باید ارسال شود"
+    assert "کانال تست" in confirms[0]      # نام کانال در متن می‌آید
+    assert service.is_awaiting_confirm(CHAT_ID, 9600) is False
+    assert storage.get_member(CHANNEL_ID, 9600)["membership_status"] == "member"
+
+
+def test_no_confirmation_while_user_is_still_not_member(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6001)], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        await service.handle_chat_action(bot, _GroupJoin(9700))
+        _due_now(CHAT_ID, 9700)
+        monkeypatch.setattr(service, "scan_cooldown", lambda: 0.0)
+        await service.confirm_pending(bot)
+
+    asyncio.run(scenario())
+    assert not any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert service.is_awaiting_confirm(CHAT_ID, 9700) is True   # هنوز منتظر
+
+
+def test_confirmation_queue_expires_without_spam(tmp_path, monkeypatch):
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(participants=[], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+
+    async def scenario():
+        service.await_join_confirmation(storage.get_group(CHAT_ID), CHAT_ID, 9800)
+        key = _due_now(CHAT_ID, 9800)
+        service._awaiting_confirm[key]["deadline"] = 0      # پنجره تمام شد
+        await service.confirm_pending(bot)
+
+    asyncio.run(scenario())
+    assert not any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert service.is_awaiting_confirm(CHAT_ID, 9800) is False
+
+
+def test_member_message_after_joining_sends_confirmation(tmp_path, monkeypatch):
+    """کاربر عضو شده و پیام می‌فرستد: پیام آزاد + پیام تأیید."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    service.save_channel_routes(CHAT_ID, _scan_only_routes())
+    client = FakeClient(participants=[_user_with_hash(6100)], mode="not_supported")
+    bot, deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    service.await_join_confirmation(storage.get_group(CHAT_ID), CHAT_ID, 6100)
+
+    async def scenario():
+        await handle_new_message(
+            bot, FakeEvent(CHAT_ID, _user(6100), "سلام", msg_id=95))
+        await asyncio.sleep(0.1)
+
+    asyncio.run(scenario())
+    assert deleted == []
+    assert any("تأیید شد" in text for _cid, text in client.sent_messages)
+
+
+def test_channel_join_event_confirms_immediately(tmp_path, monkeypatch):
+    """اگر حساب ادمین کانال باشد، رویداد، تأیید را فوری می‌فرستد."""
+    _setup_group(tmp_path, monkeypatch)
+    _register_channel()
+    client = FakeClient(participants=[], mode="not_supported")
+    bot, _deleted, _tracker, _actions = _make_bot(tmp_path, monkeypatch)
+    bot.client = client
+    service.await_join_confirmation(storage.get_group(CHAT_ID), CHAT_ID, 6200)
+
+    async def scenario():
+        update = types.UpdateChannelParticipant(
+            channel_id=CHANNEL_ID, date=None, actor_id=6200, user_id=6200, qts=1,
+            prev_participant=None,
+            new_participant=types.ChannelParticipant(user_id=6200, date=None),
+        )
+        await service.handle_chat_action(bot, events.ChatAction.build(update))
+        await asyncio.sleep(0.1)
+
+    asyncio.run(scenario())
+    assert any("تأیید شد" in text for _cid, text in client.sent_messages)
+    assert service.is_awaiting_confirm(CHAT_ID, 6200) is False
