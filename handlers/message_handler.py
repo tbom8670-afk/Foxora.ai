@@ -9167,6 +9167,29 @@ async def handle_new_message(bot, event):
                     bio_link_hit, _bio_label = bio_link_service.link_state(
                         chat_id, user_id
                     )
+                    # 🧷 مجازات فقط با «شاهد تازه»: اگر رکوردِ «لینک دارد»
+                    # از پنجرهٔ تازگی قدیمی‌تر است، بیو دوباره خوانده می‌شود
+                    # (حداکثر یک RPC در هر پنجره)؛ اگر لینک حذف شده باشد
+                    # همان‌جا پاک می‌شود و این پیام مجازات نمی‌گیرد.
+                    if bio_link_hit and bio_link_service.needs_refresh_before_punish(
+                        chat_id, user_id
+                    ):
+                        _bio_fresh = await bio_link_service.refresh_before_punish(
+                            bot, chat_id, sender
+                        )
+                        if not isinstance(_bio_fresh, dict):
+                            # شاهد تازه نداریم → مجازات ممنوع (دادهٔ کهنه/خطا)
+                            bio_link_hit = False
+                            _bio_label = None
+                            _debug_log(
+                                bot,
+                                "BIO LINK NO FRESH EVIDENCE "
+                                f"chat_id={chat_id} user_id={user_id}",
+                            )
+                        else:
+                            bio_link_hit, _bio_label = bio_link_service.link_state(
+                                chat_id, user_id
+                            )
                     if bio_link_hit:
                         bio_link_reason = bio_link.reason_text(_bio_label)
                         _debug_log(

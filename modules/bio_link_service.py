@@ -127,6 +127,14 @@ _inflight: set = set()
 # پیام‌های پیاپی همان کاربر یک RPC در هر پیام نسازند.
 _retry_after: dict = {}
 RETRY_AFTER_ERROR_SECONDS = _env_int("BIO_LINK_ERROR_RETRY_SECONDS", 1800, 60, 86400)
+
+# «تازگیِ لازم برای مجازات»: تصمیم مجازات هرگز بر پایهٔ رکورد کهنه گرفته
+# نمی‌شود. اگر رکورد «لینک دارد» از این مدت قدیمی‌تر باشد، یک‌بار (و فقط
+# یک‌بار در هر پنجره) بیو دوباره خوانده می‌شود؛ چون کاربر ممکن است لینک را
+# حذف کرده باشد و نباید تا ۶ ساعت (TTL) بابت بیوی قبلی مجازات شود.
+PUNISH_FRESHNESS_SECONDS = _env_int(
+    "BIO_LINK_PUNISH_FRESHNESS_SECONDS", 120, 15, 86400
+)
 _semaphore: Optional[asyncio.Semaphore] = None
 _group_locks: dict = {}
 _last_flood_until = 0.0
@@ -430,6 +438,87 @@ async def check_user(bot, chat_id, user, *, force: bool = False) -> Optional[dic
     )
     return record
 
+
+
+def needs_refresh_before_punish(chat_id, user_id) -> bool:
+    """آیا شاهد موجود برای مجازات «کهنه» است و باید تازه شود؟"""
+    if not user_id:
+        return False
+    record = bio_link_storage.get_user(chat_id, user_id)
+    if not isinstance(record, dict):
+        # رکوردی نیست؛ مسیر عادی (ensure_user_now) تصمیم می‌گیرد.
+        return False
+    if not record.get("link"):
+        return False
+    if record.get("exempt"):
+        return False
+    try:
+        checked_at = float(record.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        return True
+    return (time.time() - checked_at) >= PUNISH_FRESHNESS_SECONDS
+
+
+async def refresh_before_punish(bot, chat_id, user) -> Optional[dict]:
+    """بیوگرافی را پیش از مجازات تازه می‌کند (حداکثر یک RPC در هر پنجره).
+
+    خروجی ``None`` یعنی «شاهد تازه نداریم» و در این حالت فراخوان **نباید**
+    مجازات کند: دادهٔ قدیمی یا خطای API هرگز مدرک تخلف نیست.
+
+    بدون RPC اضافه در مسیر گرم: اگر رکورد تازه باشد، همان رکورد برمی‌گردد.
+    """
+    user_id = _safe_int(getattr(user, "id", 0))
+    if not user_id:
+        return None
+    try:
+        if not bio_link_storage.is_enabled(chat_id):
+            return None
+    except Exception:
+        return None
+    if not needs_refresh_before_punish(chat_id, user_id):
+        return bio_link_storage.get_user(chat_id, user_id)
+    if _safe_int(getattr(bot, "bot_account_id", 0)) == user_id:
+        return None
+    key = (str(chat_id), str(user_id))
+    if time.time() < _retry_after.get(key, 0.0):
+        _log(bot, f"REFRESH SKIPPED (retry window) user_id={user_id} "
+                  f"chat_id={chat_id}")
+        return None
+    if key in _inflight:
+        # یک بررسی همین حالا در جریان است؛ این پیام با شاهد کهنه مجازات نمی‌شود.
+        return None
+    _inflight.add(key)
+    try:
+        async with _loop_semaphore():
+            record = await asyncio.wait_for(
+                check_user(bot, chat_id, user, force=True),
+                timeout=fetch_timeout() + 1.0,
+            )
+        fresh = record if isinstance(record, dict) else bio_link_storage.get_user(chat_id, user_id)
+        if isinstance(fresh, dict):
+            if fresh.get("link"):
+                _log(bot, f"REFRESH CONFIRMED user_id={user_id} chat_id={chat_id} "
+                          f"label={fresh.get('label')!r}")
+            else:
+                # 🧹 اصلاح وضعیت تخلف قبلی: رکورد تازه جای رکورد کهنه را
+                # می‌گیرد، کاربر از «لیست لینک بیو» بیرون می‌آید و پیام‌های
+                # بعدی‌اش دیگر به‌خاطر بیوی قبلی مجازات نمی‌شوند.
+                _log(bot, f"REFRESH CLEARED user_id={user_id} chat_id={chat_id} "
+                          f"(لینک از بیو حذف شده)")
+        return fresh
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        _retry_after[key] = time.time() + RETRY_AFTER_ERROR_SECONDS
+        _log(
+            bot,
+            f"REFRESH FAILED user_id={user_id} chat_id={chat_id} "
+            f"error={type(error).__name__}",
+            error=True,
+        )
+        return None
+    finally:
+        _inflight.discard(key)
 
 async def ensure_user_now(bot, chat_id, user) -> Optional[dict]:
     """بیوی کاربر را همین حالا (در حد یک RPC) می‌خواند تا اولین پیام هم بررسی شود.

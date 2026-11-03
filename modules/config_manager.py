@@ -52,6 +52,72 @@ class ConfigManager:
             self.config = json.load(f)
         return self.config
 
+
+    # ------------------------------------------------------------------
+    # ⛔ کلمات بازنشسته
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_word_file(path) -> list:
+        words = []
+        try:
+            if not os.path.exists(path):
+                return words
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    clean = line.strip()
+                    if not clean or clean.startswith("#"):
+                        continue
+                    words.append(clean)
+        except OSError:
+            return words
+        return words
+
+    def retired_banned_words(self) -> Set[str]:
+        """واژه‌هایی که باید از لیست ممنوعه حذف شوند (``بازنشسته``)."""
+        retired = set()
+        for path in (
+            str(PROJECT_ROOT / "config" / "banned_words_retired.txt"),
+            runtime_config_file("banned_words_retired.txt"),
+        ):
+            for word in self._read_word_file(path):
+                retired.add(word.lower())
+        return retired
+
+    def _drop_retired_from_runtime(self, retired: Set[str]) -> int:
+        """واژه‌های بازنشسته را از فایل runtime حذف می‌کند.
+
+        چرا لازم است؟ همگام‌سازی موجود فقط واژهٔ تازه اضافه می‌کند؛ بدون این
+        پاک‌سازی، واژه‌ای که از مخزن حذف شود تا ابد در فایل runtime کاربر
+        می‌ماند و همان رفتار غلط را ادامه می‌دهد.
+        """
+        if not retired:
+            return 0
+        path = self.banned_words_path
+        try:
+            if not os.path.exists(path):
+                return 0
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return 0
+        kept, removed = [], 0
+        for line in lines:
+            clean = line.strip()
+            if clean and not clean.startswith("#") and clean.lower() in retired:
+                removed += 1
+                continue
+            kept.append(line)
+        if not removed:
+            return 0
+        try:
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.writelines(kept)
+            os.replace(tmp_path, path)
+        except OSError:
+            return 0
+        return removed
+
     def load_banned_words(self) -> Set[str]:
         """خواندن کلمات ممنوعه از فایل txt + config"""
         words = set()
@@ -93,6 +159,23 @@ class ConfigManager:
             for w in self.config["banned_words"]:
                 words.add(str(w).lower())
         
+        # ⛔ واژه‌های بازنشسته (مثل حرف تنهای «ک») در هیچ منبعی مجاز نیستند.
+        retired = self.retired_banned_words()
+        if retired:
+            before = len(words)
+            words = {word for word in words if word not in retired}
+            dropped = before - len(words)
+            self._drop_retired_from_runtime(retired)
+            if dropped:
+                try:
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "RETIRED BANNED WORDS REMOVED count=%s words=%s",
+                        dropped, sorted(retired),
+                    )
+                except Exception:
+                    pass
+
         self.banned_words = words
         self._banned_words_version += 1
         self._banned_words_mtime = self._file_mtime(self.banned_words_path)

@@ -70,13 +70,40 @@ class SpamDetector:
         "?": "؟?",
     }
 
+    # یک حرف تنها هرگز «کلمه» نیست و نمی‌تواند فیلتر شود. علت واقعی این
+    # محافظ: «ک» در فهرست کلمات ممنوعه بود و با مرزهای واژه، هر پیامی که این
+    # حرف به‌صورت جدا (بین ایموجی/نشانه/فاصله) داشت را «کلمهٔ ممنوعه»
+    # تشخیص می‌داد و پیام سالم کاربر را حذف/مجازات می‌کرد. حتی اگر کسی دوباره
+    # چنین واژه‌ای را به فهرست اضافه کند، این محافظ جلوی فاجعه را می‌گیرد.
+    # (استثنا: واژه‌های تک‌نویسه‌ای غیرحرفی مثل ایموجی همچنان مجازند.)
+    _MIN_BANNED_WORD_LETTERS = 2
+
+    @classmethod
+    def _is_degenerate_banned_word(cls, display: str) -> bool:
+        """آیا این مدخل خیلی کوتاه است و فقط از حروف ساخته شده؟"""
+        letters = [ch for ch in display if ch.isalpha()]
+        if len(letters) >= cls._MIN_BANNED_WORD_LETTERS:
+            return False
+        if not letters:
+            # بدون هیچ حرفی: ایموجی/نماد — رفتار قبلی حفظ می‌شود.
+            return False
+        filler = "".join(ch for ch in display if not ch.isalpha()).replace(" ", "")
+        if filler:
+            # مثل «ک؟» یا «x-» — هنوز یک حرف معنادار است، بازهم رد می‌شود.
+            pass
+        return True
+
     def _refresh_banned_word_patterns(self):
         version = getattr(self.config, "_banned_words_version", 0)
         if version == self._banned_words_version:
             return
         patterns = []
+        skipped = []
         for raw_word in self.config.banned_words:
             display = str(raw_word or "").strip()
+            if self._is_degenerate_banned_word(display):
+                skipped.append(display)
+                continue
             body = self._banned_word_fuzzy_body(display)
             if not display or not body:
                 continue
@@ -88,6 +115,15 @@ class SpamDetector:
                     re.UNICODE,
                 ),
             ))
+        if skipped:
+            try:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "BANNED WORD IGNORED (too short / single letter) words=%s",
+                    sorted(set(skipped)),
+                )
+            except Exception:
+                pass
         # Longer phrases win so «فیلم پی» is not reported as «پی».
         patterns.sort(key=lambda item: len(item[0]), reverse=True)
         self._banned_word_patterns = tuple(patterns)

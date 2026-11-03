@@ -289,6 +289,11 @@ def set_expiry(group_id, command, title=None, now=None):
     }
     if title:
         record["title"] = title
+    # پیام‌های «اعلام مهلت» قبلی (که هنوز در گروه هستند) همراه رکورد می‌مانند
+    # تا فراخوان بتواند پیش از تمدید پاک‌شان کند.
+    previous = data.get(_group_key(group_id))
+    if isinstance(previous, dict) and previous.get("notices"):
+        record["notices"] = list(previous["notices"])
     data = dict(data)
     data[_group_key(group_id)] = record
     _save(data)
@@ -505,6 +510,106 @@ def sync_records():
         _save(canonical)
     return len(canonical)
 
+
+
+# ---------------------------------------------------------------------------
+# پیام‌های «اعلام مهلت» — شناسه‌ها برای حذف خودکار در پایان مهلت
+# ---------------------------------------------------------------------------
+# چرا در همان رکورد؟ چون پیام اعلام و مهلت یک واقعیت واحدند: هر جا مهلت
+# عوض/پاک شود، پیام اعلامش هم باید پاک شود. ذخیره در فایل جدا یعنی دو
+# منبع حقیقت که می‌توانند از هم جدا بیفتند.
+NOTICE_LIMIT = 20
+
+
+def _notice_id(value):
+    """شناسهٔ پیام را از ورودی‌های مختلف (int/str/آبجکت پیام) می‌کشد."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    for attr in ("id", "message_id"):
+        candidate = getattr(value, attr, None)
+        if isinstance(candidate, int) and candidate > 0:
+            return candidate
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def notice_ids(group_id):
+    """شناسهٔ پیام‌های اعلام‌شدهٔ مهلت برای این گروه (بدون تغییر)."""
+    record = get_record(group_id)
+    if not record:
+        return []
+    result = []
+    for raw in record.get("notices") or []:
+        mid = _notice_id(raw)
+        if mid is not None and mid not in result:
+            result.append(mid)
+    return result
+
+
+def add_notice(group_id, message_id):
+    """ثبت شناسهٔ یک پیام «اعلام مهلت» تا در پایان مهلت پاک شود."""
+    mid = _notice_id(message_id)
+    if mid is None:
+        return False
+    data = _load()
+    keys = _equivalent_keys(data, group_id)
+    if not keys:
+        return False
+    data = dict(data)
+    changed = False
+    for key in keys:
+        record = data.get(key)
+        if not isinstance(record, dict):
+            continue
+        ids = [_notice_id(x) for x in (record.get("notices") or [])]
+        ids = [x for x in ids if x is not None and x != mid]
+        ids.append(mid)
+        record = dict(record)
+        record["notices"] = ids[-NOTICE_LIMIT:]
+        data[key] = record
+        changed = True
+    if not changed:
+        return False
+    _save(data)
+    return True
+
+
+def take_notices(group_id):
+    """شناسه‌های اعلام‌شده را برمی‌گرداند و از رکورد پاک می‌کند.
+
+    برای دو لحظه: تمدید مهلت (پیام کهنه باید برود) و رسیدن لحظهٔ انقضا.
+    اگر شناسه‌ای نمانده باشد، ``[]`` برمی‌گردد.
+    """
+    data = _load()
+    keys = _equivalent_keys(data, group_id)
+    if not keys:
+        return []
+    data = dict(data)
+    collected = []
+    changed = False
+    for key in keys:
+        record = data.get(key)
+        if not isinstance(record, dict):
+            continue
+        for raw in record.get("notices") or []:
+            mid = _notice_id(raw)
+            if mid is not None and mid not in collected:
+                collected.append(mid)
+        if record.get("notices"):
+            record = dict(record)
+            record["notices"] = []
+            data[key] = record
+            changed = True
+    if changed:
+        _save(data)
+    return collected
 
 # ---------------------------------------------------------------------------
 # ساخت پیام تأیید همراه با entity ها
