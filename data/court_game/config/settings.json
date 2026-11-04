@@ -1,0 +1,7 @@
+{
+  "join_seconds": 60,
+  "step_seconds": 120,
+  "punishment_seconds": 60,
+  "ai_timeout_seconds": 75,
+  "ai_retries": 1
+}

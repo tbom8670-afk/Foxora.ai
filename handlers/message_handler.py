@@ -2930,7 +2930,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "لاگ مدیریتی", "مین یاب", "بهترین جواب", "نبرد", "بخند یا بباز",
     "وضعیت ربات", "پینگ ربات", "کپی بورد", "کپی",
     "سایت بازی", "سایت", "لینک بازی", "/game", "/site",
-    "جعبه شانسی", "خون آشام", "خون‌آشام", "جرعت", "جرات", "جرئت",
+    "جعبه شانسی", "خون آشام", "خون‌آشام", "دادگاه", "دادگاه روباه", "جرعت", "جرات", "جرئت",
     "حقیقت", "حقیقت بگو", "ربات", "روباه", "/help", "!help", "help",
 }) | frozenset(command for command, _handler in RESERVED_COMMANDS) | FOX_GAME_COMMANDS | EMOJI_RESET_COMMANDS
 
@@ -3247,6 +3247,25 @@ async def handle_new_message(bot, event):
         _capture_big_spam_message(
             bot, chat_id, user_id, getattr(event.message, "id", None)
         )
+        # ⚖️ مجازات دادگاه روباه: اگر پنجرهٔ ۶۰ ثانیه‌ایِ متهمِ محکوم باز
+        # باشد، همین پیام (و فقط همین پیامِ همین کاربر در همین گروه) به
+        # صف حذف موجود ربات سپرده می‌شود. تابع sync و بدون RPC است، پس
+        # مسیر پیام کند نمی‌شود؛ هیچ پیامی از کاربران دیگر لمس نمی‌شود.
+        try:
+            from modules.court_game import punishment as _court_punishment
+            _court_punishment.observe_message(
+                bot, event, chat_id, user_id,
+                getattr(getattr(event, "message", None), "id", None),
+            )
+        except Exception as _court_punish_error:
+            try:
+                bot.logger.log_error(
+                    "COURT PUNISHMENT OBSERVE FAILED "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"error={_court_punish_error!r}"
+                )
+            except Exception:
+                pass
         # پیام‌های معمولیِ اکانت سشن نباید وارد moderation شوند، اما همین
         # اکانت در سروش نقش رابط ربات را هم دارد و مالک با آن «راهنما» و
         # «روباه» را می‌فرستد. بازگرداندنِ همهٔ event.out ها باعث می‌شد فقط
@@ -6302,6 +6321,8 @@ async def handle_new_message(bot, event):
                 "درست گاز بزن تا زنده بمونی و همه رو زامبی کنی\n\n"
                 "🕵️ کارگاه\n"
                 "حل پرونده و پیدا کردن دزد.\n\n"
+                "⚖️ دادگاه روباه\n"
+                "پرونده شکایت رو حل کن و برنده شو\n\n"
                 "😄 جک\n"
                 "با ارسال «جک»، یک جوک یا لطیفه خنده‌دار دریافت کن.\n"
                 "برای بازی خصوصی و انلاین بنویسید 🪄\n"
@@ -6339,6 +6360,8 @@ async def handle_new_message(bot, event):
                 "بمب ساعتی",
                 "زامبی",
                 "🕵️ کارگاه",
+                "⚖️ دادگاه روباه",
+                "پرونده شکایت رو حل کن و برنده شو",
                 "😄 جک",
                 "با ارسال «جک»، یک جوک یا لطیفه خنده‌دار دریافت کن.",
                 "برای بازی خصوصی و انلاین بنویسید",

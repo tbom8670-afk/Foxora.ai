@@ -40,6 +40,8 @@ from modules.fox_games.session_core import (
     normalize_text,
     to_persian_digits,
 )
+# ⚖️ دادگاه روباه — بازی مستقل، وصل‌شده از همین روتر (بدون سیستم موازی).
+from handlers import court_game_router
 # 🎮 گارد لایهٔ دوم: اگر این روتر روزی از مسیری غیر از هندلر اصلی صدا زده
 # شود، بازیِ خاموش باز هم اجرا نمی‌شود. هیچ state یا تایمری پیش از این
 # گارد ساخته نمی‌شود.
@@ -62,6 +64,8 @@ FOX_GAME_COMMANDS = frozenset({
     "کارگاه",
     "زامبی",
     "گروه آخرالزمان",
+    "دادگاه",
+    "دادگاه روباه",
     "شرکت",
 })
 
@@ -100,6 +104,7 @@ def active_game_count(chat_id):
         count += 1
     if zombie.is_active(chat_id):
         count += 1
+    count += court_game_router.active_count(chat_id)
     return count
 
 
@@ -1020,6 +1025,45 @@ async def _battle_message(bot, event, chat_id, user_id, sender, text, logger):
 
 
 # ---------------------------------------------------------------------------
+# ⚖️ دادگاه روباه — بازی ۵ نفره با قاضی هوش مصنوعی
+#
+# بازی مستقل خودش را دارد (``modules/court_game``) و فقط از همین روتر
+# صداش می‌زنیم؛ پس هیچ مسیر موازی و هیچ state دوم ساخته نمی‌شود.
+# ---------------------------------------------------------------------------
+COURT_JOINING_GAMES = (survival, vampire, karagah, zombie, battle)
+
+
+def court_other_game_active(chat_id):
+    """آیا بازی Fox دیگری (به‌جز دادگاه) در این گروه فعال است؟"""
+    return (active_game_count(chat_id)
+            - court_game_router.active_count(chat_id)) > 0
+
+
+def court_other_joining(chat_id):
+    """آیا بازی دیگری در همین گروه در حال ثبت‌نام است؟
+
+    در آن صورت «شرکت» را برای دادگاه برنمی‌داریم تا ثبت‌نام دو بازی
+    قاطی نشود.
+    """
+    for module in COURT_JOINING_GAMES:
+        try:
+            if module.is_active(chat_id) and module.phase(chat_id) == "joining":
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _court_message(bot, event, chat_id, user_id, sender, text, logger):
+    if not court_game_router.is_active(chat_id):
+        return False
+    return await court_game_router.handle_message(
+        bot, event, chat_id, user_id, sender, text, logger,
+        other_game_joining=lambda: court_other_joining(chat_id),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -1375,6 +1419,18 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         normalize_text("نبرد"): (battle, lambda b, e, c, l: _start_battle(b, e, c, user_id, sender, l)),
         normalize_text("کارگاه"): (karagah, _start_karagah),
         normalize_text("زامبی"): (zombie, _start_zombie),
+        normalize_text("دادگاه"): (
+            court_game_router,
+            lambda b, e, c, l: court_game_router.start_game(
+                b, e, c, user_id, sender, l,
+                other_game_active=lambda: court_other_game_active(c)),
+        ),
+        normalize_text("دادگاه روباه"): (
+            court_game_router,
+            lambda b, e, c, l: court_game_router.start_game(
+                b, e, c, user_id, sender, l,
+                other_game_active=lambda: court_other_game_active(c)),
+        ),
     }
 
     if command in start_games:
@@ -1391,6 +1447,7 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
 
     # پیام‌های درون‌بازی — هر بازی فقط session خودش را می‌بینند.
     for responder in (
+        _court_message,
         _laugh_message, _survival_message, _lucky_box_message, _vampire_message,
         _maemma_message, _sentence_guess_message, _minesweeper_message,
         _best_answer_message, _battle_message, _karagah_message, _zombie_message,
@@ -1412,3 +1469,4 @@ def reset_all(chat_id=None):
     battle.reset_all(chat_id)
     karagah.reset_all(chat_id)
     zombie.reset_all(chat_id)
+    court_game_router.reset_all(chat_id)

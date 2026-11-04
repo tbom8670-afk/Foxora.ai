@@ -1,0 +1,502 @@
+# -*- coding: utf-8 -*-
+"""⚖️ اتصال بازی «دادگاه روباه» به ربات.
+
+این فایل تنها نقطهٔ تماس بازی با ربات است و عمداً نازک نگه داشته شده:
+هیچ state اینجا زندگی نمی‌کند (همه در ``modules/court_game/game.py``)،
+هیچ تصمیمی دربارهٔ اقتصاد یا مجازات گرفته نمی‌شود مگر با استفاده از
+زیرساخت موجود ربات:
+
+* **اقتصاد:** ``economy.award_game`` با ``reference`` یکتای هر پرونده
+  (همان APIای که همهٔ بازی‌های Fox استفاده می‌کنند).
+* **مجازات:** ``bot.message_delete_queue`` از مسیر
+  ``modules/court_game/punishment.py``.
+* **نمایش:** کل متن Bold + نقل‌قول شیشه‌ای سروش پلاس (``texts``).
+
+مسیر صدا زدن: ``handlers/fox_games_router.handle`` → این ماژول.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from modules.court_game import ai_judge, game, punishment, storage, texts
+from modules.fox_games.session_core import log, log_error, normalize_text
+
+GAME_KEY = "court"
+REWARD_CASE = {
+    ai_judge.VERDICT_DEFENDANT: "court_acquittal",   # ۱۳ سکه برنز به متهم
+    ai_judge.VERDICT_PLAINTIFF: "court_conviction",  # ۲۰ سکه برنز به شاکی
+}
+
+_RECOVERED = [False]
+
+
+# ---------------------------------------------------------------------------
+# ابزارهای ارسال
+# ---------------------------------------------------------------------------
+def ensure_ready(logger=None):
+    """یک‌بار: ساخت پوشه‌ها، تنظیمات پیش‌فرض و بازیابی پرونده‌های نیمه‌کاره."""
+    if _RECOVERED[0]:
+        return
+    _RECOVERED[0] = True
+    try:
+        storage.ensure_dirs()
+        storage.write_default_settings()
+        summary = storage.recover()
+        if summary.get("sessions"):
+            log(logger, "COURT RECOVERY sessions=%d cases=%d punishments=%d"
+                % (summary["sessions"], summary["cases"],
+                   summary["punishments"]))
+    except Exception as error:  # pragma: no cover
+        log_error(logger, f"COURT RECOVERY FAILED error={error!r}")
+
+
+async def send_quoted(bot, event, chat_id, text):
+    """ارسال پیام دادگاه: همهٔ متن Bold و داخل نقل‌قول شیشه‌ای."""
+    if not text:
+        return None
+    entities = texts.full_quote_entities(text)
+    if event is not None:
+        try:
+            return await event.reply(text, formatting_entities=entities)
+        except Exception as error:
+            log_error(getattr(bot, "logger", None),
+                      f"COURT REPLY FAILED chat_id={chat_id} error={error!r}")
+            try:
+                return await event.reply(text)
+            except Exception:
+                pass
+    client = getattr(bot, "client", None)
+    if client is not None and getattr(bot, "logger", None) is not None:
+        try:
+            return await client.send_message(
+                chat_id, text, formatting_entities=entities)
+        except Exception:
+            try:
+                return await client.send_message(chat_id, text)
+            except Exception:
+                pass
+    return None
+
+
+async def _bot_username(bot):
+    cached = getattr(bot, "_court_bot_username", None)
+    if cached:
+        return cached
+    me = getattr(bot, "me", None)
+    if me is None:
+        try:
+            me = await bot.client.get_me()
+        except Exception:
+            me = None
+    username = str(getattr(me, "username", "") or "").strip().lstrip("@")
+    value = f"@{username}" if username else (
+        getattr(me, "first_name", None) or "ربات")
+    try:
+        bot._court_bot_username = value
+    except Exception:
+        pass
+    return value
+
+
+# ---------------------------------------------------------------------------
+# اقتصاد و مجازات (روی زیرساخت موجود)
+# ---------------------------------------------------------------------------
+def _pay(bot, chat_id, user_id, amount, game_key, reference, name=None,
+         logger=None):
+    """پرداخت جایزه از سیستم بانک فعلی؛ ``reference`` از پرداخت دوباره جلوگیری می‌کند."""
+    override = getattr(bot, "award_coins", None)
+    try:
+        if override is not None:
+            balance = override(chat_id, user_id, name, amount)
+        else:
+            from economy import award_game as economy_award_game
+            balance = economy_award_game(
+                chat_id, user_id, game_key,
+                reference=reference, name=name, amount=amount,
+            )
+        log(logger, f"COURT REWARD PAID chat_id={chat_id} user_id={user_id} "
+                    f"game={game_key} amount={amount} balance={balance} "
+                    f"reference={reference}")
+        return True
+    except Exception as error:
+        log_error(logger, f"COURT REWARD FAILED chat_id={chat_id} "
+                          f"user_id={user_id} amount={amount} "
+                          f"reference={reference} error={error!r}")
+        return False
+
+
+def reward_amount(verdict_key) -> int:
+    """مقدار جایزه از جدول واحد ``economy.rewards`` (نه عدد جادویی)."""
+    from economy import rewards
+    return rewards.amount_for(REWARD_CASE[verdict_key])
+
+
+async def _start_punishment(bot, event, chat_id, case, verdict, logger=None):
+    """اعلام حکم و اجرای مجازات ۶۰ ثانیه‌ای متهم."""
+    defendant_id = verdict["defendant_user_id"]
+    defendant_display = verdict.get("defendant_display") or "متهم"
+    seconds = storage.settings()["punishment_seconds"]
+    await send_quoted(bot, event, chat_id,
+                      texts.punishment_notice(defendant_display))
+    stats = punishment.start(chat_id, defendant_id, verdict["case_id"],
+                             seconds=seconds)
+    log(logger, f"COURT PUNISH START chat_id={chat_id} "
+                f"user_id={defendant_id} seconds={seconds} "
+                f"case_id={verdict['case_id']}")
+    case_id = verdict["case_id"]
+
+    async def _finish_later():
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            raise
+        final = punishment.finish(chat_id, defendant_id) or stats
+        summary = punishment.summary(final)
+        log(logger, f"COURT PUNISH END chat_id={chat_id} "
+                    f"deleted={summary['deleted']} failed={summary['failed']} "
+                    f"observed={summary['observed']} status={summary['status']}")
+        await send_quoted(bot, event, chat_id,
+                          punishment.report_text(final))
+        try:
+            current = storage.read_case(case_id) or {}
+            current["punishment"] = summary
+            storage.write_case(current)
+            result = storage.read_result(case_id) or {}
+            result["punishment"] = summary
+            storage.write_result(case_id, result)
+        except Exception as error:
+            log_error(logger, f"COURT PUNISH PERSIST FAILED {error!r}")
+
+    return asyncio.create_task(_finish_later(), name=f"court-punish:{case_id}")
+
+
+# ---------------------------------------------------------------------------
+# تحلیل پس‌زمینهٔ هر پیام (بدون هیچ پاسخی به کاربران)
+# ---------------------------------------------------------------------------
+def _schedule_analysis(bot, case_snapshot, entry, logger=None):
+    async def _run():
+        if not ai_judge.is_configured():
+            return
+        try:
+            record = await ai_judge.analyze_message(case_snapshot, entry, logger)
+        except Exception as error:
+            log_error(logger, f"COURT AI ANALYSIS FAILED "
+                              f"case_id={case_snapshot.get('case_id')} "
+                              f"order={entry.get('order')} error={error!r}")
+            return
+        if record:
+            storage.append_ai_log(case_snapshot.get("case_id"), record)
+
+    try:
+        return asyncio.create_task(
+            _run(), name=f"court-ai:{entry.get('order')}")
+    except RuntimeError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# رأی نهایی
+# ---------------------------------------------------------------------------
+async def _run_judging(bot, event, chat_id, case, logger=None):
+    """فراخوانی قاضی هوش مصنوعی، اعتبارسنجی، پرداخت و اعلام رأی."""
+    await send_quoted(bot, event, chat_id, texts.judging())
+    try:
+        verdict, raw = await ai_judge.judge_case(case, logger)
+    except ai_judge.JudgeError as error:
+        log_error(logger, f"COURT JUDGE INVALID case_id={case.get('case_id')} "
+                          f"error={error!r}")
+        storage.append_ai_log(case.get("case_id"), {
+            "stage": "verdict",
+            "error": str(error),
+            "at": storage.now_iso(),
+        })
+        payment = {"status": "skipped", "reason": "invalid_ai_response"}
+        try:
+            current = storage.read_case(case.get("case_id")) or {}
+            current["verdict"] = None
+            current["judge_error"] = str(error)
+            current["payment"] = payment
+            storage.write_case(current)
+            game.set_payment(chat_id, payment, logger)
+            game.mark_judge_error(chat_id, str(error), logger)
+        except Exception as persist_error:
+            log_error(logger, f"COURT ERROR PERSIST FAILED {persist_error!r}")
+        await send_quoted(bot, event, chat_id, texts.ai_error())
+        return None
+
+    storage.append_ai_log(case.get("case_id"), {
+        "stage": "verdict",
+        "at": storage.now_iso(),
+        "verdict": verdict,
+        "raw": raw,
+    })
+    log(logger, f"COURT VERDICT chat_id={chat_id} case_id={verdict['case_id']} "
+                f"verdict={verdict['verdict']} winner={verdict['winner_user_id']} "
+                f"confidence={verdict['confidence']}")
+
+    reasons = [verdict["reason_1"], verdict["reason_2"], verdict["reason_3"]]
+    amount = reward_amount(verdict["verdict"])
+    reference = f"court:{verdict['case_id']}:{verdict['winner_user_id']}"
+
+    already_paid = False
+    try:
+        stored = storage.read_case(verdict["case_id"]) or {}
+        already_paid = (stored.get("payment") or {}).get("status") == "paid"
+    except Exception:
+        already_paid = False
+
+    paid = False
+    if not already_paid:
+        paid = _pay(bot, chat_id, verdict["winner_user_id"], amount,
+                    REWARD_CASE[verdict["verdict"]], reference,
+                    name=verdict.get("winner_display"), logger=logger)
+        payment = {
+            "status": "paid" if paid else "failed",
+            "amount": amount,
+            "coin": "bronze",
+            "user_id": verdict["winner_user_id"],
+            "reference": reference,
+            "at": storage.now_iso(),
+        }
+    else:
+        payment = {
+            "status": "paid",
+            "amount": amount,
+            "coin": "bronze",
+            "user_id": verdict["winner_user_id"],
+            "reference": reference,
+            "note": "already_paid",
+        }
+        paid = True
+
+    try:
+        current = storage.read_case(verdict["case_id"]) or {}
+        current["verdict"] = verdict
+        current["payment"] = payment
+        storage.write_case(current)
+        game.set_payment(chat_id, payment, logger)
+    except Exception as error:
+        log_error(logger, f"COURT VERDICT PERSIST FAILED {error!r}")
+
+    if verdict["verdict"] == ai_judge.VERDICT_DEFENDANT:
+        body = texts.verdict_acquittal(
+            verdict.get("defendant_display") or "متهم", reasons, amount)
+    else:
+        body = texts.verdict_conviction(
+            verdict.get("plaintiff_display") or "شاکی", reasons, amount)
+
+    if not paid:
+        body = body + "\n" + texts.reward_failed()
+        log_error(logger, f"COURT REWARD NOT PAID case_id="
+                          f"{verdict['case_id']} reference={reference}")
+
+    await send_quoted(bot, event, chat_id, body)
+
+    if verdict["verdict"] == ai_judge.VERDICT_PLAINTIFF and paid:
+        try:
+            await _start_punishment(bot, event, chat_id, case, verdict, logger)
+        except Exception as error:
+            log_error(logger, f"COURT PUNISH START FAILED {error!r}")
+    return verdict
+
+
+# ---------------------------------------------------------------------------
+# چرخهٔ بازی
+# ---------------------------------------------------------------------------
+def _callbacks(bot, event, chat_id, logger):
+    async def on_cancel(reason, count=0, role_label=None):
+        if reason == "not_enough_players":
+            await send_quoted(bot, event, chat_id,
+                              texts.not_enough_players(count,
+                                                       game.REQUIRED_PLAYERS))
+        elif reason == "step_timeout":
+            await send_quoted(bot, event, chat_id,
+                              texts.step_timeout(role_label or "بازیکن"))
+        else:
+            log_error(logger, f"COURT CANCEL chat_id={chat_id} reason={reason}")
+
+    async def on_start(case, roster):
+        await send_quoted(bot, event, chat_id,
+                          texts.roster_message(case.get("court"), roster))
+        log(logger, f"COURT TRIAL STARTED chat_id={chat_id} "
+                    f"case_id={case.get('case_id')}")
+
+    async def on_prompt(phase, text):
+        await send_quoted(bot, event, chat_id, text)
+
+    async def on_judging(case):
+        session = game.session_of(chat_id)
+        session_id = (session or {}).get("session_id")
+        verdict = None
+        try:
+            verdict = await _run_judging(bot, event, chat_id, case, logger)
+        finally:
+            if session_id is not None:
+                game.finish(chat_id, session_id, verdict, logger,
+                            status=(None if verdict else "judge_error"))
+
+    async def bot_username():
+        return await _bot_username(bot)
+
+    return {
+        "on_cancel": on_cancel,
+        "on_start": on_start,
+        "on_prompt": on_prompt,
+        "on_judging": on_judging,
+        "bot_username": bot_username,
+    }
+
+
+# ---------------------------------------------------------------------------
+# نقطهٔ ورود از روتر بازی‌ها
+# ---------------------------------------------------------------------------
+def is_active(chat_id) -> bool:
+    return game.is_active(chat_id)
+
+
+def active_count(chat_id) -> int:
+    return 1 if game.is_active(chat_id) else 0
+
+
+def phase(chat_id):
+    return game.phase(chat_id)
+
+
+async def start_game(bot, event, chat_id, user_id, sender, logger=None,
+                     other_game_active=None):
+    """دستور «دادگاه»: ساخت پروندهٔ جدید و باز کردن ثبت‌نام."""
+    ensure_ready(logger)
+    if getattr(event, "is_private", False):
+        await send_quoted(bot, event, chat_id, texts.private_only())
+        return True
+    if game.is_active(chat_id):
+        await send_quoted(bot, event, chat_id, texts.already_running())
+        return True
+    if other_game_active is not None and other_game_active():
+        await send_quoted(bot, event, chat_id, texts.other_game_running())
+        return True
+
+    settings = storage.settings()
+    session = game.start(chat_id, logger=logger, group_event=event)
+    if session is None:
+        await send_quoted(bot, event, chat_id, texts.already_running())
+        return True
+
+    await send_quoted(bot, event, chat_id,
+                      texts.join_prompt(game.REQUIRED_PLAYERS,
+                                        settings["join_seconds"]))
+    game.schedule(chat_id, session["session_id"],
+                  _callbacks(bot, event, chat_id, logger),
+                  logger=logger,
+                  join_seconds=settings["join_seconds"],
+                  step_seconds=settings["step_seconds"])
+    log(logger, f"COURT GAME START chat_id={chat_id} user_id={user_id}")
+    return True
+
+
+async def handle_message(bot, event, chat_id, user_id, sender, text,
+                         logger=None, other_game_joining=None):
+    """پیام‌های درون‌بازی: «شرکت» و متن مراحل پرونده."""
+    if not game.is_active(chat_id):
+        return False
+    ensure_ready(logger)
+    phase = game.phase(chat_id)
+    normalized = normalize_text(text)
+
+    if phase == game.PHASE_JOINING:
+        if normalized != normalize_text(game.JOIN_WORD):
+            return False
+        # اگر بازی دیگری هم در همین گروه در حال ثبت‌نام است، «شرکت» را
+        # نمی‌بلعیم تا هر بازی ثبت‌نام خودش را داشته باشد.
+        if other_game_joining is not None and other_game_joining():
+            return False
+        result, players = game.join(chat_id, user_id, sender, logger)
+        if result == "joined":
+            await send_quoted(bot, event, chat_id,
+                              texts.join_confirmed(len(players),
+                                                   game.REQUIRED_PLAYERS))
+        elif result == "duplicate":
+            await send_quoted(bot, event, chat_id, texts.join_duplicate())
+        elif result == "full":
+            await send_quoted(bot, event, chat_id, texts.join_full())
+        return True
+
+    # دستورهای خود ربات هرگز به‌عنوان «متن پرونده» بلعیده نمی‌شوند؛
+    # بازی‌ها و فرمان‌های موجود ربات باید در طول دادگاه هم کار کنند.
+    if _is_bot_command(text):
+        return False
+
+    # مراحل متنی: فقط بازیکنِ نوبت‌دار و فقط یک بار.
+    message_id = getattr(getattr(event, "message", None), "id", None)
+    status, info = game.submit(chat_id, user_id, text, message_id, logger)
+
+    if status == "not_active":
+        return False
+    if status == "wrong_user":
+        # پیام دیگران در گروه عادی ادامه پیدا می‌کند؛ فقط اگر خودِ بازیکن
+        # بازی باشد یک یادآوری کوتاه می‌دهیم تا سردرگم نشود.
+        if user_id in _player_ids(chat_id):
+            await send_quoted(bot, event, chat_id,
+                              texts.wrong_turn(info["role_label"]))
+            return True
+        return False
+    if status == "empty":
+        await send_quoted(bot, event, chat_id, texts.too_short())
+        return True
+    if status == "invalid":
+        await send_quoted(bot, event, chat_id, texts.crime_invalid())
+        return True
+    if status == "limit":
+        session = game.session_of(chat_id)
+        game.cancel(chat_id, (session or {}).get("session_id"),
+                    "invalid_choices", logger)
+        await send_quoted(bot, event, chat_id,
+                          texts.too_many_invalid(game.MAX_INVALID_CHOICES))
+        return True
+    if status == "recorded":
+        entry = (info["case"]["entries"] or [None])[-1]
+        # انتخاب جرم یک «گزینش» است نه متن پرونده؛ برای آن تأیید ثبت
+        # فرستاده نمی‌شود و بلافاصله درخواست شرح شکایت می‌آید.
+        if entry and entry.get("kind") != "crime_choice":
+            await send_quoted(bot, event, chat_id, texts.recorded())
+        if entry:
+            _schedule_analysis(bot, info["case"], entry, logger)
+        return True
+    return False
+
+
+_COMMAND_LIKE = frozenset({
+    "لیست بازی", "لیست بازی ها", "راهنما", "موجودی", "فروشگاه", "رتبه ها",
+    "امتیاز من", "آمارم", "اصلم", "قوانین", "جک", "دانستنی",
+})
+
+
+def _is_bot_command(text) -> bool:
+    """آیا متن، دستور خود ربات است (نه متن پرونده)؟"""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith(("!", "/", ".")):
+        return True
+    normalized = normalize_text(raw)
+    if normalized in _COMMAND_LIKE:
+        return True
+    try:
+        from modules import entertainment_control
+        if entertainment_control.is_game_command(raw):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _player_ids(chat_id):
+    session = game.session_of(chat_id) or {}
+    return {int(p.get("user_id") or 0) for p in session.get("players", [])}
+
+
+def reset_all(chat_id=None):
+    game.reset_all(chat_id)
+    punishment.reset_all()
+    if chat_id is None:
+        _RECOVERED[0] = False

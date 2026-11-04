@@ -69,8 +69,24 @@ modules/         ماژول‌ها: runtime_paths, rpc_governor, moderation_queu
                  fair_delete_queue (قابلیت‌های محفوظ Foxora) و…
 economy/         سکه/فروشگاه/رتبه‌بندی
 tests/           ~۱۱۰ تست B2 + تست‌های Foxora (مسیر/صف/لاگ/pacing)
+modules/court_game/   بازی «دادگاه روباه» (پرونده، قاضی AI، مجازات)
+data/court_game/      دادهٔ دائمی دادگاه روباه (cases/sessions/ai_logs/results/config)
 docs/FOXORA_PRESERVED_FEATURES.md   نگاشت دقیق قابلیت‌های حفظ‌شده
 ```
+
+## ⚖️ دادگاه روباه (بازی جدید)
+
+بازی گروهی ۵ نفره با قاضی هوش مصنوعی: `دادگاه` → ثبت‌نام با `شرکت` →
+تخصیص تصادفی نقش‌ها (شاکی، متهم، شاهد شاکی، شاهد متهم، وکیل) → انتخاب جرم →
+شکایت → دفاع → دو شهادت → دفاعیهٔ وکیل → رأی هوش مصنوعی → ۱۳ سکه برنز
+(تبرئه) یا ۲۰ سکه برنز (محکومیت) + مجازات ۶۰ ثانیه‌ای حذف پیام متهم.
+
+* دادهٔ بازی داخل خود پروژه: `data/court_game/{cases,sessions,ai_logs,results,config}`
+* اقتصاد و مجازات از سیستم موجود ربات استفاده می‌کنند (بدون کیف پول/صف جدید)
+* قاضی: Cloudflare Workers AI با مدل `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
+  (کلیدها فقط در `.env`؛ هیچ کلیدی در کد نیست)
+* مستندات کامل: [`docs/COURT_GAME.md`](docs/COURT_GAME.md)
+* تست: `python3 tests/test_court_game.py`
 
 ## قابلیت‌های حفظ‌شده از Foxora قبلی
 

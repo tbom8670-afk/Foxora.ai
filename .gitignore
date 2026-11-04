@@ -30,3 +30,10 @@ backups/runtime/
 config/tmp*.tmp
 
 # .bot_instance برای Foxora عمداً commit می‌شود: identity همین مخزن است.
+
+# ⚖️ دادگاه روباه — دادهٔ اجرایی پرونده‌ها (نه مخزن؛ ساختار پوشه می‌ماند)
+data/court_game/cases/*
+data/court_game/sessions/*
+data/court_game/ai_logs/*
+data/court_game/results/*
+!data/court_game/*/.gitkeep
