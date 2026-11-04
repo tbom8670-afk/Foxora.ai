@@ -91,6 +91,9 @@ docs/FOXORA_PRESERVED_FEATURES.md   نگاشت دقیق قابلیت‌های ح
 * اقتصاد و مجازات از سیستم موجود ربات استفاده می‌کنند (بدون کیف پول/صف جدید)
 * قاضی: Cloudflare Workers AI با مدل `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
   (کلیدها فقط در `.env`؛ هیچ کلیدی در کد نیست)
+* **پرونده هیچ‌وقت بی‌رأی نمی‌ماند:** اگر سرویس خطا بدهد یا سهمیهٔ روزانهٔ
+  Workers AI تمام شود، «قاضی داخلی» با تحلیل محتوایی پرونده رأی می‌دهد و
+  جایزه پرداخت می‌شود (جزئیات در `docs/COURT_GAME.md`)
 * مستندات کامل: [`docs/COURT_GAME.md`](docs/COURT_GAME.md)
 * تست: `python3 tests/test_court_game.py` و `python3 tests/test_court_join_all_users.py`
 

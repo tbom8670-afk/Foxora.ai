@@ -206,22 +206,36 @@ async def _run_judging(bot, event, chat_id, case, logger=None):
     try:
         verdict, raw = await ai_judge.judge_case(case, logger)
     except ai_judge.JudgeError as error:
+        # حتی اگر مدل/سرویس خطا بدهد، پرونده بی‌رأی نمی‌ماند: قاضی داخلی
+        # رأی می‌دهد و جایزه مثل همیشه پرداخت می‌شود.
         log_error(logger, f"COURT JUDGE INVALID case_id={case.get('case_id')} "
-                          f"error={error!r}")
+                          f"error={error!r} — قاضی داخلی فعال شد")
+        try:
+            verdict = ai_judge.local_verdict(case, str(error))
+            verdict["model"] = "local-fallback"
+            raw = {"fallback": True, "error": str(error)}
+            log(logger, f"COURT LOCAL VERDICT case_id={verdict['case_id']} "
+                        f"verdict={verdict['verdict']}")
+        except Exception as fallback_error:
+            log_error(logger, "COURT LOCAL VERDICT FAILED "
+                              f"case_id={case.get('case_id')} "
+                              f"error={fallback_error!r}")
+            verdict = None
+    if verdict is None:
         storage.append_ai_log(case.get("case_id"), {
             "stage": "verdict",
-            "error": str(error),
+            "error": "no_verdict",
             "at": storage.now_iso(),
         })
         payment = {"status": "skipped", "reason": "invalid_ai_response"}
         try:
             current = storage.read_case(case.get("case_id")) or {}
             current["verdict"] = None
-            current["judge_error"] = str(error)
+            current["judge_error"] = "no_verdict"
             current["payment"] = payment
             storage.write_case(current)
             game.set_payment(chat_id, payment, logger)
-            game.mark_judge_error(chat_id, str(error), logger)
+            game.mark_judge_error(chat_id, "no_verdict", logger)
         except Exception as persist_error:
             log_error(logger, f"COURT ERROR PERSIST FAILED {persist_error!r}")
         await send_quoted(bot, event, chat_id, texts.ai_error())
@@ -281,12 +295,16 @@ async def _run_judging(bot, event, chat_id, case, logger=None):
     except Exception as error:
         log_error(logger, f"COURT VERDICT PERSIST FAILED {error!r}")
 
+    note = (texts.FALLBACK_NOTE
+            if verdict.get("source") == ai_judge.SOURCE_FALLBACK else None)
     if verdict["verdict"] == ai_judge.VERDICT_DEFENDANT:
         body = texts.verdict_acquittal(
-            verdict.get("defendant_display") or "متهم", reasons, amount)
+            verdict.get("defendant_display") or "متهم", reasons, amount,
+            note=note)
     else:
         body = texts.verdict_conviction(
-            verdict.get("plaintiff_display") or "شاکی", reasons, amount)
+            verdict.get("plaintiff_display") or "شاکی", reasons, amount,
+            note=note)
 
     if not paid:
         body = body + "\n" + texts.reward_failed()

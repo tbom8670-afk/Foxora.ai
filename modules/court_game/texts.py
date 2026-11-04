@@ -272,7 +272,11 @@ def ai_error() -> str:
     ])
 
 
-def verdict_acquittal(defendant_display, reasons, coins) -> str:
+FALLBACK_NOTE = ("⚠️ سرویس داوری هوش مصنوعی در دسترس نبود؛ رأی بر پایهٔ "
+                 "بررسی خودکار متن پرونده صادر شد.")
+
+
+def verdict_acquittal(defendant_display, reasons, coins, note=None) -> str:
     lines = [
         "⚖️ رأی نهایی دادگاه روباه",
         f"کاربر متهم: {defendant_display}",
@@ -285,11 +289,13 @@ def verdict_acquittal(defendant_display, reasons, coins) -> str:
                  for index, reason in enumerate(reasons, 1))
     lines.append("نتیجه: دادگاه روباه رأی به بی‌گناهی متهم صادر کرد.")
     lines.append(f"🎁 جایزه: {persian_digits(coins)} سکه برنز به متهم تعلق گرفت.")
+    if note:
+        lines.append(note)
     lines.append("⚠️ این یک بازی نمایشی است و رأی دادگاه سند اثبات جرم واقعی نیست.")
     return "\n".join(lines)
 
 
-def verdict_conviction(plaintiff_display, reasons, coins) -> str:
+def verdict_conviction(plaintiff_display, reasons, coins, note=None) -> str:
     lines = [
         "⚖️ رأی نهایی دادگاه روباه",
         f"کاربر شاکی: {plaintiff_display}",
@@ -302,6 +308,8 @@ def verdict_conviction(plaintiff_display, reasons, coins) -> str:
                  for index, reason in enumerate(reasons, 1))
     lines.append("نتیجه: دادگاه روباه رأی به محکومیت متهم صادر کرد.")
     lines.append(f"🎁 جایزه: {persian_digits(coins)} سکه برنز به شاکی تعلق گرفت.")
+    if note:
+        lines.append(note)
     lines.append("⚠️ این یک بازی نمایشی است و رأی دادگاه سند اثبات جرم واقعی نیست.")
     return "\n".join(lines)
 

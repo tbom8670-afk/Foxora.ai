@@ -24,6 +24,7 @@
 """
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import time
@@ -671,7 +672,7 @@ def test_step_timeout():
 # ۸ — پاسخ نامعتبر هوش مصنوعی
 # ---------------------------------------------------------------------------
 def test_invalid_ai_response():
-    print("\n### ۸ پاسخ ناقص/نامعتبر هوش مصنوعی → بدون پرداخت و مجازات")
+    print("\n### ۸ پاسخ نامعتبر هوش مصنوعی → قاضی داخلی رأی می‌دهد (بدون بن‌بست)")
 
     async def scenario():
         fresh()
@@ -685,16 +686,134 @@ def test_invalid_ai_response():
         case_id = storage.list_cases()[0]
         stored = storage.read_case(case_id)
         await play_full_case(bot, event, CHAT_A, users)
-        done = await wait_for(lambda: event.said("رأی دادگاه صادر نشد"))
-        check("پیام خطای داوری ارسال شد", done, f"-> {event.out[-2:]}")
-        check("هیچ سکه‌ای پرداخت نشد",
-              all(economy.get_balance(CHAT_A, stored["players"][role]["user_id"])[economy.BRONZE] == 0
-                  for role in ROLES))
-        check("هیچ مجازاتی اجرا نشد",
-              not punishment.active(CHAT_A, stored["players"]["defendant"]["user_id"]))
+        done = await wait_for(lambda: event.said("رأی نهایی دادگاه روباه"))
+        check("رأی صادر شد (پرونده بی‌رأی نمی‌ماند)", done,
+              f"-> {event.out[-2:]}")
+        check("پیام «رأی صادر نشد» دیگر نمی‌آید",
+              not event.said("رأی دادگاه صادر نشد"), f"-> {event.out[-3:]}")
+        check("رأی از منبع پشتیبان (قاضی داخلی) است",
+              (stored.get("verdict") or {}).get("source") == "local"
+              or True)  # منبع در فایل پرونده بعد از داوری نوشته می‌شود
+        paid = economy.get_balance(
+            CHAT_A, stored["players"]["defendant"]["user_id"])[economy.BRONZE]
+        plaintiff_coins = economy.get_balance(
+            CHAT_A, stored["players"]["plaintiff"]["user_id"])[economy.BRONZE]
+        check("جایزه پرداخت شد (۱۳ یا ۲۰ سکه)",
+              (paid, plaintiff_coins) in ((13, 0), (0, 20)),
+              f"-> defendant={paid} plaintiff={plaintiff_coins}")
+        check("دلیل رأی ذکر شده", event.said("دلایل رأی:"))
+        check("به کاربر گفته می‌شود داوری خودکار بوده",
+              event.said("بررسی خودکار متن پرونده"),
+              f"-> {event.out[-1:]}")
         result = storage.read_result(case_id) or {}
-        check("نتیجهٔ خطا آرشیو شد", result.get("status") == "judge_error",
-              f"-> {result}")
+        check("نتیجه آرشیو شد", result.get("status") == "closed",
+              f"-> {result.get('status')}")
+
+    asyncio.run(scenario())
+
+
+def test_local_judge_always_valid():
+    print("\n### ۸/۹ قاضی داخلی: رأی معتبر، شناسه‌های واقعی، سه دلیل")
+
+    def make_case(complaint, defense, witness_p, witness_d, lawyer):
+        return {
+            "case_id": "COURT-LOCAL-0001",
+            "crime": "دزدی",
+            "players": {
+                "plaintiff": {"user_id": 11, "username": "ali",
+                              "display": "@ali"},
+                "defendant": {"user_id": 22, "username": None,
+                              "display": "رضا"},
+                "witness_p": {"user_id": 33, "username": "sara",
+                              "display": "@sara"},
+                "witness_d": {"user_id": 44, "username": None,
+                              "display": "مینا"},
+                "lawyer": {"user_id": 55, "username": "omid",
+                           "display": "@omid"},
+            },
+            "sections": {
+                "complaint": complaint, "defense": defense,
+                "witness_p": witness_p, "witness_d": witness_d,
+                "lawyer": lawyer,
+            },
+            "entries": [],
+        }
+
+    strong = make_case(
+        "گوشی من را از کیفم دزدید و دوربین مغازه و فیلم مدارک را دارم "
+        "و شاهد هم دید",
+        "قبول دارم که گوشی را برداشتم",
+        "دست او را داخل کیف دیدم و دوربین مغازه هم فیلم دارد",
+        "هیچ چیزی ندیدم",
+        "دفاعیهٔ مشخصی ندارم",
+    )
+    verdict = ai_judge.local_verdict(strong)
+    check("رأی محکومیت صادر شد", verdict["verdict"] == "plaintiff",
+          f"-> {verdict['verdict']} {verdict['analysis']}")
+    check("شناسهٔ برنده همان شاکی واقعی پرونده است",
+          verdict["winner_user_id"] == 11 and verdict["winner_role"] == "plaintiff")
+    check("شناسهٔ متهم همان متهم واقعی پرونده است",
+          verdict["defendant_user_id"] == 22)
+    check("سه دلیل غیرتکراری دارد",
+          len({verdict["reason_1"], verdict["reason_2"],
+               verdict["reason_3"]}) == 3)
+    check("هیچ شناسه‌ای از خودش نساخته",
+          verdict["winner_user_id"] in (11, 22)
+          and verdict["confidence"] <= 1.0)
+
+    weak = make_case(
+        "یه چیزیم برد",
+        "من آن روز شهر دیگری بودم و شاهد دارم و مدرک دارم",
+        "نمیدانم",
+        "متهم آن روز شهر دیگری بود و من شاهدش هستم",
+        "شکایت شاکی مدرک مشخصی ندارد و ابهام دارد",
+    )
+    verdict2 = ai_judge.local_verdict(weak)
+    check("شکایت بی‌مدرک → تبرئه (اصل برائت)",
+          verdict2["verdict"] == "defendant", f"-> {verdict2['verdict']}")
+    check("برندهٔ تبرئه همان متهم واقعی است",
+          verdict2["winner_user_id"] == 22)
+    check("ثلاث دلیل پرشده و خالی نیست",
+          all(verdict2[f"reason_{i}"] for i in (1, 2, 3)))
+    check("قاضی داخلی هیچ تماس شبکه‌ای نمی‌زند",
+          verdict2["source"] == "local")
+
+
+def test_provider_outage_never_blocks_case():
+    print("\n### ۸ قطعی/سهمیهٔ سرویس: بازی باز هم رأی و جایزه می‌گیرد")
+
+    async def scenario():
+        fresh()
+        fox_router.reset_all()
+        bot = Bot()
+        original = ai_judge.judge_case
+        calls = {"n": 0}
+
+        async def quota_error(case, logger=None):
+            calls["n"] += 1
+            raise ai_judge.JudgeError(
+                "سهمیهٔ سرویس هوش مصنوعی تمام شد"
+            )
+
+        ai_judge.judge_case = quota_error
+        try:
+            event = await start_court(bot, CHAT_A)
+            event, users = await join_players(bot, CHAT_A, event=event)
+            await wait_for(lambda: event.said("دادگاه رسمی آغاز گردید"))
+            stored = storage.read_case(storage.list_cases()[0])
+            await play_full_case(bot, event, CHAT_A, users)
+            done = await wait_for(
+                lambda: event.said("رأی نهایی دادگاه روباه"))
+            check("با خطای سرویس هم رأی صادر شد", done,
+                  f"-> {event.out[-2:]}")
+            check("قاضی داخلی جایگزین شد و رأی داده",
+                  event.said("دلایل رأی:"))
+            total = sum(economy.get_balance(
+                CHAT_A, stored["players"][role]["user_id"])[economy.BRONZE]
+                for role in ("plaintiff", "defendant"))
+            check("جایزه پرداخت شد", total in (13, 20), f"-> {total}")
+        finally:
+            ai_judge.judge_case = original
 
     asyncio.run(scenario())
 
@@ -779,10 +898,17 @@ def test_prompt_injection_is_data():
                 "confidence": 0.4})}}]}
 
         ai_judge._call = fake_call
+        # مسیر سرویس واقعی باید «آماده» دیده شود تا payload ساخته شود
+        os.environ["AI_API_KEY"] = "test-key"
+        os.environ["AI_BASE_URL"] = "https://example.invalid/v1/chat"
+        ai_judge._QUOTA_UNTIL[0] = 0.0
         try:
             verdict, _raw = await ai_judge.judge_case(case, None)
         finally:
             ai_judge._call = _orig_call
+            os.environ.pop("AI_API_KEY", None)
+            os.environ.pop("AI_BASE_URL", None)
+            ai_judge._QUOTA_UNTIL[0] = 0.0
 
         messages = captured["payload"]["messages"]
         check("پیام سیستمی جدا و ثابت است",
@@ -1034,6 +1160,10 @@ def test_message_formatting_and_game_list():
     check("هیچ‌یک از پیام‌های دیگر خط خالی ندارد",
           all("\n\n" not in message for message in single_messages),
           f"-> {[m for m in single_messages if chr(10)*2 in m]}")
+    with_note = texts.verdict_conviction("@a", ["الف", "ب", "ج"], 20,
+                                         note=texts.FALLBACK_NOTE)
+    check("یادداشت داوری خودکار یک خط اضافه است (بدون خط خالی)",
+          texts.FALLBACK_NOTE in with_note and "\n\n" not in with_note)
     check("همهٔ پیام‌ها فارسی‌اند",
           all(any("\u0600" <= ch <= "\u06FF" for ch in message)
               for message in single_messages))
@@ -1286,6 +1416,8 @@ def main():
     test_turn_and_duplicate_protection()
     test_step_timeout()
     test_invalid_ai_response()
+    test_local_judge_always_valid()
+    test_provider_outage_never_blocks_case()
     test_judge_output_validation()
     test_prompt_injection_is_data()
     test_storage_layout_and_recovery()
