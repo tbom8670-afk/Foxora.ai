@@ -73,18 +73,33 @@ def test_new_notice_waits_its_own_ttl():
 
 
 def test_persist_survives_restart():
-    print("\n### بعد از ری‌استارت صف باقی می‌ماند")
+    print("\n### بعد از ری‌استارت: تایمر منقضی‌نشده می‌ماند، ردیف کهنه نمی‌ماند")
     handle, path = tempfile.mkstemp(suffix=".json")
     os.close(handle)
     os.unlink(path)
     try:
+        now = time.time()
         first = NoticeCleanup(path, ttl_seconds=60)
-        first.schedule(-5, 77, now=3_000_000.0)
+        # مهلت بلندمدت (مثل «۵ روز» گروه): هرگز نباید با ری‌استارت از بین برود.
+        first.schedule(-5, 77, ttl=5 * 86400, now=now)
+        # منقضیِ نزدیک (کمتر از پنجرهٔ بازیابی): یک‌بار جبران می‌شود.
+        first.schedule(-5, 78, ttl=-120, now=now)
+        # منقضیِ خیلی کهنه: نباید طوفان RPC بسازد.
+        first.schedule(-5, 79, ttl=-10 ** 7, now=now)
         first._persist()
+
         second = NoticeCleanup(path, ttl_seconds=60)
-        pending = second.pending(-5)
-        check("stale rows are not replayed", pending == [], f"-> {pending}")
-        check("stale persistence removed", not os.path.exists(path))
+        ids = [row["message_id"] for row in second.pending(-5)]
+        check("pending notice survives restart", 77 in ids, f"-> {ids}")
+        check("recently due notice is recovered", 78 in ids, f"-> {ids}")
+        check("ancient row is dropped", 79 not in ids, f"-> {ids}")
+        check("persisted file kept while rows remain", os.path.exists(path))
+
+        third = NoticeCleanup(path, ttl_seconds=60)
+        third._items.clear()
+        third._persist()
+        fourth = NoticeCleanup(path, ttl_seconds=60)
+        check("all rows gone -> file removed", not os.path.exists(path))
     finally:
         if os.path.isfile(path):
             os.unlink(path)

@@ -271,15 +271,16 @@ def test_notice_cleanup_keeps_inflight_ids_persisted_until_rpc_finishes(tmp_path
     # In-flight rows stay persisted while their RPC is unresolved (no silent
     # drop while the healthy process is alive).
     assert payload["-14"][0]["message_id"] == 801
-    # Current deliberate contract: notices persisted by a previous run are
-    # discarded on restart instead of replaying stale deletes (startup-storm
-    # fix). test_notice_cleanup.py pins the same contract.
+    # قرارداد تازه: تصمیمِ پاک‌سازیِ گرفته‌شده با ری‌استارت گم نمی‌شود.
+    # ردیفی که هنوز منقضی نشده (یا تازه منقضی شده) بازیابی می‌شود تا پیام
+    # اعلان برای همیشه در گروه نماند؛ ردیف‌های کهنه دور ریخته می‌شوند
+    # (ضد طوفان RPC). test_notice_cleanup.py همین قرارداد را تثبیت می‌کند.
     reloaded = NoticeCleanup(str(path), ttl_seconds=1)
-    assert reloaded.pending(-14) == []
-    assert not path.exists()
+    recovered = [row["message_id"] for row in reloaded.pending(-14)]
+    assert recovered == [801]
 
 
-def test_notice_cleanup_retry_attempts_counted_stale_rows_not_replayed(tmp_path):
+def test_notice_cleanup_retry_counted_and_ancient_rows_not_replayed(tmp_path):
     class Queue:
         def __init__(self):
             self.calls = 0
@@ -305,10 +306,22 @@ def test_notice_cleanup_retry_attempts_counted_stale_rows_not_replayed(tmp_path)
     path = tmp_path / "persisted-notice.json"
     # The failed delete is retried once within the same process...
     assert asyncio.run(run(path)) == 1
-    # ...but after a restart the stale notice is deliberately discarded
-    # rather than replayed (documented startup-storm fix).
-    reloaded = NoticeCleanup(str(path), ttl_seconds=1)
-    assert reloaded.pending(-12) == []
+
+    # قرارداد تازه: ردیفِ تازه‌منقضی پس از ری‌استارت یک‌بار جبران می‌شود...
+    recent = NoticeCleanup(str(path), ttl_seconds=1)
+    assert [row["message_id"] for row in recent.pending(-12)] == [601]
+
+    # ...ولی ردیفِ خیلی کهنه (شناسهٔ بی‌اعتبار) دور ریخته می‌شود تا همان
+    # «طوفان حذف در استارتاپ» قدیمی برنگردد.
+    import json as _json
+    payload = _json.loads(path.read_text(encoding="utf-8"))
+    for rows in payload.values():
+        for row in rows:
+            row["expires_at"] = 0.0     # منقضیِ بسیار کهنه
+    path.write_text(_json.dumps(payload), encoding="utf-8")
+
+    ancient = NoticeCleanup(str(path), ttl_seconds=1)
+    assert ancient.pending(-12) == []
     assert not path.exists()
 
 

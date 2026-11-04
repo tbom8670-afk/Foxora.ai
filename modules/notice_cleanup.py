@@ -18,6 +18,12 @@ DEFAULT_TTL_SECONDS = 60
 MAX_PER_CHAT = 500
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_SECONDS = 2
+# ردیف‌های ذخیره‌شده در ری‌استارت بازیابی می‌شوند؛ ولی ردیفی که خیلی وقت
+# است منقضی شده (شناسهٔ کهنه/peer نامعتبر) دوباره اجرا نمی‌شود تا همان
+# «طوفان حذف در استارتاپ» قبلی برنگردد.
+DEFAULT_RECOVER_GRACE_SECONDS = 6 * 60 * 60
+DEFAULT_RECOVER_MAX_ROWS = 2000
+DEFAULT_RECOVER_MAX_PER_CHAT = 200
 
 
 def _chat_key(chat_id):
@@ -174,13 +180,22 @@ class NoticeCleanup:
 
     def __init__(self, persist_path, logger=None, *, ttl_seconds=DEFAULT_TTL_SECONDS,
                  delete_queue=None, max_retries=DEFAULT_MAX_RETRIES,
-                 retry_delay_seconds=DEFAULT_RETRY_DELAY_SECONDS):
+                 retry_delay_seconds=DEFAULT_RETRY_DELAY_SECONDS,
+                 recover_grace_seconds=None, recover_max_rows=None):
         self.persist_path = persist_path
         self.logger = logger
         self.ttl_seconds = float(ttl_seconds)
         self.delete_queue = delete_queue
         self.max_retries = max(0, int(max_retries))
         self.retry_delay_seconds = max(0.01, float(retry_delay_seconds))
+        self.recover_grace_seconds = float(
+            DEFAULT_RECOVER_GRACE_SECONDS
+            if recover_grace_seconds is None else recover_grace_seconds
+        )
+        self.recover_max_rows = int(
+            DEFAULT_RECOVER_MAX_ROWS
+            if recover_max_rows is None else recover_max_rows
+        )
         self._items = {}
         # InputPeer/access-hash objects are process-local and intentionally not
         # serialized. They are retained from send results for reliable deletes.
@@ -531,21 +546,86 @@ class NoticeCleanup:
                 self._persist()
 
     def _load(self):
-        """Discard previous-run notice deletes instead of replaying stale RPCs.
+        """بازیابی اعلان‌های معلق پس از ری‌استارت (بدون طوفان RPC).
 
-        Notice TTL is cosmetic.  Replaying a persisted delete after reconnect
-        caused a startup storm across old chats (often invalid IDs), which
-        delayed real moderation and commands. New notices remain tracked for
-        the lifetime of the current healthy process.
+        قبلاً کل فایل دور ریخته می‌شد؛ یعنی هر ری‌استارت، تایمر تمام
+        اعلان‌های در انتظار را از بین می‌برد و پیام‌ها تا ابد در گروه
+        می‌ماندند (مشکل «اعلام مهلت پاک نمی‌شود»).
+
+        حالا:
+          • ردیفی که هنوز منقضی نشده **همیشه** بازیابی می‌شود (این‌ها
+            دقیقاً همان تایمرهای بلندمدتی هستند که ری‌استارت از بین می‌برد).
+          • ردیفی که منقضی شده ولی حداکثر ``recover_grace_seconds`` قدمت
+            دارد یک‌بار دیگر تلاش می‌شود (حذفِ ازدست‌رفته جبران می‌شود).
+          • ردیف کهنه‌تر یا نامعتبر دور ریخته می‌شود؛ سقف کلی و سقف هر
+            گروه هم جلوی طوفان را می‌گیرد.
         """
         path = self.persist_path
         self._items = {}
         if not path or not os.path.isfile(path):
             return
+        now = time.time()
+        grace = self.recover_grace_seconds
         try:
-            os.unlink(path)
-        except OSError:
-            pass
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            payload = {}
+        recovered = {}
+        total = 0
+        dropped = 0
+        if isinstance(payload, dict):
+            for key, rows in payload.items():
+                if not isinstance(rows, list):
+                    continue
+                keep = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        dropped += 1
+                        continue
+                    try:
+                        message_id = int(row.get("message_id"))
+                        expires_at = float(row.get("expires_at"))
+                    except (TypeError, ValueError):
+                        dropped += 1
+                        continue
+                    if message_id <= 0 or expires_at < (now - grace):
+                        dropped += 1
+                        continue
+                    if total >= self.recover_max_rows:
+                        dropped += 1
+                        continue
+                    if len(keep) >= DEFAULT_RECOVER_MAX_PER_CHAT:
+                        dropped += 1
+                        continue
+                    keep.append({
+                        "message_id": message_id,
+                        "expires_at": expires_at,
+                        "chat_id": row.get("chat_id"),
+                        "attempts": int(row.get("attempts") or 0),
+                    })
+                    total += 1
+                if keep:
+                    recovered[str(key)] = keep
+        self._items = recovered
+        if not recovered:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return
+        self._dirty = True
+        if dropped:
+            self._persist()
+        logger = self.logger
+        if logger is not None:
+            try:
+                logger.log_info(
+                    "NOTICE CLEANUP RECOVERED "
+                    f"rows={total} groups={len(recovered)} dropped={dropped}"
+                )
+            except Exception:
+                pass
 
     def _write_persist_payload(self, path, payload):
         """Pure file I/O, safe to run in an executor thread."""
