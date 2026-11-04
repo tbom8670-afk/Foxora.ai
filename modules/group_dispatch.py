@@ -161,6 +161,11 @@ _COMMAND_EXACT = frozenset({
     "کی بیشتر بلده", "دروغ یا حقیقت",
     "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
     "کارگاه", "زامبی", "گروه آخرالزمان", "دادگاه", "دادگاه روباه",
+    # «شرکت» همان واژهٔ ثبت‌نام/پیوستن بازی‌هاست (بقا، خون آشام، نبرد،
+    # کارگاه، زامبی و دادگاه روباه). مثل بقیهٔ دستورهای بازی باید در خط
+    # «دستور» بماند؛ وگرنه پیام کوتاهِ تکراریِ عضو عادی در لایهٔ هرزنگاری
+    # بلعیده و حذف می‌شد و بازی فقط برای مالک/ادمین کار می‌کرد.
+    "شرکت",
     "جرعت", "جرات", "جرئت", "حقیقت", "حقیقت بگو",
     "ربات", "روباه",
     "سطح گروه", "پیام سنجاق",
@@ -202,7 +207,54 @@ def classify_priority(text, event=None):
         return PRIORITY_COMMAND, LANE_COMMAND
     if raw.startswith(_COMMAND_PREFIXES):
         return PRIORITY_COMMAND, LANE_COMMAND
+    # پاسخ/ثبت‌نام داخل یک بازیِ در جریان (دادگاه روباه، بقا، زامبی، …) هم
+    # روی خط «دستور» می‌رود. دلیل: صف عادیِ هر گروه می‌تواند پر/سرریز شود
+    # و پیام کوتاه بازیکنِ عادی در لایهٔ هرزنگاری حذف می‌شد؛ نتیجه این بود
+    # که بازی فقط برای مالک/ادمین کار می‌کرد.
+    if _is_active_game_answer(event):
+        return PRIORITY_COMMAND, LANE_COMMAND
     return PRIORITY_NORMAL, LANE_NORMAL
+
+
+def _event_user_id(event):
+    user_id = getattr(event, "sender_id", None)
+    if user_id is None:
+        sender = getattr(event, "sender", None)
+        user_id = getattr(sender, "id", None)
+    return user_id
+
+
+def _is_active_game_answer(event):
+    """آیا این پیام، پیام یک بازیِ در جریان در همان گروه است؟
+
+    برای دادگاه روباه دقیق‌تر عمل می‌کند: فقط پنج بازیکن همان پرونده
+    (یا زمان ثبت‌نام، همهٔ اعضا) پاسخ بازی محسوب می‌شوند؛ بقیهٔ اعضای گروه
+    مسیر عادی moderation خودشان را دارند.
+    """
+    chat_id = getattr(event, "chat_id", None)
+    if chat_id is None or getattr(event, "is_private", False):
+        return False
+    try:
+        from handlers.fox_games_router import any_active
+        if not any_active(chat_id):
+            return False
+    except Exception:
+        return False
+    user_id = _event_user_id(event)
+    try:
+        from modules.court_game import game as court_game
+        session = court_game.session_of(chat_id)
+    except Exception:
+        session = None
+    if session:
+        players = session.get("players") or []
+        if not players or session.get("phase") == court_game.PHASE_JOINING:
+            return True
+        if user_id is None:
+            return False
+        return any(int(row.get("user_id") or 0) == int(user_id)
+                   for row in players)
+    return True
 
 
 def lane_for(priority, kind=None):

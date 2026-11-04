@@ -1054,20 +1054,6 @@ def court_other_joining(chat_id):
     return False
 
 
-COURT_JOIN_WORD = "شرکت"
-
-
-def join_resumable(chat_id, text):
-    """این پیام «شرکت»ِ یک پروندهٔ بازِ روی دیسک است؟ (مسیر ری‌استارت)
-
-    بدون این بررسی، بعد از ری‌استارت ربات، «شرکت» هیچ‌جا مسیر نمی‌شد و
-    کاربر مجبور بود دوباره «دادگاه» بزند (همان باگ شمارش از صفر).
-    """
-    if normalize_text(text) != normalize_text(COURT_JOIN_WORD):
-        return False
-    return court_game_router.has_pending_join(chat_id)
-
-
 async def _court_message(bot, event, chat_id, user_id, sender, text, logger):
     other_joining = lambda: court_other_joining(chat_id)
     if court_game_router.is_active(chat_id):

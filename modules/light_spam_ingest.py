@@ -204,6 +204,19 @@ def _ingest(bot, chat_id, user_id, message_id, text, *, event=None, is_private=F
     if _cheap_admin_bypass(bot, chat_id, user_id):
         return IngestResult(skip_heavy=False, detected=False)
 
+    # پاسخ داخل یک بازیِ در جریان (بقا/زامبی/دادگاه روباه/…) دادهٔ بازی است،
+    # نه پیام عمومی. پیش از بررسی قفل هرزنگاری و incident‌ها سنجیده می‌شود
+    # تا بازیکنِ عادی وسط بازی پیامش حذف/بلعیده نشود؛ پیش‌تر این بررسی
+    # بعد از شاخه‌های قفل بود و «شرکت»/پاسخ بازیکن از دست می‌رفت.
+    game_probe = getattr(bot, "_light_game_answer_active", None)
+    if callable(game_probe):
+        try:
+            if game_probe(chat_id, user_id):
+                return IngestResult(skip_heavy=False, detected=False,
+                                    reason="game_answer")
+        except Exception:
+            pass
+
     key = incident_key(chat_id, user_id)
     incidents = getattr(bot, "_big_spam_incidents", {}) or {}
     if key in incidents:

@@ -1330,10 +1330,8 @@ def test_join_recovery_policy():
 
         check("روتر وجود پروندهٔ باز را می‌بیند",
               court_router.has_pending_join(CHAT_A))
-        check("«شرکت» بعد از ری‌استارت مسیر می‌شود",
-              fox_router.join_resumable(CHAT_A, "شرکت"))
-        check("پیام‌های دیگر مسیر نمی‌شوند",
-              not fox_router.join_resumable(CHAT_A, "سلام"))
+        check("«شرکت» در فهرست دستورهای بازی روتر است (خط دستور)",
+              "شرکت" in fox_router.FOX_GAME_COMMANDS)
         check("پروندهٔ بسته‌شده بازیابی نمی‌شود",
               game.restore(424242) is None)
 
@@ -1354,9 +1352,10 @@ def test_join_recovery_policy():
               not court_router.has_pending_join(CHAT_A))
 
         source = (ROOT / "handlers" / "message_handler.py").read_text(encoding="utf-8")
-        check("در مسیر پیام، «شرکت» با پروندهٔ روی دیسک وصل شده",
-              "fox_join_resumable" in source
-              and "and fox_join_resumable(chat_id, clean_text)" in source)
+        check("مسیر پیام برای «شرکت» روی خط دستور بازی‌ها است",
+              "clean_text in FOX_GAME_COMMANDS or fox_game_active(chat_id)"
+              in source
+              and "COURT EARLY ROUTE" not in source)
 
     asyncio.run(scenario())
 

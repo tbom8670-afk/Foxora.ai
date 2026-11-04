@@ -48,7 +48,6 @@ from handlers.fox_games_router import (
     FOX_GAME_COMMANDS,
     any_active as fox_game_active,
     handle as handle_fox_games,
-    join_resumable as fox_join_resumable,
 )
 from handlers.clipboard_handler import (
     HELP_BLOCK as CLIPBOARD_HELP_BLOCK,
@@ -3267,35 +3266,6 @@ async def handle_new_message(bot, event):
                 )
             except Exception:
                 pass
-        # ⚖️ دادگاه روباه — مسیر مستقل بازی، پیش از فیلتر/ضداسپم/مجازات.
-        # چرا اینجا؟ چون پیام بازیکنِ عادی نباید در قفل ضداسپم یا فیلتر
-        # کلمات گم شود؛ پیش‌تر فقط مالک/ادمین (که از ضداسپم معاف‌اند)
-        # می‌توانست «شرکت» بزند و بازی برای بقیهٔ اعضا کار نمی‌کرد.
-        if not getattr(event, "is_private", False):
-            try:
-                import handlers.court_game_router as _court_router
-                _court_text = normalize_command(message_text)
-                if _court_router.should_route(chat_id, _court_text, user_id):
-                    bot.logger.log_info(
-                        "COURT EARLY ROUTE "
-                        f"chat_id={chat_id} user_id={user_id} text={_court_text!r}"
-                    )
-                    # گارد «سرگرمی خاموش» داخل همین مسیر (در روتر دادگاه)
-                    # اعمال می‌شود؛ مسیر بازی‌های دیگر دست‌نخورده است.
-                    if await _court_router.route_early(
-                        bot, event, chat_id, user_id, sender,
-                        _court_text, bot.logger,
-                    ):
-                        return
-            except Exception as _court_route_error:
-                try:
-                    bot.logger.log_error(
-                        "COURT EARLY ROUTE FAILED "
-                        f"chat_id={chat_id} user_id={user_id} "
-                        f"error={_court_route_error!r}"
-                    )
-                except Exception:
-                    pass
         # پیام‌های معمولیِ اکانت سشن نباید وارد moderation شوند، اما همین
         # اکانت در سروش نقش رابط ربات را هم دارد و مالک با آن «راهنما» و
         # «روباه» را می‌فرستد. بازگرداندنِ همهٔ event.out ها باعث می‌شد فقط
@@ -5577,17 +5547,6 @@ async def handle_new_message(bot, event):
                 bot, user_id, message_text, logger=bot.logger
             ):
                 return
-        # ⚖️ «شرکت» در پروندهٔ دادگاهی که فقط روی دیسک باز است (بعد از
-        # ری‌استارت ربات) هم باید به روتر بازی‌ها برسد؛ فقط برای همین کلمه
-        # بررسی می‌شود، پس مسیر پیام‌های معمولی هزینه‌ای ندارد.
-        if (
-            not getattr(event, "is_private", False)
-            and fox_join_resumable(chat_id, clean_text)
-            and await handle_fox_games(
-                bot, event, chat_id, user_id, sender, clean_text, bot.logger
-            )
-        ):
-            return
         if (
             clean_text in FOX_GAME_COMMANDS or fox_game_active(chat_id)
         ) and await handle_fox_games(
