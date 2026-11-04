@@ -48,6 +48,7 @@ from handlers.fox_games_router import (
     FOX_GAME_COMMANDS,
     any_active as fox_game_active,
     handle as handle_fox_games,
+    join_resumable as fox_join_resumable,
 )
 from handlers.clipboard_handler import (
     HELP_BLOCK as CLIPBOARD_HELP_BLOCK,
@@ -5547,6 +5548,17 @@ async def handle_new_message(bot, event):
                 bot, user_id, message_text, logger=bot.logger
             ):
                 return
+        # ⚖️ «شرکت» در پروندهٔ دادگاهی که فقط روی دیسک باز است (بعد از
+        # ری‌استارت ربات) هم باید به روتر بازی‌ها برسد؛ فقط برای همین کلمه
+        # بررسی می‌شود، پس مسیر پیام‌های معمولی هزینه‌ای ندارد.
+        if (
+            not getattr(event, "is_private", False)
+            and fox_join_resumable(chat_id, clean_text)
+            and await handle_fox_games(
+                bot, event, chat_id, user_id, sender, clean_text, bot.logger
+            )
+        ):
+            return
         if (
             clean_text in FOX_GAME_COMMANDS or fox_game_active(chat_id)
         ) and await handle_fox_games(

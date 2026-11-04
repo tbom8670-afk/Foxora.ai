@@ -51,10 +51,13 @@ def ensure_ready(logger=None):
 
 
 async def send_quoted(bot, event, chat_id, text):
-    """ارسال پیام دادگاه: همهٔ متن Bold و داخل نقل‌قول شیشه‌ای."""
+    """ارسال پیام دادگاه: همهٔ متن **Bold** و بدون نقل‌قول.
+
+    (قالب نقل‌قول حذف شد: پیام‌ها باید ردیفی و ساده دیده شوند.)
+    """
     if not text:
         return None
-    entities = texts.full_quote_entities(text)
+    entities = texts.bold_entities(text)
     if event is not None:
         try:
             return await event.reply(text, formatting_entities=entities)
@@ -377,6 +380,22 @@ async def start_game(bot, event, chat_id, user_id, sender, logger=None,
         return True
 
     settings = storage.settings()
+
+    # اگر پروندهٔ این گروه از قبل باز است (مثلاً ربات ری‌استارت شده یا
+    # کسی دوباره «دادگاه» زده)، فهرست ثبت‌نام‌شده‌ها بازیابی می‌شود؛
+    # هرگز پروندهٔ نیمه‌کاره با یک پروندهٔ خالی جایگزین نمی‌شود.
+    restored = game.restore(chat_id, logger)
+    if restored is not None:
+        log(logger, f"COURT START RESUMED chat_id={chat_id} "
+                    f"players={len(restored.get('players', []))}")
+        await send_quoted(bot, event, chat_id,
+                          texts.join_resumed(len(restored.get("players", [])),
+                                             game.REQUIRED_PLAYERS))
+        game.schedule(chat_id, restored["session_id"],
+                      _callbacks(bot, event, chat_id, logger),
+                      logger=logger)
+        return True
+
     session = game.start(chat_id, logger=logger, group_event=event)
     if session is None:
         await send_quoted(bot, event, chat_id, texts.already_running())
@@ -394,10 +413,54 @@ async def start_game(bot, event, chat_id, user_id, sender, logger=None,
     return True
 
 
+def has_pending_join(chat_id):
+    """آیا پروندهٔ در حال ثبت‌نام این گروه روی دیسک هست؟
+
+    برای این است که اگر ربات ری‌استارت شود، پیام «شرکت» کاربران هنوز به
+    دادگاه برسد (در حافظه بازی فعال نیست، اما پرونده باز است).
+    """
+    try:
+        data = storage.read_session(storage.chat_key_for(chat_id))
+    except Exception:
+        return False
+    if not data or data.get("kind") != "case":
+        return False
+    return (data.get("phase") == game.PHASE_JOINING
+            and bool(data.get("players")))
+
+
+async def join_after_restart(bot, event, chat_id, user_id, sender, text,
+                             logger=None, other_game_joining=None):
+    """«شرکت» وقتی بازی در حافظه نیست: پروندهٔ باز را از دیسک بازیابی کن.
+
+    این مسیر تضمین می‌کند اگر ربات وسط ۶۰ ثانیهٔ ثبت‌نام خاموش/روشن شود،
+    «شرکت» بعدی همان پرونده را ادامه دهد و ثبت‌نام از صفر شروع نشود.
+    """
+    if normalize_text(text) != normalize_text(game.JOIN_WORD):
+        return False
+    ensure_ready(logger)
+    restored = game.restore(chat_id, logger)
+    if restored is None:
+        return False
+    log(logger, f"COURT JOIN AFTER RESTORE chat_id={chat_id} user_id={user_id} "
+                f"players={len(restored.get('players', []))}")
+    await send_quoted(bot, event, chat_id,
+                      texts.join_resumed(len(restored.get("players", [])),
+                                         game.REQUIRED_PLAYERS))
+    game.schedule(chat_id, restored["session_id"],
+                  _callbacks(bot, event, chat_id, logger),
+                  logger=logger)
+    return await handle_message(bot, event, chat_id, user_id, sender, text,
+                                logger, other_game_joining=other_game_joining)
+
+
 async def handle_message(bot, event, chat_id, user_id, sender, text,
                          logger=None, other_game_joining=None):
     """پیام‌های درون‌بازی: «شرکت» و متن مراحل پرونده."""
     if not game.is_active(chat_id):
+        if normalize_text(text) == normalize_text(game.JOIN_WORD):
+            log(logger, f"COURT JOIN IGNORED chat_id={chat_id} "
+                        f"user_id={user_id} reason=no_open_case")
         return False
     ensure_ready(logger)
     phase = game.phase(chat_id)

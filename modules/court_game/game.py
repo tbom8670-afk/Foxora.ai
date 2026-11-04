@@ -40,6 +40,10 @@ COMMANDS = ("دادگاه", "دادگاه روباه")
 
 REQUIRED_PLAYERS = 5
 JOIN_SECONDS = 60
+# اگر مهلت ثبت‌نام یک پروندهٔ ذخیره‌شده بیش از این مقدار گذشته باشد،
+# پرونده «کهنه» است و بازیابی نمی‌شود (فقط پاک می‌شود) تا بعد از چند روز
+# پیام «پروندهٔ این گروه باز است» به کاربر نشان داده نشود.
+JOIN_EXPIRED_GRACE = 300
 JOIN_WORD = texts.JOIN_WORD
 
 ROLE_ORDER = ("plaintiff", "defendant", "witness_p", "witness_d", "lawyer")
@@ -165,7 +169,12 @@ def _stop_task(chat_id) -> None:
 
 
 def _persist(chat_id, session) -> None:
-    """آینه‌سازی session روی دیسک (برای بازیابی بعد از ری‌استارت)."""
+    """آینه‌سازی session روی دیسک (برای بازیابی بعد از ری‌استارت).
+
+    فهرست کامل ثبت‌نام‌شده‌ها (شناسه، یوزرنیم، نام نمایشی) و مهلت
+    ثبت‌نام ذخیره می‌شود تا اگر ربات وسط ثبت‌نام خاموش/روشن شود،
+    هیچ شرکت‌کننده‌ای گم نشود.
+    """
     try:
         storage.write_session(storage.chat_key_for(chat_id), {
             "kind": "case",
@@ -174,9 +183,12 @@ def _persist(chat_id, session) -> None:
             "case_id": (session.get("case") or {}).get("case_id"),
             "phase": session.get("phase"),
             "players": [
-                {"user_id": p.get("user_id"), "display": p.get("display")}
+                {"user_id": p.get("user_id"),
+                 "username": p.get("username"),
+                 "display": p.get("display")}
                 for p in session.get("players", [])
             ],
+            "join_expires_at": session.get("join_expires_at"),
             "saved_at": storage.now_iso(),
         })
     except Exception as error:  # pragma: no cover - خطای دیسک نباید بازی را بکشد
@@ -209,6 +221,8 @@ def start(chat_id, logger=None, group_event=None):
         "phase_deadline": None,
         "pending_prompt": None,
         "judged": False,
+        "join_expires_at": time.time() + storage.settings()["join_seconds"],
+        "restored": False,
     })
     if session is None:
         log(logger, f"COURT START BLOCKED chat_id={chat_id} reason=already_active")
@@ -216,6 +230,101 @@ def start(chat_id, logger=None, group_event=None):
     log(logger, f"COURT START chat_id={chat_id} session_id={session['session_id']}")
     _persist(chat_id, session)
     return dict(session)
+
+
+def join_deadline(chat_id):
+    """زمان پایان ثبت‌نام (epoch) برای session جاری."""
+    session = _STORE.get(chat_id)
+    return (session or {}).get("join_expires_at")
+
+
+def remaining_join_seconds(chat_id):
+    deadline = join_deadline(chat_id)
+    if deadline is None:
+        return float(JOIN_SECONDS)
+    return max(0.0, float(deadline) - time.time())
+
+
+def restore(chat_id, logger=None):
+    """بازیابی پروندهٔ در حال ثبت‌نام از روی دیسک.
+
+    اگر ربات وسط ۶۰ ثانیهٔ ثبت‌نام ری‌استارت شود (یا session از حافظه
+    برود)، این تابع فهرست ثبت‌نام‌شده‌ها را از فایل session برمی‌گرداند
+    و بازی را در همان نقطه ادامه می‌دهد. بدون این کار، هر «شرکت» یک
+    پروندهٔ تازه می‌ساخت و شمارش از «۱ از ۵» شروع می‌شد.
+
+    فقط مرحلهٔ «ثبت‌نام» بازیابی می‌شود؛ پروندهٔ نیمه‌کارهٔ وسط دادگاه
+    طبق سیاست بازی بسته می‌شود (بدون جایزه).
+    """
+    if _STORE.is_active(chat_id):
+        return dict(_STORE.get(chat_id))
+    try:
+        data = storage.read_session(storage.chat_key_for(chat_id))
+    except Exception:
+        data = None
+    if not data or data.get("kind") != "case":
+        return None
+    if data.get("phase") != PHASE_JOINING:
+        return None
+    try:
+        deadline = data.get("join_expires_at")
+        stale = (deadline is not None
+                 and float(deadline) + JOIN_EXPIRED_GRACE < time.time())
+    except (TypeError, ValueError):
+        stale = False
+    if stale:
+        try:
+            storage.delete_session(storage.chat_key_for(chat_id))
+        except Exception:
+            pass
+        log(logger, f"COURT STALE JOIN DROPPED chat_id={chat_id}")
+        return None
+    players = []
+    ids = set()
+    for row in data.get("players") or []:
+        try:
+            user_id = int(row.get("user_id"))
+        except (TypeError, ValueError):
+            continue
+        if user_id in ids:
+            continue
+        ids.add(user_id)
+        players.append({
+            "user_id": user_id,
+            "username": row.get("username"),
+            "display": row.get("display") or "@%s" % user_id,
+            "peer": None,
+        })
+    if not players:
+        return None
+    session = _STORE.create(chat_id, {
+        "phase": PHASE_JOINING,
+        "players": players,
+        "ids": ids,
+        "role_players": {},
+        "case": None,
+        "logger": logger,
+        "invalid_choices": 0,
+        "phase_deadline": None,
+        "pending_prompt": None,
+        "judged": False,
+        "join_expires_at": data.get("join_expires_at"),
+        "restored": True,
+    })
+    if session is None:
+        return dict(_STORE.get(chat_id))
+    log(logger, f"COURT SESSION RESTORED chat_id={chat_id} "
+                f"players={len(players)}")
+    return dict(session)
+
+
+def forget(chat_id):
+    """فقط حافظهٔ همین گروه را پاک می‌کند (شبیه‌سازی ری‌استارت ربات).
+
+    فایل session روی دیسک دست‌نخورده می‌ماند؛ برای تست بازیابی و برای
+    ری‌استارت واقعی که state در حافظه از دست می‌رود.
+    """
+    _STORE.reset(chat_id)
 
 
 def join(chat_id, user_id, user, logger=None):
@@ -579,6 +688,10 @@ async def run(chat_id, session_id, callbacks, logger=None, join_seconds=None,
               step_seconds=None):
     """چرخهٔ کامل دادگاه؛ همهٔ ارسال‌ها از همین task انجام می‌شود."""
     join_wait = JOIN_SECONDS if join_seconds is None else join_seconds
+    session = _STORE.get(chat_id)
+    if join_seconds is None and session and session.get("join_expires_at"):
+        join_wait = max(0.0, float(session["join_expires_at"]) - time.time())
+        join_wait = min(join_wait, float(JOIN_SECONDS))
     step_wait = (storage.settings()["step_seconds"]
                  if step_seconds is None else step_seconds)
     finished = False
@@ -592,6 +705,9 @@ async def run(chat_id, session_id, callbacks, logger=None, join_seconds=None,
         session = _STORE.get(chat_id)
         if not session or session["session_id"] != session_id:
             return
+        if not session.get("join_expires_at"):
+            session["join_expires_at"] = time.time() + join_wait
+            _persist(chat_id, session)
         if len(session["players"]) < REQUIRED_PLAYERS:
             count = len(session["players"])
             # پیام پایانی پیش از بستن session فرستاده می‌شود تا حتی اگر
@@ -674,10 +790,10 @@ def reset_all(chat_id=None):
     if chat_id is None:
         _STORE.reset()
         return
-    session = _STORE.get(chat_id)
-    if session:
-        try:
-            storage.delete_session(storage.chat_key_for(chat_id))
-        except Exception:
-            pass
+    # فایل session همیشه پاک می‌شود، حتی اگر state در حافظه نباشد
+    # (مثلاً بعد از ری‌استارت)، وگرنه پروندهٔ بسته‌شده دوباره بازیابی می‌شد.
+    try:
+        storage.delete_session(storage.chat_key_for(chat_id))
+    except Exception:
+        pass
     _STORE.reset(chat_id)

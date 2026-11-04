@@ -3,8 +3,9 @@
 
 قواعد قالب (خواستهٔ صریح کارفرما):
 
-* همهٔ متن‌ها فارسی، رسمی، کوتاه و **کاملاً Bold** هستند و در قالب
-  **نقل‌قول شیشه‌ای** (Blockquote) سروش پلاس ارسال می‌شوند.
+* همهٔ متن‌ها فارسی، رسمی، کوتاه و **کاملاً Bold** هستند. هیچ پیامی در
+  قالب **نقل‌قول** (Blockquote) ارسال نمی‌شود؛ نقل‌قول در این بازی
+  خواسته نشده است.
 * همه‌چیز **ردیفی** است: بین خطوط هیچ خط خالی‌ای نیست.
   تنها استثنا «پیام آغاز دادگاه» است؛ آنجا تنها یک خط خالی پیش از
   فهرست شماره‌دار بازیکنان گذاشته می‌شود (جایی که کاربران یکی‌یکی
@@ -53,15 +54,21 @@ def u16(text) -> int:
     return len(str(text or "").encode("utf-16-le")) // 2
 
 
-def full_quote_entities(text):
-    """کل پیام را هم Bold و هم داخل نقل‌قول شیشه‌ای می‌برد."""
+def bold_entities(text):
+    """کل پیام را **Bold** می‌کند — بدون نقل‌قول.
+
+    پیام‌های دادگاه عمداً در قالب نقل‌قول (Blockquote) فرستاده نمی‌شوند:
+    تمام متن باید Bold باشد و ردیف‌به‌ردیف و ساده دیده شود.
+    """
     length = u16(text)
     if length <= 0:
         return []
-    return [
-        MessageEntityBold(offset=0, length=length),
-        MessageEntityBlockquote(offset=0, length=length),
-    ]
+    return [MessageEntityBold(offset=0, length=length)]
+
+
+def full_quote_entities(text):
+    """نام قدیمی (سازگاری) — همان Bold، بدون نقل‌قول."""
+    return bold_entities(text)
 
 
 def persian_digits(value) -> str:
@@ -111,6 +118,15 @@ def private_only() -> str:
 
 def already_running() -> str:
     return "⚖️ یک دادگاه همین حالا در این گروه در جریان است."
+
+
+def join_resumed(count, players_need) -> str:
+    """پروندهٔ نیمه‌باز این گروه (مثلاً بعد از ری‌استارت) ادامه پیدا می‌کند."""
+    return "\n".join([
+        "⚖️ پروندهٔ این گروه باز است و ثبت‌نام آن ادامه دارد",
+        f"ثبت‌نام‌شده‌ها: {persian_digits(count)} از {persian_digits(players_need)}",
+        f"برای شرکت بنویسید: {JOIN_WORD}",
+    ])
 
 
 def other_game_running() -> str:

@@ -26,6 +26,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1006,7 +1007,7 @@ def test_two_groups_isolated():
 # ۱۵ — قالب پیام‌ها و لیست بازی
 # ---------------------------------------------------------------------------
 def test_message_formatting_and_game_list():
-    print("\n### ۱۵ قالب پیام‌ها (ردیفی، Bold، نقل‌قول) و لیست بازی")
+    print("\n### ۱۵ قالب پیام‌ها (ردیفی، Bold، بدون نقل‌قول) و لیست بازی")
     roster = texts.roster_message("@fox", {
         "plaintiff": "@a", "defendant": "@b", "witness_p": "@c",
         "witness_d": "@d", "lawyer": "@e",
@@ -1039,13 +1040,19 @@ def test_message_formatting_and_game_list():
 
     entities = texts.full_quote_entities("سلام دنیا ⚖️")
     check("کل پیام Bold می‌شود",
-          any(entity.__class__.__name__ == "MessageEntityBold"
-              and entity.offset == 0 for entity in entities))
-    check("کل پیام نقل‌قول شیشه‌ای می‌شود",
-          any(entity.__class__.__name__ == "MessageEntityBlockquote"
-              and entity.offset == 0 for entity in entities))
+          len(entities) == 1
+          and entities[0].__class__.__name__ == "MessageEntityBold"
+          and entities[0].offset == 0)
+    check("هیچ نقل‌قولی در پیام‌ها نیست (Bold فقط)",
+          not any(entity.__class__.__name__ == "MessageEntityBlockquote"
+                  for entity in entities),
+          f"-> {[e.__class__.__name__ for e in entities]}")
     check("طول entity با واحد UTF-16 درست است",
           entities[0].length == len("سلام دنیا ⚖️".encode("utf-16-le")) // 2)
+    check("پیام بازیابی ثبت‌نام هم ردیفی است",
+          "\n\n" not in texts.join_resumed(3, 5)
+          and "۳" in texts.join_resumed(3, 5)
+          and "شرکت" in texts.join_resumed(3, 5))
 
     check("دستور بازی در روتر ثبت شده",
           "دادگاه" in fox_router.FOX_GAME_COMMANDS)
@@ -1069,6 +1076,159 @@ def test_message_formatting_and_game_list():
           not any(secret_pattern.search(source) for source in sources))
     check(".env در gitignore است",
           ".env" in (ROOT / ".gitignore").read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# ۱۶ — ثبت‌نام: بدون ریست شمارنده و بازیابی بعد از ری‌استارت
+# ---------------------------------------------------------------------------
+def test_join_counter_and_restart_recovery():
+    print("\n### ۱۶ ثبت‌نام پیوسته (بدون ریست) و بازیابی پرونده پس از ری‌استارت")
+
+    async def scenario():
+        fresh(join_seconds=20.0)
+        fox_router.reset_all()
+        bot = Bot()
+        event = await start_court(bot, CHAT_A)
+        check("پیام آغاز دادگاه یک بار ارسال شد",
+              event.out.count(texts.join_prompt(5, 20.0)) == 1,
+              f"-> {event.out}")
+
+        # سه نفر پشت سر هم «شرکت» می‌زنند: شمارنده باید ۱ → ۲ → ۳ برود.
+        for index, user_id in enumerate((201, 202, 203)):
+            user = User(user_id, f"بازیکن{user_id}", f"player{user_id}")
+            await send(bot, event, CHAT_A, user, "شرکت", 600 + index)
+        for count in (1, 2, 3):
+            check(f"شمارنده {count} از ۵ درست است",
+                  event.said(f"({texts.persian_digits(count)} از ۵)"),
+                  f"-> {event.out[-5:]}")
+        sequence = [message for message in event.out if "از ۵)" in message]
+        check("ترتیب شمارنده ۱ ← ۲ ← ۳ و بدون بازگشت است",
+              sequence == [texts.join_confirmed(count, 5) for count in (1, 2, 3)],
+              f"-> {sequence}")
+        check("پیام دعوت ثبت‌نام تکرار نشد",
+              sum("تعداد مورد نیاز" in message for message in event.out) == 1,
+              f"-> {event.out}")
+        check("سه ثبت‌نام‌شده در حافظه ثبت شده‌اند",
+              game.player_count(CHAT_A) == 3, f"-> {game.player_count(CHAT_A)}")
+
+        # ری‌استارت: حافظه خالی می‌شود، فایل session روی دیسک می‌ماند.
+        game.forget(CHAT_A)
+        check("حافظه بعد از ری‌استارت خالی است", not game.is_active(CHAT_A))
+        restored = game.restore(CHAT_A)
+        check("پروندهٔ در حال ثبت‌نام از دیسک بازیابی شد",
+              bool(restored) and len(restored.get("players") or []) == 3,
+              f"-> {restored}")
+        check("فهرست بازیابی‌شده همان سه کاربر است",
+              sorted(p["user_id"] for p in (restored or {}).get("players", []))
+              == [201, 202, 203])
+        check("مهلت ثبت‌نام اصلی حفظ شده (شمارش از صفر شروع نمی‌شود)",
+              0 < game.remaining_join_seconds(CHAT_A) <= 20.0,
+              f"-> {game.remaining_join_seconds(CHAT_A)}")
+        check("پروندهٔ وسط دادگاه بازیابی نمی‌شود",
+              game.restore(999999) is None)
+        game.forget(CHAT_A)
+
+        # «شرکت» بعدی از مسیر واقعی ربات باید همان پرونده را ادامه دهد.
+        event2 = Event(CHAT_A)
+        await send(bot, event2, CHAT_A, User(204, "بازیکن204", "player204"),
+                   "شرکت", 604)
+        check("پیام ادامهٔ ثبت‌نام ارسال شد",
+              event2.said("پروندهٔ این گروه باز است"), f"-> {event2.out}")
+        check("شمارنده بعد از ری‌استارت ادامه یافت",
+              event2.said("(۴ از ۵)"), f"-> {event2.out}")
+        check("چهار نفر در پرونده‌اند", game.player_count(CHAT_A) == 4,
+              f"-> {game.player_count(CHAT_A)}")
+
+        # نفر پنجم: پرونده باید تشکیل شود و هیچ شمارنده‌ای ریست نشود.
+        await send(bot, event2, CHAT_A, User(205, "بازیکن205", "player205"),
+                   "شرکت", 605)
+        opened = await wait_for(lambda: game.is_active(CHAT_A)
+                                and game.phase(CHAT_A) != game.PHASE_JOINING)
+        check("با پنجمین نفر پرونده تشکیل شد", opened,
+              f"-> phase={game.phase(CHAT_A)}")
+        check("فهرست آغاز دادگاه (۶ نقش) ارسال شد",
+              event2.said("1 - قاضی") and event2.said("6 - وکیل"),
+              f"-> {event2.out[-4:]}")
+        check("همهٔ پیام‌های دادگاه Bold و بدون نقل‌قول‌اند",
+              bool(event2.entities)
+              and all(not any(entity.__class__.__name__ == "MessageEntityBlockquote"
+                              for entity in group)
+                      for group in event2.entities)
+              and all(any(entity.__class__.__name__ == "MessageEntityBold"
+                          and entity.offset == 0 for entity in group)
+                      for group in event2.entities),
+              f"-> {[[e.__class__.__name__ for e in g] for g in event2.entities]}")
+        blank = [message for message in event2.out if "\n\n" in message]
+        check("تنها پیام فهرست بازیکنان یک خط خالی دارد",
+              len(blank) == 1 and "1 - قاضی" in blank[0]
+              and blank[0].count("\n\n") == 1,
+              f"-> {blank}")
+        game.reset_all(CHAT_A)
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# ۱۷ — سیاست بازیابی: ثبت‌نام حفظ می‌شود، پروندهٔ نیمه‌کاره بسته می‌شود
+# ---------------------------------------------------------------------------
+def test_join_recovery_policy():
+    print("\n### ۱۷ بازیابی: ثبت‌نام حفظ می‌شود، پروندهٔ نیمه‌کاره بسته می‌شود")
+
+    async def scenario():
+        fresh(join_seconds=20.0)
+        fox_router.reset_all()
+        bot = Bot()
+        event = await start_court(bot, CHAT_A)
+        await send(bot, event, CHAT_A, User(301, "بازیکن301", "player301"), "شرکت", 700)
+        await send(bot, event, CHAT_A, User(302, "بازیکن302", "player302"), "شرکت", 701)
+
+        # ری‌استارت: حافظه خالی، پوشهٔ session سالم
+        game.forget(CHAT_A)
+        session_file = (storage.sessions_dir()
+                        / ("session_%s.json" % storage.chat_key_for(CHAT_A)))
+        check("فایل session ثبت‌نام روی دیسک هست", session_file.is_file())
+        summary = storage.recover()
+        check("بازیابی، ثبت‌نام را ادامه‌پذیر نگه می‌دارد",
+              summary.get("resumable") == 1, f"-> {summary}")
+        check("فایل session ثبت‌نام پاک نشد", session_file.is_file())
+        data = storage.read_session(storage.chat_key_for(CHAT_A)) or {}
+        check("فهرست ثبت‌نام‌شده‌ها سالم است",
+              [row["user_id"] for row in data.get("players") or []] == [301, 302],
+              f"-> {data.get('players')}")
+        check("پروندهٔ نیمه‌کاره‌ای برای آرشیو ساخته نشد",
+              not storage.list_cases(), f"-> {storage.list_cases()}")
+
+        check("روتر وجود پروندهٔ باز را می‌بیند",
+              court_router.has_pending_join(CHAT_A))
+        check("«شرکت» بعد از ری‌استارت مسیر می‌شود",
+              fox_router.join_resumable(CHAT_A, "شرکت"))
+        check("پیام‌های دیگر مسیر نمی‌شوند",
+              not fox_router.join_resumable(CHAT_A, "سلام"))
+        check("پروندهٔ بسته‌شده بازیابی نمی‌شود",
+              game.restore(424242) is None)
+
+        # پروندهٔ کهنه (مهلت خیلی گذشته) بازیابی نمی‌شود و پاک می‌شود
+        storage.write_session(storage.chat_key_for(CHAT_A), {
+            "kind": "case", "chat_key": storage.chat_key_for(CHAT_A),
+            "chat_id": CHAT_A, "case_id": None, "phase": game.PHASE_JOINING,
+            "players": [{"user_id": 301, "username": "player301",
+                         "display": "@player301"}],
+            "join_expires_at": time.time() - (game.JOIN_EXPIRED_GRACE + 60),
+        })
+        check("پروندهٔ کهنه بازیابی نمی‌شود",
+              game.restore(CHAT_A) is None and not session_file.is_file())
+
+        # پس از بستن پرونده، دیگر ادامه‌ای وجود ندارد
+        game.reset_all(CHAT_A)
+        check("بعد از بستن، پروندهٔ بازیابی‌شدنی نیست",
+              not court_router.has_pending_join(CHAT_A))
+
+        source = (ROOT / "handlers" / "message_handler.py").read_text(encoding="utf-8")
+        check("در مسیر پیام، «شرکت» با پروندهٔ روی دیسک وصل شده",
+              "fox_join_resumable" in source
+              and "and fox_join_resumable(chat_id, clean_text)" in source)
+
+    asyncio.run(scenario())
 
 
 def test_ai_config_from_env_only():
@@ -1133,6 +1293,8 @@ def main():
     test_prompts_and_command_isolation()
     test_conflict_with_other_games()
     test_message_formatting_and_game_list()
+    test_join_counter_and_restart_recovery()
+    test_join_recovery_policy()
     test_ai_config_from_env_only()
     test_judging_runs_once()
     print("\n" + "=" * 54)

@@ -262,6 +262,16 @@ def delete_session(chat_key) -> None:
         pass
 
 
+def read_session(chat_key):
+    """خواندن session ذخیره‌شدهٔ یک گروه (برای بازیابی ثبت‌نام)."""
+    try:
+        with open(session_path(chat_key), encoding="utf-8") as stream:
+            data = json.load(stream)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 def list_sessions():
     ensure_dirs()
     rows = []
@@ -358,14 +368,18 @@ def list_results():
 def recover(now=None):
     """وضعیت پرونده‌های نیمه‌کاره را قابل‌بازیابی و بی‌خطر می‌کند.
 
-    هر session فعالِ باقی‌مانده روی دیسک یعنی پروسه وسط بازی خاموش شده
-    است. پروندهٔ مربوطش «interrupted» علامت می‌خورد، در ``results/``
-    آرشیو می‌شود و فایل session پاک می‌شود تا بازی بعدی تداخل نکند.
-    طبق سیاست بازی، پروندهٔ نیمه‌کاره **هیچ جایزه‌ای** ندارد.
+    * session مربوط به **ثبت‌نام** (پرونده هنوز تشکیل نشده) حذف نمی‌شود؛
+      دست‌نخورده می‌ماند تا «شرکت» بعدی همان پرونده را ادامه دهد و
+      شرکت‌کننده‌های قبلی گم نشوند. (باگ قبلی: همین پاک‌سازی باعث می‌شد
+      بعد از هر ری‌استارت، شمارش ثبت‌نام از «۱ از ۵» شروع شود.)
+    * session مربوط به پروندهٔ **تشکیل‌شده** «interrupted» علامت می‌خورد،
+      در ``results/`` آرشیو می‌شود و فایل session پاک می‌شود تا بازی بعدی
+      تداخل نکند. طبق سیاست بازی، پروندهٔ نیمه‌کاره **هیچ جایزه‌ای** ندارد.
 
     خروجی: خلاصهٔ کارهای انجام‌شده (برای لاگ و تست).
     """
-    summary = {"sessions": 0, "cases": 0, "punishments": 0, "details": []}
+    summary = {"sessions": 0, "cases": 0, "punishments": 0,
+               "resumable": 0, "details": []}
     for row in list_sessions():
         chat_key = row.get("chat_key")
         case_id = row.get("case_id")
@@ -376,6 +390,15 @@ def recover(now=None):
             "phase": row.get("phase"),
         }
         summary["sessions"] += 1
+        if (row.get("kind") != "punishment"
+                and not case_id
+                and row.get("phase") == "joining"
+                and row.get("players")):
+            # پروندهٔ هنوز تشکیل‌نشده: ثبت‌نام ادامه‌پذیر می‌ماند.
+            summary["resumable"] += 1
+            detail["action"] = "kept_resumable"
+            summary["details"].append(detail)
+            continue
         if row.get("kind") == "punishment":
             summary["punishments"] += 1
         else:
