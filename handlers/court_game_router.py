@@ -174,7 +174,7 @@ async def _start_punishment(bot, event, chat_id, case, verdict, logger=None):
 
 
 # ---------------------------------------------------------------------------
-# تحلیل پس‌زمینهٔ هر پیام (بدون هیچ پاسخی به کاربران)
+# ثبت تحلیل داخلی هر پیام در بایگانی پرونده (بدون پاسخ در گروه)
 # ---------------------------------------------------------------------------
 def _schedule_analysis(bot, case_snapshot, entry, logger=None):
     async def _run():
@@ -183,7 +183,7 @@ def _schedule_analysis(bot, case_snapshot, entry, logger=None):
         try:
             record = await ai_judge.analyze_message(case_snapshot, entry, logger)
         except Exception as error:
-            log_error(logger, f"COURT AI ANALYSIS FAILED "
+            log_error(logger, f"COURT JUDGE ANALYSIS FAILED "
                               f"case_id={case_snapshot.get('case_id')} "
                               f"order={entry.get('order')} error={error!r}")
             return
@@ -192,7 +192,7 @@ def _schedule_analysis(bot, case_snapshot, entry, logger=None):
 
     try:
         return asyncio.create_task(
-            _run(), name=f"court-ai:{entry.get('order')}")
+            _run(), name=f"court-judge:{entry.get('order')}")
     except RuntimeError:
         return None
 
@@ -201,18 +201,18 @@ def _schedule_analysis(bot, case_snapshot, entry, logger=None):
 # رأی نهایی
 # ---------------------------------------------------------------------------
 async def _run_judging(bot, event, chat_id, case, logger=None):
-    """فراخوانی قاضی هوش مصنوعی، اعتبارسنجی، پرداخت و اعلام رأی."""
+    """داوری با قاضی داخلی ربات (بدون شبکه)، پرداخت جایزه و اعلام رأی."""
     await send_quoted(bot, event, chat_id, texts.judging())
     try:
         verdict, raw = await ai_judge.judge_case(case, logger)
     except ai_judge.JudgeError as error:
-        # حتی اگر مدل/سرویس خطا بدهد، پرونده بی‌رأی نمی‌ماند: قاضی داخلی
-        # رأی می‌دهد و جایزه مثل همیشه پرداخت می‌شود.
+        # رکورد پرونده ناقص است؛ یک بار دیگر با تحلیل داخلی تلاش می‌شود
+        # تا پرونده بی‌رأی نماند.
         log_error(logger, f"COURT JUDGE INVALID case_id={case.get('case_id')} "
-                          f"error={error!r} — قاضی داخلی فعال شد")
+                          f"error={error!r}")
         try:
             verdict = ai_judge.local_verdict(case, str(error))
-            verdict["model"] = "local-fallback"
+            verdict["model"] = "local-evidence-judge"
             raw = {"fallback": True, "error": str(error)}
             log(logger, f"COURT LOCAL VERDICT case_id={verdict['case_id']} "
                         f"verdict={verdict['verdict']}")
@@ -227,7 +227,7 @@ async def _run_judging(bot, event, chat_id, case, logger=None):
             "error": "no_verdict",
             "at": storage.now_iso(),
         })
-        payment = {"status": "skipped", "reason": "invalid_ai_response"}
+        payment = {"status": "skipped", "reason": "invalid_case_record"}
         try:
             current = storage.read_case(case.get("case_id")) or {}
             current["verdict"] = None
@@ -295,16 +295,12 @@ async def _run_judging(bot, event, chat_id, case, logger=None):
     except Exception as error:
         log_error(logger, f"COURT VERDICT PERSIST FAILED {error!r}")
 
-    note = (texts.FALLBACK_NOTE
-            if verdict.get("source") == ai_judge.SOURCE_FALLBACK else None)
     if verdict["verdict"] == ai_judge.VERDICT_DEFENDANT:
         body = texts.verdict_acquittal(
-            verdict.get("defendant_display") or "متهم", reasons, amount,
-            note=note)
+            verdict.get("defendant_display") or "متهم", reasons, amount)
     else:
         body = texts.verdict_conviction(
-            verdict.get("plaintiff_display") or "شاکی", reasons, amount,
-            note=note)
+            verdict.get("plaintiff_display") or "شاکی", reasons, amount)
 
     if not paid:
         body = body + "\n" + texts.reward_failed()
