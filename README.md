@@ -83,6 +83,8 @@ docs/FOXORA_PRESERVED_FEATURES.md   نگاشت دقیق قابلیت‌های ح
 
 * ثبت‌نام پیوسته است: هر `شرکت` یک ثبت‌نام، شمارنده فقط بالا می‌رود و بعد از
   ری‌استارت ربات هم از همان فهرست ادامه پیدا می‌کند (بدون ریست).
+* بازی برای **همهٔ اعضای گروه** است: مسیر دادگاه پیش از ضداسپم/فیلتر گرفته
+  می‌شود، پس پیام عضو عادی (حتی در حالت قفل ضداسپم) هم ثبت می‌شود.
 * همهٔ پیام‌های دادگاه **Bold** و ردیفی‌اند؛ هیچ نقل‌قولی استفاده نمی‌شود.
 
 * دادهٔ بازی داخل خود پروژه: `data/court_game/{cases,sessions,ai_logs,results,config}`
@@ -90,7 +92,7 @@ docs/FOXORA_PRESERVED_FEATURES.md   نگاشت دقیق قابلیت‌های ح
 * قاضی: Cloudflare Workers AI با مدل `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
   (کلیدها فقط در `.env`؛ هیچ کلیدی در کد نیست)
 * مستندات کامل: [`docs/COURT_GAME.md`](docs/COURT_GAME.md)
-* تست: `python3 tests/test_court_game.py`
+* تست: `python3 tests/test_court_game.py` و `python3 tests/test_court_join_all_users.py`
 
 ## قابلیت‌های حفظ‌شده از Foxora قبلی
 

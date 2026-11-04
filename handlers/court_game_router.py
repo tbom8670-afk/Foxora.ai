@@ -413,6 +413,67 @@ async def start_game(bot, event, chat_id, user_id, sender, logger=None,
     return True
 
 
+async def route_early(bot, event, chat_id, user_id, sender, text, logger=None):
+    """مسیر مستقل دادگاه پیش از لایهٔ ضداسپم/فیلتر.
+
+    True یعنی پیام کاملن مصرف شد و هندلر باید return کند. این تابع همان
+    کار ``fox_games_router.handle`` را برای دادگاه انجام می‌دهد، ولی مستقیم
+    صدا زده می‌شود تا پیام عضو عادی در قفل ضداسپم یا فیلتر کلمات گم نشود.
+    """
+    ensure_ready(logger)
+    normalized = normalize_text(text)
+    if normalized in COURT_COMMANDS_NORMALIZED:
+        # همان گارد «سرگرمی خاموش» که همهٔ بازی‌ها دارند.
+        from modules import entertainment_control
+        if await entertainment_control.guard(event, chat_id, normalized):
+            return True
+        from handlers.fox_games_router import court_other_game_active
+        return await start_game(
+            bot, event, chat_id, user_id, sender, logger,
+            other_game_active=lambda: court_other_game_active(chat_id),
+        )
+    if game.is_active(chat_id):
+        return await handle_message(
+            bot, event, chat_id, user_id, sender, text, logger
+        )
+    return await join_after_restart(
+        bot, event, chat_id, user_id, sender, text, logger
+    )
+
+
+def should_route(chat_id, text, user_id=None):
+    """آیا این پیام باید همین‌جا (پیش از فیلتر/ضداسپم) به دادگاه برسد؟
+
+    این تابع قلبِ «بازی برای همه» است: پیام بازیکنِ عادی نباید در قفل
+    ضداسپم، فیلتر کلمات یا محدودیت نرخ گم شود. فقط این‌ها گرفته می‌شوند:
+
+    * دستور شروع: ``دادگاه`` / ``دادگاه روباه``
+    * ``شرکت`` وقتی پرونده‌ای در حال ثبت‌نام است (در حافظه یا روی دیسک)
+    * پیام خودِ پنج بازیکنِ پروندهٔ در جریان (نه بقیهٔ اعضای گروه)
+
+    بقیهٔ پیام‌ها مسیر عادی moderation خودشان را می‌روند.
+    """
+    normalized = normalize_text(text)
+    if normalized in COURT_COMMANDS_NORMALIZED:
+        return True
+    session = game.session_of(chat_id)
+    if not session:
+        if normalized == normalize_text(game.JOIN_WORD):
+            return has_pending_join(chat_id)
+        return False
+    if session.get("phase") == game.PHASE_JOINING:
+        return normalized == normalize_text(game.JOIN_WORD)
+    if user_id is None:
+        return False
+    players = session.get("players") or []
+    return any(int(row.get("user_id") or 0) == int(user_id) for row in players)
+
+
+COURT_COMMANDS_NORMALIZED = frozenset(
+    normalize_text(command) for command in game.COMMANDS
+)
+
+
 def has_pending_join(chat_id):
     """آیا پروندهٔ در حال ثبت‌نام این گروه روی دیسک هست؟
 
