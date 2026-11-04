@@ -510,12 +510,10 @@ async def handle_message(bot, event, chat_id, user_id, sender, text,
     if status == "not_active":
         return False
     if status == "wrong_user":
-        # پیام دیگران در گروه عادی ادامه پیدا می‌کند؛ فقط اگر خودِ بازیکن
-        # بازی باشد یک یادآوری کوتاه می‌دهیم تا سردرگم نشود.
-        if user_id in _player_ids(chat_id):
-            await send_quoted(bot, event, chat_id,
-                              texts.wrong_turn(info["role_label"]))
-            return True
+        # بازیکنی که نوبتش نیست آزاد است هر چیزی بنویسد؛ ربات هیچ پیامی
+        # نمی‌فرستد و هیچ یادآوری‌ای («الان نوبت فلانی است») تکرار نمی‌شود.
+        # فقط منتظر پیام بازیکنِ نوبت‌دار می‌مانیم و پیام بقیه مسیر عادی
+        # خودش را می‌رود.
         return False
     if status == "empty":
         await send_quoted(bot, event, chat_id, texts.too_short())

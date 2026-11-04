@@ -237,11 +237,6 @@ def recorded() -> str:
     return "پیام شما با موفقیت در پرونده ثبت شد. ⚖️"
 
 
-def wrong_turn(role_label) -> str:
-    return (f"⚠️ در این مرحله فقط {role_label} باید پیام بفرستد. "
-            "لطفاً تا پایان مهلت صبر کنید.")
-
-
 def too_short() -> str:
     return "⚠️ متن ارسال‌شده بسیار کوتاه است؛ لطفاً کمی توضیح بدهید."
 

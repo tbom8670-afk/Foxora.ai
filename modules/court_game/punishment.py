@@ -12,6 +12,9 @@
 
 قواعد:
 
+* **هیچ تبعیضی نیست:** پیامِ محکوم حذف می‌شود حتی اگر مالک ربات، مالک
+  گروه، ادمین ثبت‌شده، ادمین واقعی گروه، VIP یا هر نقش دیگری داشته باشد.
+  هیچ‌جای این ماژول و مسیر حذف، نقش/سطح کاربر را نمی‌پرسد.
 * **فقط** پیام‌های همان کاربرِ محکوم در همان گروه حذف می‌شوند.
 * پنجره دقیقاً ``punishment_seconds`` (پیش‌فرض ۶۰) ثانیه است و بعد از
   پایان آن هیچ حذفی انجام نمی‌شود.
@@ -74,6 +77,8 @@ def start(chat_id, user_id, case_id=None, seconds=None, group_event=None):
         "deleted": 0,
         "failed": 0,
         "observed": 0,
+        "retried": 0,
+        "seen": set(),
         "closed": False,
         "started_iso": storage.now_iso(),
     }
@@ -171,7 +176,14 @@ def observe_message(bot, event, chat_id, user_id, message_id, now=None):
     if not isinstance(message_id, int) or message_id <= 0:
         return False
 
+    seen = window.get("seen")
+    if isinstance(seen, set) and message_id in seen:
+        return False
     window["observed"] += 1
+    if isinstance(seen, set):
+        if len(seen) > 500:
+            seen.clear()
+        seen.add(message_id)
     queue = getattr(bot, "message_delete_queue", None)
     if queue is None:
         window["failed"] += 1
@@ -179,7 +191,9 @@ def observe_message(bot, event, chat_id, user_id, message_id, now=None):
                   f"message_id={message_id}", error=True)
         return True
     try:
-        future = queue.enqueue(chat_id, [message_id], priority=1)
+        # اولویت ۰ (همان اولویت حذف دستی/مدیریتی): حکم دادگاه نه در صف
+        # خودکار معطل می‌شود، نه با مکثِ «حذف خودکار» رد می‌شود.
+        future = queue.enqueue(chat_id, [message_id], priority=0)
     except Exception as error:
         window["failed"] += 1
         _log(bot, f"COURT PUNISH ENQUEUE FAILED chat_id={chat_id} "
@@ -198,18 +212,74 @@ def observe_message(bot, event, chat_id, user_id, message_id, now=None):
         failed_ids = list(remaining_ids or [])
         if deleted > 0 and not failed_ids:
             window["deleted"] += deleted
-        else:
-            window["deleted"] += max(0, deleted)
-            window["failed"] += max(1, len(failed_ids))
+            return
+        window["deleted"] += max(0, deleted)
+        # شمارش «ناموفق» فقط بعد از تلاش دوم انجام می‌شود تا هر پیام یک بار
+        # شمرده شود (نه یک بار برای صف و یک بار برای تلاش مستقیم).
         _log(bot, f"COURT PUNISH DELETE chat_id={chat_id} "
                   f"message_id={message_id} deleted={deleted} "
                   f"failed={len(failed_ids)}")
+        if failed_ids and not window.get("closed") and \
+                window["ends_at"] > time.monotonic():
+            # تلاش دومِ مستقیم (بدون صف): اگر صف به هر دلیلی حذف نکرد،
+            # همان پیام یک بار دیگر مستقیم حذف می‌شود تا حکم بی‌اثر نماند.
+            _retry_direct(bot, window, chat_id, message_id)
 
     try:
         future.add_done_callback(_done)
     except Exception:
         pass
     return True
+
+
+def _retry_direct(bot, window, chat_id, message_id):
+    """یک تلاش مستقیم دیگر برای حذف همان پیام (بدون واسطهٔ صف)."""
+    import asyncio
+
+    async def _run():
+        client = getattr(bot, "client", None)
+        if client is None:
+            window["failed"] += 1
+            return
+        window["retried"] += 1
+        try:
+            await client.delete_messages(chat_id, [message_id])
+        except Exception as error:
+            window["failed"] += 1
+            _log(bot, f"COURT PUNISH DIRECT DELETE FAILED chat_id={chat_id} "
+                      f"message_id={message_id} error={error!r}", error=True)
+            return
+        window["deleted"] += 1
+        _log(bot, f"COURT PUNISH DIRECT DELETE OK chat_id={chat_id} "
+                  f"message_id={message_id}")
+
+    try:
+        return asyncio.get_running_loop().create_task(
+            _run(), name=f"court-punish-direct:{message_id}")
+    except Exception:
+        return None
+
+
+def observe_event(bot, event):
+    """قلاب عمومی: شناسه‌ها را از event می‌خواند (بدون await) و حذف می‌کند.
+
+    این تابع در اولین نقطهٔ ورود پیام‌های گروه صدا زده می‌شود — پیش از
+    هر گیت ادمین/VIP — تا حکم دادگاه برای هیچ نقشی استثنا نشود.
+    """
+    try:
+        chat_id = getattr(event, "chat_id", None)
+        if chat_id is None or getattr(event, "is_private", False):
+            return False
+        message = getattr(event, "message", None)
+        message_id = getattr(message, "id", None)
+        user_id = getattr(event, "sender_id", None)
+        if user_id is None:
+            sender = getattr(event, "_bot_cached_sender", None) or \
+                getattr(event, "sender", None)
+            user_id = getattr(sender, "id", None)
+        return observe_message(bot, event, chat_id, user_id, message_id)
+    except Exception:
+        return False
 
 
 def report_text(stats) -> str:

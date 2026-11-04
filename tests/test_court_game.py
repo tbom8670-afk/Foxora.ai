@@ -571,7 +571,12 @@ def test_turn_and_duplicate_protection():
         stored = storage.read_case(case_id)
         check("پیام نقش غیرنوبت ثبت نشد", stored["entries"] == [],
               f"-> {stored['entries']}")
-        check("یادآوری نوبت ارسال شد", event.said("فقط شاکی"))
+        # بازیکنِ غیرنوبت آزاد است بنویسد؛ ربات هیچ یادآوری‌ای نمی‌فرستد
+        # و فقط منتظر پیام بازیکنِ نوبت‌دار می‌ماند.
+        check("ربات هیچ یادآوری «فقط شاکی» نفرستاد",
+              not event.said("فقط شاکی"), f"-> {event.out[-3:]}")
+        check("هیچ پیام «نوبت»ی در گروه تکرار نشد",
+              not any("در این مرحله" in message for message in event.out))
 
         # گزینهٔ نامعتبر جرم (آدم‌ربایی در فهرست جرائم دادگاه نیست)
         await send(bot, event, CHAT_A, as_user(by_role["plaintiff"]),
@@ -604,6 +609,55 @@ def test_turn_and_duplicate_protection():
 # ---------------------------------------------------------------------------
 # ۵ — مهلت هر مرحله
 # ---------------------------------------------------------------------------
+def test_out_of_turn_player_is_not_nagged():
+    print("\n### ۴ بازیکنی که نوبتش نیست آزاد است بنویسد (هیچ یادآوری‌ای)")
+
+    async def scenario():
+        fresh()
+        fox_router.reset_all()
+        bot = Bot()
+        event = await start_court(bot, CHAT_A)
+        event, users = await join_players(bot, CHAT_A, event=event)
+        await wait_for(lambda: event.said("دادگاه رسمی آغاز گردید"))
+        by_role = await current_roles(CHAT_A)
+        check("نقش‌ها تخصیص داده شد", len(by_role) == 5, f"-> {by_role}")
+
+        # شاکی جرم و شکایت را می‌فرستد تا نوبت به متهم برسد.
+        await send(bot, event, CHAT_A, as_user(by_role["plaintiff"]), "دزدی", 600)
+        await send(bot, event, CHAT_A, as_user(by_role["plaintiff"]),
+                   "گوشی مرا دزدید", 601)
+        await wait_for(lambda: game.PHASE_ROLE.get(
+            (game.session_of(CHAT_A) or {}).get("phase")) == "defendant",
+            timeout=4.0)
+
+        before = len(event.out)
+        # دو بازیکن دیگر (که نوبتشان نیست) پیام می‌فرستند.
+        await send(bot, event, CHAT_A, as_user(by_role["witness_p"]),
+                   "سلام بچه‌ها، من هم نظری دارم", 602)
+        await send(bot, event, CHAT_A, as_user(by_role["lawyer"]),
+                   "یه سوال داشتم", 603)
+        await asyncio.sleep(0.1)
+        check("ربات هیچ پیامی دربارهٔ نوبت نفرستاد",
+              len(event.out) == before, f"-> {event.out[before:]}")
+        check("هیچ متنی از «فقط … باید پیام بفرستد» نمانده",
+              not any("باید پیام بفرستد" in message for message in event.out))
+        check("هیچ یادآوری «در این مرحله» تکرار نشد",
+              sum("در این مرحله" in message for message in event.out) <= 1,
+              f"-> {[m for m in event.out if 'در این مرحله' in m]}")
+        check("متن wrong_turn از texts حذف شده",
+              not hasattr(texts, "wrong_turn"))
+
+        # مرحله دست‌نخورده مانده و بازیکنِ نوبت‌دار می‌تواند پیامش را بفرستد.
+        await send(bot, event, CHAT_A, as_user(by_role["defendant"]),
+                   "من آن روز در شهر دیگری بودم و هیچ کاری نکردم", 604)
+        await asyncio.sleep(0.1)
+        check("پیام بازیکنِ نوبت‌دار ثبت شد",
+              (game.session_of(CHAT_A) or {}).get("phase") != "defendant",
+              f"-> {(game.session_of(CHAT_A) or {}).get('phase')}")
+
+    asyncio.run(scenario())
+
+
 def test_step_timeout():
     print("\n### ۵ پایان مهلت مرحله → لغو بدون جایزه")
 
@@ -1352,6 +1406,7 @@ def main():
     test_conviction_and_punishment()
     test_punishment_failure_is_reported()
     test_turn_and_duplicate_protection()
+    test_out_of_turn_player_is_not_nagged()
     test_step_timeout()
     test_verdict_is_always_issued()
     test_local_judge_always_valid()

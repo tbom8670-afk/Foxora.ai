@@ -2756,6 +2756,24 @@ class SoroushAntiSpamBot:
                                 pass
             except Exception:
                 pass
+            # ⚖️ حکم دادگاه روباه: در پنجرهٔ ۶۰ ثانیه‌ایِ مجازات، پیام محکوم
+            # حذف می‌شود — بدون هیچ استثنایی برای مالک ربات، مالک گروه، ادمین
+            # ثبت‌شده، ادمین واقعی گروه یا VIP. این قلاب پیش از هر گیت و
+            # بای‌پس اجرا می‌شود تا هیچ نقشی از حکم معاف نشود. sync است و
+            # پیام را کند نمی‌کند (فقط یک job روی صف حذف می‌گذارد).
+            try:
+                if not getattr(event, "is_private", False):
+                    from modules.court_game import punishment as _court_punish
+                    _court_punish.observe_event(self, event)
+            except Exception as _court_punish_error:
+                try:
+                    self.logger.log_error(
+                        "COURT PUNISHMENT OBSERVE FAILED "
+                        f"chat_id={getattr(event, 'chat_id', None)} "
+                        f"error={_court_punish_error!r}"
+                    )
+                except Exception:
+                    pass
             try:
                 if await try_handle_private_start(self, event):
                     return
