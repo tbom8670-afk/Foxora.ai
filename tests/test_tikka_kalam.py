@@ -92,7 +92,7 @@ def fresh_state():
 def test_texts_are_clean_and_unique():
     print("\n### ۱ فهرست متن‌ها سالم و بدون تکرار است")
     texts = list(tikka_kalam.TIKKAS)
-    check("فهرست خالی نیست", len(texts) >= 70, f"-> {len(texts)}")
+    check("فهرست کامل است (۹۷ جمله)", len(texts) >= 95, f"-> {len(texts)}")
     check("هیچ متن خالی/فاصله‌ی خالی نیست",
           all(text.strip() for text in texts))
     check("هیچ متن تکراری نیست", len(set(texts)) == len(texts),
@@ -140,25 +140,81 @@ def test_two_users_do_not_get_the_same_line_at_once():
           len(set(many)) == 20, f"-> {len(set(many))}")
 
 
+def _simulate_restart():
+    """همهٔ حافظهٔ درون‌پروسه پاک می‌شود؛ فقط فایل روی دیسک می‌ماند."""
+    tikka_kalam._STATE.clear()
+    tikka_kalam._STATE.update({"users": {}, "recent": []})
+    tikka_kalam._LOADED[0] = False
+
+
 def test_state_survives_restart():
-    print("\n### ۴ وضعیت بعد از ری‌استارت ادامه پیدا می‌کند")
+    print("\n### ۴ وضعیت بعد از ری‌استارت/ریست ادامه پیدا می‌کند")
     tmp = fresh_state()
     first = [tikka_kalam.next_tikka(CHAT, 3001) for _ in range(10)]
-    # شبیه‌سازی ری‌استارت: حافظهٔ درون‌پروسه پاک می‌شود، فایل می‌ماند
-    tikka_kalam._STATE.clear()
-    tikka_kalam._LOADED[0] = False
+    _simulate_restart()
     tikka_kalam.set_state_path(tmp)
-    check("فایل وضعیت روی دیسک هست", tmp.exists(), f"-> {tmp}")
     rest = [tikka_kalam.next_tikka(CHAT, 3001)
             for _ in range(tikka_kalam.TOTAL - 10)]
     all_draws = first + rest
-    check("بعد از ری‌استارت هم دوره کامل شد",
+    check("بعد از ری‌استارت هم هیچ تکراری نبود",
           len(set(all_draws)) == tikka_kalam.TOTAL,
           f"-> {len(set(all_draws))} از {tikka_kalam.TOTAL}")
+    check("فایل وضعیت روی دیسک هست", tmp.exists(), f"-> {tmp}")
+
+
+def test_never_repeats_even_after_many_requests():
+    print("\n### ۵ حتی با صدها بار پرسیدن و ریست، تکرار نمی‌شود")
+    tmp = fresh_state()
+    draws = []
+    for index in range(300):
+        if index % 37 == 0:          # شبیه‌سازی ری‌استارت‌های پیاپی
+            _simulate_restart()
+            tikka_kalam.set_state_path(tmp)
+        draws.append(tikka_kalam.next_tikka(CHAT, 6001))
+    blocks_ok = True
+    for start in range(0, len(draws) - tikka_kalam.TOTAL + 1,
+                       tikka_kalam.TOTAL):
+        block = draws[start:start + tikka_kalam.TOTAL]
+        if len(set(block)) != len(block):
+            blocks_ok = False
+            break
+    check("در هر دورهٔ کامل هیچ جمله‌ای تکرار نشد", blocks_ok,
+          f"-> {len(draws)} برداشت")
+    first_cycle = draws[:tikka_kalam.TOTAL]
+    check("دورهٔ اول کامل و بدون تکرار بود",
+          len(set(first_cycle)) == tikka_kalam.TOTAL)
+    status = tikka_kalam.stats(CHAT, 6001)
+    check("شمارندهٔ دوره‌ها درست چرخید",
+          status["cycle"] == 300 // tikka_kalam.TOTAL + 1, f"-> {status}")
+
+
+def test_bot_knows_what_it_told_the_user():
+    print("\n### ۶ ربات می‌داند به هر کاربر چه تیکه‌هایی گفته است")
+    tmp = fresh_state()
+    told = [tikka_kalam.next_tikka(CHAT, 7001) for _ in range(12)]
+    remembered = tikka_kalam.history(CHAT, 7001)
+    check("تاریخچه دقیقاً همان جمله‌های گفته‌شده است",
+          remembered[-12:] == told, f"-> {remembered[-3:]}")
+    check("حافظه بین دو کاربر قاطی نمی‌شود",
+          tikka_kalam.history(CHAT, 7002) == [])
+    status = tikka_kalam.stats(CHAT, 7001)
+    check("تعداد «گفته‌شده» ثبت شده", status["used"] == 12, f"-> {status}")
+    check("تعداد باقی‌مانده درست است",
+          status["remaining"] == tikka_kalam.TOTAL - 12, f"-> {status}")
+    import json as _json
+    payload = _json.loads(tmp.read_text(encoding="utf-8"))
+    check("فایل وضعیت نسخهٔ ۲ و شامل used است",
+          payload.get("version") == 2
+          and len(payload["users"][f"{CHAT}:7001"]["used"]) == 12,
+          f"-> {list(payload)[:4]}")
+    check("ربات در استفادهٔ عادی هیچ‌وقت فایل را پاک نمی‌کند",
+          tikka_kalam.__file__ and
+          "unlink" not in (ROOT / "modules" / "tikka_kalam.py")
+          .read_text(encoding="utf-8").split("def reset_all")[0])
 
 
 def test_command_sends_bold_text():
-    print("\n### ۵ دستور «تیکه کلام» پاسخ Bold می‌دهد")
+    print("\n### ۷ دستور «تیکه کلام» پاسخ Bold می‌دهد")
 
     async def scenario():
         import handlers.message_handler as message_handler
@@ -201,7 +257,7 @@ def test_command_sends_bold_text():
 
 
 def test_guide_mentions_the_command():
-    print("\n### ۶ راهنمای روباه دستور را معرفی می‌کند")
+    print("\n### ۸ راهنمای روباه دستور را معرفی می‌کند")
     source = (ROOT / "handlers" / "message_handler.py").read_text(encoding="utf-8")
     check("در راهنما نوشته «برای دریافت تیکه کلام بنویسید»",
           "برای دریافت تیکه کلام بنویسید" in source)
@@ -224,6 +280,8 @@ def main():
     test_one_user_gets_all_texts_before_any_repeat()
     test_two_users_do_not_get_the_same_line_at_once()
     test_state_survives_restart()
+    test_never_repeats_even_after_many_requests()
+    test_bot_knows_what_it_told_the_user()
     test_command_sends_bold_text()
     test_guide_mentions_the_command()
     print("\n" + "=" * 58)

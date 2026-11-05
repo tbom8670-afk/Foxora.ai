@@ -4,16 +4,20 @@
 قرارداد کارفرما:
 
 * با نوشتن «تیکه کلام» یک جملهٔ تصادفی از این فهرست فرستاده می‌شود.
-* **برای یک کاربر تکرار نمی‌شود:** هر کاربر یک «دستهٔ بُر» (deck) از همهٔ
-  جمله‌ها دارد؛ تا وقتی همهٔ جمله‌ها را نگرفته، هیچ جمله‌ای برایش تکرار
-  نمی‌شود. وقتی دسته خالی شد، دوباره به‌طور تصادفی بُر می‌خورد.
+* **برای یک کاربر هرگز تکرار نمی‌شود:** برای هر (گروه، کاربر) فهرست
+  «همهٔ متن‌هایی که تا حالا گرفته» روی دیسک نگه داشته می‌شود. تا وقتی حتی
+  یک جمله از فهرست برای او باقی مانده، همان را می‌گیرد؛ **ری‌استارت ربات،
+  ریست حافظه یا صدها بار پرسیدن هم این حافظه را پاک نمی‌کند.** فقط وقتی
+  همهٔ جمله‌ها برای همان کاربر گفته شده باشد، دورهٔ بعدی (با بُر تازه)
+  شروع می‌شود.
 * **هم‌زمان برای دو نفر تکرار نمی‌شود:** جمله‌ای که در «پنجرهٔ تازگی»
   (پیش‌فرض ۱۵ دقیقه) به کسی داده شده، به کاربر دیگری داده نمی‌شود؛ اگر
   همهٔ گزینه‌های باقی‌ماندهٔ یک کاربر تازه باشند، قدیمی‌ترین‌شان انتخاب
   می‌شود تا همچنان «بدون تکرار برای همان کاربر» حفظ شود.
 * تصادفی‌بودن واقعی است: ترتیب هر دسته با `random.SystemRandom` بُر می‌خورد.
-* وضعیت روی دیسک ذخیره می‌شود (فایل JSON در پوشهٔ دادهٔ همین نمونهٔ ربات)،
-  پس بعد از ری‌استارت هم حافظهٔ «چه کسی چه چیزی گرفته» از دست نمی‌رود.
+* وضعیت روی دیسک ذخیره می‌شود (فایل JSON در پوشهٔ دادهٔ همین نمونهٔ ربات)
+  و شامل تاریخچهٔ کامل «چه کسی چه جمله‌هایی گرفته» است؛ همان فایل، حافظهٔ
+  دائمی ربات در طول پیام‌ها است.
 """
 from __future__ import annotations
 
@@ -104,6 +108,25 @@ TIKKAS = (
     "از چشم من افتادی و نقش زمینی\nپا می‌خوری؛ الحق که سزاوار همینی",
     "به درد رفاقت نمی‌خوری چه برسه رقابت",
     "مثل پاکت چیپس نصفت باد هوا بود",
+    "تو تاکسیک نبودی ؛ تاکسی بودی عزیزم",
+    "قولاتو گذاشتی زیر پات قدت بلند شده ؟",
+    "مثل عکست شدی ؛ بزرگت کردم بی کیفیت شدی",
+    "تنها کسی که باهام سرد بودنش روم تاثیر داشت کولر بود",
+    "گریه نمی‌کنم برات شرمنده ریملم گرونه",
+    "جایگزین کردن ما آسونه ولی یکی پیدا کردن مثل ما سخت",
+    "توهم پرونده داری اما تو مدرسه",
+    "قلبت بوی پا گرفته از بس توش رفتن اومدن",
+    "همه ویژگی های یه سگ رو داری جز وفاداری",
+    "چشم دیدن مارو نداری؟ آب هویج بخور",
+    "اگه اذیتم کنین یه جوری به زن داییم میگم براتون دعا بنویسه که ابلیس هم نتونه باطلش کنه",
+    "بی فایده ای مثل هشدار روی پاکت سیگار",
+    "آرامشی که الان دارم مدیون رلیه که ندارم",
+    "عین آسانسور شدی همه دکمتو می‌زنن",
+    "تو که مارو فروختی اما خوشبحال خریدار",
+    "مثل برنج همه خیست کردن 😝",
+    "برو با اکسات تیم فوتبال بزن اینجا از وفاداری صحبت نکن",
+    "دور سطل اشغال از ذاتت پاک تره",
+    "به مار عسل دادن ولی باز زهر داد بیرون",
 )
 
 TOTAL = len(TIKKAS)
@@ -111,15 +134,18 @@ TOTAL = len(TIKKAS)
 # جمله‌ای که در این مدت (ثانیه) به کسی داده شده، به کاربر دیگری داده نمی‌شود.
 FRESH_SECONDS = 15 * 60
 _MAX_RECENT = 400
+_HISTORY_CAP = 50           # سقف تاریخچهٔ کوتاه هر کاربر (حجم فایل)
+_MAX_USERS = 5000           # سقف کاربران ردیابی‌شده (پیرترین‌ها هرس می‌شوند)
 
 _LOCK = threading.RLock()
-_STATE = {}          # در حافظه بالا آمده از دیسک
+_STATE = {"users": {}, "recent": []}
 _LOADED = [False]
-_OVERRIDE_FILE = [None]   # فقط برای تست/استقرار صریح
+_OVERRIDE_FILE = [None]     # فقط برای تست/استقرار صریح
 _RNG = random.SystemRandom()
 
 _FILE_ENV = "TIKKA_KALAM_FILE"
 _FILE_NAME = "tikka_kalam.json"
+STATE_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +172,20 @@ def set_state_path(path=None):
     with _LOCK:
         _OVERRIDE_FILE[0] = None if path is None else Path(path).expanduser()
         _STATE.clear()
+        _STATE.update({"users": {}, "recent": []})
         _LOADED[0] = False
+
+
+def _clean_indices(values):
+    out = []
+    for value in values or []:
+        try:
+            index = int(value)
+        except Exception:
+            continue
+        if 0 <= index < TOTAL:
+            out.append(index)
+    return out
 
 
 def _ensure_loaded():
@@ -155,29 +194,45 @@ def _ensure_loaded():
     _LOADED[0] = True
     path = state_path()
     try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            users = data.get("users")
-            if isinstance(users, dict):
-                _STATE["users"] = {str(key): value for key, value in users.items()
-                                   if isinstance(value, dict)}
-            recent = data.get("recent")
-            if isinstance(recent, list):
-                _STATE["recent"] = [row for row in recent
-                                    if isinstance(row, list) and len(row) == 2]
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        pass
+        data = None
     except Exception:
-        # فایل خراب هرگز بازی را نمی‌خواباند؛ از نو شروع می‌کنیم.
-        pass
+        # فایل خراب هرگز ربات را نمی‌خواباند؛ ولی پاک هم نمی‌شود.
+        data = None
+    if isinstance(data, dict):
+        users = data.get("users")
+        if isinstance(users, dict):
+            for key, value in users.items():
+                if isinstance(value, dict):
+                    _STATE["users"][str(key)] = value
+        recent = data.get("recent")
+        if isinstance(recent, list):
+            _STATE["recent"] = [row for row in recent
+                                if isinstance(row, list) and len(row) == 2]
     _STATE.setdefault("users", {})
     _STATE.setdefault("recent", [])
 
 
+def _prune_users():
+    """هرس کاربران قدیمی تا فایل وضعیت برای همیشه سبک بماند."""
+    users = _STATE.get("users") or {}
+    if len(users) <= _MAX_USERS:
+        return
+    def _stamp(item):
+        record = item[1] if isinstance(item[1], dict) else {}
+        try:
+            return float(record.get("last_at") or 0)
+        except Exception:
+            return 0.0
+    keep = sorted(users.items(), key=_stamp, reverse=True)[:_MAX_USERS]
+    _STATE["users"] = dict(keep)
+
+
 def _persist():
+    _prune_users()
     data = {
-        "version": 1,
+        "version": STATE_VERSION,
         "total": TOTAL,
         "saved_at": time.time(),
         "users": _STATE.get("users", {}),
@@ -203,7 +258,7 @@ def _new_deck(exclude=()) -> list:
     _RNG.shuffle(deck)
     excluded = set(exclude)
     if excluded and len(excluded) < TOTAL:
-        # جمله‌ای که همین حالا به کاربر دیگری داده شده، ته دسته می‌رود.
+        # جمله‌های تازه‌داده‌شده به کاربر دیگری، ته دسته می‌روند.
         deck = [index for index in deck if index not in excluded] + \
                [index for index in deck if index in excluded]
     return deck
@@ -225,40 +280,68 @@ def _fresh_indices(now) -> set:
     return fresh
 
 
+def _record_for(chat_id, user_id) -> dict:
+    users = _STATE["users"]
+    key = _user_key(chat_id, user_id)
+    record = users.get(key)
+    if not isinstance(record, dict):
+        record = {"cycle": 1, "used": [], "deck": _new_deck(),
+                  "draws": 0, "history": []}
+        users[key] = record
+    # سازگاری با نسخهٔ قدیمی (که فقط deck/draws داشت)
+    used = set(_clean_indices(record.get("used")))
+    deck = _clean_indices(record.get("deck"))
+    if not used and deck:
+        used = {index for index in range(TOTAL) if index not in set(deck)}
+    record["used"] = sorted(used)
+    record["deck"] = [index for index in dict.fromkeys(deck) if index not in used]
+    record.setdefault("cycle", 1)
+    record.setdefault("draws", 0)
+    if not isinstance(record.get("history"), list):
+        record["history"] = []
+    return record
+
+
 def next_tikka(chat_id, user_id, now=None) -> str:
-    """جملهٔ بعدی برای این کاربر (بدون تکرار برای او، بدون تکرار هم‌زمان)."""
+    """جملهٔ بعدی برای این (گروه، کاربر) — هرگز تکرار تا اتمام کل فهرست."""
     with _LOCK:
         _ensure_loaded()
         now = time.time() if now is None else float(now)
-        users = _STATE["users"]
-        key = _user_key(chat_id, user_id)
-        record = users.get(key)
-        if not isinstance(record, dict):
-            record = {"deck": _new_deck(), "draws": 0}
-            users[key] = record
-        deck = record.get("deck")
-        if not isinstance(deck, list) or not deck:
+        record = _record_for(chat_id, user_id)
+        used = set(record["used"])
+        deck = list(record["deck"])
+
+        if len(used) >= TOTAL:
+            # همهٔ متن‌ها برای همین کاربر گفته شده → تنها حالت مجاز تکرار:
+            # شروع دورهٔ تازه با بُر کامل و تصادفیِ جدید.
+            record["cycle"] = int(record.get("cycle", 1)) + 1
+            used = set()
             deck = _new_deck()
-        deck = [int(index) for index in deck
-                if isinstance(index, int) and 0 <= index < TOTAL]
         if not deck:
-            deck = _new_deck()
+            deck = _new_deck(exclude=used)
 
         fresh = _fresh_indices(now)
-        choice_at = next((position for position, index in enumerate(deck)
-                          if index not in fresh), None)
+        choice_at = next(
+            (position for position, index in enumerate(deck)
+             if index not in used and index not in fresh), None)
         if choice_at is None:
-            # همهٔ باقی‌ماندهٔ دسته تازه‌اند → قدیمی‌ترینِ آن‌ها (بدون تکرار
-            # برای همین کاربر، حتی اگر برای دیگری تازه باشد).
-            stamps = {index: stamp for index, stamp in _STATE.get("recent", [])}
-            oldest = min(range(len(deck)), key=lambda pos: stamps.get(deck[pos], 0))
-            choice_at = oldest
+            choice_at = next(
+                (position for position, index in enumerate(deck)
+                 if index not in used), None)
+        if choice_at is None:
+            deck = _new_deck(exclude=used)
+            choice_at = 0
 
         index = deck.pop(choice_at)
+        used.add(index)
+        record["used"] = sorted(used)
         record["deck"] = deck
         record["draws"] = int(record.get("draws", 0)) + 1
         record["last"] = index
         record["last_at"] = now
+        history = record["history"]
+        history.append([index, now])
+        del history[:-_HISTORY_CAP]
 
         _STATE.setdefault("recent", []).append([index, now])
         _STATE["recent"] = _STATE["recent"][-_MAX_RECENT:]
@@ -266,25 +349,43 @@ def next_tikka(chat_id, user_id, now=None) -> str:
         return TIKKAS[index]
 
 
+def history(chat_id, user_id, limit=None) -> list:
+    """جمله‌هایی که ربات تا حالا به این کاربر در این گروه گفته است."""
+    with _LOCK:
+        _ensure_loaded()
+        record = _STATE["users"].get(_user_key(chat_id, user_id)) or {}
+        rows = []
+        for entry in record.get("history") or []:
+            try:
+                index = int(entry[0])
+            except Exception:
+                continue
+            if 0 <= index < TOTAL:
+                rows.append(TIKKAS[index])
+        return rows[-limit:] if limit else rows
+
+
 def stats(chat_id, user_id) -> dict:
     """وضعیت توزیع برای این کاربر (برای تست/گزارش)."""
     with _LOCK:
         _ensure_loaded()
-        record = _STATE["users"].get(_user_key(chat_id, user_id)) or {}
+        record = _record_for(chat_id, user_id)
+        used = set(record.get("used") or [])
         return {
             "total": TOTAL,
             "draws": int(record.get("draws", 0)),
-            "remaining": len(record.get("deck") or []),
+            "used": len(used),
+            "remaining": max(0, TOTAL - len(used)),
+            "cycle": int(record.get("cycle", 1)),
             "recent": len(_STATE.get("recent") or []),
         }
 
 
 def reset_all():
-    """پاک‌کردن وضعیت (فقط تست/مدیریت)."""
+    """پاک‌کردن وضعیت — فقط برای تست. ربات واقعی هرگز این را صدا نمی‌زند."""
     with _LOCK:
         _STATE.clear()
-        _STATE["users"] = {}
-        _STATE["recent"] = []
+        _STATE.update({"users": {}, "recent": []})
         _LOADED[0] = True
         try:
             state_path().unlink()
