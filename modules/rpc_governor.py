@@ -248,6 +248,52 @@ def _stable_chat_key(value):
             return "global"
 
 
+# ---------------------------------------------------------------------------
+# 🚦 رجیستری Governor فعال + هوک FloodWait
+# ---------------------------------------------------------------------------
+# ``rpc_resilience`` بیرونی‌ترین لایه است و FloodWait را همان‌جا می‌بیند؛ برای
+# اینکه حالتِ auto بتواند خودش را محافظه‌کار کند، فقط کافی است Governor فعال
+# را اینجا ثبت کنیم و از آن لایه خبر بدهیم.
+_ACTIVE_GOVERNOR = [None]
+
+_DELETE_REQUEST_HINTS = (
+    "deletemessages", "deletechannelmessages", "deletehistory",
+    "deleteparticipanthistory", "deletephonenumber",
+)
+
+
+def register_active(governor):
+    """ثبت Governor فعال پروسه (برای هوکِ FloodWait)."""
+    _ACTIVE_GOVERNOR[0] = governor
+    return governor
+
+
+def active_governor():
+    return _ACTIVE_GOVERNOR[0]
+
+
+def bucket_for_request_name(request_name):
+    """نگاشتِ سریعِ نام درخواست به باکت (بدون ساختن شیء درخواست)."""
+    name = str(request_name or "").replace("_", "").lower()
+    for hint in _DELETE_REQUEST_HINTS:
+        if hint in name:
+            return "delete"
+    return "send"
+
+
+def note_flood_wait(request_name=None, bucket=None, seconds=0.0):
+    """لایهٔ بیرونی وقتی FloodWait دید اینجا خبر می‌دهد."""
+    governor = _ACTIVE_GOVERNOR[0]
+    if governor is None:
+        return False
+    target = bucket or bucket_for_request_name(request_name)
+    try:
+        governor.note_flood_wait(target, seconds=seconds)
+        return True
+    except Exception:
+        return False
+
+
 def classify_request(request, *, urgent_send=False, critical_context=False,
                      channel="main"):
     """Classify a SPlusthon TL request using names stable across versions.
@@ -328,6 +374,8 @@ class RpcGovernor:
         wait_log_ms=20.0,
         max_send_waiters=32,
         min_interval_seconds=0.0,
+        auto_delete=False,
+        flood_cooldown_s=60.0,
     ):
         self.total_limit = max(1, int(total_limit))
         isolated_default = noncritical_limit is None
@@ -380,6 +428,10 @@ class RpcGovernor:
         )
         self.enabled = bool(enabled)
         self.shadow = bool(shadow)
+        # حالتِ auto برای delete: سقف ۲ ولی با نگهبانِ FloodWait.
+        self.auto_delete = bool(auto_delete)
+        self.flood_cooldown_s = max(0.0, float(flood_cooldown_s))
+        self._flood_until = {}
         self.logger = logger
         self.wait_log_ms = max(0.0, float(wait_log_ms))
         self.max_send_waiters = max(0, int(max_send_waiters))
@@ -421,7 +473,18 @@ class RpcGovernor:
         # Three normal slots let one slow resolve, one user-facing send and
         # one delete coexist. P0 gets its own small reserve below.
         total_limit = min(3, max(2, _env_int("BOT_RPC_TOTAL_LIMIT", 3)))
-        delete_limit = min(2, max(1, _env_int("BOT_RPC_DELETE_LIMIT", 1)))
+        # BOT_RPC_DELETE_LIMIT=auto → سقف ۲ برای bucket=delete، ولی «مشروط»:
+        # به‌محضِ دیدن یک FloodWait روی همین باکت، تا پایانِ cooldown به ۱
+        # برمی‌گردد (پایین‌تر: note_flood_wait/_delete_cap).
+        delete_raw = str(os.environ.get("BOT_RPC_DELETE_LIMIT", "1")).strip().lower()
+        auto_delete = delete_raw in {"auto", "خودکار"}
+        if auto_delete:
+            delete_limit = 2 if total_limit >= 3 else 1
+        else:
+            try:
+                delete_limit = min(2, max(1, int(delete_raw)))
+            except (TypeError, ValueError):
+                delete_limit = 1
         send_limit = min(2, max(1, _env_int("BOT_RPC_SEND_LIMIT", 1)))
         heavy_limit = min(1, max(1, _env_int("BOT_RPC_HEAVY_LIMIT", 1)))
         isolated = min(total_limit, delete_limit + send_limit)
@@ -463,7 +526,54 @@ class RpcGovernor:
             min_interval_seconds=min(
                 60.0, _env_float("RPC_MIN_INTERVAL_SECONDS", 0.0)
             ),
+            auto_delete=auto_delete,
+            flood_cooldown_s=_env_float("BOT_RPC_FLOOD_GUARD_S", 60.0),
         )
+
+    # ------------------------------------------------------------------
+    # 🚦 حالتِ «auto» برای bucket=delete
+    # ------------------------------------------------------------------
+    # مقایسه (جزئیات در docs/RPC_TUNING.md):
+    #   (الف) delete_limit=2 ساده: انتظارِ Governor برای حذف نصف می‌شود، ولی
+    #         تعداد فراخوانیِ هم‌زمانِ delete_messages دو برابر است و اگر سروش
+    #         فشار را زیاد ببیند FLOOD_WAIT می‌دهد؛ در آن حالت همهٔ حذف‌ها
+    #         (از جمله پاک‌سازی خودکار) عقب می‌افتند.
+    #   (ب) auto: در حالتِ سالم ۲ می‌شود، و به‌محضِ یک FloodWait روی delete
+    #         تا پایانِ cooldown (پیش‌فرض ۶۰ ثانیه) به ۱ برمی‌گردد.
+    # حالتِ auto همان (الف) است ولی ریسکِ FLOOD_WAIT را خودش مهار می‌کند؛
+    # پیش‌فرضِ پروژه هم‌چنان ۱ (محافظه‌کارانه) می‌ماند.
+    def note_flood_wait(self, bucket=None, seconds=0.0, cooldown=None):
+        """ثبتِ FloodWait روی یک باکت؛ حالتِ auto را محافظه‌کار می‌کند."""
+        bucket = str(bucket or "delete")
+        cooldown = self.flood_cooldown_s if cooldown is None else float(cooldown)
+        until = time.monotonic() + max(0.0, min(600.0, cooldown))
+        self._flood_until[bucket] = until
+        try:
+            self._log_warn(
+                "GOVERNOR FLOOD GUARD "
+                f"bucket={bucket} wait_s={float(seconds or 0.0):.1f} "
+                f"cooldown_s={cooldown:g} delete_limit={self._delete_cap()}"
+            )
+        except Exception:
+            pass
+
+    def _log_warn(self, message):
+        if self.logger is None:
+            return
+        try:
+            self.logger.log_info(message)
+        except Exception:
+            pass
+
+    def _delete_cap(self):
+        """سقفِ مؤثرِ delete (با احتساب حالتِ auto و cooldown)."""
+        cap = self.class_limits.get("delete", 1)
+        if not self.auto_delete:
+            return cap
+        until = self._flood_until.get("delete", 0.0)
+        if until and time.monotonic() < until:
+            return 1
+        return cap
 
     @property
     def active(self):
@@ -510,6 +620,8 @@ class RpcGovernor:
         if priority == P0_CRITICAL:
             return True
         cap = self.class_limits.get(bucket)
+        if bucket == "delete":
+            cap = self._delete_cap()
         if cap is not None and self._active_by_bucket[bucket] >= cap:
             return False
         # Long reads/lookups are accounted as noncritical for background

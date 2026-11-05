@@ -186,6 +186,14 @@ def install_rpc_resilience(client, logger=None, policy=None, controller=None):
                 raise
             except Exception as error:
                 seconds = flood_wait_seconds(error)
+                if seconds is not None:
+                    # 🚦 خبر دادن به Governor: حالتِ auto برای delete تا پایانِ
+                    # cooldown به سقفِ ۱ برمی‌گردد (مهار ریسکِ FloodWait).
+                    try:
+                        from modules.rpc_governor import note_flood_wait
+                        note_flood_wait(name, seconds=seconds)
+                    except Exception:
+                        pass
                 if seconds is None or attempt >= policy.flood_max_retries:
                     raise
                 key = controller.key_for(name, chat_id, error)

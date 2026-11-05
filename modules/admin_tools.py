@@ -814,25 +814,130 @@ def get_group_lock(chat_id):
     return lock
 
 
+def _usable_peer(value):
+    """آیا این مقدار یک InputPeer واقعی است (نه شناسهٔ خام)؟"""
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return False
+    if isinstance(value, str):
+        return False
+    return True
+
+
+def _cleanup_peer_fallbacks(chat_id):
+    """InputPeerهای امنِ جایگزین — **هیچ‌وقت** شناسهٔ خام برنمی‌گردانیم.
+
+    چرا: وقتی یک عدد خام به ``iter_messages``/``get_messages`` داده شود،
+    SPlusthon خودش سعی می‌کند آن را resolve کند: ``GetChannelsRequest`` را
+    می‌زند و بی‌هیچ بررسی‌ای ``channels[0]`` را می‌خواند. برای گروه‌هایی که
+    سروش در آن پاسخ، کانال برنمی‌گرداند این کار به
+    ``IndexError('list index out of range')`` می‌رسد؛ و برای بعضی شناسه‌ها
+    هم ``GetUsersRequest`` با ``404 NOT_FOUND`` کلِ درخواست را می‌کشد.
+    با پاس‌دادن یک Peer صریح، آن مسیر پرخطر کلاً طی نمی‌شود.
+    """
+    variants = []
+    try:
+        normalized = int(normalize_group_id(chat_id))
+    except (TypeError, ValueError):
+        return variants
+    try:
+        from splusthon.tl import types as tl_types
+    except Exception:
+        return variants
+    for name in ("PeerChannel", "InputPeerChannel"):
+        factory = getattr(tl_types, name, None)
+        if factory is None:
+            continue
+        try:
+            variants.append(factory(channel_id=normalized))
+            continue
+        except Exception:
+            pass
+        try:
+            variants.append(factory(normalized, 0))
+        except Exception:
+            continue
+    return variants
+
+
+async def _resolve_cleanup_peer(bot, chat_id, log):
+    """تلاشِ امن برای گرفتن InputPeer گروه؛ در شکست ``None`` می‌دهد."""
+    resolver = getattr(getattr(bot, "group_actions", None), "_group_peer", None)
+    if callable(resolver):
+        try:
+            peer = await resolver(chat_id)
+            if _usable_peer(peer):
+                log(
+                    f"SNAPSHOT PEER RESOLVED chat_id={chat_id} "
+                    f"target_type={type(peer).__name__} via=group_actions"
+                )
+                return [peer]
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log(
+                f"SNAPSHOT PEER RESOLVE FAILED chat_id={chat_id} "
+                f"via=group_actions error={type(error).__name__}: {error}"
+            )
+
+    client = getattr(bot, "client", None)
+    factory = getattr(client, "get_input_entity", None)
+    if callable(factory) and _is_int_like(chat_id):
+        candidate = int(normalize_group_id(chat_id))
+        try:
+            peer = await factory(candidate)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log(
+                f"SNAPSHOT PEER RESOLVE FAILED chat_id={chat_id} "
+                f"via=get_input_entity error={type(error).__name__}: {error}"
+            )
+            peer = None
+        if _usable_peer(peer):
+            log(
+                f"SNAPSHOT PEER RESOLVED chat_id={chat_id} "
+                f"target_type={type(peer).__name__} via=get_input_entity"
+            )
+            return [peer]
+
+    fallbacks = _cleanup_peer_fallbacks(chat_id)
+    if fallbacks:
+        log(
+            f"SNAPSHOT PEER FALLBACK chat_id={chat_id} "
+            f"candidates={len(fallbacks)}"
+        )
+    return fallbacks
+
+
+def _is_int_like(value):
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _cleanup_rpc_targets(bot, chat_id):
-    """Prefer a resolved event InputPeer, then safe full/legacy ID forms."""
+    """InputPeerهای امنِ کش‌شده برای گروه (بدون هیچ شناسهٔ خام)."""
     targets = []
     wanted = normalize_group_id(chat_id)
     cache = getattr(bot, "reply_input_peer_cache", {}) or {}
     direct = cache.get(chat_id)
-    if direct is not None:
+    if _usable_peer(direct):
         targets.append(direct)
     for cached_id, peer in list(cache.items()):
-        if peer is not None and normalize_group_id(cached_id) == wanted:
+        if not _usable_peer(peer):
+            continue
+        try:
+            same_chat = normalize_group_id(cached_id) == wanted
+        except Exception:
+            same_chat = False
+        if same_chat and peer is not direct:
             targets.append(peer)
             break
-
-    candidate_factory = getattr(
-        getattr(bot, "group_actions", None), "_peer_id_candidates", None
-    )
-    if callable(candidate_factory):
-        targets.extend(candidate_factory(chat_id))
-    targets.append(chat_id)
+    return targets
 
     unique = []
     markers = set()
@@ -849,7 +954,28 @@ async def _snapshot_cleanup_message_ids(bot, chat_id, count, log):
     """Freeze existing IDs, distinguishing an empty group from RPC failure."""
     iterator_factory = getattr(bot.client, "iter_messages", None)
     errors = []
-    for target in _cleanup_rpc_targets(bot, chat_id):
+    try:
+        count = max(1, min(int(count or 0), 10000))
+    except (TypeError, ValueError):
+        count = 3000
+
+    targets = _cleanup_rpc_targets(bot, chat_id)
+    seen_targets = {repr(target) for target in targets}
+    for target in await _resolve_cleanup_peer(bot, chat_id, log):
+        if repr(target) in seen_targets:
+            continue
+        seen_targets.add(repr(target))
+        targets.append(target)
+
+    if not targets:
+        # بدون Peer قابل‌اعتماد، هیچ RPCای با شناسهٔ خام زده نمی‌شود.
+        log(
+            f"SNAPSHOT FAILED chat_id={chat_id} reason=no_resolvable_peer "
+            "(گروه هنوز resolve نشده؛ به‌جای شناسهٔ خام، پاک‌سازی لغو شد)"
+        )
+        return None
+
+    for target in targets:
         ids = []
         try:
             if callable(iterator_factory):
@@ -868,7 +994,8 @@ async def _snapshot_cleanup_message_ids(bot, chat_id, count, log):
             errors.append(error)
             log(
                 f"SNAPSHOT RETRY chat_id={chat_id} "
-                f"target_type={type(target).__name__} error={error!r}"
+                f"target_type={type(target).__name__} "
+                f"error={type(error).__name__}: {error}"
             )
             continue
 
@@ -880,8 +1007,15 @@ async def _snapshot_cleanup_message_ids(bot, chat_id, count, log):
         )
         return ids
 
-    last_error = errors[-1] if errors else RuntimeError("no cleanup target")
-    log(f"SNAPSHOT FAILED chat_id={chat_id} error={last_error!r}")
+    if errors:
+        last_error = errors[-1]
+        log(
+            f"SNAPSHOT FAILED chat_id={chat_id} reason=rpc_failed "
+            f"attempts={len(errors)} "
+            f"error={type(last_error).__name__}: {last_error}"
+        )
+    else:
+        log(f"SNAPSHOT FAILED chat_id={chat_id} reason=no_cleanup_target")
     return None
 
 
@@ -912,7 +1046,10 @@ async def execute_cleanup(bot, chat_id, count, logger=None):
             if ids is None:
                 # Never mark a failed history lookup as a successful zero-item
                 # cleanup. The watcher retains the schedule for a later retry.
-                _log(f"ABORT chat_id={chat_id} reason=snapshot_failed")
+                _log(
+                    f"ABORT chat_id={chat_id} reason=snapshot_failed "
+                    "action=cleanup_cancelled schedule_kept_for_retry"
+                )
                 return False
 
             # ۱) قفلِ گروه

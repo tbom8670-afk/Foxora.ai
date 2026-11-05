@@ -226,3 +226,29 @@ python3 -m tools.soroush_membership_probe --channel @mychannel
 ```bash
 python3 tests/test_tikka_kalam.py   # ۳۵ بررسی
 ```
+
+---
+
+## 🚦 پایداری و کندی (راند ۱۱)
+
+پنج نقطهٔ کند/خطادار که در لاگِ کلاینت دیده شد، بدونِ دست‌زدن به مسیرهای سالم:
+
+* **پاک‌سازی خودکار:** هرگز با شناسهٔ خام به `iter_messages` نمی‌رود (علتِ
+  `IndexError: list index out of range`)؛ اگر peer پیدا نشود پاک‌سازی با پیامِ
+  شفاف لغو می‌شود، نه با traceback.
+* **کاربرِ حذف‌شده:** یک `GetUsersRequest … 404 NOT_FOUND` دیگر کلِ batch را
+  نمی‌کشد؛ اول batch، در صورتِ شکست تک‌به‌تک (`modules/safe_rpc.py`).
+* **`GetParticipants`:** کشِ ۶۰ ثانیه + single-flight + حداقل ۲ ثانیه فاصله
+  (`modules/participant_cache.py`) — از ~۱۰ فراخوانی در ۱۴ ثانیه به حداکثر
+  ۱ در دقیقه برای هر گروه.
+* **Governor:** `BOT_RPC_DELETE_LIMIT=auto` سقفِ delete را ۲ می‌کند و بعد از
+  هر FloodWait آن را ۶۰ ثانیه به ۱ برمی‌گرداند (پیش‌فرض همان ۱).
+* **ترموکس:** نگهبانِ حافظه (`modules/memory_guard.py`) هر دقیقه RSS را
+  می‌خواند و کش‌ها را هرس می‌کند (soft ۲۲۰MB / hard ۳۲۰MB).
+
+جزئیات، مقایسهٔ گزینه‌های Governor و سناریوی تست هر تغییر:
+[`docs/RPC_TUNING.md`](docs/RPC_TUNING.md)
+
+```bash
+PYTHONPATH=. python3 tests/test_slow_and_error_fixes.py   # ۳۵ بررسی
+```

@@ -343,7 +343,13 @@ async def _group_main_owner_display(bot, chat, fallback_user=None, chat_id=None)
         except Exception:
             pass
 
-    try:
+    # ⏱️ همین یک پرس‌وجو قبلاً در هر دستور (و برای هر پیامِ گروه) تکرار
+    # می‌شد؛ در لاگ ~۱۰ بار GetParticipantsRequest در ۱۴ ثانیه دیده شد.
+    # حالا نتیجه ۶۰ ثانیه کش می‌شود و درخواست‌های هم‌زمان single-flight
+    # می‌شوند، پس هر گروه حداکثر یک RPC در دقیقه می‌زند.
+    from modules import participant_cache
+
+    async def _fetch_owner():
         participants = await bot.client.get_participants(chat, limit=1)
         if participants:
             owner_user = participants[0]
@@ -354,6 +360,17 @@ async def _group_main_owner_display(bot, chat, fallback_user=None, chat_id=None)
                     f"username={getattr(owner_user, 'username', None)!r}")
                 return format_user(owner_user)
         _log(f"GROUP OWNER FALLBACK chat_id={chat_id} reason=participants_empty")
+        return None
+
+    try:
+        cached = participant_cache.get_cached(chat_id, "owner")
+        if cached:
+            return cached
+        label = await participant_cache.get_or_fetch(
+            chat_id, "owner", _fetch_owner, logger=_log_logger(bot)
+        )
+        if label:
+            return label
     except Exception as error:
         _log(f"GROUP OWNER FALLBACK chat_id={chat_id} reason={error!r}")
     return format_user(fallback_user)
@@ -1153,6 +1170,14 @@ def _queue_big_spam_ban(bot, event, chat_id, user_id, sender, seed_ids, reason):
 _NATIVE_ADMIN_FAIL_TTL = 180
 _NATIVE_ADMIN_NEGATIVE_TTL = 90
 _NATIVE_ADMIN_LIST_TTL = 60
+
+
+def _log_logger(bot):
+    """logger ساده برای ماژول کش (بدون شکستن تست‌ها وقتی logger نیست)."""
+    logger = getattr(bot, "logger", None)
+    if logger is None:
+        return None
+    return logger
 
 
 async def _bot_status_text(bot):

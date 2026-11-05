@@ -2854,6 +2854,72 @@ class SoroushAntiSpamBot:
         except Exception:
             pass
 
+        # 🧠 نگهبانِ حافظه: روی ترموکس/اندروید پروسهٔ پرمصرف بی‌رحمانه kill
+        # می‌شود (بدون traceback). این حلقه هر دقیقه RSS را می‌خواند و
+        # کش‌های ثبت‌شده را هرس می‌کند تا هرگز به آن نقطه نرسیم.
+        try:
+            from modules import memory_guard as _memory_guard
+            from modules import participant_cache as _participant_cache
+
+            _memory_guard.register(
+                "participant_cache",
+                lambda kind: _participant_cache.prune_to(
+                    200 if kind == "hard" else 1200),
+                size=lambda: _participant_cache.describe().get("entries", 0),
+            )
+
+            def _prune_reply_peer_cache(kind):
+                cache = getattr(self, "reply_input_peer_cache", None)
+                if not isinstance(cache, dict):
+                    return 0
+                limit = 200 if kind == "hard" else 800
+                removed = 0
+                while len(cache) > limit:
+                    try:
+                        cache.pop(next(iter(cache)))
+                    except Exception:
+                        break
+                    removed += 1
+                return removed
+
+            _memory_guard.register(
+                "reply_input_peer_cache", _prune_reply_peer_cache,
+                size=lambda: len(getattr(self, "reply_input_peer_cache", {}) or {}),
+            )
+
+            def _prune_native_admin_cache(kind):
+                cache = getattr(self, "native_group_admin_ids_cache", None)
+                if not isinstance(cache, dict):
+                    return 0
+                limit = 200 if kind == "hard" else 800
+                removed = 0
+                while len(cache) > limit:
+                    try:
+                        cache.pop(next(iter(cache)))
+                    except Exception:
+                        break
+                    removed += 1
+                return removed
+
+            _memory_guard.register(
+                "native_group_admin_ids_cache", _prune_native_admin_cache,
+                size=lambda: len(
+                    getattr(self, "native_group_admin_ids_cache", {}) or {}),
+            )
+
+            asyncio.create_task(
+                _memory_guard.run(self, getattr(self, "logger", None)),
+                name="memory-guard",
+            )
+        except Exception as _memory_guard_error:
+            try:
+                self.logger.log_error(
+                    "MEMORY GUARD START FAILED "
+                    f"error={_memory_guard_error!r}"
+                )
+            except Exception:
+                pass
+
         # ⛑️ حلقهٔ اصلی: مالکِ بازسازی، supervisor است (با client_factory
         # که یک SoroushClient کاملاً جدید با سشن تازه می‌سازد و self.client
         # را عوض می‌کند). این حلقه فقط روی self.clientِ فعلی منتظر قطع شدن

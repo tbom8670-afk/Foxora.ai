@@ -833,6 +833,11 @@ def install(client, bot, logger=None):
             bot.rpc_governor = governor
         except Exception:
             pass
+        try:
+            from modules.rpc_governor import register_active
+            register_active(governor)
+        except Exception:
+            pass
         if effective_logger:
             effective_logger.log_info(
                 "RPC GOVERNOR READY "
