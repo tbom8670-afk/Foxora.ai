@@ -2860,6 +2860,14 @@ class SoroushAntiSpamBot:
         try:
             from modules import memory_guard as _memory_guard
             from modules import participant_cache as _participant_cache
+            from modules import user_profile_cache as _user_profile_cache
+
+            # لاگرِ پیش‌فرض برای کش‌ها؛ مسیرهایی مثل force_join_api و
+            # bio_link_service لاگرِ خودشان را ندارند و از این استفاده می‌کنند
+            # تا خط‌های «GetParticipants cache hit/coalesced» و
+            # «GETFULLUSER cache hit/coalesced» در لاگ دیده شوند.
+            _participant_cache.set_default_logger(getattr(self, "logger", None))
+            _user_profile_cache.set_default_logger(getattr(self, "logger", None))
 
             _memory_guard.register(
                 "participant_cache",
@@ -2881,6 +2889,13 @@ class SoroushAntiSpamBot:
                         break
                     removed += 1
                 return removed
+
+            _memory_guard.register(
+                "user_profile_cache",
+                lambda kind: _user_profile_cache.prune_to(
+                    500 if kind == "hard" else 3000),
+                size=lambda: _user_profile_cache.describe().get("entries", 0),
+            )
 
             _memory_guard.register(
                 "reply_input_peer_cache", _prune_reply_peer_cache,

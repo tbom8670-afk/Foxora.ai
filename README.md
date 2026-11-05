@@ -252,3 +252,27 @@ python3 tests/test_tikka_kalam.py   # ۳۵ بررسی
 ```bash
 PYTHONPATH=. python3 tests/test_slow_and_error_fixes.py   # ۳۵ بررسی
 ```
+
+---
+
+## 🧊 راند ۱۲ — کشِ `GetParticipants` و جداسازیِ لِین‌های Governor
+
+* **ریشهٔ طوفان:** بررسیِ عضویت روی سروش `getParticipant` ندارد، پس
+  `find_member` فهرست را صفحه‌به‌صفحه می‌خواند (۱۳۰۰ عضو ⇒ ۱۳ RPC). حالا هر
+  صفحه از کشِ مشترک می‌آید: **TTL ۸ ثانیه**، حداقل فاصلهٔ ۱٫۵ ثانیه بین دو
+  RPC واقعی برای همان گروه، و coalescingِ درخواست‌های هم‌زمان.
+  لاگ: `GetParticipants cache hit chat=X` / `GetParticipants coalesced chat=X`.
+* **Governor:** `GetParticipantsRequest` لِینِ مستقلِ `poll` گرفت
+  (`BOT_RPC_POLL_LIMIT=1`)، خواندنِ سنگین دیگر سهمِ `notice`/`delete` را
+  نمی‌خورد و heavy/poll وقتی صفِ send/notice دارد شروع نمی‌شود. لاگِ
+  `GOVERNOR HOLD SLOW` حالا `culprit=` هم دارد.
+* **پروفایل:** `GetFullUserRequest` یک کشِ کاربریِ ۴۵ ثانیه‌ای دارد
+  (`GETFULLUSER cache hit user=X`) — یک کاربر در چند گروه یک RPC.
+* **`PERF WARNING`:** حالا `slowest=…` و `notes=bio_check=…,banned_word=…`
+  را هم می‌نویسد، پس گلوگاهِ هر پیامِ کند معلوم است.
+
+جزئیات و جدولِ مقایسهٔ گزینه‌های Governor: [`docs/RPC_TUNING.md`](docs/RPC_TUNING.md)
+
+```bash
+PYTHONPATH=. python3 tests/test_heavy_poll_and_profile_cache.py   # ۳۵ بررسی
+```

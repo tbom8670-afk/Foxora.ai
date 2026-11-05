@@ -98,7 +98,17 @@ async def _punish_existing_members_by_filtered_name(bot, event, chat_id, actor_u
 
     chat_target = getattr(event, "chat", None) or chat_id
     try:
-        participants = await client.get_participants(chat_target)
+        from modules import participant_cache
+
+        async def _fetch_members():
+            return await client.get_participants(chat_target)
+
+        # 🧊 کشِ مشترکِ فهرست اعضا (TTL ۸ثانیه): دستورهای گروهیِ پشتِ‌سرِهم
+        # دیگر هر بار GetParticipants نمی‌زنند.
+        participants = await participant_cache.get_or_fetch(
+            chat_id, "members", _fetch_members,
+            logger=getattr(bot, "logger", None),
+        )
     except Exception:
         return 0, is_mute_mode
     if not participants:

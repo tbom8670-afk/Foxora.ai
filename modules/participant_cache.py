@@ -1,28 +1,35 @@
 # -*- coding: utf-8 -*-
 """🧊 کشِ مشترکِ «فهرست اعضا» — جلوگیری از طوفانِ GetParticipantsRequest.
 
-مشکلِ مشاهده‌شده در لاگ: برای یک گروه، ``GetParticipantsRequest`` حدود ۱۰ بار
-در ۱۴ ثانیه صدا زده می‌شد. هر تماس یک RPC کامل روی Governor است، پس هم
-bucket=delete را پشتِ صف می‌اندازد و هم روی ترموکس/موبایل فشار می‌آورد.
+مشکلِ مشاهده‌شده در لاگِ کلاینت (22:53:58 تا 22:54:09): برای **یک** chat_id
+``GetParticipantsRequest`` حدود ۱۳ بار پشتِ‌سرِهم با فاصلهٔ ~۱۰۰ms بین پاسخ و
+درخواستِ بعدی زده شد (همه با ``bucket=heavy``). هر تماس یک RPC کامل روی
+Governor است، پس هم باکت heavy را اشباع می‌کند و هم ``delete``/``notice``/
+``send`` پشتش در صف می‌مانند (``GOVERNOR HOLD SLOW bucket=notice`,
+``bucket=delete`` هر دو ~۵۰۳ms).
 
 این ماژول سه کار می‌کند و هیچ RPCای از خودش نمی‌زند:
 
-1. **کشِ TTL:** نتیجهٔ هر پرس‌وجو برای ``ttl`` ثانیه (پیش‌فرض ۶۰) نگه داشته
+1. **کشِ TTL:** نتیجهٔ هر پرس‌وجو برای ``ttl`` ثانیه (پیش‌فرض ۸) نگه داشته
    می‌شود؛ تماسِ بعدی در این بازه صفر RPC است.
-2. **Single-flight:** اگر دو مسیر هم‌زمان همان کلید را بخواهند، فقط **یک**
-   RPC زده می‌شود و بقیه منتظر همان Future می‌مانند (نه ۱۰ درخواست موازی).
-3. **حداقلِ فاصلهٔ RPC بین دو شکستِ کش:** اگر نتیجه «خالی/خطا» بود و کسی
-   دوباره پرسید، حداقل ``MIN_INTERVAL`` ثانیه (پیش‌فرض ۲ ثانیه) صبر می‌شود؛
-   یعنی حتی در حالت خرابی هم polling به حداکثر یک RPC در ۲ ثانیه محدود است.
+2. **Single-flight (coalescing):** اگر چند مسیر هم‌زمان همان کلید را بخواهند،
+   فقط **یک** RPC زده می‌شود و بقیه منتظر همان Future می‌مانند.
+3. **حداقلِ فاصلهٔ RPC:** بین دو تلاشِ واقعی برای همان کلید دست‌کم
+   ``MIN_INTERVAL`` ثانیه (پیش‌فرض ۱٫۵) فاصله می‌افتد؛ یعنی حتی در حالت
+   کش‌نشده/خطا هم polling به یک RPC در ۱٫۵ ثانیه محدود است.
 
-مقدارها و دلیلشان:
+مقدارها و دلیلشان (طبقِ درخواستِ راند ۱۲):
 
-* ``TTL = 60s``: نقش ادمین/مالک در گروه‌های سروش به‌ندرت (دقیقه‌ای) عوض
-  می‌شود؛ ۶۰ ثانیه تأخیر در دیده‌شدنِ تغییرِ نقش بی‌خطر است و در عوض حجم
-  RPC را برای هر گروه از «هر پیام/هر دستور» به «حداکثر یک بار در دقیقه»
-  می‌رساند.
-* ``MIN_INTERVAL = 2s``: کرانِ بالا برای حالتِ خطا/کش‌نشده؛ کمتر از آن سودی
-  ندارد و بیشتر از ۲ ثانیه باعث می‌شود پاسخِ دستورِ کاربر دیر شود.
+* ``TTL = 8s`` در بازهٔ پیشنهادی ۵ تا ۱۰ ثانیه: تغییرِ فهرستِ اعضا/نقش‌ها
+  نادر است و سروش خودش update می‌فرستد؛ TTL کوتاه‌تر (مثلاً ۲s) فشار را
+  کم نمی‌کند و بلندتر از ۱۰s ممکن است دادهٔ کهنه بدهد. ۸ ثانیه وسطِ این
+  بازه است تا هم طوفانِ ۱۳ تایی به ۱ RPC تبدیل شود و هم داده کهنه نشود.
+* ``MIN_INTERVAL = 1.5s`` در بازهٔ پیشنهادی ۱ تا ۲ ثانیه: کفِ فاصلهٔ دو RPC
+  واقعی برای همان **chat_id** (نه فقط همان کلید)؛ ۱ ثانیه سست است و ۲ ثانیه
+  پاسخِ دستور را دیر می‌کند. تنها استثنا پیمایشِ صفحه‌به‌صفحهٔ force-join است
+  که ``min_interval=0`` می‌فرستد: آن یک «اسکنِ واحد» با تأخیرِ داخلی و
+  بودجهٔ زمانی است و اعمالِ ۱٫۵ ثانیه بین صفحه‌ها آن را از بودجهٔ ۲۰ ثانیه
+  بیرون می‌انداخت (یعنی خراب‌کردنِ یک مسیرِ سالم).
 * سقفِ تعداد کلید = ۲۰۰۰ با حذفِ قدیمی‌ترین (LRU ساده) تا حافظهٔ ترموکس
   هیچ‌وقت با رشدِ بی‌نهایت بالا نرود.
 """
@@ -32,15 +39,45 @@ import asyncio
 import time
 from collections import OrderedDict
 
-DEFAULT_TTL = 60.0
-MIN_INTERVAL = 2.0
+DEFAULT_TTL = 8.0
+MIN_INTERVAL = 1.5
 MAX_ENTRIES = 2000
+
+# فاصلهٔ حداقلیِ لاگِ «cache hit» برای هر کلید (ضد طوفانِ لاگ).
+_HIT_LOG_INTERVAL = 1.0
+_LOG_TS = {}
+
+# لاگرِ پیش‌فرض (core یک بار ثبت می‌کند تا مسیرهایی که logger ندارند هم لاگ بدهند)
+_DEFAULT_LOGGER = [None]
+
+
+def set_default_logger(logger):
+    """ثبتِ لاگرِ پروسه؛ مسیرهایی مثل force_join_api لاگر ندارند."""
+    _DEFAULT_LOGGER[0] = logger
+    return logger
+
+
+def _logger(logger=None):
+    return logger if logger is not None else _DEFAULT_LOGGER[0]
+
+
+def _log(logger, message, *, error=False):
+    logger = _logger(logger)
+    if logger is None:
+        return
+    try:
+        if error:
+            logger.log_error(message)
+        else:
+            logger.log_info(message)
+    except Exception:
+        pass
 
 # key → (saved_at, value)
 _CACHE = OrderedDict()
 # key → asyncio.Future (درخواستِ در جریان)
 _INFLIGHT = {}
-# key → monotonic timestamp آخرین تلاش
+# chat_key → monotonic timestamp آخرین RPC واقعی (cooldownِ هر chat)
 _LAST_CALL = {}
 # key → آخرین خطا (برای گزارش/تست)
 _LAST_ERROR = {}
@@ -55,6 +92,15 @@ def _key(chat_id, kind, extra=""):
     except Exception:
         chat_key = str(chat_id)
     return f"{chat_key}:{kind}:{extra}"
+
+
+def _chat_key(chat_id):
+    """کلیدِ «گروه» برای cooldown — مستقل از kind/offset."""
+    try:
+        from modules.group_id import normalize_group_id
+        return str(normalize_group_id(chat_id))
+    except Exception:
+        return str(chat_id)
 
 
 def _prune():
@@ -124,8 +170,27 @@ def clear():
     _INFLIGHT.clear()
     _LAST_CALL.clear()
     _LAST_ERROR.clear()
+    _LOG_TS.clear()
     for name in STATS:
         STATS[name] = 0
+
+
+def _log_hit(chat_id, kind, value, logger, extra="", label="GetParticipants"):
+    """لاگِ «cache hit» با محدودیتِ ۱ بار در ثانیه برای هر کلید (ضد طوفان)."""
+    key = _key(chat_id, kind, extra)
+    now = time.monotonic()
+    if now - _LOG_TS.get(key, 0.0) < _HIT_LOG_INTERVAL:
+        return
+    _LOG_TS[key] = now
+    try:
+        size = len(value) if isinstance(value, (list, tuple, dict, set)) else 1
+    except Exception:
+        size = 1
+    _log(
+        logger,
+        f"{label} cache hit chat={chat_id} kind={kind} key={extra or '-'} "
+        f"size={size} hits={STATS['hits']} rpc_saved=1",
+    )
 
 
 async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
@@ -147,18 +212,25 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
             if time.monotonic() - saved_at <= ttl:
                 _CACHE.move_to_end(key)
                 STATS["hits"] += 1
+                _log_hit(chat_id, kind, value, logger, extra)
                 return value
             _CACHE.pop(key, None)
 
     inflight = _INFLIGHT.get(key)
     if inflight is not None and not inflight.done():
         STATS["coalesced"] += 1
+        _log(
+            logger,
+            f"GetParticipants coalesced chat={chat_id} kind={kind} "
+            f"key={extra or '-'} action=await_inflight",
+        )
         try:
             return await asyncio.shield(inflight)
         except Exception:
             return None
 
-    last_call = _LAST_CALL.get(key)
+    chat_key = _chat_key(chat_id)
+    last_call = _LAST_CALL.get(chat_key) if min_interval > 0 else None
     if last_call is not None:
         wait_for = min_interval - (time.monotonic() - last_call)
         if wait_for > 0:
@@ -180,7 +252,8 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     _INFLIGHT[key] = future
-    _LAST_CALL[key] = time.monotonic()
+    if min_interval > 0:
+        _LAST_CALL[chat_key] = time.monotonic()
     STATS["calls"] += 1
     try:
         value = await fetch()

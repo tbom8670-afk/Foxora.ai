@@ -227,24 +227,43 @@ async def fetch_about(bot, user) -> Tuple[str, Optional[str]]:
         except Exception as error:
             return _classify_error(error), None
 
-    try:
-        full = await asyncio.wait_for(
-            client(GetFullUserRequest(request_input)), timeout=fetch_timeout()
-        )
-    except asyncio.TimeoutError:
-        return STATUS_ERROR, None
-    except asyncio.CancelledError:
-        raise
-    except Exception as error:
-        return _classify_error(error), None
+    async def _fetch_full_user():
+        try:
+            full = await asyncio.wait_for(
+                client(GetFullUserRequest(request_input)), timeout=fetch_timeout()
+            )
+        except asyncio.TimeoutError:
+            return STATUS_ERROR, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return _classify_error(error), None
 
-    full_user = getattr(full, "full_user", None)
-    if full_user is None:
-        return STATUS_NO_ACCESS, None
-    about = getattr(full_user, "about", None)
-    if about is None or not str(about).strip():
-        return STATUS_EMPTY, None
-    return STATUS_OK, str(about)
+        full_user = getattr(full, "full_user", None)
+        if full_user is None:
+            return STATUS_NO_ACCESS, None
+        about = getattr(full_user, "about", None)
+        if about is None or not str(about).strip():
+            return STATUS_EMPTY, None
+        return STATUS_OK, str(about)
+
+    # 👤 پروفایل یک چیزِ «کاربری» است، نه «گروهی»: بدونِ کش، همان کاربر در
+    # چند گروه ⇒ چند GetFullUserRequest پشتِ‌سرِهم (لاگ 22:54:01.834).
+    # کشِ ۴۵ ثانیه‌ای + coalescing این تکرار را حذف می‌کند.
+    try:
+        from modules import user_profile_cache
+        user_id = getattr(user, "id", None)
+        if user_id is not None:
+            value = await user_profile_cache.get_about(
+                user_id, _fetch_full_user,
+                logger=getattr(bot, "logger", None),
+            )
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                return value[0], value[1]
+    except Exception as cache_error:
+        _log(bot, f"CACHE FAILED user_id={getattr(user, 'id', None)} "
+                  f"error={type(cache_error).__name__}")
+    return await _fetch_full_user()
 
 
 # ---------------------------------------------------------------------------

@@ -206,7 +206,7 @@ def test_safe_get_users_skips_deleted_user():
 # ۵ — کشِ GetParticipants
 # ---------------------------------------------------------------------------
 def test_participants_are_cached_and_coalesced():
-    print("\n### ۵ GetParticipants: کش ۶۰ ثانیه + single-flight + حداقل فاصله")
+    print("\n### ۵ GetParticipants: کش TTL + single-flight + حداقل فاصله")
     participant_cache.clear()
     calls = {"n": 0}
 
@@ -231,14 +231,18 @@ def test_participants_are_cached_and_coalesced():
     check("فراخوانی بعدی از کش آمد", again == "owner-label" and calls["n"] == 1)
     stats = participant_cache.describe()
     check("۹ درخواست coalesce شدند", stats["coalesced"] == 9, f"-> {stats}")
-    check("TTL پیش‌فرض ۶۰ ثانیه است",
-          participant_cache.DEFAULT_TTL == 60.0)
-    check("حداقل فاصلهٔ RPC ۲ ثانیه است",
-          participant_cache.MIN_INTERVAL == 2.0)
+    # راند ۱۲: TTL از ۶۰ به ۸ ثانیه آمد (بازهٔ پیشنهادی ۵ تا ۱۰) و حداقل
+    # فاصله از ۲ به ۱٫۵ ثانیه (بازهٔ ۱ تا ۲).
+    check("TTL پیش‌فرض در بازهٔ ۵ تا ۱۰ ثانیه است",
+          5.0 <= participant_cache.DEFAULT_TTL <= 10.0,
+          f"-> {participant_cache.DEFAULT_TTL}")
+    check("حداقل فاصلهٔ RPC در بازهٔ ۱ تا ۲ ثانیه است",
+          1.0 <= participant_cache.MIN_INTERVAL <= 2.0,
+          f"-> {participant_cache.MIN_INTERVAL}")
 
 
 def test_participant_cache_throttles_failures():
-    print("\n### ۶ در حالت خطا، polling به یک RPC در ۲ ثانیه محدود می‌شود")
+    print("\n### ۶ در حالت خطا، polling با حداقلِ فاصله محدود می‌شود")
     participant_cache.clear()
     calls = {"n": 0}
 
@@ -255,7 +259,7 @@ def test_participant_cache_throttles_failures():
 
     first, second, waited = asyncio.run(scenario())
     check("خطا به کشِ دائمی تبدیل نشد", first is None and second is None)
-    check("بین دو تلاشِ ناموفق حداقل ~۲ ثانیه فاصله بود",
+    check("بین دو تلاشِ ناموفق حداقلِ فاصله رعایت شد",
           waited >= participant_cache.MIN_INTERVAL - 0.1, f"-> {waited:.2f}s")
 
 

@@ -555,6 +555,49 @@ async def bot_api_get_chat_member(token, chat_id, user_id, *,
             "text": "unknown_status"}
 
 
+# ---------------------------------------------------------------------------
+# 🧊 کشِ صفحهٔ GetParticipants
+# ---------------------------------------------------------------------------
+# لاگِ 22:53:58 تا 22:54:09 نشان داد برای **یک** chat_id سیزده
+# ``GetParticipantsRequest`` با فاصلهٔ ~۱۰۰ms پشتِ‌سرِهم زده می‌شود: هر پیمایشِ
+# «آیا این کاربر عضو است؟» از offset=0 شروع می‌کند و کلِ فهرست را صفحه‌به‌صفحه
+# می‌خواند. با کشِ ۸ ثانیه‌ای (کلید = کانال + نوع فیلتر + offset + limit) پیمایشِ
+# دوم و سوم در همان بازه **صفر** RPC است و درخواست‌های هم‌زمان coalesce می‌شوند.
+async def participants_page(client, channel_input, page_filter, offset, limit,
+                            *, timeout=20.0, hash_value=0):
+    """همان ``GetParticipantsRequest``، ولی از کشِ مشترک و با coalescing."""
+    try:
+        from modules import participant_cache
+    except Exception:  # pragma: no cover - مسیرِ استند‌الون
+        participant_cache = None
+
+    async def _fetch():
+        return await asyncio.wait_for(
+            client(GetParticipantsRequest(
+                channel=channel_input,
+                filter=page_filter,
+                offset=offset,
+                limit=limit,
+                hash=hash_value,
+            )),
+            timeout=timeout,
+        )
+
+    if participant_cache is None:
+        return await _fetch()
+
+    channel_id = getattr(channel_input, "channel_id", None) or channel_input
+    return await participant_cache.get_or_fetch(
+        channel_id, "participants_page", _fetch,
+        extra=f"{type(page_filter).__name__}:{offset}:{limit}",
+        # min_interval=0: یک اسکنِ صفحه‌به‌صفحه خودش «یک» عملیات است و
+        # تأخیرِ داخلی/بودجهٔ زمانی دارد؛ cooldownِ ۱٫۵ ثانیه‌ای بین صفحه‌ها
+        # اسکن را از بودجه بیرون می‌انداخت. تکرارِ اسکن با کشِ ۸ ثانیه‌ای
+        # صفر RPC می‌شود، پس طوفان برنمی‌گردد.
+        min_interval=0.0,
+    )
+
+
 async def list_admins(client, channel_input, *, limit: int = 100,
                       timeout: float = 15.0) -> dict:
     """فهرست **ادمین‌های** کانال (``ChannelParticipantsAdmins``).
@@ -568,14 +611,9 @@ async def list_admins(client, channel_input, *, limit: int = 100,
     CALL_COUNTER["list_admins"] = CALL_COUNTER.get("list_admins", 0) + 1
     try:
         from splusthon.tl.types import ChannelParticipantsAdmins
-        page = await asyncio.wait_for(
-            client(GetParticipantsRequest(
-                channel=channel_input,
-                filter=ChannelParticipantsAdmins(),
-                offset=0,
-                limit=max(1, min(int(limit), 200)),
-                hash=0,
-            )),
+        page = await participants_page(
+            client, channel_input, ChannelParticipantsAdmins(),
+            0, max(1, min(int(limit), 200)),
             timeout=timeout,
         )
     except asyncio.CancelledError:
@@ -605,14 +643,9 @@ async def list_probe(client, channel_input, *, timeout: float = 15.0) -> dict:
         return result
     CALL_COUNTER["list_probe"] = CALL_COUNTER.get("list_probe", 0) + 1
     try:
-        page = await asyncio.wait_for(
-            client(GetParticipantsRequest(
-                channel=channel_input,
-                filter=ChannelParticipantsRecent(),
-                offset=0,
-                limit=1,
-                hash=0,
-            )),
+        page = await participants_page(
+            client, channel_input, ChannelParticipantsRecent(),
+            0, 1,
             timeout=timeout,
         )
     except asyncio.CancelledError:
@@ -650,14 +683,9 @@ async def search_participants(client, channel_input, query, target_user_id,
     CALL_COUNTER["search_participants"] = CALL_COUNTER.get("search_participants", 0) + 1
     try:
         from splusthon.tl.types import ChannelParticipantsSearch
-        page = await asyncio.wait_for(
-            client(GetParticipantsRequest(
-                channel=channel_input,
-                filter=ChannelParticipantsSearch(text),
-                offset=0,
-                limit=max(1, min(int(limit), 50)),
-                hash=0,
-            )),
+        page = await participants_page(
+            client, channel_input, ChannelParticipantsSearch(text),
+            0, max(1, min(int(limit), 50)),
             timeout=timeout,
         )
     except asyncio.CancelledError:
@@ -713,16 +741,11 @@ async def find_members(client, channel_input, user_ids, *,
             return summary
         CALL_COUNTER["get_participants"] += 1
         try:
-            page = await asyncio.wait_for(
-                client(GetParticipantsRequest(
-                    channel=channel_input,
-                    filter=ChannelParticipantsRecent(),
-                    offset=offset,
-                    limit=page_size,
-                    hash=0,
-                )),
+            page = await participants_page(
+                client, channel_input, ChannelParticipantsRecent(),
+                offset, page_size,
                 timeout=20.0,
-            )
+        )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -795,16 +818,11 @@ async def find_member(client, channel_input, user_id, *,
             return summary
         CALL_COUNTER["get_participants"] += 1
         try:
-            page = await asyncio.wait_for(
-                client(GetParticipantsRequest(
-                    channel=channel_input,
-                    filter=ChannelParticipantsRecent(),
-                    offset=offset,
-                    limit=page_size,
-                    hash=0,
-                )),
+            page = await participants_page(
+                client, channel_input, ChannelParticipantsRecent(),
+                offset, page_size,
                 timeout=20.0,
-            )
+        )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -867,14 +885,9 @@ async def iter_members(client, channel_input, *, limit: Optional[int] = None,
         page_limit = page_size if not cap else min(page_size, cap - offset)
         CALL_COUNTER["get_participants"] += 1
         try:
-            page = await asyncio.wait_for(
-                client(GetParticipantsRequest(
-                    channel=channel_input,
-                    filter=ChannelParticipantsRecent(),
-                    offset=offset,
-                    limit=page_limit,
-                    hash=0,
-                )),
+            page = await participants_page(
+                client, channel_input, ChannelParticipantsRecent(),
+                offset, page_limit,
                 timeout=30.0,
             )
         except asyncio.CancelledError:

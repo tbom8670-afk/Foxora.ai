@@ -138,3 +138,157 @@ PYTHONPATH=. python3 -m pytest tests/test_auto_cleanup_resolution.py \
     tests/test_rpc_governor.py tests/test_rpc_send_resilience.py \
     tests/test_outgoing_rpc_lifecycle.py tests/test_foxora_rpc_queue.py -q
 ```
+
+---
+
+# 🔁 راند ۱۲ — طوفانِ `GetParticipants`، باکتِ heavy و کشِ پروفایل
+
+لاگِ دوم نشان داد کندی **واقعی** است ولی شبکه سالم (`socket_wait=0`,
+`reconnects=0`). ریشه در کد بود: برای **یک** `chat_id` سیزده
+`GetParticipantsRequest` با فاصلهٔ ~۱۰۰ms زده می‌شد، همه با `bucket=heavy`.
+
+## A) ریشهٔ واقعی طوفان: پیمایشِ صفحه‌به‌صفحهٔ فهرست اعضا
+
+**شواهد:** ۲۲:۵۳:۵۸٫۷۴۲ تا ۲۲:۵۴:۰۳٫۰۹۳ → ۷ درخواست، سپس
+۲۲:۵۴:۰۶٫۵۱۴ تا ۲۲:۵۴:۰۹٫۱۲۶ → ۶ درخواست؛ همه برای `chat_id=22389465` و
+همه `bucket=heavy`؛ فاصلهٔ «پاسخ → درخواستِ بعدی» ~۱۰۰ms
+(= `FORCE_JOIN_SCAN_DELAY` پیش‌فرض ۰٫۱).
+
+**علت:** بررسیِ «آیا کاربر عضو کانال/گروه است؟» روی سروش
+`getParticipant` ندارد، پس `find_member` کلِ فهرست را صفحه‌به‌صفحه
+(`ChannelParticipantsRecent`, `limit=100`) از `offset=0` می‌خواند. برای ۱۳۰۰
+عضو این **دقیقاً ۱۳ RPC** است؛ و برای هر پیام/هر بررسیِ بعدی از صفر تکرار
+می‌شد. تست `tests/test_heavy_poll_and_profile_cache.py` بخش ۹ همان ۱۳ صفحه را
+بازتولید می‌کند.
+
+**تغییر (حداقلی):** یک قیفِ کش روی همان درخواستِ صفحه در
+`modules/force_join_api.py::participants_page` و
+`modules/participant_cache.py`:
+
+* کلید = کانال + نوعِ فیلتر + `offset` + `limit` (پس صفحه‌های مختلف قاطی نمی‌شوند)؛
+* **TTL = ۸ ثانیه** (بازهٔ درخواستی ۵ تا ۱۰): تغییرِ لیست اعضا نادر است و سروش
+  خودش update می‌فرستد؛ کوتاه‌تر فشار را کم نمی‌کند و بلندتر از ۱۰ کهنه می‌شود؛
+* **حداقل فاصله = ۱٫۵ ثانیه** (بازهٔ ۱ تا ۲) بین دو RPC واقعی برای همان
+  `chat_id`؛
+* **coalescing:** درخواست‌های هم‌زمانِ همان کلید به یک Future وصل می‌شوند؛
+* لاگ‌های خواسته‌شده: `GetParticipants cache hit chat=X` و
+  `GetParticipants coalesced chat=X`.
+
+⚠️ استثنای مستند: پیمایشِ صفحه‌به‌صفحه `min_interval=0` می‌فرستد. یک اسکن
+«یک عملیات» است که خودش `delay` و `budget_seconds=20` دارد؛ اعمالِ ۱٫۵ ثانیه
+بین ۱۳ صفحه، اسکن را از بودجه بیرون می‌انداخت (خراب‌کردنِ مسیرِ سالم). طوفان
+هم برنمی‌گردد، چون تکرارِ همان اسکن در ۸ ثانیه صد درصد از کش می‌آید.
+
+**سناریوی تست (بخش ۱ و ۹ تستِ راند):** ۱۳ فراخوانیِ پشتِ‌سرِهم → **۱ RPC +
+۱۲ cache hit**؛ اسکنِ دومِ کامل (۱۳ صفحه) → **صفر RPC اضافه**.
+
+## B) دکمه‌های دیگرِ همان مسیر
+
+* `modules/participant_cache.py` TTL از ۶۰ → **۸ ثانیه** و حداقل فاصله ۲ →
+  **۱٫۵ ثانیه** (طبقِ درخواست؛ مالکِ گروه هنوز حداکثر ۱ RPC در ۸ ثانیه).
+* دو مسیرِ «سکوت/اخراج نام …» در `message_handler` و بازشماریِ
+  `group_words_commands` هم به همان کش وصل شدند (قبلاً هر دستور یک
+  `GetParticipants` کامل می‌زد).
+
+## C) Governor — سه گزینه، مقایسه و انتخابِ شفاف
+
+لاگ‌های مرتبط::
+
+    22:54:00.753 OUTGOING RPC SLOW operation=GetParticipantsRequest governor_wait_ms=204.3
+    22:54:00.982 OUTGOING RPC SLOW operation=GetParticipantsRequest governor_wait_ms=501.4
+    22:54:01.834 RPC GOVERNOR WAIT GetFullUserRequest wait_ms=412.7
+    22:54:08.716 GOVERNOR HOLD SLOW bucket=notice request=SendMessageRequest held_ms=503.9 reason=rpc_in_flight
+    22:54:08.716 GOVERNOR HOLD SLOW bucket=delete request=DeleteMessagesRequest held_ms=502.0 reason=rpc_in_flight
+
+| معیار | (الف) `delete_limit`/`notice_limit` را ۱→۲ کنیم | (ب) اولویت‌دهیِ buckets | (ج) سقفِ مستقلِ heavy/poll |
+|---|---|---|---|
+| اثر روی `governor_wait_ms` | کم (تعداد هم‌زمانی بالا می‌رود، صف کوتاه‌تر) | زیاد | متوسط |
+| ریسکِ FloodWait | **بالا**: دو delete هم‌زمان = ریسکِ `FLOOD_WAIT` و توقفِ همهٔ حذف‌ها (شاملِ پاک‌سازی خودکار) | کم | کم |
+| ریسکِ گرسنگی (starvation) | کم | **زیاد** اگر بی‌محافظ باشد (اولویت‌دادن به delete می‌تواند sync را گرسنه کند) | کم |
+| تغییرِ معماری | یک خط | زیاد (preemptionِ باکت‌آگاه در صف) | کم |
+| ترموکس | خنثی | منفی (ساختار صفِ اضافه) | خنثی |
+| **انتخاب** | فقط به‌صورتِ اختیاری (`BOT_RPC_DELETE_LIMIT=auto` از راند ۱۱) | **انجام شد، محافظه‌کارانه** | **انجام شد** |
+
+**سه تغییرِ پیاده‌شده در Governor:**
+
+1. **سقفِ مستقل برای polling** (`bucket=poll`, `BOT_RPC_POLL_LIMIT=1`):
+   `GetParticipantsRequest` از `heavy` جدا شد تا با خواندنِ تاریخچه/کانال
+   سهمیهٔ مشترک نداشته باشد. (`GetHistoryRequest` همچنان `heavy` است.)
+2. **read سنگین سهمِ send/notice را نمی‌خورد:** در `_eligible` شرطِ آخر با
+   `_active_noncritical - read_active` سنجیده می‌شود (قبلاً خام). این همان
+   `GOVERNOR HOLD SLOW bucket=notice held_ms=503.9` را می‌بندد: یک
+   `GetParticipants` در جریان + یک `delete` دیگر همهٔ سهمِ ۲تایی را پر
+   نمی‌کند.
+3. **yieldِ heavy/poll:** اگر هر `notice`/`send`/`delete` در صف باشد،
+   خواندنِ سنگینِ جدید **شروع نمی‌شود** (تا وقتی صف خالی شود). قابلِ برگشت با
+   `BOT_RPC_HEAVY_YIELD_P2=0`.
+
+**پاسخ به پرسشِ «P3 یا P4؟»:** P4 نیازمندِ یک سطحِ اولویتِ جدید + قاعدهٔ
+promotionِ سنّی است تا اسکنِ عضویت در ترافیکِ سنگین هرگز گرسنه نشود؛ با
+توجه به اینکه (الف) کشِ صفحه‌ها ۹۰٪+ بار را حذف می‌کند و (ب) heavy/poll
+پایین‌ترین اولویت را دارند و حالا به صفِ بالاتر yield می‌دهند، افزودنِ P4 در
+این راند ریسکِ بی‌فایده بود. اگر بعد از راند ۱۲ باز هم
+`RPC GOVERNOR WAIT bucket=poll` دیدید، همان P4 با promotion گامِ بعد است.
+
+**لاگ‌های غنی‌شده (بدون تغییرِ رفتار):**
+`GOVERNOR HOLD SLOW … culprit=heavy:GetParticipantsRequest:chat=…:held_ms=612`
+و `RPC GOVERNOR WAIT … holders=[…]` — یعنی دقیقاً معلوم است کدام RPC باعثِ
+hold شده.
+
+**سناریوهای تست:** بخش ۴ (باکت و سقفِ poll)، ۵ (notice با خواندنِ سنگین در
+جریان)، ۶ (yield به صفِ notice).
+
+## D) `GetFullUserRequest` — کشِ پروفایل
+
+**شواهد:** `RPC GOVERNOR WAIT GetFullUserRequest wait_ms=412.7` و
+`BIO LINK CHECK user_id=70874302 status=ok` و بعد
+`ERROR PERF WARNING chat_id=24100530 stage=RECEIVE elapsed_ms=1218.02`.
+
+**علت:** بررسیِ بیو برای هر **(گروه، کاربر)** ذخیره می‌شود، ولی پروفایل
+مالِ **کاربر** است: یک کاربر در ۵ گروه ⇒ تا ۵ `GetFullUserRequest`؛ به‌علاوهٔ
+`refresh_before_punish`. هر کدام یک RPC و داخلِ مسیرِ پیام.
+
+**تغییر:** `modules/user_profile_cache.py` (TTL **۴۵ ثانیه**، بازهٔ معقول
+۳۰–۶۰؛ حداقل فاصله ۲ ثانیه؛ coalescing؛ LRU ۴۰۰۰؛ فقط `ok`/`empty` کش
+می‌شود و `error`/`no_access`/`flood_wait` هرگز) و اتصالِ آن به
+`bio_link_service.fetch_about`. لاگ‌ها: `GETFULLUSER cache hit user=X` و
+`GETFULLUSER coalesced user=X`.
+
+**سناریوی تست (بخش ۷):** همان کاربر در ۵ گروه → ۱ RPC؛ خطا کش نمی‌شود.
+
+## E) `PERF WARNING` — حالا می‌گوید وقت کجا خورده
+
+قبلاً فقط `stage=RECEIVE elapsed_ms=1218.02` بود و معلوم نبود گلوگاه
+`GetFullUser` است یا precheck یا بیو. حالا `MessagePerformance.note()` هست و
+خطِ هشدار این‌طور می‌شود::
+
+    PERF SLOW chat_id=24100530 total_ms=1218.02 slowest=receive:1200.4ms
+      breakdown=receive=1200.4,admin_check=9.1 notes=bio_check=812.3,banned_word=0.6
+    PERF WARNING chat_id=24100530 stage=RECEIVE elapsed_ms=1200.40
+      slowest=receive:1200.4ms notes=bio_check=812.3,banned_word=0.6
+
+`bio_check` و `banned_word` در `handlers/message_handler.py` اندازه‌گیری
+می‌شوند (شاملِ انتظار در Governor برای `GetFullUserRequest`).
+
+**سناریوی تست:** بخش ۸ — زیرمرحله‌ها در خطِ هشدار ظاهر می‌شوند.
+
+## متغیرهای محیطیِ این راند
+
+```env
+BOT_RPC_POLL_LIMIT=1        # سقفِ هم‌زمانیِ GetParticipants (لِین مستقل)
+BOT_RPC_HEAVY_YIELD_P2=1    # heavy/poll به صفِ send/notice yield بدهد
+# از راند ۱۱:
+BOT_RPC_DELETE_LIMIT=auto
+BOT_RPC_FLOOD_GUARD_S=60
+```
+
+## فرضیات
+
+1. `GetParticipantsRequest` تنها منبعِ پیمایشِ اعضاست و سروش `getParticipant`
+   برای حسابِ ربات نمی‌دهد (کدِ فعلی همین را فرض کرده).
+2. فهرست اعضا در ۸ ثانیه عملاً ثابت است (سروش update می‌فرستد).
+3. بیوگرافی در ۴۵ ثانیه تغییرِ مؤثر ندارد؛ مجازاتِ بیو با «شاهدِ تازه»
+   (`BIO_LINK_PUNISH_FRESHNESS_SECONDS`) جدا محافظت می‌شود.
+4. `bucket=delete`/`notice` را ۲ نکردیم؛ ریسکِ FloodWait آن بیشتر از سودش است.
+5. هیچ تغییر رفتاری در `SendMessage` معمولی، `GetDifference`،
+   `GetChannelDifference` و مسیرهای بازی/دادگاه داده نشده است.

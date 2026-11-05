@@ -3474,6 +3474,7 @@ async def handle_new_message(bot, event):
             )
         # Banned words run before the spam/burst filter so obfuscated
         # forms map to the original listed word, not to generic flood.
+        _banned_word_started = time.perf_counter()
         banned_precheck = False
         banned_precheck_reason = None
         if (not skip_inspect and not event.is_private and not admin_bypass
@@ -3488,6 +3489,16 @@ async def handle_new_message(bot, event):
                     f"reason=banned_word detail={banned_precheck_reason!r} "
                     f"text={message_text[:60]!r}"
                 )
+
+        # ⏱️ زمانِ precheck کلمات ممنوع در گزارشِ کندی می‌آید (تا معلوم شود
+        # گلوگاه این مرحله است یا GetFullUser/بررسی بیو).
+        try:
+            profiler.note(
+                "banned_word",
+                (time.perf_counter() - _banned_word_started) * 1000,
+            )
+        except Exception:
+            pass
 
         # Fast lane for promotional/repeated payloads: it runs immediately
         # after the in-memory tracker update. Two clearly similar ads, or
@@ -8785,8 +8796,18 @@ async def handle_new_message(bot, event):
                 from modules import manual_mute_storage
 
                 chat_target = resolved_permission_chat or event_chat or chat_id
+                async def _fetch_group_members():
+                    return await bot.client.get_participants(chat_target)
+
                 try:
-                    participants = await bot.client.get_participants(chat_target)
+                    from modules import participant_cache
+                    # 🧊 لیستِ اعضا از کشِ مشترک (TTL ۸ثانیه + coalescing)؛
+                    # قبلاً هر دستورِ «سکوت/اخراج نام …» یک GetParticipants
+                    # کامل می‌زد و روی یک chat_id تکراری می‌شد.
+                    participants = await participant_cache.get_or_fetch(
+                        chat_id, "members", _fetch_group_members,
+                        logger=bot.logger,
+                    )
                 except Exception as part_err:
                     bot.logger.log_error(f"FAILED TO GET PARTICIPANTS chat_id={chat_id}: {part_err}")
                     await event.reply(f"❌ خطا در دریافت لیست اعضای گروه:\n{part_err}")
@@ -8880,8 +8901,18 @@ async def handle_new_message(bot, event):
                 from modules import banned_storage
 
                 chat_target = resolved_permission_chat or event_chat or chat_id
+                async def _fetch_group_members():
+                    return await bot.client.get_participants(chat_target)
+
                 try:
-                    participants = await bot.client.get_participants(chat_target)
+                    from modules import participant_cache
+                    # 🧊 لیستِ اعضا از کشِ مشترک (TTL ۸ثانیه + coalescing)؛
+                    # قبلاً هر دستورِ «سکوت/اخراج نام …» یک GetParticipants
+                    # کامل می‌زد و روی یک chat_id تکراری می‌شد.
+                    participants = await participant_cache.get_or_fetch(
+                        chat_id, "members", _fetch_group_members,
+                        logger=bot.logger,
+                    )
                 except Exception as part_err:
                     bot.logger.log_error(f"FAILED TO GET PARTICIPANTS chat_id={chat_id}: {part_err}")
                     await event.reply(f"❌ خطا در دریافت لیست اعضای گروه:\n{part_err}")
@@ -9231,6 +9262,7 @@ async def handle_new_message(bot, event):
         # می‌گردد؛ پس از آن فقط از حافظه/دیسک خوانده می‌شود و هیچ RPC اضافه‌ای
         # در پیام‌های بعدی وجود ندارد. اگر سرویس کند/خطا بدهد، بررسی به
         # پس‌زمینه می‌رود و همان پیام بدون تخلف پردازش می‌شود.
+        _bio_check_started = time.perf_counter()
         bio_link_hit = False
         bio_link_reason = None
         if (not event.is_private
@@ -9285,6 +9317,16 @@ async def handle_new_message(bot, event):
                     "BIO LINK PRECHECK FAILED "
                     f"chat_id={chat_id} user_id={user_id} error={bio_error!r}"
                 )
+
+        # ⏱️ بررسیِ لینک بیو (شاملِ GetFullUserRequest) — بزرگ‌ترین گلوگاهِ
+        # RECEIVE در لاگِ راند ۱۲ بود (stage=RECEIVE elapsed_ms=1218).
+        try:
+            profiler.note(
+                "bio_check",
+                (time.perf_counter() - _bio_check_started) * 1000,
+            )
+        except Exception:
+            pass
 
         # مدیر/مالک ثبت‌شده از فیلتر خودکار و فیلتر کلمات گروه عبور می‌کند،
         # اما اجرای راهنما، بازی‌ها و فرمان‌های مدیریت باید ادامه داشته باشد.
