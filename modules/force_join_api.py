@@ -797,7 +797,9 @@ async def find_member(client, channel_input, user_id, *,
     یعنی «نمی‌دانیم» و هرگز نباید سبب حذف پیام شود.
     """
     summary = {"state": RESULT_ERROR, "scanned": 0, "pages": 0,
-               "complete": False, "user": None, "reason": None}
+               "complete": False, "user": None, "reason": None,
+               "member_ids": [], "position": None,
+               "member_ids_complete": True}
     if not LIBRARY_AVAILABLE or channel_input is None:
         summary["reason"] = "unavailable"
         return summary
@@ -818,11 +820,14 @@ async def find_member(client, channel_input, user_id, *,
             return summary
         CALL_COUNTER["get_participants"] += 1
         try:
+            # Soroush's documented library cap is 200. Start at 100 rather
+            # than assuming sub-100 limits work; continue in 200-member pages.
+            request_limit = min(page_size, 100) if offset == 0 else page_size
             page = await participants_page(
                 client, channel_input, ChannelParticipantsRecent(),
-                offset, page_size,
+                offset, request_limit,
                 timeout=20.0,
-        )
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -835,24 +840,36 @@ async def find_member(client, channel_input, user_id, *,
         summary["pages"] += 1
         users = list(getattr(page, "users", None) or ())
         participants = list(getattr(page, "participants", None) or ())
+        if participants and not users:
+            # Without user IDs, this cannot prove that the target is absent.
+            summary["member_ids_complete"] = False
         for index, user in enumerate(users):
             participant = participants[index] if index < len(participants) else None
             if participant is not None and \
                     participant_state(participant) != RESULT_MEMBER:
                 continue
-            if int(getattr(user, "id", 0) or 0) == target:
+            uid = int(getattr(user, "id", 0) or 0)
+            if uid:
+                summary["member_ids"].append(uid)
+            if uid == target:
                 summary.update(state="found", user=user,
-                               scanned=offset + len(users), complete=False)
+                               scanned=offset + index + 1,
+                               position=offset + index + 1, complete=False)
                 return summary
         step = len(users) if users else len(participants)
         if not step:
-            summary.update(state="absent", complete=True,
-                           scanned=offset)
+            summary.update(
+                state=("absent" if summary["member_ids_complete"] else "partial"),
+                complete=bool(summary["member_ids_complete"]), scanned=offset,
+            )
             return summary
         offset += step
         total = getattr(page, "count", None)
         if total is not None and offset >= int(total):
-            summary.update(state="absent", complete=True, scanned=offset)
+            summary.update(
+                state=("absent" if summary["member_ids_complete"] else "partial"),
+                complete=bool(summary["member_ids_complete"]), scanned=offset,
+            )
             return summary
         if delay:
             await asyncio.sleep(delay)
@@ -863,6 +880,10 @@ async def iter_members(client, channel_input, *, limit: Optional[int] = None,
                        budget_seconds: float = 60.0,
                        delay: float = 0.35, page_size: int = 200) -> dict:
     """پیمایش اعضای کانال با صفحه‌بندی صریح، بودجهٔ زمانی و فاصلهٔ RPC.
+
+    این مسیرِ اسکن کامل برای کارهای عمدی (cleanup، گزارش ادمین، همگام‌سازی
+    اسنپ‌شات) است؛ آن را با جست‌وجوی یک عضو یکی نکنید. فاصلهٔ پیش‌فرض ۳۵۰ms
+    بین صفحات عمداً حفظ شده است تا فشار روی Governor کم بماند.
 
     خروجی: ``{"users": [...], "complete": bool, "reason": str|None,
     "pages": int}``. ``complete=False`` یعنی اسنپ‌شات ناقص است و **نباید**

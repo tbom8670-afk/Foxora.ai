@@ -89,12 +89,12 @@ def _env_float(name: str, default: float, minimum: float = 0.0,
 
 def member_ttl() -> int:
     """چند ثانیه وضعیت «عضو» بدون بررسی دوباره معتبر است."""
-    return _env_int("FORCE_JOIN_MEMBER_TTL", 1800, 30, 7 * 24 * 3600)
+    return _env_int("FORCE_JOIN_MEMBER_TTL", 300, 30, 7 * 24 * 3600)
 
 
 def not_member_ttl() -> int:
     """چند ثانیه وضعیت «غیرعضو» معتبر است (کوتاه‌تر، تا عضو تازه اذیت نشود)."""
-    return _env_int("FORCE_JOIN_NOT_MEMBER_TTL", 300, 10, 24 * 3600)
+    return _env_int("FORCE_JOIN_NOT_MEMBER_TTL", 20, 10, 24 * 3600)
 
 
 def member_grace_seconds() -> int:
@@ -104,7 +104,7 @@ def member_grace_seconds() -> int:
 
 def not_member_grace_seconds() -> int:
     """در قطعی API، شاهد «غیرعضو» تا این مدت همچنان اجرا می‌شود."""
-    return _env_int("FORCE_JOIN_NOT_MEMBER_GRACE_SECONDS", 600, 0, 24 * 3600)
+    return _env_int("FORCE_JOIN_NOT_MEMBER_GRACE_SECONDS", 20, 0, 24 * 3600)
 
 
 def api_timeout() -> float:
@@ -249,11 +249,10 @@ def channel_routes(record) -> dict:
         ROUTE_SCAN: bool((stored or {}).get(ROUTE_SCAN)),
     }
     if stored is None:
-        # رکوردهای قدیمی (پیش از این نسخه) هرگز سنجیده نشده‌اند و فقط بر پایهٔ
-        # getParticipant کار می‌کردند. اگر آن جواب نداد، اولین فراخوانی خودش
-        # این مسیر را **برای همیشه** غیرفعال می‌کند (وگرنه هر پیام دوباره
-        # همان RPC بی‌فایده را می‌فرستاد).
-        routes[ROUTE_PARTICIPANT] = bool(record.get("force_join_enabled"))
+        # رکوردهای legacy شواهدی از پشتیبانی سرور ندارند. محافظه‌کارانه
+        # channels.getParticipant را پیش‌فرض خاموش می‌کنیم؛ فقط نتیجهٔ probe
+        # موفق (ذخیره‌شده در routes) اجازهٔ فعال‌کردن این مسیر را می‌دهد.
+        routes[ROUTE_PARTICIPANT] = False
         routes[ROUTE_BOT_API] = bool(bot_api_token())
     return routes
 
@@ -507,6 +506,11 @@ _NEGATIVE_CACHE_TTL = 60.0
 
 #: (channel_id, user_id) → (status, verified_at_epoch)
 _member_cache: dict = {}
+#: اسنپ‌شات کاملِ کوتاه‌عمر برای جواب‌دادن به کاربران دیگر همان کانال.
+#: channel_key → (verified_at_epoch, set(member_ids)); فقط بعد از اسکن کامل پر می‌شود.
+_full_scan_cache: dict = {}
+_FULL_SCAN_CACHE_TTL = 45.0
+_FULL_SCAN_CACHE_MAX = 256
 #: (channel_id, user_id) → Future در حال اجرا (single-flight)
 _inflight: dict = {}
 #: (group_key, user_id) → زمان آخرین پیام راهنما
@@ -844,9 +848,31 @@ def _remember(channel_id, user_id, status, verified_at):
     _member_cache[(channel_id, user_id)] = (status, verified_at)
 
 
+def _completed_scan_status(record, user_id, now=None):
+    """Use only a fresh, complete member set; partial/error scans never decide absence."""
+    now = time.time() if now is None else now
+    key = channel_key(record["channel_id"])
+    entry = _full_scan_cache.get(key)
+    if not entry:
+        return None
+    verified_at, member_ids = entry
+    age = now - verified_at
+    if age > _FULL_SCAN_CACHE_TTL:
+        _full_scan_cache.pop(key, None)
+        return None
+    if _safe_int(user_id) in member_ids:
+        return storage.STATUS_MEMBER
+    # The shared snapshot lives 30–60s, but absence still has a shorter TTL.
+    if age > not_member_ttl():
+        return None
+    return storage.STATUS_NOT_MEMBER
+
+
 def forget_user(channel_id, user_id) -> None:
     """باطل‌سازی فوری کش حافظه (رویداد خروج/ورود از همین استفاده می‌کند)."""
     _member_cache.pop((channel_key(channel_id), _safe_int(user_id)), None)
+    # Membership changed after the snapshot: it must not answer for other users.
+    _full_scan_cache.pop(channel_key(channel_id), None)
 
 
 async def _api_check(bot, record, user_id, user_entity=None):
@@ -1067,9 +1093,33 @@ async def _scan_route(bot, record, user_id, *, inline=False):
         delay=scan_delay(),
     )
     state = found.get("state")
+    # Every successfully read page is positive evidence for its listed users.
+    # A complete pass additionally gives a short-lived answer for every ID in
+    # this channel, including negatives. Errors/partial passes are never cached.
+    scanned_ids = found.get("member_ids") or ()
+    verified_at = time.time()
+    for scanned_id in scanned_ids:
+        _remember(channel_id, _safe_int(scanned_id), storage.STATUS_MEMBER,
+                  verified_at)
     if state == "found":
+        position = _safe_int(found.get("position"))
+        level = (20 if position and position <= 20 else
+                 100 if position and position <= 100 else
+                 500 if position and position <= 500 else "full")
+        _log(bot, f"MEMBER CHECK progressive chat={record['group_id']} "
+                  f"user={user_id} level={level} rpc_count={found.get('pages', 0)}")
         return storage.STATUS_MEMBER, state, found
     if state == "absent" and found.get("complete"):
+        member_ids = {_safe_int(value) for value in scanned_ids}
+        _full_scan_cache[channel_key(channel_id)] = (verified_at, member_ids)
+        if len(_full_scan_cache) > _FULL_SCAN_CACHE_MAX:
+            oldest = min(_full_scan_cache.items(),
+                         key=lambda item: item[1][0])[0]
+            _full_scan_cache.pop(oldest, None)
+        _log(bot, f"MEMBER CHECK full scan done chat={record['group_id']} "
+                  f"members_count={len(member_ids)}")
+        _log(bot, f"MEMBER CHECK progressive chat={record['group_id']} "
+                  f"user={user_id} level=full rpc_count={found.get('pages', 0)}")
         return storage.STATUS_NOT_MEMBER, state, found
     # ناقص/خطا → اسنپ‌شات را در پس‌زمینه تازه کن تا پیام بعدی حکم بگیرد.
     _schedule_snapshot_refresh(bot, record)
@@ -1350,15 +1400,32 @@ async def resolve_status(bot, record, user_id, user_entity=None, *,
         status, verified_at = entry
         if now - verified_at <= _ttl_for(status):
             STATS["cache_hits"] += 1
+            _log(bot, f"MEMBER CHECK cache hit chat={record['group_id']} "
+                      f"user={user_id} result={str(status == storage.STATUS_MEMBER).lower()}")
             _record_decision(record["group_id"], user_id, status, "memory")
             return status, "memory", None
         _member_cache.pop((channel_id, user_id), None)
+
+    # A fresh complete scan is shared across all queried users in this channel.
+    # This is distinct from targeted checks; no partial scan may infer absence.
+    if not force:
+        scanned_status = _completed_scan_status(record, user_id, now)
+        if scanned_status is not None:
+            _remember(channel_id, user_id, scanned_status, now)
+            STATS["cache_hits"] += 1
+            _log(bot, f"MEMBER CHECK cache hit chat={record['group_id']} "
+                      f"user={user_id} result={str(scanned_status == storage.STATUS_MEMBER).lower()}")
+            _record_decision(record["group_id"], user_id, scanned_status,
+                             "full_scan_cache")
+            return scanned_status, "full_scan_cache", None
 
     stored = storage.get_member(channel_id, user_id)
     if stored and stored.get("last_verified_at") and not force:
         age = now - float(stored["last_verified_at"])
         if age <= _ttl_for(stored["membership_status"]):
             STATS["db_hits"] += 1
+            _log(bot, f"MEMBER CHECK cache hit chat={record['group_id']} "
+                      f"user={user_id} result={str(stored['membership_status'] == storage.STATUS_MEMBER).lower()}")
             _remember(channel_id, user_id, stored["membership_status"],
                       float(stored["last_verified_at"]))
             _record_decision(record["group_id"], user_id,
@@ -1724,8 +1791,8 @@ def _notice_allowed(chat_id, user_id) -> bool:
 
 
 async def _deliver_text(bot, chat_id, text, *, entities=None,
-                        event=None) -> bool:
-    """ارسال یک متن (با entity) به گروه — صف خروجی، بعد کلاینت."""
+                        event=None, urgent=False) -> bool:
+    """ارسال متن؛ تأیید عضویتِ رویداد با اولویت ۰ و بدون تأخیر poll."""
     sender = getattr(bot, "outgoing_sender", None)
     extra = {"formatting_entities": list(entities)} if entities else {}
 
@@ -1733,6 +1800,16 @@ async def _deliver_text(bot, chat_id, text, *, entities=None,
         try:
             from modules.notice_cleanup import capture_sent
             capture_sent(bot, chat_id, sent)
+        except Exception:
+            pass
+
+    # A join event is already a positive membership proof. Queue its
+    # confirmation as urgent instead of waiting for confirm_first_delay/tick.
+    if urgent and sender is not None:
+        try:
+            sender.enqueue_send(chat_id, text, priority=0, on_done=capture,
+                                channel="main", **extra)
+            return True
         except Exception:
             pass
 
@@ -1820,7 +1897,10 @@ async def confirm_membership(bot, chat_id, user_id, *, name=None) -> bool:
     who = name or entry.get("name") or "کاربر"
     text = confirm_text(record, who)
     sent = await _deliver_text(bot, chat_id, text,
-                               entities=confirm_entities(text, who))
+                               entities=confirm_entities(text, who),
+                               urgent=True)
+    if sent:
+        _log(bot, f"JOIN CONFIRM queued chat={chat_id} user={user_id} priority=0")
     _record_decision(record.get("group_id"), user_id, "member", "confirm_join")
     return sent
 
@@ -2511,6 +2591,8 @@ async def _handle_channel_membership(bot, event, groups, user_ids) -> None:
             # باطل‌سازی **هم دیتابیس و هم کش حافظه** (الزام پرامپت)
             forget_user(channel_id, user_id)
             _remember(channel_id, user_id, status, time.time())
+            if joined:
+                _log(bot, f"JOIN EVENT cached chat={record['group_id']} user={user_id}")
         if joined:
             STATS["events_join"] += len(user_ids)
             # اگر همین کاربر راهنمای عضویت گرفته بود، فوراً «تأیید شد» را بگو
@@ -3128,6 +3210,7 @@ def reset_runtime_state() -> None:
     _group_cache_at.clear()
     _channel_index.clear()
     _member_cache.clear()
+    _full_scan_cache.clear()
     _inflight.clear()
     _notice_sent.clear()
     _notice_window.clear()
