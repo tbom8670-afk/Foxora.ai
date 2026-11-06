@@ -325,12 +325,20 @@ def classify_request(request, *, urgent_send=False, critical_context=False,
         # to turn a long deletion wave into P0 would defeat the reserved slots.
         priority, bucket = P1_DELETE, "delete"
     elif name_set.intersection(_SEND_REQUESTS):
-        # A delayed notice is preferable to starving EditBanned/connection
-        # synchronization.  Even an admin reply is a send, never a P0 RPC.
-        # Notices get a dedicated bucket so they cannot head-block the main
-        # send lane (architecture decision: separate lanes, one socket).
-        priority = P2_SEND
-        bucket = "notice" if channel == "notice" else "send"
+        # Command/admin text replies share P1 with deletion work, but are
+        # selected first with a bounded burst so a delete wave cannot hold up
+        # an essential reply and continuous replies cannot starve deletes.
+        # Cosmetic notices and media/file sends stay in their original lanes.
+        urgent_text = (
+            urgent_send
+            and channel != "notice"
+            and "SendMessageRequest" in name_set
+        )
+        if urgent_text:
+            priority, bucket = P1_DELETE, "urgent_send"
+        else:
+            priority = P2_SEND
+            bucket = "notice" if channel == "notice" else "send"
     # Name lookup has its own bounded lane and timeout: it should not occupy
     # the generic heavy-read slot or block another request in the same class.
     elif name_set.intersection(_RESOLVE_REQUESTS):
@@ -412,6 +420,7 @@ class RpcGovernor:
             "delete": max(1, int(delete_limit)),
             # لِینِ نظرسنجیِ فهرستِ اعضا؛ پیش‌فرض ۱ = یک GetParticipants
             # هم‌زمان در کلِ پروسه (سقفِ مستقل از heavy).
+            "urgent_send": max(1, int(send_limit)),
             "poll": max(1, int(poll_limit if poll_limit is not None else 1)),
             "send": max(1, int(send_limit)),
             "heavy": max(1, int(heavy_limit)),
@@ -462,6 +471,8 @@ class RpcGovernor:
         # SerialRpcQueue did, without merging or dropping any request.
         self.min_interval_seconds = max(0.0, min(60.0, float(min_interval_seconds)))
         self._next_start_at = 0.0
+        self._pace_lock = asyncio.Lock()
+        self._urgent_send_streak = 0
 
         self._active_total = 0
         self._active_noncritical = 0
@@ -650,11 +661,26 @@ class RpcGovernor:
             return False
         if priority == P0_CRITICAL:
             return True
-        cap = self.class_limits.get(bucket)
-        if bucket == "delete":
-            cap = self._delete_cap()
-        if cap is not None and self._active_by_bucket[bucket] >= cap:
-            return False
+        if bucket in {"send", "urgent_send"}:
+            # Urgent text replies get queue priority, not a second send slot.
+            # Keep the configured aggregate send ceiling unchanged.
+            cap = self.class_limits.get("send")
+            active_sends = (
+                int(self._active_by_bucket.get("send") or 0)
+                + int(self._active_by_bucket.get("urgent_send") or 0)
+            )
+        else:
+            cap = self.class_limits.get(bucket)
+            if bucket == "delete":
+                cap = self._delete_cap()
+            active_sends = 0
+        if cap is not None:
+            if bucket in {"send", "urgent_send"}:
+                active = active_sends
+            else:
+                active = self._active_by_bucket[bucket]
+            if active >= cap:
+                return False
         # Long reads/lookups are accounted as noncritical for background
         # backpressure, but do not consume the admission budget reserved for a
         # user-facing send or delete. Keep the configured total_limit as the
@@ -752,7 +778,7 @@ class RpcGovernor:
         )
 
     def format_active_by_bucket(self):
-        buckets = {"critical": 0, "delete": 0, "send": 0, "heavy": 0,
+        buckets = {"critical": 0, "delete": 0, "urgent_send": 0, "send": 0, "heavy": 0,
                    "poll": 0, "resolve": 0, "notice": 0, "other": 0}
         buckets.update(dict(self._active_by_bucket))
         return ",".join(f"{name}:{int(count)}" for name, count in buckets.items() if count)
@@ -772,13 +798,11 @@ class RpcGovernor:
         else:
             self._burst_max_waiting = max(self._burst_max_waiting, self._waiting)
 
-    def _pop_priority(self, priority):
-        """Pop one eligible waiter, round-robin between chats and buckets.
+    def _pop_priority(self, priority, preferred_bucket=None):
+        """Pop an eligible waiter round-robin across chats and buckets.
 
-        A full ``resolve`` bucket must not leave a ResolveUsername waiter at
-        the head of the same-chat P3 deque and block an eligible ``heavy`` read.
-        Preserve FIFO within a bucket, but skip a head waiter whose own bucket
-        is full so independent buckets can make progress.
+        A preferred bucket can pass a P1 command reply ahead of delete work;
+        FIFO is still preserved among replies in each chat.
         """
         rounds = self._chat_rounds[priority]
         groups = self._queues[priority]
@@ -788,10 +812,6 @@ class RpcGovernor:
             group = groups.get(chat_key)
             if group is None:
                 continue
-
-            # Remove cancelled/timed-out waiters anywhere in this chat's lane;
-            # otherwise a cancelled waiter behind a blocked head could keep the
-            # waiting counter and deque alive indefinitely.
             live = [waiter for waiter in group if not waiter.future.done()]
             removed = len(group) - len(live)
             if removed:
@@ -804,7 +824,8 @@ class RpcGovernor:
 
             eligible_index = None
             for index, waiter in enumerate(group):
-                if self._eligible(waiter.priority, waiter.bucket):
+                if (preferred_bucket is None or waiter.bucket == preferred_bucket) and \
+                        self._eligible(waiter.priority, waiter.bucket):
                     eligible_index = index
                     break
             if eligible_index is None:
@@ -822,8 +843,28 @@ class RpcGovernor:
         return None
 
     def _pop_next(self):
-        """Admit the highest-priority eligible waiter. P1 always beats P3."""
-        for priority in (P0_CRITICAL, P1_DELETE, P2_SEND, P3_HEAVY):
+        """Admit by priority, with bounded reply bursts ahead of deletes."""
+        waiter = self._pop_priority(P0_CRITICAL)
+        if waiter is not None:
+            return waiter
+        if self._urgent_send_streak < 3:
+            waiter = self._pop_priority(P1_DELETE, preferred_bucket="urgent_send")
+            if waiter is not None:
+                self._urgent_send_streak += 1
+                return waiter
+        waiter = self._pop_priority(P1_DELETE, preferred_bucket="delete")
+        if waiter is not None:
+            self._urgent_send_streak = 0
+            return waiter
+        waiter = self._pop_priority(P1_DELETE, preferred_bucket="urgent_send")
+        if waiter is not None:
+            self._urgent_send_streak = min(3, self._urgent_send_streak + 1)
+            return waiter
+        waiter = self._pop_priority(P1_DELETE)
+        if waiter is not None:
+            self._urgent_send_streak = 0
+            return waiter
+        for priority in (P2_SEND, P3_HEAVY):
             waiter = self._pop_priority(priority)
             if waiter is not None:
                 return waiter
@@ -867,10 +908,10 @@ class RpcGovernor:
             raise TypeError("admission must be RpcAdmission")
         # Sending a cosmetic/game response after it sat behind five RPCs is
         # worse than dropping it: it prolongs the backlog and delays mute/ban.
-        # Only shed ordinary/background sends. Command and moderation replies
-        # are P0 and must remain deliverable even while normal notifications
-        # have already filled the send backlog.
-        if (not self.shadow and admission.bucket in ("send", "notice")
+        # Only shed queued sends at the configured backlog bound. Urgent
+        # command text shares the send bound, but Governor priority still puts
+        # it ahead of ordinary sends/deletes when a slot opens.
+        if (not self.shadow and admission.bucket in ("send", "urgent_send", "notice")
                 and admission.priority != P0_CRITICAL):
             cap = (
                 self.max_notice_waiters
@@ -1017,16 +1058,18 @@ class RpcGovernor:
         interval = self.min_interval_seconds
         if interval <= 0.0 or not self.enabled or self.shadow:
             return
-        now = time.monotonic()
-        base = max(self._next_start_at, now)
-        wait_for = base - now
-        if wait_for > 0.0:
-            await asyncio.sleep(wait_for)
-        self._next_start_at = max(base, time.monotonic()) + interval
+        async with self._pace_lock:
+            now = time.monotonic()
+            wait_for = max(0.0, self._next_start_at - now)
+            if wait_for > 0.0:
+                await asyncio.sleep(wait_for)
+            # Reserve only once this caller reaches its slot; cancellation
+            # cannot leave an empty pacing gap for later requests.
+            self._next_start_at = time.monotonic() + interval
 
     def format_waiting_by_bucket(self):
         counts = {
-            "critical": 0, "delete": 0, "send": 0, "heavy": 0,
+            "critical": 0, "delete": 0, "urgent_send": 0, "send": 0, "heavy": 0,
             "poll": 0, "resolve": 0, "notice": 0, "other": 0,
         }
         for groups in self._queues.values():
@@ -1284,7 +1327,7 @@ class RpcGovernor:
     def snapshot(self):
         waiting_by_priority = {}
         waiting_by_bucket = {
-            "critical": 0, "delete": 0, "send": 0, "heavy": 0,
+            "critical": 0, "delete": 0, "urgent_send": 0, "send": 0, "heavy": 0,
             "resolve": 0, "notice": 0, "other": 0,
         }
         for priority, groups in self._queues.items():

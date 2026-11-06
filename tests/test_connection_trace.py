@@ -234,3 +234,22 @@ def test_timeout_emits_conn_trace():
     assert timed
     assert any(line.startswith("CONN TRACE TIMEOUT") for line in logger.infos)
     assert any("GetDifferenceRequest" in line for line in logger.infos + logger.errors)
+
+
+def test_unhooked_socket_is_reported_as_unmeasured():
+    class BlindClient(Client):
+        async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+            await asyncio.sleep(self.rpc_ms / 1000.0)
+            return "ok"
+
+    async def scenario():
+        logger = Logger()
+        client = BlindClient(rpc_ms=5)
+        instrument_client(client, logger)
+        await client._call(client._sender, SendMessageRequest())
+        return logger
+
+    logger = asyncio.run(scenario())
+    response = _trace(logger, "RESPONSE")[0]
+    assert "socket_wait_ms=unmeasured" in response
+    assert "socket_observed=0" in response

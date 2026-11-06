@@ -70,3 +70,26 @@ def test_from_environment_defaults_pacing_off(monkeypatch) -> None:
 def test_pacing_knob_is_clamped_to_documented_bounds() -> None:
     assert RpcGovernor(min_interval_seconds=-1).min_interval_seconds == 0.0
     assert RpcGovernor(min_interval_seconds=999).min_interval_seconds == 60.0
+
+
+def test_concurrent_pacing_reserves_distinct_start_slots() -> None:
+    async def scenario() -> None:
+        governor = RpcGovernor(total_limit=8, noncritical_limit=8,
+                               send_limit=8, heavy_limit=8,
+                               min_interval_seconds=0.04)
+        starts = []
+        permits = []
+
+        async def begin():
+            permit = await governor.acquire(_admission())
+            starts.append(time.monotonic())
+            permits.append(permit)
+
+        await asyncio.gather(*(begin() for _ in range(4)))
+        gaps = [right - left for left, right in zip(starts, starts[1:])]
+        assert len(gaps) == 3
+        assert min(gaps) >= 0.03, f"concurrent starts bunched: {gaps}"
+        for permit in permits:
+            permit.release()
+
+    asyncio.run(scenario())

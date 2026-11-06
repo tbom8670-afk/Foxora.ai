@@ -218,9 +218,10 @@ def test_missing_wire_hook_counts_as_rpc_wait():
     inner = [row for row in traces if row.get("request") == "SendMessageRequest"]
     check("TRACE داخلی هست", bool(inner))
     if inner:
-        check("connection_wait=0 وقتی mark نشده",
-              inner[0]["connection_wait_ms"] < 5,
-              f"-> {inner[0]['connection_wait_ms']:.1f}")
+        check("socket time is explicitly unmeasured when no wire hook fires",
+              inner[0].get("connection_wait_ms") is None
+              and inner[0].get("socket_observed") == "0",
+              f"-> {inner[0]}")
         check("rpc_wait کل await است",
               inner[0]["rpc_wait_ms"] >= 70,
               f"-> {inner[0]['rpc_wait_ms']:.1f}")

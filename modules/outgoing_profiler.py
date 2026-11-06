@@ -302,6 +302,8 @@ def begin_rpc_phases(operation=None):
         "governor_wait_ms": 0.0,
         "sender_wait_ms": 0.0,
         "rpc_await_ms": 0.0,
+        "socket_observed_count": 0,
+        "socket_unobserved_count": 0,
         "total_ms": 0.0,
         "operation": operation,
         "started": time.perf_counter(),
@@ -369,6 +371,8 @@ def _log_rpc_budget(logger, owner, operation, phases, extra=None):
         f"governor_wait_ms={governor_wait:.1f} "
         f"sender_wait_ms={sender_wait:.1f} "
         f"rpc_await_ms={rpc_await:.1f} "
+        f"socket_observed={int(phases.get('socket_observed_count') or 0)} "
+        f"socket_unobserved={int(phases.get('socket_unobserved_count') or 0)} "
         f"total_ms={total:.1f} "
         f"sender_pending={sender_pending} "
         f"sender_pending_live={int(snapshot.get('sender_pending_live') or 0)} "
@@ -634,6 +638,7 @@ def _format_trace(fields):
         "operation",
         "chat_id",
         "connection_wait_ms",
+        "socket_observed",
         "rpc_wait_ms",
         "post_rpc_ms",
         "total_rpc_ms",
@@ -1347,7 +1352,10 @@ def _wrap_call(client, logger):
                     attempt=attempt,
                     op_id=op_id,
                     await_ms=total_rpc_ms,
-                    socket_wait_ms=connection_wait_ms,
+                    socket_wait_ms=(
+                        connection_wait_ms if send_started is not None else "unmeasured"
+                    ),
+                    socket_observed=int(send_started is not None),
                     rpc_await_ms=rpc_wait_ms,
                     reconnects=reconnects,
                     reconnect_ms=reconnect_ms,
@@ -1363,7 +1371,10 @@ def _wrap_call(client, logger):
                 "request_id": request_id,
                 "operation": operation or _request_name(request),
                 "chat_id": chat_id,
-                "connection_wait_ms": connection_wait_ms,
+                "connection_wait_ms": (
+                    connection_wait_ms if send_started is not None else None
+                ),
+                "socket_observed": int(send_started is not None),
                 "rpc_wait_ms": rpc_wait_ms,
                 "post_rpc_ms": post_rpc_ms,
                 "total_rpc_ms": total_rpc_ms,
@@ -1377,6 +1388,11 @@ def _wrap_call(client, logger):
             if phases is not None:
                 phases["rpc_await_ms"] = float(phases.get("rpc_await_ms") or 0.0) + rpc_wait_ms
                 phases["sender_wait_ms"] = float(phases.get("sender_wait_ms") or 0.0) + connection_wait_ms
+                observed_key = (
+                    "socket_observed_count" if send_started is not None
+                    else "socket_unobserved_count"
+                )
+                phases[observed_key] = int(phases.get(observed_key) or 0) + 1
                 if not phases.get("operation"):
                     phases["operation"] = operation or _request_name(request)
             should_log = (
@@ -1454,8 +1470,18 @@ def _wrap(owner, attribute, operation, logger):
             ended = time.perf_counter()
             elapsed_ms = (ended - started) * 1000
             calls = state.get("calls") or ()
-            connection_wait_ms = sum(item["connection_wait_ms"] for item in calls)
-            rpc_wait_ms = sum(item["rpc_wait_ms"] for item in calls)
+            observed_calls = [
+                item for item in calls if item.get("socket_observed")
+            ]
+            connection_wait_ms = (
+                sum(float(item.get("connection_wait_ms") or 0.0) for item in observed_calls)
+                if observed_calls else None
+            )
+            socket_observed_count = len(observed_calls)
+            socket_unobserved_count = sum(
+                1 for item in calls if not item.get("socket_observed")
+            )
+            rpc_wait_ms = sum(float(item.get("rpc_wait_ms") or 0.0) for item in calls)
             last_return = state.get("last_return")
             if last_return is None:
                 post_rpc_ms = 0.0 if calls else elapsed_ms
@@ -1471,6 +1497,7 @@ def _wrap(owner, attribute, operation, logger):
                     "operation": operation,
                     "chat_id": chat_id,
                     "connection_wait_ms": connection_wait_ms,
+                    "socket_observed": socket_observed_count,
                     "rpc_wait_ms": rpc_wait_ms,
                     "post_rpc_ms": post_rpc_ms,
                     "total_rpc_ms": elapsed_ms,
@@ -1481,7 +1508,9 @@ def _wrap(owner, attribute, operation, logger):
                     "OUTGOING RPC FINISHED "
                     f"request_id={request_id} operation={operation} chat_id={chat_id} "
                     f"started_at={started_wall:.3f} finished_at={time.time():.3f} "
-                    f"rpc_ms={elapsed_ms:.2f} result={result} nested={depth > 0}"
+                    f"rpc_ms={elapsed_ms:.2f} result={result} nested={depth > 0} "
+                    f"socket_observed={socket_observed_count} "
+                    f"socket_unobserved={socket_unobserved_count}"
                 )
             if _RPC_DEBUG and operation in {"send_message", "reply"}:
                 logger.log_info(

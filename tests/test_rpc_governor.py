@@ -42,7 +42,9 @@ def test_request_classification_matches_soroush_workloads():
     assert classify_request(DeleteMessagesRequest()).priority == P1_DELETE
     assert classify_request(SendMessageRequest()).priority == P2_SEND
     assert classify_request(GetParticipantsRequest()).priority == P3_HEAVY
-    assert classify_request(SendMessageRequest(), urgent_send=True).priority == P2_SEND
+    urgent = classify_request(SendMessageRequest(), urgent_send=True)
+    assert urgent.priority == P1_DELETE
+    assert urgent.bucket == "urgent_send"
     assert classify_request(GetParticipantsRequest(), critical_context=True).priority == P3_HEAVY
     assert classify_request(DeleteMessagesRequest(), critical_context=True).priority == P1_DELETE
 

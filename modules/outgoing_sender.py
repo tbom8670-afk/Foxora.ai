@@ -707,7 +707,7 @@ def _wrap_call_with_gate(client, logger, governor=None):
         channel = _SEND_CHANNEL.get() or "main"
         if channel != "notice":
             channel = "main"
-        urgent_send = send_priority == 0
+        urgent_send = send_priority in (0, 1)
         critical_context = bool(
             dispatch_priority is not False
             and dispatch_priority is not None
@@ -718,7 +718,7 @@ def _wrap_call_with_gate(client, logger, governor=None):
         # lane keeps the historical priority-0 bypass.  Either way a notice
         # can never take a slot from a user-facing reply.
         is_low = name in _LOW and (
-            channel == "notice" or not urgent_send
+            channel == "notice" or send_priority != 0
         )
         chat_for_gate = _request_chat(request)
         gate_wait = 0.0
