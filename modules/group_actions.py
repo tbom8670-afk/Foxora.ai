@@ -164,11 +164,12 @@ class GroupActions:
         except (TypeError, ValueError):
             return (chat_id,)
 
-        full_channel_id = -(CHANNEL_ID_OFFSET + short_id)
-        candidates = [full_channel_id]
-        if raw_id not in candidates:
-            candidates.append(raw_id)
-        return tuple(candidates)
+        # Do not retry the positive short channel ID: SPlusthon interprets it
+        # as a user and issues GetUsersRequest (404). A normalized full ID is
+        # the only safe numeric lookup; real InputPeers still come from cache.
+        if raw_id <= -CHANNEL_ID_OFFSET or raw_id < 0:
+            return (raw_id,)
+        return (-(CHANNEL_ID_OFFSET + short_id),)
 
     async def _group_peer(self, chat_id):
         """Prefer the bot's resolved InputPeer, then legacy ID resolution."""

@@ -287,11 +287,14 @@ def test_governor_auto_delete_mode():
     check("بعد از پایان cooldown به ۲ برمی‌گردد",
           governor._delete_cap() == 2)
 
-    # پیش‌فرض پروژه محافظه‌کارانه می‌ماند
+    # Runtime default is adaptive; the hard total-limit still bounds peak RPCs.
     default = rpc_governor.RpcGovernor.from_environment(None)
-    check("پیش‌فرضِ بدون تنظیم، سقف ۱ است",
-          default.auto_delete is False
-          and default.class_limits["delete"] == 1, f"-> {default.class_limits}")
+    expected_delete_cap = 2 if default.total_limit >= 3 else 1
+    check("پیش‌فرضِ بدون تنظیم، auto با سقف سازگار با total است",
+          default.auto_delete is True
+          and default.class_limits["delete"] == expected_delete_cap
+          and default._delete_cap() == expected_delete_cap,
+          f"-> total={default.total_limit} limits={default.class_limits}")
 
     # هوک FloodWait از لایهٔ بیرونی
     rpc_governor.register_active(governor)
@@ -349,47 +352,19 @@ def test_memory_guard_prunes_before_oom():
 
 
 
-def test_peer_fallback_never_returns_raw_int():
-    print("\n### ۹ جایگزینِ Peer هرگز شناسهٔ خام برنمی‌گرداند (شبیه‌سازی splusthon)")
-    import types as pytypes
+def test_peer_fallback_never_fabricates_peer_without_hash():
+    print("\n### ۹ نبودِ access_hash معتبر، Peer ساختگی تولید نمی‌کند")
+    from modules.group_actions import GroupActions
+    from modules.group_id import CHANNEL_ID_OFFSET
 
-    fake_tl = pytypes.ModuleType("splusthon.tl")
-    fake_types = pytypes.ModuleType("splusthon.tl.types")
-
-    class PeerChannel:
-        def __init__(self, channel_id, access_hash=None):
-            self.channel_id = channel_id
-            self.access_hash = access_hash
-
-    class InputPeerChannel:
-        def __init__(self, channel_id, access_hash=None):
-            self.channel_id = channel_id
-            self.access_hash = access_hash
-
-    fake_types.PeerChannel = PeerChannel
-    fake_types.InputPeerChannel = InputPeerChannel
-    fake_tl.types = fake_types
-    fake_root = pytypes.ModuleType("splusthon")
-    saved = {name: sys.modules.get(name) for name in
-             ("splusthon", "splusthon.tl", "splusthon.tl.types")}
-    sys.modules["splusthon"] = fake_root
-    sys.modules["splusthon.tl"] = fake_tl
-    sys.modules["splusthon.tl.types"] = fake_types
-    try:
-        variants = admin_tools._cleanup_peer_fallbacks(CHAT)
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = value
-
-    check("جایگزین ساخته شد", bool(variants), f"-> {variants}")
-    check("هیچ شناسهٔ خامی در جایگزین‌ها نیست",
-          all(not isinstance(item, int) for item in variants), f"-> {variants}")
-    check("شناسهٔ نرمال‌شدهٔ کانال داخل Peer است",
-          any(getattr(item, "channel_id", None) == abs(CHAT)
-              for item in variants), f"-> {[getattr(v, 'channel_id', None) for v in variants]}")
+    variants = admin_tools._cleanup_peer_fallbacks(CHAT)
+    candidates = GroupActions._peer_id_candidates(CHAT)
+    check("بدون peer معتبر، fallback ساختگی خالی است", variants == [],
+          f"-> {variants}")
+    check("resolver فقط full channel ID را lookup می‌کند",
+          candidates == (-(CHANNEL_ID_OFFSET + CHAT),), f"-> {candidates}")
+    check("full channel ID معتبر و منفی است",
+          candidates[0] < -CHANNEL_ID_OFFSET, f"-> {candidates}")
 
 
 def main():
@@ -404,7 +379,7 @@ def main():
     test_participant_cache_throttles_failures()
     test_governor_auto_delete_mode()
     test_memory_guard_prunes_before_oom()
-    test_peer_fallback_never_returns_raw_int()
+    test_peer_fallback_never_fabricates_peer_without_hash()
     print("\n" + "=" * 60)
     print(f"passed={PASSED} failed={FAILED}")
     print("=" * 60)

@@ -241,8 +241,13 @@ python3 tests/test_tikka_kalam.py   # ۳۵ بررسی
 * **`GetParticipants`:** کشِ ۶۰ ثانیه + single-flight + حداقل ۲ ثانیه فاصله
   (`modules/participant_cache.py`) — از ~۱۰ فراخوانی در ۱۴ ثانیه به حداکثر
   ۱ در دقیقه برای هر گروه.
-* **Governor:** `BOT_RPC_DELETE_LIMIT=auto` سقفِ delete را ۲ می‌کند و بعد از
-  هر FloodWait آن را ۶۰ ثانیه به ۱ برمی‌گرداند (پیش‌فرض همان ۱).
+* **Governor:** پیش‌فرضِ runtime و `.env.example` اکنون `auto` است؛ سقفِ delete
+  فقط وقتی `BOT_RPC_TOTAL_LIMIT=3` باشد به ۲ می‌رسد و بعد از FloodWait برای
+  ۶۰ ثانیه به ۱ برمی‌گردد. در Foxora2 با total پیش‌فرض ۲، سقف delete همچنان ۱
+  است. اگر `.env` فعال خودش `BOT_RPC_DELETE_LIMIT=1` داشته باشد، همان مقدار
+  صریح حفظ می‌شود.
+* **حذف خودکار:** پنجرهٔ merge پیش‌فرض از ۶۰ms به ۲۰ms کم شده؛ burstها همچنان
+  در تست به یک RPC batch شدند.
 * **ترموکس:** نگهبانِ حافظه (`modules/memory_guard.py`) هر دقیقه RSS را
   می‌خواند و کش‌ها را هرس می‌کند (soft ۲۲۰MB / hard ۳۲۰MB).
 

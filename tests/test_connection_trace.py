@@ -253,3 +253,100 @@ def test_unhooked_socket_is_reported_as_unmeasured():
     response = _trace(logger, "RESPONSE")[0]
     assert "socket_wait_ms=unmeasured" in response
     assert "socket_observed=0" in response
+
+
+def test_send_loop_context_is_correlated_to_pending_rpc():
+    """SPlusthon sends from a long-lived task, not the caller's ContextVar."""
+    class WireConnection:
+        async def send(self, _payload):
+            await asyncio.sleep(0.015)
+
+    class WireSender:
+        def __init__(self):
+            self._pending_state = {}
+            self._queued = []
+            self._connection = WireConnection()
+            self._send_ready = asyncio.Event()
+            self._next_id = 0
+
+        def send(self, request):
+            self._next_id += 1
+            future = asyncio.get_running_loop().create_future()
+            state = RequestState(request, future, self._next_id)
+            self._queued.append(state)
+            self._send_ready.set()
+            return future
+
+        async def send_loop(self):
+            await self._send_ready.wait()
+            state = self._queued.pop(0)
+            # SPlusthon adds only the current packed batch to _pending_state
+            # immediately before connection.send; queued requests aren't there yet.
+            self._pending_state[state.msg_id] = state
+            assert op._CALL_STATE.get() is None
+            await self._connection.send(b"encrypted")
+            # Same pending RequestState is written again after reconnect.
+            op._RECONNECT_GEN += 1
+            await self._connection.send(b"encrypted replay")
+            if not state.future.done():
+                state.future.set_result("ok")
+            self._pending_state.pop(state.msg_id, None)
+
+    class WireClient:
+        def __init__(self):
+            self._sender = WireSender()
+
+        async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+            return await sender.send(request)
+
+    async def scenario():
+        logger = Logger()
+        client = WireClient()
+        previous_generation = op._RECONNECT_GEN
+        send_loop = asyncio.create_task(client._sender.send_loop())
+        instrument_client(client, logger)
+        try:
+            result = await client._call(client._sender, SendMessageRequest())
+            await send_loop
+            return result, logger
+        finally:
+            op._RECONNECT_GEN = previous_generation
+
+    result, logger = asyncio.run(scenario())
+    assert result == "ok"
+    response = _trace(logger, "RESPONSE")[0]
+    assert "socket_observed=1" in response
+    assert "socket_wait_ms=unmeasured" not in response
+    assert "resend_count=1" in response
+    assert "reconnects=1" in response
+    assert _trace(logger, "SOCKET SEND")
+    assert _trace(logger, "SOCKET RESEND")
+
+
+def test_unobserved_socket_wait_is_not_reported_as_zero():
+    class UnobservedClient:
+        def __init__(self):
+            self._sender = SimpleNamespace(_pending_state={}, _connection=SimpleNamespace())
+
+        async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+            await asyncio.sleep(0.002)
+            return "ok"
+
+    async def scenario():
+        logger = Logger()
+        client = UnobservedClient()
+        instrument_client(client, logger)
+        await client._call(client._sender, GetDifferenceRequest())
+        return logger
+
+    previous_threshold = op._RPC_SLOW_MS
+    op._RPC_SLOW_MS = 0
+    try:
+        logger = asyncio.run(scenario())
+    finally:
+        op._RPC_SLOW_MS = previous_threshold
+    response = _trace(logger, "RESPONSE")[0]
+    assert "socket_observed=0" in response
+    assert "socket_wait_ms=unmeasured" in response
+    budget = [line for line in logger.infos if "OUTGOING RPC" in line]
+    assert budget and all("sender_wait_ms=unmeasured" in line for line in budget)

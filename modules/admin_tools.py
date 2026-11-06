@@ -33,7 +33,7 @@ from modules.owner_check import is_global_owner
 from modules.admin_storage import is_admin
 from modules.group_storage import get_group_owner
 from modules.user_display import format_user
-from modules.group_id import normalize_group_id
+from modules.group_id import CHANNEL_ID_OFFSET, normalize_group_id
 
 _BASE = CONFIG_DIR
 _ADMIN_LOG_FILE = _BASE / "admin_log.json"
@@ -826,43 +826,30 @@ def _usable_peer(value):
 
 
 def _cleanup_peer_fallbacks(chat_id):
-    """InputPeerهای امنِ جایگزین — **هیچ‌وقت** شناسهٔ خام برنمی‌گردانیم.
+    """No synthetic Peer/InputPeer fallback is safe without an access hash.
 
-    چرا: وقتی یک عدد خام به ``iter_messages``/``get_messages`` داده شود،
-    SPlusthon خودش سعی می‌کند آن را resolve کند: ``GetChannelsRequest`` را
-    می‌زند و بی‌هیچ بررسی‌ای ``channels[0]`` را می‌خواند. برای گروه‌هایی که
-    سروش در آن پاسخ، کانال برنمی‌گرداند این کار به
-    ``IndexError('list index out of range')`` می‌رسد؛ و برای بعضی شناسه‌ها
-    هم ``GetUsersRequest`` با ``404 NOT_FOUND`` کلِ درخواست را می‌کشد.
-    با پاس‌دادن یک Peer صریح، آن مسیر پرخطر کلاً طی نمی‌شود.
+    A fabricated PeerChannel or InputPeerChannel(access_hash=0) can cause
+    SPlusthon to issue futile GetChannels/GetHistory/GetUsers RPCs. Cleanup
+    must use a real InputPeer from the live cache/session or abort and retry
+    later when one becomes available.
     """
-    variants = []
+    return []
+
+
+def _cleanup_channel_id(chat_id):
+    """Canonical full SPlusthon channel ID for one cache/session lookup."""
     try:
-        normalized = int(normalize_group_id(chat_id))
+        raw_id = int(chat_id)
+        short_id = int(normalize_group_id(chat_id))
     except (TypeError, ValueError):
-        return variants
-    try:
-        from splusthon.tl import types as tl_types
-    except Exception:
-        return variants
-    for name in ("PeerChannel", "InputPeerChannel"):
-        factory = getattr(tl_types, name, None)
-        if factory is None:
-            continue
-        try:
-            variants.append(factory(channel_id=normalized))
-            continue
-        except Exception:
-            pass
-        try:
-            variants.append(factory(normalized, 0))
-        except Exception:
-            continue
-    return variants
+        return None
+    if raw_id <= -CHANNEL_ID_OFFSET or raw_id < 0:
+        return raw_id
+    return -(CHANNEL_ID_OFFSET + short_id)
 
 
 async def _resolve_cleanup_peer(bot, chat_id, log):
-    """تلاشِ امن برای گرفتن InputPeer گروه؛ در شکست ``None`` می‌دهد."""
+    """Resolve only a real cached/session InputPeer; avoid duplicate bad RPCs."""
     resolver = getattr(getattr(bot, "group_actions", None), "_group_peer", None)
     if callable(resolver):
         try:
@@ -880,11 +867,14 @@ async def _resolve_cleanup_peer(bot, chat_id, log):
                 f"SNAPSHOT PEER RESOLVE FAILED chat_id={chat_id} "
                 f"via=group_actions error={type(error).__name__}: {error}"
             )
+        # GroupActions already tried the canonical ID. Do not repeat the same
+        # lookup or fall back to a positive ID that SPlusthon treats as a user.
+        return []
 
     client = getattr(bot, "client", None)
     factory = getattr(client, "get_input_entity", None)
-    if callable(factory) and _is_int_like(chat_id):
-        candidate = int(normalize_group_id(chat_id))
+    candidate = _cleanup_channel_id(chat_id)
+    if callable(factory) and candidate is not None:
         try:
             peer = await factory(candidate)
         except asyncio.CancelledError:
@@ -901,14 +891,7 @@ async def _resolve_cleanup_peer(bot, chat_id, log):
                 f"target_type={type(peer).__name__} via=get_input_entity"
             )
             return [peer]
-
-    fallbacks = _cleanup_peer_fallbacks(chat_id)
-    if fallbacks:
-        log(
-            f"SNAPSHOT PEER FALLBACK chat_id={chat_id} "
-            f"candidates={len(fallbacks)}"
-        )
-    return fallbacks
+    return []
 
 
 def _is_int_like(value):
@@ -960,12 +943,10 @@ async def _snapshot_cleanup_message_ids(bot, chat_id, count, log):
         count = 3000
 
     targets = _cleanup_rpc_targets(bot, chat_id)
-    seen_targets = {repr(target) for target in targets}
-    for target in await _resolve_cleanup_peer(bot, chat_id, log):
-        if repr(target) in seen_targets:
-            continue
-        seen_targets.add(repr(target))
-        targets.append(target)
+    # A cached real InputPeer (including InputPeerChat for basic groups) is
+    # already sufficient; avoid an unnecessary entity-resolution RPC.
+    if not targets:
+        targets.extend(await _resolve_cleanup_peer(bot, chat_id, log))
 
     if not targets:
         # بدون Peer قابل‌اعتماد، هیچ RPCای با شناسهٔ خام زده نمی‌شود.

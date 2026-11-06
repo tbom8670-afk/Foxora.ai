@@ -81,6 +81,22 @@ def test_micro_buffering_batches_rapid_single_deletes():
     asyncio.run(scenario())
 
 
+def test_default_delete_buffer_is_shorter_and_keeps_burst_merging():
+    async def scenario():
+        client = FakeDeleteClient(rpc_delay=0.002)
+        queue = MessageDeleteQueue(client, FakeLogger(), batch_size=15)
+        assert queue.micro_buffer_seconds == 0.02
+        futures = [
+            queue.enqueue(chat_id=778, message_ids=[message_id], priority=1)
+            for message_id in range(1, 7)
+        ]
+        await asyncio.gather(*futures)
+        return client.delete_calls
+
+    calls = asyncio.run(scenario())
+    assert calls == [(778, [1, 2, 3, 4, 5, 6])]
+
+
 def test_priority_0_admin_deletes_bypass_micro_buffer():
     async def scenario():
         client = FakeDeleteClient(rpc_delay=0.001)
@@ -190,6 +206,7 @@ def run_comparative_delete_benchmark():
 
 if __name__ == "__main__":
     test_micro_buffering_batches_rapid_single_deletes()
+    test_default_delete_buffer_is_shorter_and_keeps_burst_merging()
     test_priority_0_admin_deletes_bypass_micro_buffer()
     test_ban_mute_not_delayed_by_delete_micro_buffer()
     test_60_groups_concurrent_spam_waves_and_deletes()

@@ -68,6 +68,9 @@ _RESPONSE_RPC_MS = contextvars.ContextVar("response_rpc_ms", default=0.0)
 _RPC_DEPTH = contextvars.ContextVar("outgoing_rpc_depth", default=0)
 _OP_STATE = contextvars.ContextVar("outgoing_op_state", default=None)
 _CALL_STATE = contextvars.ContextVar("outgoing_call_state", default=None)
+# Calls are created in RPC tasks, but SPlusthon writes from a long-lived send-loop task.
+# Correlate request objects across that task boundary instead of relying on ContextVar.
+_WIRE_CALLS = {}
 _RPC_PHASES = contextvars.ContextVar("outgoing_rpc_phases", default=None)
 _INFLIGHT_RPCS = {}
 _RPC_DEBUG = os.getenv("BOT_RPC_DEBUG", "").strip() == "1"
@@ -127,22 +130,16 @@ def end_response_measurement(token):
     _RESPONSE_RPC_MS.reset(token)
 
 
-def mark_rpc_on_wire():
-    """Stamp the moment this RPC is actually written to the connection.
-
-    Called from send-path hooks (``connection.send`` / ``writer.drain``)
-    and from tests. Does nothing when no ``_call`` is in progress.
-    A later write on the same await is a reconnect replay, not a new RPC.
-    """
-    call = _CALL_STATE.get()
+def _record_wire_send(call, now=None, *, allow_resend=False):
     if call is None:
         return False
-    now = time.perf_counter()
+    now = time.perf_counter() if now is None else now
     logger = call.get("logger")
     name = call.get("request_name") or "unknown"
     request_id = call.get("request_id") or "-"
     if call.get("send_started") is None:
         call["send_started"] = now
+        call["send_reconnect_gen"] = _RECONNECT_GEN
         queued = call.get("queued") or now
         if _should_trace(name):
             _log_conn_trace(
@@ -153,8 +150,11 @@ def mark_rpc_on_wire():
                 queue_to_wire_ms=(now - queued) * 1000.0,
             )
         return True
+    if not allow_resend:
+        return False
     call["resend_count"] = int(call.get("resend_count") or 0) + 1
     call["last_resend"] = now
+    call["send_reconnect_gen"] = _RECONNECT_GEN
     _log_conn_trace(
         logger,
         "SOCKET RESEND",
@@ -164,6 +164,103 @@ def mark_rpc_on_wire():
         since_first_send_ms=(now - call["send_started"]) * 1000.0,
     )
     return True
+
+
+def mark_rpc_on_wire():
+    """Stamp a send when the call's ContextVar is available (also used by tests)."""
+    return _record_wire_send(_CALL_STATE.get(), allow_resend=True)
+
+
+def _request_wire_objects(request):
+    """Yield request wrappers and their ``query`` payloads for exact correlation."""
+    pending = list(request) if isinstance(request, (list, tuple)) else [request]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        try:
+            nested = getattr(current, "query", None)
+        except Exception:
+            nested = None
+        if nested is not None:
+            pending.append(nested)
+
+
+def _register_wire_call(sender, request, call):
+    keys = call.setdefault("wire_registry_keys", set())
+    for item in _request_wire_objects(request):
+        key = (id(sender), id(item))
+        calls = _WIRE_CALLS.setdefault(key, [])
+        if not any(existing is call for existing in calls):
+            calls.append(call)
+        keys.add(key)
+
+
+def _unregister_wire_call(call):
+    for key in call.pop("wire_registry_keys", ()):
+        calls = _WIRE_CALLS.get(key)
+        if not calls:
+            continue
+        remaining = [existing for existing in calls if existing is not call]
+        if remaining:
+            _WIRE_CALLS[key] = remaining
+        else:
+            _WIRE_CALLS.pop(key, None)
+
+
+def _stamp_pending_sender_calls(sender, *, allow_resend=False):
+    """Correlate SPlusthon's pending RequestStates with RPC tasks at transport send."""
+    try:
+        states = list((getattr(sender, "_pending_state", {}) or {}).values())
+    except Exception:
+        return 0
+    stamped = 0
+    now = time.perf_counter()
+    for state in states:
+        request = getattr(state, "request", None)
+        matched = False
+        for item in _request_wire_objects(request):
+            # A caller can legally reuse the same request instance. Match FIFO
+            # one-to-one with pending RequestStates instead of stamping every
+            # call registered under that object's identity.
+            for call in tuple(_WIRE_CALLS.get((id(sender), id(item)), ())):
+                if call.get("send_started") is None:
+                    recorded = _record_wire_send(call, now)
+                elif (allow_resend
+                      and call.get("send_reconnect_gen") != _RECONNECT_GEN):
+                    recorded = _record_wire_send(call, now, allow_resend=True)
+                else:
+                    recorded = False
+                if recorded:
+                    stamped += 1
+                    matched = True
+                    break
+            if matched:
+                break
+    return stamped
+
+
+def _hook_sender_send(sender):
+    """Register each request before it enters SPlusthon's async send queue."""
+    original = getattr(sender, "send", None)
+    if original is None or getattr(original, "_outgoing_send_hook", False):
+        return False
+
+    def hooked(request, *args, **kwargs):
+        call = _CALL_STATE.get()
+        if call is not None:
+            _register_wire_call(sender, request, call)
+        return original(request, *args, **kwargs)
+
+    hooked._outgoing_send_hook = True
+    try:
+        setattr(sender, "send", hooked)
+        return True
+    except (AttributeError, TypeError):
+        return False
 
 
 def _log_conn_trace(logger, event, **fields):
@@ -350,6 +447,12 @@ def _log_rpc_budget(logger, owner, operation, phases, extra=None):
     queue_wait = float(phases.get("queue_wait_ms") or 0.0)
     governor_wait = float(phases.get("governor_wait_ms") or 0.0)
     sender_wait = float(phases.get("sender_wait_ms") or 0.0)
+    socket_observed = int(phases.get("socket_observed_count") or 0)
+    socket_unobserved = int(phases.get("socket_unobserved_count") or 0)
+    sender_wait_text = (
+        f"{sender_wait:.1f}" if socket_observed
+        else ("unmeasured" if socket_unobserved else f"{sender_wait:.1f}")
+    )
     rpc_await = float(phases.get("rpc_await_ms") or 0.0)
     total = queue_wait + governor_wait + sender_wait + rpc_await
     phases["total_ms"] = total
@@ -369,10 +472,10 @@ def _log_rpc_budget(logger, owner, operation, phases, extra=None):
         f"operation={operation or phases.get('operation') or 'unknown'} "
         f"queue_wait_ms={queue_wait:.1f} "
         f"governor_wait_ms={governor_wait:.1f} "
-        f"sender_wait_ms={sender_wait:.1f} "
+        f"sender_wait_ms={sender_wait_text} "
         f"rpc_await_ms={rpc_await:.1f} "
-        f"socket_observed={int(phases.get('socket_observed_count') or 0)} "
-        f"socket_unobserved={int(phases.get('socket_unobserved_count') or 0)} "
+        f"socket_observed={socket_observed} "
+        f"socket_unobserved={socket_unobserved} "
         f"total_ms={total:.1f} "
         f"sender_pending={sender_pending} "
         f"sender_pending_live={int(snapshot.get('sender_pending_live') or 0)} "
@@ -663,13 +766,17 @@ def _log_trace(logger, fields):
         logger.log_info(line)
 
 
-def _hook_method(obj, name):
+def _hook_method(obj, name, sender=None):
     original = getattr(obj, name, None)
     if original is None or getattr(original, "_outgoing_send_hook", False):
         return False
 
     def _stamp():
         if name == "drain" and not getattr(obj, "_pending", None):
+            return
+        if sender is not None and _stamp_pending_sender_calls(
+            sender, allow_resend=(name == "send")
+        ):
             return
         mark_rpc_on_wire()
 
@@ -695,22 +802,23 @@ def _ensure_send_hooks(client):
     sender = getattr(client, "_sender", None)
     if sender is None:
         return
+    sender_hooked = _hook_sender_send(sender)
     conn = getattr(sender, "_connection", None)
     writer = getattr(conn, "_writer", None) if conn is not None else None
     ws = getattr(writer, "_ws", None) if writer is not None else None
-    marker = (id(conn), id(writer), id(ws))
+    marker = (id(sender), id(conn), id(writer), id(ws))
     if getattr(client, "_outgoing_send_hook_ids", None) == marker:
         return
     hooked = False
     if conn is not None:
-        hooked = _hook_method(conn, "send") or hooked
+        hooked = _hook_method(conn, "send", sender=sender) or hooked
         if writer is not None:
-            hooked = _hook_method(writer, "drain") or hooked
+            hooked = _hook_method(writer, "drain", sender=sender) or hooked
             if ws is not None:
-                hooked = _hook_method(ws, "send_bytes") or hooked
+                hooked = _hook_method(ws, "send_bytes", sender=sender) or hooked
     try:
         client._outgoing_send_hook_ids = marker
-        if hooked:
+        if hooked or sender_hooked:
             client._outgoing_send_hooks = True
     except (AttributeError, TypeError):
         pass
@@ -1292,6 +1400,8 @@ def _wrap_call(client, logger):
             sender = args[0]
         elif client is not None:
             sender = getattr(client, "_sender", None)
+        if sender is not None:
+            _register_wire_call(sender, request, call)
         try:
             _log_conn_trace(
                 logger,
@@ -1362,6 +1472,7 @@ def _wrap_call(client, logger):
                     resend_count=int(call.get("resend_count") or 0),
                     socket_sent=int(send_started is not None),
                 )
+            _unregister_wire_call(call)
             _CALL_STATE.reset(token)
             detach_cancel_target(request_id)
             _unregister_inflight(inflight_key)
@@ -1412,6 +1523,8 @@ def _wrap_call(client, logger):
                         "governor_wait_ms": 0.0,
                         "sender_wait_ms": connection_wait_ms,
                         "rpc_await_ms": rpc_wait_ms,
+                        "socket_observed_count": int(send_started is not None),
+                        "socket_unobserved_count": int(send_started is None),
                         "started": call["queued"],
                     },
                     extra=f"result={result}",

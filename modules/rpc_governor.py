@@ -506,7 +506,7 @@ class RpcGovernor:
         # BOT_RPC_DELETE_LIMIT=auto → سقف ۲ برای bucket=delete، ولی «مشروط»:
         # به‌محضِ دیدن یک FloodWait روی همین باکت، تا پایانِ cooldown به ۱
         # برمی‌گردد (پایین‌تر: note_flood_wait/_delete_cap).
-        delete_raw = str(os.environ.get("BOT_RPC_DELETE_LIMIT", "1")).strip().lower()
+        delete_raw = str(os.environ.get("BOT_RPC_DELETE_LIMIT", "auto")).strip().lower()
         auto_delete = delete_raw in {"auto", "خودکار"}
         if auto_delete:
             delete_limit = 2 if total_limit >= 3 else 1
@@ -573,7 +573,7 @@ class RpcGovernor:
     #   (ب) auto: در حالتِ سالم ۲ می‌شود، و به‌محضِ یک FloodWait روی delete
     #         تا پایانِ cooldown (پیش‌فرض ۶۰ ثانیه) به ۱ برمی‌گردد.
     # حالتِ auto همان (الف) است ولی ریسکِ FLOOD_WAIT را خودش مهار می‌کند؛
-    # پیش‌فرضِ پروژه هم‌چنان ۱ (محافظه‌کارانه) می‌ماند.
+    # پیش‌فرضِ runtime حالتِ auto است؛ با سقف کل ۲، cap همچنان ۱ می‌ماند.
     def note_flood_wait(self, bucket=None, seconds=0.0, cooldown=None):
         """ثبتِ FloodWait روی یک باکت؛ حالتِ auto را محافظه‌کار می‌کند."""
         bucket = str(bucket or "delete")

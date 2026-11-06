@@ -115,3 +115,75 @@ def test_execute_cleanup_aborts_before_lock_when_snapshot_failed():
     assert actions.lock_calls == 0
     assert actions.unlock_calls == 0
     assert any("ABORT" in line and "snapshot_failed" in line for line in lines)
+
+
+def test_group_actions_resolution_failure_is_not_retried_with_raw_id():
+    async def scenario():
+        calls = {"resolver": 0, "input_entity": [], "history": 0}
+
+        class Actions:
+            async def _group_peer(self, _chat_id):
+                calls["resolver"] += 1
+                raise LookupError("no cached peer")
+
+        class Client:
+            async def get_input_entity(self, value):
+                calls["input_entity"].append(value)
+                return _Peer(9429374)
+
+            async def iter_messages(self, _target, limit):
+                calls["history"] += 1
+                if False:
+                    yield None
+
+        bot = SimpleNamespace(
+            client=Client(), reply_input_peer_cache={}, group_actions=Actions()
+        )
+        logs = []
+        result = await admin_tools._snapshot_cleanup_message_ids(
+            bot, 9429374, 700, logs.append
+        )
+        return result, calls, logs
+
+    result, calls, logs = asyncio.run(scenario())
+    assert result is None
+    assert calls == {"resolver": 1, "input_entity": [], "history": 0}
+    assert any("no_resolvable_peer" in line for line in logs)
+
+
+def test_cached_basic_group_input_peer_skips_channel_resolution():
+    async def scenario():
+        peer = SimpleNamespace(chat_id=5678)
+        calls = {"resolver": 0, "input_entity": 0, "targets": []}
+
+        class Actions:
+            async def _group_peer(self, _chat_id):
+                calls["resolver"] += 1
+                raise AssertionError("cached basic-group peer should be enough")
+
+        class Client:
+            async def get_input_entity(self, _value):
+                calls["input_entity"] += 1
+                raise AssertionError("must not try channel-ID resolution")
+
+            async def iter_messages(self, target, limit):
+                calls["targets"].append(target)
+                if target is not peer:
+                    raise AssertionError("wrong peer type/identity")
+                yield SimpleNamespace(id=41)
+
+        bot = SimpleNamespace(
+            client=Client(), reply_input_peer_cache={5678: peer},
+            group_actions=Actions(),
+        )
+        ids = await admin_tools._snapshot_cleanup_message_ids(
+            bot, 5678, 100, lambda _line: None
+        )
+        return ids, calls
+
+    ids, calls = asyncio.run(scenario())
+    assert ids == [41]
+    assert calls["resolver"] == 0
+    assert calls["input_entity"] == 0
+    assert len(calls["targets"]) == 1
+    assert calls["targets"][0].chat_id == 5678

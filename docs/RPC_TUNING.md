@@ -98,10 +98,12 @@ BOT_RPC_DELETE_LIMIT=auto     # سقف delete = ۲ فقط در حالتِ سال
 BOT_RPC_FLOOD_GUARD_S=60      # بعد از هر FloodWait روی delete، ۶۰ ثانیه سقف = ۱
 ```
 
-**پیش‌فرضِ پروژه عوض نشد:** بدونِ این متغیرها همان `delete_limit=1`
-محافظه‌کارانه می‌ماند. اگر بعد از چند روز `wait_s` در لاگِ
-`GOVERNOR FLOOD GUARD` صفر بود، می‌شود `auto` را دائمی کرد؛ اگر FloodWait
-تکرار شد، برگشتن به `1` یک خط است.
+**پیش‌فرضِ runtime اکنون `auto` است** (و `.env.example` هم همین را نشان
+می‌دهد): در `BOT_RPC_TOTAL_LIMIT=3` سقفِ delete در حالتِ سالم ۲ است؛ با سقفِ
+کل ۲، سقفِ delete همچنان ۱ می‌ماند. پس از FloodWait، auto تا پایانِ cooldown
+سقف را به ۱ برمی‌گرداند. یک مقدار صریح در فایلِ runtime `.env`—مثلاً
+`BOT_RPC_DELETE_LIMIT=1`—همچنان override می‌کند؛ این فایل در این تغییر دست
+نخورده باقی مانده است.
 
 خطوطِ لاگِ جدید: `GOVERNOR FLOOD GUARD bucket=delete wait_s=… cooldown_s=60
 delete_limit=1`.
