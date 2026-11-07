@@ -17,9 +17,10 @@
 یا بازهٔ زمانی به‌طور کامل پوشش داده نشده باشد، به‌جای عدد «تکمیل نشده»
 نوشته می‌شود. هیچ عددِ تخمینی یا جعلی ساخته نمی‌شود.
 
-«امروز» تا همین لحظه شمرده می‌شود؛ ولی «این هفته» و «این ماه» بر پایهٔ
-وضعیتِ **پایانِ روزِ قبل** حساب می‌شوند تا عددشان هیچ‌وقت از «امروز»
-کوچک‌تر نشود (گزارشِ سالم و بدونِ تناقض).
+بازه‌ها **غلتان** هستند، نه تقویمی: «امروز» = ۲۴ ساعتِ گذشته، «این هفته»
+= ۷ روزِ گذشته و «این ماه» = ۳۰ روزِ گذشته. هر ورود/خروجی که در این
+پنجره‌ها ثبت شده باشد شمرده می‌شود؛ چند ورود در یک دقیقه هم همه ثبت و
+شمارش می‌شوند (هیچ رخدادی به‌خاطرِ نزدیکیِ زمانی حذف نمی‌شود).
 """
 from __future__ import annotations
 
@@ -433,31 +434,31 @@ def _now_local():
     return now_local()
 
 
-def day_start(ts=None):
-    """نیمه‌شبِ امروز به وقتِ تهران (آگاه از منطقهٔ زمانی)."""
-    if ts is None:
-        moment = _now_local()
-    else:
-        moment = _now_local().fromtimestamp(float(ts), _now_local().tzinfo)
-    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+#: طولِ هر بازه به ثانیه: «امروز» ۲۴ ساعت، «این هفته» ۷ روز، «این ماه» ۳۰ روز.
+WINDOW_SECONDS = {"day": 24 * 3600, "week": 7 * 24 * 3600, "month": 30 * 24 * 3600}
+
+
+def now_ts_ref(ts=None) -> float:
+    """لحظهٔ مرجعِ گزارش (پیش‌فرض: همین حالا)."""
+    return float(ts) if ts is not None else now_ts()
 
 
 def window_start(key: str, ts=None) -> float:
-    start = day_start(ts)
-    days = WINDOW_DAYS[key]
-    if days == 1:
-        return start.timestamp()
-    return (start - timedelta(days=days - 1)).timestamp()
+    """شروعِ بازهٔ غلتان: «همین حالا منهای ۲۴ ساعت / ۷ روز / ۳۰ روز».
+
+    دقیقاً همان چیزی که لازم است: هر کسی در طولِ آن پنجره عضو شده یا رفته
+    باشد شمرده می‌شود، حتی اگر چند نفر در یک دقیقهٔ همان پنجره آمده باشند.
+    """
+    return now_ts_ref(ts) - WINDOW_SECONDS[key]
 
 
-def yesterday_end(ts=None) -> float:
-    """آخرین لحظهٔ روزِ قبل — مرجعِ «وضعیت تا دیشب»."""
-    return (day_start(ts) - timedelta(seconds=1)).timestamp()
+def window_end(ts=None) -> float:
+    """پایانِ بازه = همین حالا."""
+    return now_ts_ref(ts)
 
 
-def _today_start_ts() -> float:
-    """نیمه‌شبِ امروز به‌صورتِ timestamp (مرجعِ بررسیِ کامل‌بودنِ «امروز»)."""
-    return day_start().timestamp()
+#: نامِ خوانای هر بازه برای پیام‌های توضیحی.
+WINDOW_LABELS = {"day": "۲۴ ساعت", "week": "۷ روز", "month": "۳۰ روز"}
 
 
 def _count_events(chat_id, event: str, since: float, until=None) -> int:
@@ -478,43 +479,42 @@ def _count_events(chat_id, event: str, since: float, until=None) -> int:
     return int(row[0]) if row else 0
 
 
-def _window_covered(chat_id, key: str, ts=None):
-    """آیا دادهٔ این بازه از ابتدای آن تا حالا ثبت شده است؟
-
-    برای «امروز» فقط ثبت بودن کافی نیست: اگر پایش وسطِ امروز شروع شده
-    باشد، ورودهای صبحِ همان روز در دفتر نیستند و عدد ناقص می‌شود.
-    """
+def tracking_start(chat_id, ts=None):
+    """از چه لحظه‌ای داده‌های این گروه کامل ثبت شده است؟"""
     state = ensure_tracker(chat_id, ts)
-    start = window_start(key, ts)
     if not state["baseline_complete"]:
-        return _count_events(chat_id, "join", start) > 0 or \
-            _count_events(chat_id, "leave", start) > 0
-    tracked_from = state["baseline_at"] or 0.0
-    if tracked_from > start:
+        return None
+    return state["baseline_at"]
+
+
+def _window_covered(chat_id, key: str, ts=None):
+    """آیا کلِ این پنجرهٔ غلتان زیرِ پوششِ پایش بوده است؟
+
+    ملاک فقط زمانِ شروعِ پایش است: اگر پایش ۱۰ روز پیش شروع شده باشد،
+    پنجرهٔ ۲۴ ساعته و ۷ روزه کامل‌اند و پنجرهٔ ۳۰ روزه نه.
+    """
+    start = tracking_start(chat_id, ts)
+    if start is None:
         return False
-    if key == "day" and tracked_from > _today_start_ts():
-        # امروز کامل نیست چون پایش بعد از نیمه‌شب شروع شده است.
-        return False
-    return True
+    return float(start) <= window_start(key, ts)
+
+
 
 
 def joins(chat_id, key: str, ts=None):
-    """تعدادِ ورود در بازه — ``None`` اگر بازه کامل پوشش داده نشده باشد."""
+    """تعدادِ ورود در پنجرهٔ غلتان — ``None`` اگر پنجره کامل پوشش نداشته باشد."""
     _ensure_schema()
     if not _window_covered(chat_id, key, ts):
         return None
-    return _count_events(chat_id, "join", window_start(key, ts))
+    return _count_events(chat_id, "join", window_start(key, ts), window_end(ts))
 
 
 def leaves(chat_id, key: str, ts=None):
-    """تعدادِ ترک در بازه — ``None`` اگر بازه کامل پوشش داده نشده باشد."""
+    """تعدادِ ترک در پنجرهٔ غلتان — ``None`` اگر پوشش کامل نباشد."""
     _ensure_schema()
-    state = ensure_tracker(chat_id, ts)
-    if not state["baseline_complete"] or state["baseline_at"] is None:
-        return None
     if not _window_covered(chat_id, key, ts):
         return None
-    return _count_events(chat_id, "leave", window_start(key, ts))
+    return _count_events(chat_id, "leave", window_start(key, ts), window_end(ts))
 
 
 def current_members(chat_id):
@@ -530,25 +530,28 @@ def current_members(chat_id):
     return total
 
 
-def members_at_yesterday(chat_id, ts=None):
-    """تعداد اعضا در پایانِ روزِ قبل — ``None`` اگر داده کامل نباشد."""
-    state = ensure_tracker(chat_id, ts)
-    if not state["baseline_complete"] or state["baseline_at"] is None:
+def members_before(chat_id, key: str, ts=None):
+    """تعدادِ اعضا در **ابتدای** این پنجره (۲۴ ساعت/۷ روز/۳۰ روز پیش).
+
+    ``None`` اگر پنجره کامل پوشش نداشته باشد — هیچ عددی حدس زده نمی‌شود.
+    """
+    start = tracking_start(chat_id, ts)
+    if start is None or not _window_covered(chat_id, key, ts):
         return None
-    cutoff = yesterday_end(ts)
+    cut = window_start(key, ts)
     total = baseline_count(chat_id)
-    total += _count_events(chat_id, "join", state["baseline_at"], cutoff)
-    total -= _count_events(chat_id, "leave", state["baseline_at"], cutoff)
+    total += _count_events(chat_id, "join", start, cut)
+    total -= _count_events(chat_id, "leave", start, cut)
     return max(total, 0)
 
 
 def nets(chat_id, key: str, ts=None):
-    """``(joined, left)`` بازه برابرِ وضعیتِ پایانِ روزِ قبل، یا ``(None, None)``."""
-    if not ensure_tracker(chat_id, ts)["baseline_complete"]:
+    """``(joined, left)`` همین پنجره؛ همان چیزی که در گزارش چاپ می‌شود."""
+    if not _window_covered(chat_id, key, ts):
         return (None, None)
-    joined = _count_events(chat_id, "join", window_start(key, ts), yesterday_end(ts))
-    left = _count_events(chat_id, "leave", window_start(key, ts), yesterday_end(ts))
-    return (joined, left)
+    start, end = window_start(key, ts), window_end(ts)
+    return (_count_events(chat_id, "join", start, end),
+            _count_events(chat_id, "leave", start, end))
 
 
 # ---------------------------------------------------------------------------
@@ -635,12 +638,12 @@ def build_report(chat_id, ts=None, title=None) -> tuple:
         ("⟳ تعداد اعضای فعلی : 『  " + _cell(current) + "  』", True, True),
         ("", False, False),
         ("〄 اعضای عضو شده", True, False),
-        (" │امروز : 「 " + _cell(join_counts["day"]) + " 」", False, True),
+        (" │امروز (۲۴ ساعت) : 「 " + _cell(join_counts["day"]) + " 」", False, True),
         (" │این هفته :  「 " + _cell(join_counts["week"]) + " 」", False, True),
         (" │این ماه : 「 " + _cell(join_counts["month"]) + " 」", False, True),
         ("", False, False),
         ("〄  ریزش اعضا", True, False),
-        ("│ امروز : 「 " + _cell(leave_counts["day"]) + " 」", False, True),
+        ("│ امروز (۲۴ ساعت) : 「 " + _cell(leave_counts["day"]) + " 」", False, True),
         ("│این هفته :  「 " + _cell(leave_counts["week"]) + " 」", False, True),
         ("│این ماه : 「 " + _cell(leave_counts["month"]) + " 」", False, True),
         ("", False, False),
@@ -666,24 +669,22 @@ def build_insight(chat_id, ts=None):
     «امروز» را با وضعیتِ پایانِ روزِ قبل مقایسه می‌کند و فقط عددهای
     واقعیِ ثبت‌شده را می‌نویسد.
     """
-    if not ensure_tracker(chat_id, ts)["baseline_complete"]:
+    day_join = joins(chat_id, "day", ts)
+    day_left = leaves(chat_id, "day", ts)
+    before = members_before(chat_id, "day", ts)
+    if None in (day_join, day_left, before):
         return None
-    today_join = joins(chat_id, "day", ts)
-    today_left = leaves(chat_id, "day", ts)
-    yesterday_total = members_at_yesterday(chat_id, ts)
-    if None in (today_join, today_left, yesterday_total):
+    now_total = current_members(chat_id)
+    if now_total is None:
         return None
-    today_total = current_members(chat_id)
-    if today_total is None:
-        return None
-    delta = today_total - yesterday_total
+    delta = now_total - before
     sign = "+" if delta >= 0 else "−"
     parts = [
         "«", "وضعیت تحلیلی :",
-        f"امروز {sign}{to_fa(abs(delta))} نفر",
-        f"| رشد {to_fa(today_join)}",
-        f"و ریزش {to_fa(today_left)}",
-        f"| گروه {to_fa(yesterday_total)} نفره",
+        f"۲۴ ساعتِ گذشته {sign}{to_fa(abs(delta))} نفر",
+        f"| رشد {to_fa(day_join)}",
+        f"و ریزش {to_fa(day_left)}",
+        f"| گروه {to_fa(now_total)} نفره",
     ]
     streak = streak_days(chat_id, ts)
     if streak is not None and streak >= 2:
@@ -696,15 +697,15 @@ def streak_days(chat_id, ts=None, limit: int = 30):
     state = ensure_tracker(chat_id, ts)
     if not state["baseline_complete"] or state["baseline_at"] is None:
         return None
-    start = day_start(ts)
+    moment = now_ts_ref(ts)
     streak = 0
     for step in range(1, limit + 1):
-        day_end = (start - timedelta(days=step - 1)).timestamp() - 1
-        day_begin = (start - timedelta(days=step)).timestamp()
-        if day_begin < (state["baseline_at"] or 0.0):
+        chunk_end = moment - (step - 1) * 86400
+        chunk_begin = moment - step * 86400
+        if chunk_begin < (state["baseline_at"] or 0.0):
             return None
-        joined = _count_events(chat_id, "join", day_begin, day_end)
-        left = _count_events(chat_id, "leave", day_begin, day_end)
+        joined = _count_events(chat_id, "join", chunk_begin, chunk_end)
+        left = _count_events(chat_id, "leave", chunk_begin, chunk_end)
         if joined - left <= 0:
             break
         streak += 1

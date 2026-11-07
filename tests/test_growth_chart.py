@@ -8,7 +8,8 @@
    نوشته می‌شود (نه صفر، نه تخمین).
 3. قالبِ خروجی دقیقاً همان چیزی است که خواسته شده، با ارقامِ بولد و با
    entity واقعیِ Bold/Blockquote سروش پلاس.
-4. «این هفته» و «این ماه» هرگز عددِ کوچک‌تر از «امروز» نشان نمی‌دهند.
+4. پنجره‌ها غلتان‌اند: «امروز» ۲۴ ساعتِ گذشته، «این هفته» ۷ روز و
+   «این ماه» ۳۰ روز؛ هر ورود/خروجی در آن پنجره‌ها شمرده می‌شود.
 5. دستور فقط برای مالک سراسری، مالک ثبت‌شده و ادمین‌های ثبت‌شده مجاز است
    و این فهرست از دیتابیس خوانده می‌شود، نه از متنِ پیام.
 6. متنِ راهنمای «لیست ادمینی» کامل Bold است و «نمودار» داخل نقل‌قول.
@@ -173,10 +174,10 @@ def test_format_is_exact():
     for line in ("⟳ تعداد اعضای فعلی : 『",
                  "〄 اعضای عضو شده",
                  "〄  ریزش اعضا",
-                 " │امروز : 「",
+                 " │امروز (۲۴ ساعت) : 「",
                  " │این هفته :  「",
                  " │این ماه : 「",
-                 "│ امروز : 「",
+                 "│ امروز (۲۴ ساعت) : 「",
                  "│این هفته :  「",
                  "│این ماه : 「",
                  "« نتیجه گیری : "):
@@ -220,7 +221,7 @@ def test_entities_are_real():
 def test_incomplete_windows():
     print("\n### ۳ بازهٔ ناقص «تکمیل نشده» می‌شود، نه عددِ جعلی")
     reset_store()
-    # نصبِ ربات از هشت روز پیش: امروز و این هفته کامل، این ماه نه.
+    # پایش از هشت روز پیش: پنجرهٔ ۲۴ ساعته و ۷ روزه کامل، ۳۰ روزه نه.
     gg.save_baseline(CHAT, list(range(2000, 2600)), days_ago(8))
     gg.record_join(CHAT, 5001, days_ago(0, 1))
     gg.record_join(CHAT, 5002, days_ago(2))
@@ -290,26 +291,59 @@ def test_equal_or_missing_gives_unknown():
           find_cells(text)[0] == gg.INCOMPLETE, f"-> {find_cells(text)}")
 
 
-def test_monotonic_windows():
-    print("\n### ۵ «این هفته»/«این ماه» هرگز کوچک‌تر از «امروز» نیست")
+def test_rolling_windows():
+    print("\n### ۵ پنجره‌ها غلتان‌اند: ۲۴ ساعت / ۷ روز / ۳۰ روز (نه تقویمی)")
     reset_store()
-    # امروز ۵ ورود، ولی در بقیهٔ هفته هیچ ورودی نیست (دادهٔ ناسازگارِ ساختگی)
-    gg.save_baseline(CHAT, list(range(3000, 3100)), days_ago(10))
-    for user in range(7001, 7006):
-        gg.record_join(CHAT, user, days_ago(0, 1))
+    gg.save_baseline(CHAT, list(range(3000, 3100)), days_ago(40))
+    # یک ورود ۲۵ ساعت پیش (بیرونِ پنجرهٔ ۲۴ ساعته) و دو ورود در ۲ ساعت اخیر
+    gg.record_join(CHAT, 7001, days_ago(1, 1))
+    gg.record_join(CHAT, 7002, days_ago(0, 2))
+    gg.record_join(CHAT, 7003, days_ago(0, 1))
+    # یک ورود ۸ روز پیش (بیرونِ ۷ روزه، داخلِ ۳۰ روزه)
+    gg.record_join(CHAT, 7004, days_ago(8))
     text, _ = gg.build_report(CHAT)
     cells = find_cells(text)
-    day, week, month = cells[1], cells[2], cells[3]
-    check("امروز = ۵", day == gg.bold_digits(5), f"-> {day}")
-    check("این هفته حداقل برابرِ امروز است",
-          week == gg.bold_digits(5), f"-> {week}")
-    check("«این ماه» چون از نصب قدیمی‌تر است، تکمیل نشده می‌ماند",
-          month == gg.INCOMPLETE, f"-> {month}")
+    check("۲۴ ساعتِ گذشته = ۲", cells[1] == gg.bold_digits(2), f"-> {cells[1]}")
+    # ورودِ ۲۵ ساعت پیش بیرونِ ۲۴ ساعته است ولی داخلِ ۷ روزه می‌ماند.
+    check("۷ روزِ گذشته = ۳", cells[2] == gg.bold_digits(3), f"-> {cells[2]}")
+    check("۳۰ روزِ گذشته = ۴ (ورودِ ۸ روز پیش هم هست)",
+          cells[3] == gg.bold_digits(4), f"-> {cells[3]}")
+    check("همان ورودِ ۸ روز پیش در ۷ روزه شمرده نمی‌شود",
+          gg.joins(CHAT, "week") < gg.joins(CHAT, "month"))
+    start = gg.window_start("day")
+    check("شروعِ «امروز» دقیقاً ۲۴ ساعت پیش است",
+          abs((time.time() - start) - 86400) < 5, f"-> {time.time() - start}")
+    check("شروعِ «این هفته» دقیقاً ۷ روز پیش است",
+          abs((time.time() - gg.window_start("week")) - 7 * 86400) < 5)
+    check("شروعِ «این ماه» دقیقاً ۳۰ روز پیش است",
+          abs((time.time() - gg.window_start("month")) - 30 * 86400) < 5)
+    check("برچسبِ بازه‌ها در گزارش هست",
+          "امروز (۲۴ ساعت)" in text, f"-> {text[:120]!r}")
 
 
-# ---------------------------------------------------------------------------
-# ۶) دفترِ رخداد
-# ---------------------------------------------------------------------------
+def test_burst_in_one_minute_is_counted():
+    print("\n### ۵.۵ ده ورود در یک دقیقه، همه شمرده می‌شوند")
+    reset_store()
+    gg.save_baseline(CHAT, list(range(4000, 4100)), days_ago(2))
+    now = time.time()
+    # ده نفر در فاصلهٔ ۶۰ ثانیه + یک نفر در همان لحظه که بلافاصله رفت
+    for index in range(10):
+        gg.record_join(CHAT, 8000 + index, now - 30 + index)
+    gg.record_join(CHAT, 8100, now - 5)
+    gg.record_leave(CHAT, 8100, now - 4)
+    gg.record_join(CHAT, 8100, now - 3)   # برگشت — هر دو ورود باید بمانند
+    check("۱۰ ورود هم‌زمان همه ثبت شدند",
+          gg.joins(CHAT, "day") == 12, f"-> {gg.joins(CHAT, 'day')}")
+    check("یک خروج ثبت شد", gg.leaves(CHAT, "day") == 1,
+          f"-> {gg.leaves(CHAT, 'day')}")
+    check("چند رخداد در یک ثانیه هم حذف/ادغام نمی‌شوند",
+          gg.nets(CHAT, "day")[0] == 12, f"-> {gg.nets(CHAT, 'day')}")
+    text, _ = gg.build_report(CHAT)
+    check("همهٔ ۱۲ ورود در گزارش دیده می‌شود",
+          find_cells(text)[1] == gg.bold_digits(12), f"-> {find_cells(text)[1]}")
+    check("عضوِ برگشته یک نفر حساب می‌شود",
+          gg.current_members(CHAT) == 111, f"-> {gg.current_members(CHAT)}")
+
 
 def test_never_blank_current_members():
     print("\n### ۳.۵ «تعداد اعضای فعلی» هرگز خالی نمی‌ماند")
@@ -345,22 +379,32 @@ def test_never_blank_current_members():
           gg.build_insight(CHAT) is None)
 
 
-def test_midday_start_is_honest():
-    print("\n### ۳.۶ شروعِ پایش در میانهٔ روز «امروز» را کامل حساب نمی‌کند")
+def test_window_completeness_is_about_tracking_start():
+    print("\n### ۳.۶ کامل‌بودنِ پنجره فقط به شروعِ پایش بستگی دارد")
     reset_store()
-    # پایش همین حالا شروع شده (بعد از نیمه‌شب) و یک ورود ثبت شده است.
-    gg.save_baseline(CHAT, list(range(6000, 6100)), time.time())
-    gg.record_join(CHAT, 6101, time.time())
+    # پایش ۱۰ دقیقه پیش شروع شده: پنجرهٔ ۲۴ ساعته کامل نیست (نه اینکه
+    # چون نیمه‌شب گذشته باشد). عددِ ثبت‌شده هم نباید «کلِ ۲۴ ساعت» جا بزند.
+    gg.save_baseline(CHAT, list(range(6000, 6100)), time.time() - 600)
+    gg.record_join(CHAT, 6101, time.time() - 300)
     text, _ = gg.build_report(CHAT)
     cells = find_cells(text)
     check("«تعداد اعضای فعلی» واقعی است",
           cells[0] == gg.bold_digits(101), f"-> {cells[0]}")
-    check("«امروز» تکمیل نشده می‌ماند (ورودهای صبح ثبت نشده‌اند)",
+    check("پنجرهٔ ۲۴ ساعته (که کامل پوشش نداشته) تکمیل نشده است",
           cells[1] == gg.INCOMPLETE, f"-> {cells[1]}")
-    check("«این هفته» هم تکمیل نشده می‌ماند",
-          cells[2] == gg.INCOMPLETE, f"-> {cells[2]}")
-    check("هیچ عددی از بازهٔ ناقص ساخته نشد",
+    check("هیچ عددِ ناقصی به‌جای بازهٔ ۲۴ ساعته چاپ نشد",
           gg.joins(CHAT, "day") is None and gg.leaves(CHAT, "day") is None)
+
+    # پایش ۳۰ ساعت پیش شروع شده → پنجرهٔ ۲۴ ساعته کامل است، هر ساعتی
+    reset_store()
+    gg.save_baseline(CHAT, list(range(6200, 6300)), time.time() - 30 * 3600)
+    gg.record_join(CHAT, 6301, time.time() - 20 * 3600)   # دیشب ۲۳:۰۰
+    gg.record_join(CHAT, 6302, time.time() - 60)          # همین حالا
+    check("۲۴ ساعت اخیر کامل شمرده می‌شود (بدونِ توجه به نیمه‌شب)",
+          gg.joins(CHAT, "day") == 2, f"-> {gg.joins(CHAT, 'day')}")
+    text, _ = gg.build_report(CHAT)
+    check("گزارش عددِ واقعیِ ۲۴ ساعته را نشان می‌دهد",
+          find_cells(text)[1] == gg.bold_digits(2), f"-> {find_cells(text)[1]}")
 
 
 def test_event_ledger():
@@ -400,7 +444,7 @@ def test_first_snapshot_is_not_a_join():
           gg.current_members(CHAT) == 100, f"-> {gg.current_members(CHAT)}")
     text, _ = gg.build_report(CHAT)
     cells = find_cells(text)
-    check("«امروز» صفرِ واقعی نیست بلکه داده ندارد",
+    check("«۲۴ ساعت» چون پایش تازه شروع شده، تکمیل نشده است",
           cells[1] == gg.INCOMPLETE, f"-> {cells[1]}")
     check("«این ماه» تکمیل نشده", cells[3] == gg.INCOMPLETE, f"-> {cells[3]}")
     check("تعداد فعلی درست گزارش شد",
@@ -642,9 +686,10 @@ def main():
         test_entities_are_real,
         test_incomplete_windows,
         test_equal_or_missing_gives_unknown,
-        test_monotonic_windows,
+        test_rolling_windows,
+        test_burst_in_one_minute_is_counted,
         test_never_blank_current_members,
-        test_midday_start_is_honest,
+        test_window_completeness_is_about_tracking_start,
         test_event_ledger,
         test_first_snapshot_is_not_a_join,
         test_permissions_and_help,
