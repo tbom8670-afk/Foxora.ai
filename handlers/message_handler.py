@@ -1999,6 +1999,106 @@ async def get_activation_admin_info(bot, chat_id):
     return owner, admins
 
 
+# ---------------------------------------------------------------------------
+# 📊 «نمودار» — ثبتِ عضویت/ریزش و گزارشِ رشد گروه
+# ---------------------------------------------------------------------------
+
+def _growth_report_entities(spans):
+    """بازه‌های ``(offset, length, kind)`` را به entity واقعی سروش تبدیل می‌کند."""
+    entities = []
+    for offset, length, kind in spans:
+        if kind == "quote":
+            entities.append(MessageEntityBlockquote(offset=offset, length=length))
+        else:
+            entities.append(MessageEntityBold(offset=offset, length=length))
+    return entities
+
+
+async def _growth_member_ids(bot, chat_id):
+    """فهرستِ زندهٔ شناسهٔ اعضای گروه از خودِ سروش (برای همگام‌سازی)."""
+    try:
+        entity = await bot.client.get_input_entity(chat_id)
+        participants = await bot.client.get_participants(entity)
+    except Exception as error:
+        bot.logger.log_error(
+            f"GROWTH MEMBER LIST FAILED chat_id={chat_id} error={error!r}"
+        )
+        return []
+    ids = []
+    for member in participants or []:
+        user_id = getattr(member, "id", None)
+        if user_id:
+            ids.append(user_id)
+    return ids
+
+
+async def _growth_sync(bot, chat_id):
+    """اسنپ‌شاتِ اول (اگر لازم است) + جبرانِ رخدادهای جاافتاده."""
+    from modules import group_growth
+
+    try:
+        members = await _growth_member_ids(bot, chat_id)
+        if members:
+            result = group_growth.sync_members(chat_id, members)
+            bot.logger.log_info(
+                "GROWTH SYNC "
+                f"chat_id={chat_id} members={len(members)} "
+                f"joined={result['joined']} left={result['left']} "
+                f"baseline={result['baseline']}"
+            )
+        else:
+            group_growth.set_baseline_incomplete(chat_id)
+    except Exception as error:
+        bot.logger.log_error(
+            f"GROWTH SYNC FAILED chat_id={chat_id} error={error!r}"
+        )
+
+
+async def handle_growth_command(bot, event, chat_id, user_id, username=None):
+    """دستور «نمودار» — فقط مالک سراسری، مالک ثبت‌شده یا ادمینِ ثبت‌شده.
+
+    دسترسی از دیتابیس خوانده می‌شود (owner.json / group_storage /
+    admin_storage)، نه از متنِ پیام. داده هم فقط از دفترِ رخدادِ ربات
+    می‌آید؛ هیچ عددی تخمین زده نمی‌شود.
+    """
+    from modules import group_growth
+
+    if not _has_group_management_permission(bot, chat_id, user_id, username):
+        await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
+        return
+
+    bot.logger.log_info(
+        f"HANDLER CALLED handler=growth_chart command='نمودار' chat_id={chat_id}"
+    )
+    await _growth_sync(bot, chat_id)
+
+    try:
+        report, spans = group_growth.build_report(chat_id)
+        model = group_growth.build_insight(chat_id)
+        if model:
+            # خطِ تحلیلی هم کاملاً Bold و داخل نقل‌قول است.
+            offset = len(report.encode("utf-16-le")) // 2
+            report = report + "\n" + model + "\n"
+            spans = list(spans) + [
+                (offset + 1, len(model.encode("utf-16-le")) // 2, "bold"),
+                (offset + 1, len(model.encode("utf-16-le")) // 2, "quote"),
+            ]
+    except Exception as error:
+        bot.logger.log_error(
+            f"GROWTH REPORT FAILED chat_id={chat_id} error={error!r}"
+        )
+        await event.reply(
+            "❌ ساخت گزارش نمودار ممکن نشد. لطفاً کمی بعد دوباره تلاش کنید."
+        )
+        return
+
+    try:
+        await event.reply(report,
+                          formatting_entities=_growth_report_entities(spans))
+    except Exception:
+        await event.reply(report)
+
+
 async def send_activation_message(bot, event, chat_id, title):
     owner, admins = await get_activation_admin_info(bot, chat_id)
     owner_text = owner or "یافت نشد (دسترسی کافی ندارم)"
@@ -2954,6 +3054,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "تغییر اخطار", "تغییر مجازات",
     "لاگ مدیریتی", "مین یاب", "بهترین جواب", "نبرد", "بخند یا بباز",
     "وضعیت ربات", "پینگ ربات", "کپی بورد", "کپی",
+    "نمودار",
     "سایت بازی", "سایت", "لینک بازی", "/game", "/site",
     "جعبه شانسی", "خون آشام", "خون‌آشام", "دادگاه", "دادگاه روباه", "جرعت", "جرات", "جرئت",
     "حقیقت", "حقیقت بگو", "ربات", "روباه", "/help", "!help", "help",
@@ -3607,6 +3708,7 @@ async def handle_new_message(bot, event):
                 "ثبت گروه", "حذف گروه",
                 "۵ روز", "یک هفته", "دو هفته", "یک ماه",
                 "لیست فیلتر اسم", "لیست فیلتر نام", "فیلترهای اسم",
+                "نمودار",
             }
             or norm_cmd_text.startswith((
                 "سکوت نام", "اخراج نام",
@@ -4283,6 +4385,7 @@ async def handle_new_message(bot, event):
             "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
             "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
             "سابقه ها", "سابقه‌ها", "سطح گروه",
+            "نمودار",
         }
         _debug_log(
             bot,
@@ -4709,7 +4812,7 @@ async def handle_new_message(bot, event):
             and (
                 clean_text in SIMPLE_REPLIES
                 or clean_text in INSULTS
-                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
+                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
                 or clean_text.startswith(("سکوت نام", "اخراج نام"))
                 or (
                     clean_text.startswith(("!", "/", "."))
@@ -6311,6 +6414,25 @@ async def handle_new_message(bot, event):
             except Exception as e:
                 await event.reply(f"❌ خطا: {e}")
 
+            return
+
+        # 📊 نمودار رشد/ریزش گروه — فقط مالک سراسری، مالک ثبت‌شده یا
+        # ادمینِ ثبت‌شده. داده از دفترِ عضویتِ خودِ ربات می‌آید و هر بازه‌ای
+        # که کامل نباشد «تکمیل نشده» گزارش می‌شود (بدونِ عددِ جعلی).
+        if clean_text == "نمودار":
+            if getattr(event, "is_private", False):
+                # «نمودار» گزارشِ یک گروه است؛ در چت خصوصی گروهی وجود ندارد.
+                await event.reply("📊 دستور «نمودار» را داخل گروه ارسال کنید.")
+                return
+            _growth_sender = locals().get("sender")
+            if _growth_sender is None:
+                try:
+                    _growth_sender = await event.get_sender()
+                except Exception:
+                    _growth_sender = None
+            await handle_growth_command(
+                bot, event, chat_id, user_id,
+                getattr(_growth_sender, "username", None))
             return
 
         # آمار گروه

@@ -23,6 +23,17 @@ def _u16(s):
     return len(s.encode("utf-16-le")) // 2
 
 
+#: 📊 متنِ راهنمای دستور «نمودار» — کامل Bold و دستور داخلِ نقل‌قول.
+GROWTH_HELP_TEXT = (
+    "📊 برای دیدن نمودار رشد گروه یا ریزش گروه دستور\n"
+    "« نمودار »\n"
+    "را ارسال کنید."
+)
+
+#: نشانهٔ «این ردیف یک بلوکِ آمادهٔ Bold/نقل‌قول است، نه عنوان + دستور».
+READY_BLOCK = object()
+
+
 def build_admin_help():
     """تولید متن کامل راهنمای ادمین به همراه آرایه دقیق موجودیت‌های نقل‌قول و ضخیم."""
     parts = []
@@ -55,6 +66,19 @@ def build_admin_help():
                 cursor += _u16(line) + 1
         parts.append("\n\n")
 
+    def add_rich_item(chunk, quote_texts=(), trailing="\n\n"):
+        """بلوکِ آماده: کلِ متن Bold، و فقط بخش‌های خواسته‌شده داخل نقل‌قول."""
+        start = _u16("".join(parts))
+        parts.append(chunk)
+        entities.append(MessageEntityBold(offset=start, length=_u16(chunk)))
+        for needle in quote_texts:
+            index = chunk.find(needle)
+            if index >= 0:
+                entities.append(MessageEntityBlockquote(
+                    offset=start + _u16(chunk[:index]),
+                    length=_u16(needle)))
+        parts.append(trailing)
+
     blocks_before_vip = [
         # 🔒 عضویت اجباری کانال — عنوان Bold و هر دو دستور Bold داخل **یک**
         # نقل‌قول سروش پلاس (نه دو نقل‌قول جدا).
@@ -75,11 +99,16 @@ def build_admin_help():
         ]),
         ("📊نمایش آمار گروه با دستور", ["آمار گپ | آمار گروه"]),
         ("📈صفر کردن  آمار گروه با دستور", ["ریست آمار"]),
+        # 📊 نمودار رشد/ریزش — متن کامل Bold، و خودِ دستور داخل نقل‌قول.
+        (READY_BLOCK, [GROWTH_HELP_TEXT, ("« نمودار »",)]),
         ("📇افزودن ادمین به ربات با دستور", ["ریپلای کنید : ثبت ادمین"]),
         ("🗃برکناری ادمین ثبت شده ربات با دستور", ["با ریپلای : لغو ادمین | برکناری ادمین"]),
     ]
 
     for index, (title, cmds) in enumerate(blocks_before_vip):
+        if title is READY_BLOCK:
+            add_rich_item(cmds[0], quote_texts=cmds[1])
+            continue
         # فقط بلوک عضویت اجباری (اولین بلوک) دستورهایش Bold است.
         add_item(title, cmds, bold_cmds=(index == 0))
 

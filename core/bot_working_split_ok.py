@@ -1359,6 +1359,16 @@ class SoroushAntiSpamBot:
                 f"FORCE JOIN SETUP FAILED error={force_join_setup_error!r}"
             )
 
+        # 📊 ثبتِ رویدادهای عضویت/خروج برای دستور «نمودار». کاملاً مستقل؛
+        # فقط یک شنوندهٔ ChatAction نصب می‌کند و هیچ پیامی نمی‌فرستد.
+        try:
+            from modules import group_growth_events
+            group_growth_events.register(self)
+        except Exception as growth_setup_error:
+            self.logger.log_error(
+                f"GROWTH RECORDER SETUP FAILED error={growth_setup_error!r}"
+            )
+
         # 🌙 ناظر گزارش فعالیت کمترین ادمین در ساعت ۱۱ شب (۲۳:۰۰ به وقت تهران)
         async def daily_admin_report_loop():
             from modules.daily_admin_report import run_daily_admin_report_watcher
