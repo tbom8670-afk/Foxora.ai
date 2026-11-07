@@ -81,7 +81,9 @@ CREATE TABLE IF NOT EXISTS membership_state (
     baseline_complete INTEGER NOT NULL DEFAULT 0,
     last_sync_ts REAL,
     server_count INTEGER,
-    server_count_at REAL
+    server_count_at REAL,
+    baseline_count INTEGER,
+    baseline_ids_ts REAL
 );
 """
 
@@ -107,6 +109,12 @@ def _ensure_schema():
         if "server_count_at" not in columns:
             connection.execute(
                 "ALTER TABLE membership_state ADD COLUMN server_count_at REAL")
+        if "baseline_count" not in columns:
+            connection.execute(
+                "ALTER TABLE membership_state ADD COLUMN baseline_count INTEGER")
+        if "baseline_ids_ts" not in columns:
+            connection.execute(
+                "ALTER TABLE membership_state ADD COLUMN baseline_ids_ts REAL")
         _schema_ready = True
 
 
@@ -287,13 +295,15 @@ def get_state(chat_id) -> dict:
     _ensure_schema()
     row = runtime_db.query_one(
         "SELECT tracker_since, baseline_at, baseline_complete, last_sync_ts, "
-        "server_count, server_count_at FROM membership_state WHERE group_id=?",
+        "server_count, server_count_at, baseline_count, baseline_ids_ts "
+        "FROM membership_state WHERE group_id=?",
         (group,),
     )
     if row is None:
         return {"tracker_since": None, "baseline_at": None,
                 "baseline_complete": False, "last_sync_ts": None,
-                "server_count": None, "server_count_at": None}
+                "server_count": None, "server_count_at": None,
+                "baseline_count": None, "baseline_ids_ts": None}
     return {
         "tracker_since": float(row[0]) if row[0] is not None else None,
         "baseline_at": float(row[1]) if row[1] is not None else None,
@@ -301,6 +311,8 @@ def get_state(chat_id) -> dict:
         "last_sync_ts": float(row[3]) if row[3] is not None else None,
         "server_count": int(row[4]) if row[4] is not None else None,
         "server_count_at": float(row[5]) if row[5] is not None else None,
+        "baseline_count": int(row[6]) if row[6] is not None else None,
+        "baseline_ids_ts": float(row[7]) if row[7] is not None else None,
     }
 
 
@@ -462,6 +474,121 @@ def sync_members(chat_id, current_ids, ts=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# تشخیص از روی تفاضلِ فهرستِ اعضا (گروهِ بزرگ)
+# ---------------------------------------------------------------------------
+
+#: آستانهٔ «گروهِ بزرگ». در گروهِ بزرگ، سرویس «عضو شد/ترک کرد» را نشان
+#: نمی‌دهد؛ پس فقط می‌توان از تفاضلِ فهرستِ اعضا فهمید.
+LARGE_GROUP_THRESHOLD = 200
+
+#: در گروهِ بزرگ، مقایسهٔ فهرستِ اعضا در هر اجرای دستور حداکثر یک بار.
+DEFAULT_SCAN_INTERVAL_SECONDS = 120
+
+
+def scan_interval_seconds() -> float:
+    import os
+
+    try:
+        return float(os.environ.get("GROWTH_SCAN_INTERVAL_SECONDS",
+                                    DEFAULT_SCAN_INTERVAL_SECONDS))
+    except (TypeError, ValueError):
+        return float(DEFAULT_SCAN_INTERVAL_SECONDS)
+
+
+def is_large_group(chat_id) -> bool:
+    """آیا این گروه آن‌قدر بزرگ است که سرویس عضویت/ترک را نشان ندهد؟"""
+    import os
+
+    try:
+        threshold = int(os.environ.get("GROWTH_LARGE_GROUP",
+                                       LARGE_GROUP_THRESHOLD))
+    except (TypeError, ValueError):
+        threshold = LARGE_GROUP_THRESHOLD
+    state = get_state(chat_id)
+    size = state.get("server_count") or state.get("baseline_count") or 0
+    return int(size or 0) >= threshold
+
+
+def save_member_ids(chat_id, ids, ts=None) -> int:
+    """جایگزینیِ فهرستِ ذخیره‌شده با وضعیتِ فعلیِ اعضا (فقط شناسه‌ها)."""
+    group = normalize_chat(chat_id)
+    stamp = float(ts if ts is not None else now_ts())
+    _ensure_schema()
+    current = set()
+    with runtime_db.transaction():
+        runtime_db.execute(
+            "DELETE FROM membership_baseline WHERE group_id=?", (group,))
+        for user_id in ids:
+            user = _clean_id(user_id)
+            if user is None:
+                continue
+            current.add(user)
+            runtime_db.execute(
+                "INSERT INTO membership_baseline(group_id,user_id,first_ts) "
+                "VALUES(?,?,?) ON CONFLICT(group_id,user_id) DO NOTHING",
+                (group, user, stamp),
+            )
+        runtime_db.execute(
+            "UPDATE membership_state SET baseline_count=?, baseline_ids_ts=? "
+            "WHERE group_id=?",
+            (len(current), stamp, group),
+        )
+    return len(current)
+
+
+def stored_member_ids(chat_id) -> set:
+    """فهرستِ ذخیره‌شدهٔ اعضا (فقط برای مقایسه؛ هنگامِ خاموشیِ ربات)."""
+    group = normalize_chat(chat_id)
+    _ensure_schema()
+    return {row[0] for row in runtime_db.query_all(
+        "SELECT user_id FROM membership_baseline WHERE group_id=?", (group,))}
+
+
+def current_ids(chat_id) -> set:
+    """اعضای فعلی بر اساسِ دفترِ رخداد (برای مقایسه با فهرستِ تازه)."""
+    return set(member_ids(chat_id))
+
+
+def apply_snapshot(chat_id, ids, ts=None) -> dict:
+    """مقایسهٔ فهرستِ تازهٔ اعضا با وضعیتِ ذخیره‌شده و ثبتِ اختلاف.
+
+    * عضوِ تازه در فهرست → رخدادِ «join» با زمانِ **همین حالا**.
+    * عضوی که از فهرست حذف شده → رخدادِ «leave» با زمانِ همین حالا.
+
+    این تنها راهِ فهمیدنِ ورود/خروج در گروهِ بزرگ است که سرویسِ
+    «عضو شد/ترک کرد» را نشان نمی‌دهد. فقط تفاضل ثبت می‌شود، پس اجرای
+    پشت‌سرهم چیزی را دوباره نمی‌شمارد.
+    """
+    cleaned = [user for user in (_clean_id(value) for value in ids)
+               if user is not None]
+    incoming = set(cleaned)
+    stamp = float(ts if ts is not None else now_ts())
+    stamp = min(stamp, now_ts())   # زمانِ آینده هرگز ثبت نمی‌شود
+    known = current_ids(chat_id)
+    result = {"joined": 0, "left": 0, "seen": len(incoming)}
+    for user in incoming - known:
+        if record_join(chat_id, user, stamp, source="diff"):
+            result["joined"] += 1
+    for user in known - incoming:
+        if record_leave(chat_id, user, stamp, source="diff"):
+            result["left"] += 1
+    save_member_ids(chat_id, cleaned, stamp)
+    mark_synced(chat_id, stamp)
+    return result
+
+
+def should_scan(chat_id, ts=None) -> bool:
+    """آیا حالا وقتِ مقایسهٔ فهرستِ اعضاست؟ (گروهِ بزرگ: با فاصلهٔ زمانی)"""
+    if not is_large_group(chat_id):
+        return True
+    state = get_state(chat_id)
+    last = state.get("baseline_ids_ts") or state.get("last_sync_ts")
+    if not last:
+        return True
+    return (now_ts_ref(ts) - float(last)) >= scan_interval_seconds()
+
+
+# ---------------------------------------------------------------------------
 # بازه‌های زمانی و شمارش
 # ---------------------------------------------------------------------------
 
@@ -566,11 +693,18 @@ def current_members(chat_id):
     (نه صفرِ جعلی).
     """
     total, stamp = server_count(chat_id)
-    if total is not None:
-        if stamp is None or (now_ts() - float(stamp)) <= SERVER_COUNT_TTL_SECONDS:
-            return total
-    if has_any_data(chat_id):
-        return len(member_ids(chat_id))
+    ledger = len(member_ids(chat_id))
+    state = get_state(chat_id)
+    # اگر فهرستِ اعضا با دفتر مقایسه شده باشد، شمارشِ دفتر دقیق‌ترین است؛
+    # وگرنه عددِ تازهٔ خودِ سروش (اگر کهنه نباشد).
+    compared = bool(state.get("baseline_ids_ts"))
+    if compared and ledger:
+        return ledger
+    if total is not None and stamp is not None \
+            and (now_ts() - float(stamp)) <= SERVER_COUNT_TTL_SECONDS:
+        return total
+    if ledger:
+        return ledger
     return total
 
 

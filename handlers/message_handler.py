@@ -2014,6 +2014,19 @@ def _growth_report_entities(spans):
     return entities
 
 
+def _growth_log(bot, message, error=False):
+    logger = getattr(bot, "logger", None)
+    if logger is None:
+        return
+    try:
+        if error:
+            logger.log_error(message)
+        else:
+            logger.log_info(message)
+    except Exception:
+        pass
+
+
 #: عبارت‌های فارسیِ پیامِ سرویسِ ورود/خروج (اگر کلاسِ رویداد در دسترس نبود).
 _GROWTH_JOIN_MARKERS = (
     "به گروه پیوست", "به گروه اضافه شد", "عضو گروه شد", "پیوست",
@@ -2044,8 +2057,11 @@ async def _growth_participants(bot, chat_id):
     """
     try:
         entity = await bot.client.get_input_entity(chat_id)
+        # بدونِ limit → همهٔ صفحات پیمایش می‌شوند (گروهِ ۴۰ هزار نفری هم).
         participants = await bot.client.get_participants(entity)
         if participants:
+            _growth_log(bot, "GROWTH MEMBER LIST "
+                             f"chat_id={chat_id} count={len(list(participants))}")
             return list(participants)
     except Exception as error:
         bot.logger.log_error(
@@ -2098,13 +2114,24 @@ async def _growth_sync(bot, chat_id):
     members = await _growth_participants(bot, chat_id)
     if members:
         try:
-            result = group_growth.sync_members(chat_id, members)
-            bot.logger.log_info(
-                "GROWTH SYNC "
-                f"chat_id={chat_id} members={len(members)} "
-                f"joined={result['joined']} left={result['left']} "
-                f"baseline={result['baseline']}"
-            )
+            state = group_growth.ensure_tracker(chat_id)
+            if not state["baseline_complete"]:
+                # اولین دیدار: فقط اسنپ‌شات؛ هیچ‌کس «ورودِ امروز» حساب نمی‌شود.
+                result = group_growth.sync_members(chat_id, members)
+                _growth_log(bot, "GROWTH BASELINE "
+                                 f"chat_id={chat_id} members={len(members)}")
+            else:
+                # مقایسهٔ فهرست با وضعیتِ قبلی → ورود/خروجِ واقعی.
+                # در گروهِ بزرگ تنها راهِ فهمیدن است، چون سرویس
+                # «عضو شد/ترک کرد» را نشان نمی‌دهد.
+                result = group_growth.apply_snapshot(chat_id, members)
+                _growth_log(
+                    bot,
+                    "GROWTH SNAPSHOT DIFF "
+                    f"chat_id={chat_id} members={len(members)} "
+                    f"joined={result['joined']} left={result['left']} "
+                    f"large={group_growth.is_large_group(chat_id)}",
+                )
         except Exception as error:
             bot.logger.log_error(
                 f"GROWTH SYNC FAILED chat_id={chat_id} error={error!r}"

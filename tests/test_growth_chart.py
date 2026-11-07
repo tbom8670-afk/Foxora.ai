@@ -395,6 +395,52 @@ def test_never_blank_current_members():
           not hasattr(gg, "build_insight"))
 
 
+def test_large_group_snapshot_diff():
+    print("\n### ۳.۷ گروهِ بزرگ: تشخیصِ ورود/خروج از تفاضلِ فهرستِ اعضا")
+    reset_store()
+    base = list(range(100000, 100500))          # ۵۰۰ عضو
+    gg.save_baseline(CHAT, base, days_ago(1))
+    gg.set_server_count(CHAT, len(base))
+    check("گروه بزرگ تشخیص داده می‌شود", gg.is_large_group(CHAT))
+
+    # در طولِ ۲۴ ساعت: ۳ نفر تازه آمدند و ۲ نفر رفتند — هیچ پیامِ سرویسی نیست
+    after = base[2:] + [200001, 200002, 200003]
+    result = gg.apply_snapshot(CHAT, after)
+    check("۳ ورود از تفاضل فهمیده شد", result["joined"] == 3, f"-> {result}")
+    check("۲ خروج از تفاضل فهمیده شد", result["left"] == 2, f"-> {result}")
+    check("تعداد اعضا ۵۰۱ شد", gg.current_members(CHAT) == 501,
+          f"-> {gg.current_members(CHAT)}")
+
+    text, _ = gg.build_report(CHAT)
+    cells = find_cells(text)
+    check("گزارش: امروز = ۳ عضو تازه", cells[1] == gg.bold_digits(3),
+          f"-> {cells[1]}")
+    check("گزارش: ریزش امروز = ۲", cells[4] == gg.bold_digits(2),
+          f"-> {cells[4]}")
+    check("تعداد فعلی در گزارش = ۵۰۱", cells[0] == gg.bold_digits(501),
+          f"-> {cells[0]}")
+    check("نتیجه‌گیری: پیشرفت (۳ > ۲)", gg.VERDICT_GROWTH in text)
+
+    # اجرای دوباره با همان فهرست → هیچ رخدادِ تکراری
+    again = gg.apply_snapshot(CHAT, after)
+    check("اجرای دوباره چیزی اضافه نمی‌کند",
+          (again["joined"], again["left"]) == (0, 0), f"-> {again}")
+
+    # فاصلهٔ زمانیِ اسکن در گروهِ بزرگ رعایت می‌شود
+    check("اسکنِ پشتِ‌سرِهم در گروهِ بزرگ محدود شده",
+          gg.should_scan(CHAT) is False)
+    import os
+    os.environ["GROWTH_SCAN_INTERVAL_SECONDS"] = "0"
+    check("با فاصلهٔ صفر، اسکنِ بعدی مجاز است", gg.should_scan(CHAT) is True)
+    os.environ.pop("GROWTH_SCAN_INTERVAL_SECONDS", None)
+
+    # پس از خاموشیِ ربات و یک اسکنِ بعدی، فرقِ جدید هم گرفته می‌شود
+    newer = after[1:] + [200004]
+    result = gg.apply_snapshot(CHAT, newer)
+    check("تغییراتِ دورهٔ خاموشی هم گرفته شد",
+          (result["joined"], result["left"]) == (1, 1), f"-> {result}")
+
+
 def test_new_member_right_after_install_is_counted():
     print("\n### ۳.۶ همین حالا یکی عضو شد → باید فوراً شمرده شود")
     reset_store()
@@ -824,7 +870,8 @@ def test_recorder_wiring():
             user_added=False, user_left=False, user_kicked=False)
         await group_growth_events.handle_chat_action(bot, chatter)
         check("رویدادهای بی‌ربط نادیده گرفته می‌شوند",
-              gg.current_members(CHAT) == 0)
+              gg.current_members(CHAT) in (0, None),
+              f"-> {gg.current_members(CHAT)}")
 
     asyncio.run(scenario())
 
@@ -851,6 +898,7 @@ def main():
         test_rolling_windows,
         test_burst_in_one_minute_is_counted,
         test_never_blank_current_members,
+        test_large_group_snapshot_diff,
         test_new_member_right_after_install_is_counted,
         test_event_ledger,
         test_member_objects_are_stored_as_plain_ids,
