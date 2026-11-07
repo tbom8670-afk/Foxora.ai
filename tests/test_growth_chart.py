@@ -29,7 +29,8 @@ for extra in (ROOT, ROOT / "tests"):
 
 # دیتابیسِ تست، جدا از دیتابیسِ واقعیِ ربات
 _TMP = Path(tempfile.mkdtemp(prefix="growth-test-"))
-os.environ.setdefault("BOT_PRIVATE_DATA_DIR", str(_TMP))
+# هر اجرا دیتابیسِ تازهٔ خودش را دارد تا دادهٔ اجراهای قبلی نتیجه را آلوده نکند.
+os.environ["SOROUSH_BOT_DATA_DIR"] = str(_TMP)
 
 from modules import group_growth as gg  # noqa: E402
 from modules import admin_help_builder as help_builder  # noqa: E402
@@ -452,6 +453,23 @@ def test_event_ledger():
           set(gg.member_ids(CHAT)) == {"101", "103"}, f"-> {gg.member_ids(CHAT)}")
 
 
+def test_member_objects_are_stored_as_plain_ids():
+    print("\n### ۶.۵ شناسهٔ اعضا همیشه عددِ خالص ذخیره می‌شود")
+    import types as _types
+    reset_store()
+    gg.save_baseline(CHAT, [_types.SimpleNamespace(id=5551),
+                            _types.SimpleNamespace(user_id=5552), 5553, "5554"])
+    ids = gg.member_ids(CHAT)
+    check("چهار شناسهٔ عددیِ خالص ذخیره شد",
+          ids == ["5551", "5552", "5553", "5554"], f"-> {ids}")
+    check("هیچ شناسهٔ متنیِ خرابی در دفتر نیست",
+          not any("namespace" in value or "(" in value for value in ids))
+    # همان اعضا دوباره در همگام‌سازی «خروج» حساب نشوند
+    result = gg.sync_members(CHAT, [_types.SimpleNamespace(id=5551), 5553])
+    check("اعضای یکسان دوباره ورود/خروج ثبت نمی‌کنند",
+          result["joined"] == 0 and result["left"] == 2, f"-> {result}")
+
+
 def test_first_snapshot_is_not_a_join():
     print("\n### ۷ اعضای قدیمی «ورودِ امروز» حساب نمی‌شوند")
     reset_store()
@@ -646,6 +664,114 @@ def test_permissions_and_help():
     check("«نمودار» داخل نقل‌قول است", quote_ok)
 
 
+def test_leave_via_service_message():
+    print("\n### ۱۰.۵ ترک/ورود از پیامِ سرویس (گروهِ عادی) ثبت می‌شود")
+    import types as _types
+    from modules import group_growth_events
+
+    reset_store()
+    bot = _types.SimpleNamespace(logger=None, client=None)
+
+    def service(action_name, **kwargs):
+        action = _types.SimpleNamespace(**kwargs)
+        action.__class__ = type(action_name, (_types.SimpleNamespace,), {})
+        message = _types.SimpleNamespace(
+            action=action, from_id=_types.SimpleNamespace(user_id=555),
+            sender_id=None)
+        return message
+
+    # «acod.ai گروه را ترک کرد» → ChatDeleteUser که خودِ کاربر را نشان می‌دهد
+    joined_first = _types.SimpleNamespace(
+        action=type("MessageActionChatAddUser", (_types.SimpleNamespace,), {})(
+            users=[_types.SimpleNamespace(id=777)]),
+        from_id=_types.SimpleNamespace(user_id=777), sender_id=None)
+    gg.start_tracking(CHAT)
+    check("پیامِ «به گروه پیوست» تشخیص داده می‌شود",
+          group_growth_events.is_service_membership_message(joined_first))
+    check("ورود از پیامِ سرویس ثبت شد",
+          group_growth_events.handle_service_message(bot, CHAT, joined_first))
+    check("کاربر عضو شد", gg.is_member(CHAT, 777))
+
+    left = _types.SimpleNamespace(
+        action=type("MessageActionChatDeleteUser", (_types.SimpleNamespace,), {})(
+            user_id=_types.SimpleNamespace(user_id=777)),
+        from_id=_types.SimpleNamespace(user_id=777), sender_id=None)
+    check("پیامِ «گروه را ترک کرد» تشخیص داده می‌شود",
+          group_growth_events.is_service_membership_message(left))
+    check("ترک از پیامِ سرویس ثبت شد",
+          group_growth_events.handle_service_message(bot, CHAT, left))
+    check("کاربر دیگر عضو نیست", not gg.is_member(CHAT, 777))
+
+    # اخراجِ یک نفر توسطِ ادمین (removed_users) هم ریزش حساب می‌شود
+    kick = _types.SimpleNamespace(
+        action=type("MessageActionChatDeleteUser", (_types.SimpleNamespace,), {})(
+            user_id=_types.SimpleNamespace(user_id=888),
+            removed_users=[_types.SimpleNamespace(id=888)]),
+        from_id=_types.SimpleNamespace(user_id=555), sender_id=None)
+    gg.record_join(CHAT, 888, time.time() - 60)
+    check("اخراج از پیامِ سرویس ثبت شد",
+          group_growth_events.handle_service_message(bot, CHAT, kick))
+    check("کاربرِ اخراج‌شده غیرعضو شد", not gg.is_member(CHAT, 888))
+
+    text, _ = gg.build_report(CHAT)
+    cells = find_cells(text)
+    check("«امروز» هر دو رخداد را نشان می‌دهد (۲ ورود، ۲ خروج)",
+          cells[1] == gg.bold_digits(2) and cells[4] == gg.bold_digits(2),
+          f"-> {cells}")
+
+    # بعد از شروعِ پایش، ورود/ترکِ بعدی بدونِ «تکمیل نشده» شمرده می‌شود
+    reset_store()
+    gg.start_tracking(CHAT)
+    joined_again = _types.SimpleNamespace(
+        action=type("MessageActionChatAddUser", (_types.SimpleNamespace,), {})(
+            users=[_types.SimpleNamespace(id=901)]),
+        from_id=_types.SimpleNamespace(user_id=901), sender_id=None)
+    group_growth_events.handle_service_message(bot, CHAT, joined_again)
+    cells = find_cells(gg.build_report(CHAT)[0])
+    check("بلافاصله بعد از شروعِ پایش، «امروز» = ۱ (نه تکمیل نشده)",
+          cells[1] == gg.bold_digits(1), f"-> {cells[1]}")
+    check("هیچ «تکمیل نشده»ای نمانده",
+          gg.INCOMPLETE not in gg.build_report(CHAT)[0])
+
+
+def test_recent_service_scan():
+    print("\n### ۱۰.۶ اسکنِ پیام‌های اخیر، رخدادهای جاافتاده را جبران می‌کند")
+    import types as _types
+    from modules import group_growth_events
+
+    reset_store()
+    gg.start_tracking(CHAT)
+
+    def add(user_id):
+        return _types.SimpleNamespace(
+            action=type("MessageActionChatAddUser", (_types.SimpleNamespace,), {})(
+                users=[_types.SimpleNamespace(id=user_id)]),
+            from_id=_types.SimpleNamespace(user_id=user_id), sender_id=None)
+
+    def delete(user_id):
+        return _types.SimpleNamespace(
+            action=type("MessageActionChatDeleteUser", (_types.SimpleNamespace,), {})(
+                user_id=_types.SimpleNamespace(user_id=user_id)),
+            from_id=_types.SimpleNamespace(user_id=user_id), sender_id=None)
+
+    stream = [add(1001), _types.SimpleNamespace(action=None), add(1002),
+              delete(1001)]
+
+    async def get_messages(chat_id, limit=None, **kwargs):
+        return stream
+
+    bot = _types.SimpleNamespace(
+        logger=None, client=_types.SimpleNamespace(get_messages=get_messages))
+    recorded = asyncio.run(group_growth_events.recent_service_scan(bot, CHAT))
+    check("سه رخداد از پیام‌های اخیر ثبت شد", recorded == 3, f"-> {recorded}")
+    check("عضوِ تازه ثبت شد", gg.is_member(CHAT, 1002))
+    check("عضوِ رفته ثبت شد", not gg.is_member(CHAT, 1001))
+    cells = find_cells(gg.build_report(CHAT)[0])
+    check("گزارش همان اعداد را نشان می‌دهد",
+          cells[1] == gg.bold_digits(2) and cells[4] == gg.bold_digits(1),
+          f"-> {cells}")
+
+
 def test_dispatch_lane():
     print("\n### ۹ «نمودار» روی خطِ دستورهای مدیریتی می‌ماند")
     from modules import group_dispatch
@@ -675,11 +801,12 @@ def test_recorder_wiring():
                 return decorator
 
         bot = types.SimpleNamespace(client=FakeClient(), logger=None)
-        first = group_growth_events.register(bot)
-        second = group_growth_events.register(bot)
+        first = await group_growth_events.register(bot)
+        second = await group_growth_events.register(bot)
         check("ثبتِ شنونده موفق بود", first is True)
         check("ثبتِ دوباره تکرار نمی‌شود", second is False)
-        check("یک شنونده نصب شد", len(bot.client.handlers) == 1)
+        check("دو شنونده نصب شد (ChatAction + پیام‌ها)",
+              len(bot.client.handlers) == 2, f"-> {len(bot.client.handlers)}")
 
         reset_store()
         event = types.SimpleNamespace(
@@ -726,10 +853,13 @@ def main():
         test_never_blank_current_members,
         test_new_member_right_after_install_is_counted,
         test_event_ledger,
+        test_member_objects_are_stored_as_plain_ids,
         test_first_snapshot_is_not_a_join,
         test_permissions_and_help,
         test_dispatch_lane,
         test_recorder_wiring,
+        test_leave_via_service_message,
+        test_recent_service_scan,
         test_no_fake_numbers_in_source,
     ]
     for test in tests:

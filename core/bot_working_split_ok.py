@@ -1363,7 +1363,7 @@ class SoroushAntiSpamBot:
         # فقط یک شنوندهٔ ChatAction نصب می‌کند و هیچ پیامی نمی‌فرستد.
         try:
             from modules import group_growth_events
-            group_growth_events.register(self)
+            group_growth_events.register_sync(self)
         except Exception as growth_setup_error:
             self.logger.log_error(
                 f"GROWTH RECORDER SETUP FAILED error={growth_setup_error!r}"

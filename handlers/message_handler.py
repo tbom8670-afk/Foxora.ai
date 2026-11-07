@@ -2014,6 +2014,27 @@ def _growth_report_entities(spans):
     return entities
 
 
+#: عبارت‌های فارسیِ پیامِ سرویسِ ورود/خروج (اگر کلاسِ رویداد در دسترس نبود).
+_GROWTH_JOIN_MARKERS = (
+    "به گروه پیوست", "به گروه اضافه شد", "عضو گروه شد", "پیوست",
+)
+_GROWTH_LEAVE_MARKERS = (
+    "گروه را ترک کرد", "از گروه خارج شد", "گروه را ترک", "اخراج شد",
+)
+
+
+def _growth_service_hint(message_text):
+    """آیا متنِ پیامِ سرویس، ورود یا خروجِ یک عضو را نشان می‌دهد؟"""
+    value = str(message_text or "")
+    if not value:
+        return None
+    if any(marker in value for marker in _GROWTH_LEAVE_MARKERS):
+        return "leave"
+    if any(marker in value for marker in _GROWTH_JOIN_MARKERS):
+        return "join"
+    return None
+
+
 async def _growth_participants(bot, chat_id):
     """فهرستِ زندهٔ اعضای گروه از خودِ سروش.
 
@@ -6471,6 +6492,16 @@ async def handle_new_message(bot, event):
                 # «نمودار» گزارشِ یک گروه است؛ در چت خصوصی گروهی وجود ندارد.
                 await event.reply("📊 دستور «نمودار» را داخل گروه ارسال کنید.")
                 return
+            # آخرین پیام‌های سرویسِ ورود/خروج هم یک‌بار خوانده می‌شوند تا
+            # اگر شنوندهٔ رویداد چیزی را جا انداخته بود، جبران شود.
+            try:
+                from modules import group_growth_events as _growth_events
+                await _growth_events.recent_service_scan(bot, chat_id)
+            except Exception as _scan_error:
+                bot.logger.log_error(
+                    f"GROWTH RECENT SCAN FAILED chat_id={chat_id} "
+                    f"error={_scan_error!r}"
+                )
             _growth_sender = locals().get("sender")
             if _growth_sender is None:
                 try:

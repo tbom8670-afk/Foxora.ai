@@ -124,10 +124,33 @@ def normalize_chat(chat_id) -> str:
 
 
 def _clean_id(user_id):
-    value = str(user_id)
-    if value in ("", "0", "None", "none", "null"):
+    """شناسهٔ عددیِ خالص از هر شکلی (عدد، کاربر، Peer، رشته).
+
+    اگر شیءِ کاربر/Peer پاس داده شود، شناسه‌اش استخراج می‌شود؛ وگرنه
+    رشته‌ای مثل ``namespace(id=123)`` در دفتر ذخیره می‌شد و همان کاربر
+    دوباره «عضو تازه/خروجی» حساب می‌شد.
+    """
+    if user_id is None:
         return None
-    return value
+    resolved = None
+    for attr in ("id", "user_id"):
+        candidate = getattr(user_id, attr, None)
+        if isinstance(candidate, int):
+            resolved = candidate
+            break
+    if resolved is None:
+        if isinstance(user_id, int):
+            resolved = user_id
+        else:
+            try:
+                resolved = int(str(user_id).strip())
+            except (TypeError, ValueError):
+                stripped = str(user_id).strip()
+                return stripped if stripped and stripped not in (
+                    "0", "None", "none", "null") else None
+    if not resolved or resolved <= 0:
+        return None
+    return str(resolved)
 
 
 # ---------------------------------------------------------------------------
