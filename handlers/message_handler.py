@@ -2065,11 +2065,12 @@ async def _growth_count_from_server(bot, chat_id):
 
 
 async def _growth_sync(bot, chat_id):
-    """اسنپ‌شاتِ اول (اگر لازم است) + جبرانِ رخدادهای جاافتاده.
+    """گرفتنِ وضعیتِ زندهٔ گروه از خودِ سروش + جبرانِ رخدادهای جاافتاده.
 
-    خروجی: ``(baseline_ok, members_seen)``. اگر فهرست اعضا به دست نیاید،
-    هیچ اسنپ‌شاتی ساخته نمی‌شود و شمارندهٔ اعضا از سرور گرفته می‌شود؛
-    در این حالت بازه‌ها صادقانه «تکمیل نشده» می‌مانند.
+    * فهرست اعضا (اگر در دسترس باشد) با دفتر همگام می‌شود تا ورود/خروج‌هایی
+      که هنگامِ خاموشیِ ربات رخ داده‌اند از دست نروند.
+    * تعداد اعضا همیشه مستقیم از سرور گرفته می‌شود (مرجعِ دقیق).
+    * اگر هیچ‌کدام در دسترس نباشد، هیچ دادهٔ جعلی ساخته نمی‌شود.
     """
     from modules import group_growth
 
@@ -2083,7 +2084,6 @@ async def _growth_sync(bot, chat_id):
                 f"joined={result['joined']} left={result['left']} "
                 f"baseline={result['baseline']}"
             )
-            return True, len(members)
         except Exception as error:
             bot.logger.log_error(
                 f"GROWTH SYNC FAILED chat_id={chat_id} error={error!r}"
@@ -2092,11 +2092,15 @@ async def _growth_sync(bot, chat_id):
     if server_total is not None:
         group_growth.set_server_count(chat_id, server_total)
         bot.logger.log_info(
-            f"GROWTH SERVER COUNT chat_id={chat_id} total={server_total} "
-            "reason=member_list_unavailable"
+            f"GROWTH SERVER COUNT chat_id={chat_id} total={server_total}"
         )
-    state = group_growth.ensure_tracker(chat_id)
-    return bool(state["baseline_complete"]), len(members) if members else 0
+    else:
+        # نه فهرست اعضا و نه عددِ سرور: فقط «شروعِ پایش» را ثبت می‌کنیم تا
+        # ورود/خروج‌هایی که از این پس ثبت می‌شوند شمرده شوند.
+        group_growth.start_tracking(chat_id)
+    if members is None and server_total is None:
+        group_growth.start_tracking(chat_id)
+    return server_total
 
 
 async def handle_growth_command(bot, event, chat_id, user_id, username=None):
@@ -2123,23 +2127,9 @@ async def handle_growth_command(bot, event, chat_id, user_id, username=None):
         )
 
     try:
-        # عنوان گروه داخل گزارش می‌آید تا معلوم باشد کدام گروه است.
-        title = None
-        try:
-            chat = await event.get_chat()
-            title = getattr(chat, "title", None)
-        except Exception:
-            title = None
-        report, spans = group_growth.build_report(chat_id, title=title)
-        model = group_growth.build_insight(chat_id)
-        if model:
-            # خطِ تحلیلی هم کاملاً Bold و داخل نقل‌قول است.
-            offset = len(report.encode("utf-16-le")) // 2
-            report = report + "\n" + model + "\n"
-            spans = list(spans) + [
-                (offset + 1, len(model.encode("utf-16-le")) // 2, "bold"),
-                (offset + 1, len(model.encode("utf-16-le")) // 2, "quote"),
-            ]
+        # قالب دقیقاً همان ساختارِ خواسته‌شده است: بدونِ سرتیتر و بدونِ
+        # هیچ خطِ اضافه؛ فقط همان ۱۳ خطِ استاندارد.
+        report, spans = group_growth.build_report(chat_id)
     except Exception as error:
         bot.logger.log_error(
             f"GROWTH REPORT FAILED chat_id={chat_id} error={error!r}"

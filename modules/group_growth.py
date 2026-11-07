@@ -369,6 +369,20 @@ def save_baseline_legacy(chat_id, ids, ts=None) -> int:
     return inserted
 
 
+def start_tracking(chat_id, ts=None) -> bool:
+    """علامت‌گذاریِ «پایشِ این گروه شروع شد» بدونِ تکیه بر فهرست اعضا.
+
+    وقتی فهرست اعضا در دسترس نیست (گروهِ بزرگ یا خطای شبکه) هم باید
+    ورود/خروج‌های ثبت‌شده شمارش شوند؛ پس فقط شروعِ پایش ثبت می‌شود و هیچ
+    شناسه‌ای ذخیره نمی‌گردد. تعداد اعضا در این حالت از خودِ سروش می‌آید.
+    """
+    state = ensure_tracker(chat_id, ts)
+    if state["baseline_complete"]:
+        return False
+    save_baseline(chat_id, [], ts)
+    return True
+
+
 def set_baseline_incomplete(chat_id, ts=None) -> None:
     """اسنپ‌شات ناقص ماند: زمانِ پایش ثبت می‌شود ولی داده‌های قدیمی‌تر
     از آن «در دسترس» نیستند."""
@@ -488,15 +502,14 @@ def tracking_start(chat_id, ts=None):
 
 
 def _window_covered(chat_id, key: str, ts=None):
-    """آیا کلِ این پنجرهٔ غلتان زیرِ پوششِ پایش بوده است؟
+    """آیا برای این پنجره دادهٔ ثبت‌شده داریم؟
 
-    ملاک فقط زمانِ شروعِ پایش است: اگر پایش ۱۰ روز پیش شروع شده باشد،
-    پنجرهٔ ۲۴ ساعته و ۷ روزه کامل‌اند و پنجرهٔ ۳۰ روزه نه.
+    تا وقتی پایشِ گروه شروع نشده (هیچ اسنپ‌شاتی ساخته نشده) «تکمیل نشده»
+    گزارش می‌شود. بعد از آن، هر ورود/خروجی که در پنجره ثبت شده باشد
+    شمرده می‌شود؛ حتی اگر ربات همین یک دقیقه پیش نصب شده باشد و یک نفر
+    همین حالا عضو شده باشد.
     """
-    start = tracking_start(chat_id, ts)
-    if start is None:
-        return False
-    return float(start) <= window_start(key, ts)
+    return bool(ensure_tracker(chat_id, ts)["baseline_complete"])
 
 
 
@@ -517,32 +530,25 @@ def leaves(chat_id, key: str, ts=None):
     return _count_events(chat_id, "leave", window_start(key, ts), window_end(ts))
 
 
+#: تعدادِ اعلامیِ سروش تا این مدت معتبر است؛ کهنه‌تر از آن استفاده نمی‌شود.
+SERVER_COUNT_TTL_SECONDS = 24 * 3600
+
+
 def current_members(chat_id):
     """تعداد اعضای فعلی (لحظه‌ای).
 
-    اولویت: دفترِ رخداد. اگر هیچ داده‌ای در دفتر نباشد (مثلاً فهرست اعضا
-    در دسترس نبوده) عددِ اعلامیِ خودِ سروش استفاده می‌شود. اگر هیچ‌کدام
-    نبود ``None`` — نه صفرِ جعلی.
+    اولویت اول **عددِ خودِ سروش** است (`participants_count`), چون مرجع و
+    دقیق است و به کامل بودنِ فهرست اعضا وابسته نیست. اگر عددِ تازه‌ای از
+    سروش نبود، شمارشِ دفترِ رخداد استفاده می‌شود و در نهایت ``None``
+    (نه صفرِ جعلی).
     """
+    total, stamp = server_count(chat_id)
+    if total is not None:
+        if stamp is None or (now_ts() - float(stamp)) <= SERVER_COUNT_TTL_SECONDS:
+            return total
     if has_any_data(chat_id):
         return len(member_ids(chat_id))
-    total, _at = server_count(chat_id)
     return total
-
-
-def members_before(chat_id, key: str, ts=None):
-    """تعدادِ اعضا در **ابتدای** این پنجره (۲۴ ساعت/۷ روز/۳۰ روز پیش).
-
-    ``None`` اگر پنجره کامل پوشش نداشته باشد — هیچ عددی حدس زده نمی‌شود.
-    """
-    start = tracking_start(chat_id, ts)
-    if start is None or not _window_covered(chat_id, key, ts):
-        return None
-    cut = window_start(key, ts)
-    total = baseline_count(chat_id)
-    total += _count_events(chat_id, "join", start, cut)
-    total -= _count_events(chat_id, "leave", start, cut)
-    return max(total, 0)
 
 
 def nets(chat_id, key: str, ts=None):
@@ -628,22 +634,18 @@ def build_report(chat_id, ts=None, title=None) -> tuple:
     leave_nets = {key: nets(chat_id, key, ts)[1] for key in ("day", "week", "month")}
     verdict = evaluate(join_counts, leave_counts, join_nets, leave_nets)
 
-    #: (متن، بولد؟، داخلِ نقل‌قول؟)
-    header = "📊 نمودار رشد و ریزش گروه"
-    if title:
-        header += f"\n« {title} »"
+    #: (متن، بولد؟، داخلِ نقل‌قول؟) — دقیقاً همان قالبِ خواسته‌شده،
+    #: بدونِ هیچ سرتیتر یا خطِ اضافه.
     lines = [
-        (header, True, False),
-        ("", False, False),
         ("⟳ تعداد اعضای فعلی : 『  " + _cell(current) + "  』", True, True),
         ("", False, False),
         ("〄 اعضای عضو شده", True, False),
-        (" │امروز (۲۴ ساعت) : 「 " + _cell(join_counts["day"]) + " 」", False, True),
+        (" │امروز : 「 " + _cell(join_counts["day"]) + " 」", False, True),
         (" │این هفته :  「 " + _cell(join_counts["week"]) + " 」", False, True),
         (" │این ماه : 「 " + _cell(join_counts["month"]) + " 」", False, True),
         ("", False, False),
         ("〄  ریزش اعضا", True, False),
-        ("│ امروز (۲۴ ساعت) : 「 " + _cell(leave_counts["day"]) + " 」", False, True),
+        ("│ امروز : 「 " + _cell(leave_counts["day"]) + " 」", False, True),
         ("│این هفته :  「 " + _cell(leave_counts["week"]) + " 」", False, True),
         ("│این ماه : 「 " + _cell(leave_counts["month"]) + " 」", False, True),
         ("", False, False),
@@ -661,55 +663,6 @@ def build_report(chat_id, ts=None, title=None) -> tuple:
             entities.append((offset, length, BOLD))
         offset += length
     return "".join(parts), entities
-
-
-def build_insight(chat_id, ts=None):
-    """یک خطِ تحلیلیِ راستگو، یا ``None`` وقتی داده کامل نیست.
-
-    «امروز» را با وضعیتِ پایانِ روزِ قبل مقایسه می‌کند و فقط عددهای
-    واقعیِ ثبت‌شده را می‌نویسد.
-    """
-    day_join = joins(chat_id, "day", ts)
-    day_left = leaves(chat_id, "day", ts)
-    before = members_before(chat_id, "day", ts)
-    if None in (day_join, day_left, before):
-        return None
-    now_total = current_members(chat_id)
-    if now_total is None:
-        return None
-    delta = now_total - before
-    sign = "+" if delta >= 0 else "−"
-    parts = [
-        "«", "وضعیت تحلیلی :",
-        f"۲۴ ساعتِ گذشته {sign}{to_fa(abs(delta))} نفر",
-        f"| رشد {to_fa(day_join)}",
-        f"و ریزش {to_fa(day_left)}",
-        f"| گروه {to_fa(now_total)} نفره",
-    ]
-    streak = streak_days(chat_id, ts)
-    if streak is not None and streak >= 2:
-        parts.append(f"| {to_fa(streak)} روز رشد پیوسته")
-    return " ".join(parts) + " »"
-
-
-def streak_days(chat_id, ts=None, limit: int = 30):
-    """چند روزِ پیوسته (تا دیروز) خالصِ عضویت مثبت بوده است؟"""
-    state = ensure_tracker(chat_id, ts)
-    if not state["baseline_complete"] or state["baseline_at"] is None:
-        return None
-    moment = now_ts_ref(ts)
-    streak = 0
-    for step in range(1, limit + 1):
-        chunk_end = moment - (step - 1) * 86400
-        chunk_begin = moment - step * 86400
-        if chunk_begin < (state["baseline_at"] or 0.0):
-            return None
-        joined = _count_events(chat_id, "join", chunk_begin, chunk_end)
-        left = _count_events(chat_id, "leave", chunk_begin, chunk_end)
-        if joined - left <= 0:
-            break
-        streak += 1
-    return streak
 
 
 def admin_help_text() -> tuple:

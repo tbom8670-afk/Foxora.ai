@@ -174,10 +174,10 @@ def test_format_is_exact():
     for line in ("⟳ تعداد اعضای فعلی : 『",
                  "〄 اعضای عضو شده",
                  "〄  ریزش اعضا",
-                 " │امروز (۲۴ ساعت) : 「",
+                 " │امروز : 「",
                  " │این هفته :  「",
                  " │این ماه : 「",
-                 "│ امروز (۲۴ ساعت) : 「",
+                 "│ امروز : 「",
                  "│این هفته :  「",
                  "│این ماه : 「",
                  "« نتیجه گیری : "):
@@ -219,10 +219,26 @@ def test_entities_are_real():
 
 
 def test_incomplete_windows():
-    print("\n### ۳ بازهٔ ناقص «تکمیل نشده» می‌شود، نه عددِ جعلی")
+    print("\n### ۳ «تکمیل نشده» فقط وقتی است که هیچ داده‌ای در دسترس نیست")
     reset_store()
-    # پایش از هشت روز پیش: پنجرهٔ ۲۴ ساعته و ۷ روزه کامل، ۳۰ روزه نه.
-    gg.save_baseline(CHAT, list(range(2000, 2600)), days_ago(8))
+    # ۳.۱ گروهی که هیچ‌وقت پایش نشده و هیچ داده‌ای هم ندارد
+    empty_chat = -100777000999
+    text, _ = gg.build_report(empty_chat)
+    cells = find_cells(text)
+    check("۷ سلول عددی/متنی داریم", len(cells) == 7, f"-> {cells}")
+    check("تعداد اعضای فعلی «تکمیل نشده» است",
+          cells[0] == gg.INCOMPLETE, f"-> {cells[0]}")
+    check("همهٔ بازه‌ها هم «تکمیل نشده»اند",
+          cells[1:] == [gg.INCOMPLETE] * 6, f"-> {cells[1:]}")
+    check("«تکمیل نشده» داخل همان براکت‌ها نشسته است",
+          "「 تکمیل نشده 」" in text)
+    check("هیچ صفرِ جعلی نوشته نشده", gg.bold_digits(0) not in cells)
+    check("نتیجه‌گیری بدونِ داده، نامشخص است", gg.VERDICT_UNKNOWN in text)
+
+    # ۳.۲ به‌محضِ شروعِ پایش، اعدادِ واقعی می‌آیند (هیچ «تکمیل نشده»ای نه)
+    reset_store()
+    gg.start_tracking(CHAT, days_ago(3))
+    gg.save_baseline(CHAT, list(range(2000, 2600)), days_ago(3))
     gg.record_join(CHAT, 5001, days_ago(0, 1))
     gg.record_join(CHAT, 5002, days_ago(2))
     gg.record_join(CHAT, 5003, days_ago(2, 3))
@@ -230,35 +246,20 @@ def test_incomplete_windows():
     gg.record_leave(CHAT, 2501, days_ago(1))
     text, _ = gg.build_report(CHAT)
     cells = find_cells(text)
-    check("۷ سلول عددی/متنی داریم", len(cells) == 7, f"-> {cells}")
     current, join_day, join_week, join_month, leave_day, leave_week, leave_month = cells
     check("تعداد فعلی = ۶۰۰ + ۳ ورود − ۲ خروج",
           current == gg.bold_digits(601), f"-> {current}")
-    check("«امروز» واقعی است (۱ عضو تازه)",
-          join_day == gg.bold_digits(1), f"-> {join_day}")
+    check("«امروز» = ۱", join_day == gg.bold_digits(1), f"-> {join_day}")
     check("«این هفته» = ۳", join_week == gg.bold_digits(3), f"-> {join_week}")
-    check("«این ماه» تکمیل نشده است", join_month == gg.INCOMPLETE, f"-> {join_month}")
-    check("ریزشِ امروز = ۱", leave_day == gg.bold_digits(1), f"-> {leave_day}")
-    check("ریزشِ هفته = ۲", leave_week == gg.bold_digits(2), f"-> {leave_week}")
-    check("ریزشِ ماه تکمیل نشده است", leave_month == gg.INCOMPLETE, f"-> {leave_month}")
-    check("«تکمیل نشده» داخل همان براکت‌ها نشسته است",
-          "「 تکمیل نشده 」" in text)
-    check("هیچ صفرِ جعلی برای بازه‌های ناقص نوشته نشده",
-          gg.bold_digits(0) not in cells)
-    check("نتیجه‌گیری با بازه‌های موجود محاسبه شد (رشد ۳ > ریزش ۲)",
+    check("«این ماه» = ۳ (پایش ۳ روزه، همین رخدادها)", 
+          join_month == gg.bold_digits(3), f"-> {join_month}")
+    check("ریزش امروز = ۱", leave_day == gg.bold_digits(1), f"-> {leave_day}")
+    check("ریزش هفته = ۲", leave_week == gg.bold_digits(2), f"-> {leave_week}")
+    check("ریزش ماه = ۲", leave_month == gg.bold_digits(2), f"-> {leave_month}")
+    check("هیچ «تکمیل نشده»ای در گزارش نیست",
+          gg.INCOMPLETE not in text, f"-> {cells}")
+    check("نتیجه‌گیری: رشد ۳ > ریزش ۲ → پیشرفت",
           gg.VERDICT_GROWTH in text, f"-> {text[-70:]!r}")
-
-    # نصبِ همین حالا: حتی «امروز» هم بازهٔ کاملی نیست
-    reset_store()
-    gg.save_baseline(CHAT, list(range(3000, 3100)), time.time())
-    fresh, _ = gg.build_report(CHAT)
-    fresh_cells = find_cells(fresh)
-    check("در روزِ نصب، «امروز» هم تکمیل نشده است",
-          fresh_cells[1] == gg.INCOMPLETE, f"-> {fresh_cells[1]}")
-    check("تعداد فعلی حتی در روزِ نصب واقعی است",
-          fresh_cells[0] == gg.bold_digits(100), f"-> {fresh_cells[0]}")
-    check("وقتی هیچ بازه‌ای کامل نیست، نتیجه‌گیری نامشخص است",
-          gg.VERDICT_UNKNOWN in fresh)
 
 
 def test_equal_or_missing_gives_unknown():
@@ -317,8 +318,12 @@ def test_rolling_windows():
           abs((time.time() - gg.window_start("week")) - 7 * 86400) < 5)
     check("شروعِ «این ماه» دقیقاً ۳۰ روز پیش است",
           abs((time.time() - gg.window_start("month")) - 30 * 86400) < 5)
-    check("برچسبِ بازه‌ها در گزارش هست",
-          "امروز (۲۴ ساعت)" in text, f"-> {text[:120]!r}")
+    check("برچسب‌ها همان قالبِ خواسته‌شده‌اند (بدونِ توضیحِ اضافه)",
+          " │امروز : 「" in text and "│ امروز : 「" in text
+          and "۲۴ ساعت" not in text, f"-> {text[:120]!r}")
+    check("گزارش هیچ سرتیتر/خطِ اضافه‌ای ندارد",
+          text.startswith("⟳ تعداد اعضای فعلی") and "📊" not in text
+          and "وضعیت تحلیلی" not in text, f"-> {text[:60]!r}")
 
 
 def test_burst_in_one_minute_is_counted():
@@ -354,57 +359,71 @@ def test_never_blank_current_members():
     cells = find_cells(text)
     check("تعداد اعضای فعلی از عددِ سروش خوانده شد",
           cells[0] == gg.bold_digits(532), f"-> {cells[0]}")
+    gg.set_server_count(CHAT, 640, ts=time.time() - 2 * 86400)
+    check("عددِ سروش (حتی ۲ روز پیش) بر شمارشِ دفتر اولویت دارد",
+          gg.current_members(CHAT) == 640, f"-> {gg.current_members(CHAT)}")
+    gg.set_server_count(CHAT, 532)
     check("بازه‌های بدونِ داده صادقانه تکمیل‌نشده‌اند",
           cells[1:] == [gg.INCOMPLETE] * 6, f"-> {cells[1:]}")
     check("نتیجه‌گیری با دادهٔ ناکافی، نامشخص است", gg.VERDICT_UNKNOWN in text)
-    check("نامِ گروه در گزارش می‌آید", "« گروه نمونه »" in text)
-    check("سرتیترِ گزارش هست", "📊 نمودار رشد و ریزش گروه" in text)
-    check("عددِ سروش هیچ بازه‌ای را «کامل» نمی‌کند",
+    check("گزارش دقیقاً با خطِ «تعداد اعضای فعلی» شروع می‌شود",
+          text.startswith("⟳ تعداد اعضای فعلی"), f"-> {text[:40]!r}")
+    check("هیچ سرتیتر/نامِ گروهی به قالب اضافه نشده",
+          "📊" not in text and "گروه نمونه" not in text)
+    check("بدونِ اسنپ‌شات هیچ بازه‌ای عدد ندارد",
           all(gg.joins(CHAT, key) is None for key in ("day", "week", "month")))
     check("ریزش هم هیچ عدد جعلی ندارد",
           all(gg.leaves(CHAT, key) is None for key in ("day", "week", "month")))
 
     # با دادهٔ واقعی، دفترِ رخداد اولویت دارد
-    gg.save_baseline(CHAT, list(range(4000, 4500)), days_ago(10))
+    gg.save_baseline(CHAT, list(range(4000, 4450)), days_ago(10))
     gg.record_join(CHAT, 7777, days_ago(0, 1))
-    check("با وجودِ دفترِ رخداد، عدد از دفتر خوانده می‌شود",
-          gg.current_members(CHAT) == 501, f"-> {gg.current_members(CHAT)}")
+    from modules import runtime_db
+    runtime_db.execute(
+        "UPDATE membership_state SET server_count=NULL WHERE group_id=?",
+        (gg.normalize_chat(CHAT),))
+    check("حالا عدد از دفتر خوانده می‌شود (۴۵۰ + ۱)",
+          gg.current_members(CHAT) == 451, f"-> {gg.current_members(CHAT)}")
 
     # هیچ داده‌ای نباشد → تکمیل نشده (نه صفر)
     reset_store()
     text, _ = gg.build_report(CHAT)
     check("بدونِ هیچ داده‌ای، عددِ فعلی «تکمیل نشده» است",
           find_cells(text)[0] == gg.INCOMPLETE, f"-> {find_cells(text)[0]}")
-    check("خطِ تحلیلی در نبودِ داده ساخته نمی‌شود",
-          gg.build_insight(CHAT) is None)
+    check("ماژول هیچ تابعِ خطِ تحلیلی ندارد (قالب پاک است)",
+          not hasattr(gg, "build_insight"))
 
 
-def test_window_completeness_is_about_tracking_start():
-    print("\n### ۳.۶ کامل‌بودنِ پنجره فقط به شروعِ پایش بستگی دارد")
+def test_new_member_right_after_install_is_counted():
+    print("\n### ۳.۶ همین حالا یکی عضو شد → باید فوراً شمرده شود")
     reset_store()
-    # پایش ۱۰ دقیقه پیش شروع شده: پنجرهٔ ۲۴ ساعته کامل نیست (نه اینکه
-    # چون نیمه‌شب گذشته باشد). عددِ ثبت‌شده هم نباید «کلِ ۲۴ ساعت» جا بزند.
-    gg.save_baseline(CHAT, list(range(6000, 6100)), time.time() - 600)
-    gg.record_join(CHAT, 6101, time.time() - 300)
+    # ربات همین حالا نصب شده (اسنپ‌شاتِ لحظهٔ نصب = ۱۰۰ نفر)
+    gg.save_baseline(CHAT, list(range(6000, 6100)), time.time() - 60)
+    # و همین ۳۰ ثانیه پیش یک نفر عضو شده و یکی هم رفته
+    gg.record_join(CHAT, 6101, time.time() - 30)
+    gg.record_leave(CHAT, 6000, time.time() - 20)
     text, _ = gg.build_report(CHAT)
     cells = find_cells(text)
-    check("«تعداد اعضای فعلی» واقعی است",
-          cells[0] == gg.bold_digits(101), f"-> {cells[0]}")
-    check("پنجرهٔ ۲۴ ساعته (که کامل پوشش نداشته) تکمیل نشده است",
-          cells[1] == gg.INCOMPLETE, f"-> {cells[1]}")
-    check("هیچ عددِ ناقصی به‌جای بازهٔ ۲۴ ساعته چاپ نشد",
-          gg.joins(CHAT, "day") is None and gg.leaves(CHAT, "day") is None)
+    check("«امروز» عددِ واقعی را نشان می‌دهد (نه تکمیل نشده)",
+          cells[1] == gg.bold_digits(1), f"-> {cells[1]}")
+    check("«این هفته» هم همان ۱ است",
+          cells[2] == gg.bold_digits(1), f"-> {cells[2]}")
+    check("«این ماه» هم همان ۱ است",
+          cells[3] == gg.bold_digits(1), f"-> {cells[3]}")
+    check("ریزشِ امروز = ۱", cells[4] == gg.bold_digits(1), f"-> {cells[4]}")
+    check("تعداد اعضای فعلی = ۱۰۰ (۹۹ قدیمی + یک تازه)",
+          cells[0] == gg.bold_digits(100), f"-> {cells[0]}")
+    check("هیچ «تکمیل نشده»ای در گزارش نیست",
+          gg.INCOMPLETE not in text, f"-> {cells}")
 
-    # پایش ۳۰ ساعت پیش شروع شده → پنجرهٔ ۲۴ ساعته کامل است، هر ساعتی
+    # ده نفر در یک دقیقه هم باید کامل شمرده شوند
     reset_store()
-    gg.save_baseline(CHAT, list(range(6200, 6300)), time.time() - 30 * 3600)
-    gg.record_join(CHAT, 6301, time.time() - 20 * 3600)   # دیشب ۲۳:۰۰
-    gg.record_join(CHAT, 6302, time.time() - 60)          # همین حالا
-    check("۲۴ ساعت اخیر کامل شمرده می‌شود (بدونِ توجه به نیمه‌شب)",
-          gg.joins(CHAT, "day") == 2, f"-> {gg.joins(CHAT, 'day')}")
+    gg.save_baseline(CHAT, list(range(7000, 7100)), time.time() - 120)
+    for index in range(10):
+        gg.record_join(CHAT, 7200 + index, time.time() - 40 + index)
     text, _ = gg.build_report(CHAT)
-    check("گزارش عددِ واقعیِ ۲۴ ساعته را نشان می‌دهد",
-          find_cells(text)[1] == gg.bold_digits(2), f"-> {find_cells(text)[1]}")
+    check("۱۰ ورود در یک دقیقه → «امروز» = ۱۰",
+          find_cells(text)[1] == gg.bold_digits(10), f"-> {find_cells(text)[1]}")
 
 
 def test_event_ledger():
@@ -444,9 +463,12 @@ def test_first_snapshot_is_not_a_join():
           gg.current_members(CHAT) == 100, f"-> {gg.current_members(CHAT)}")
     text, _ = gg.build_report(CHAT)
     cells = find_cells(text)
-    check("«۲۴ ساعت» چون پایش تازه شروع شده، تکمیل نشده است",
-          cells[1] == gg.INCOMPLETE, f"-> {cells[1]}")
-    check("«این ماه» تکمیل نشده", cells[3] == gg.INCOMPLETE, f"-> {cells[3]}")
+    check("بلافاصله بعد از نصب هیچ ورودی نیست، پس صفرِ واقعی است",
+          cells[1] == gg.bold_digits(0), f"-> {cells[1]}")
+    check("«این ماه» هم صفرِ واقعی است", cells[3] == gg.bold_digits(0),
+          f"-> {cells[3]}")
+    check("«تکمیل نشده» فقط وقتی است که پایش شروع نشده باشد",
+          gg.INCOMPLETE not in gg.build_report(CHAT)[0])
     check("تعداد فعلی درست گزارش شد",
           cells[0] == gg.bold_digits(100), f"-> {cells[0]}")
 
@@ -568,25 +590,38 @@ def test_permissions_and_help():
 
         admin_storage.remove_admin(CHAT, ADMIN_ID)
 
-        # ۶) اگر فهرست اعضا در دسترس نباشد، هیچ اسنپ‌شاتِ جعلی ساخته نمی‌شود
+        # ۶) وقتی فهرست اعضا و عددِ سرور در دسترس نیستند: هیچ داده‌ای جعل
+        #    نمی‌شود، ولی پایش شروع می‌شود تا رخدادهای بعدی شمرده شوند.
         reset_store()
 
         async def broken_participants(*args, **kwargs):
             raise RuntimeError("participants unavailable")
 
+        async def broken_call(*args, **kwargs):
+            raise RuntimeError("rpc unavailable")
+
         bot.client.get_participants = broken_participants
-        bot.client.__call__ = None
+        bot.client.__call__ = broken_call
         event = Ev("نمودار", owner, message_id=106)
         await message_handler.handle_new_message(bot, event)
         state = gg.get_state(CHAT)
-        check("شکستِ فهرست اعضا اسنپ‌شاتِ جعلی نمی‌سازد",
-              state["baseline_complete"] is False, f"-> {state}")
+        check("شکستِ شبکه اسنپ‌شاتِ جعلی از اعضا نمی‌سازد",
+              gg.member_ids(CHAT) == [], f"-> {gg.member_ids(CHAT)}")
+        check("ولی پایش شروع شد تا رخدادهای بعدی شمرده شوند",
+              state["baseline_complete"] is True, f"-> {state}")
         check("باز هم گزارش فرستاده می‌شود",
               any("نتیجه گیری" in r for r in event.replies),
               f"-> {event.replies[:1]}")
-        check("بازه‌ها در این حالت تکمیل‌نشده می‌مانند",
-              all(cell == gg.INCOMPLETE
-                  for cell in find_cells(event.replies[0])[1:]))
+
+        # ۷) بعد از شروعِ پایش، ورودِ تازه فوراً در «امروز» شمرده می‌شود
+        gg.record_join(CHAT, 99001, time.time() - 5)
+        event2 = Ev("نمودار", owner, message_id=107)
+        await message_handler.handle_new_message(bot, event2)
+        cells = find_cells(event2.replies[0])
+        check("ورودِ تازه در «امروز» دیده می‌شود",
+              cells[1] == gg.bold_digits(1), f"-> {cells[1]}")
+        check("تعداد اعضای فعلی از دفتر = ۱",
+              cells[0] == gg.bold_digits(1), f"-> {cells[0]}")
 
     asyncio.run(scenario())
 
@@ -689,7 +724,7 @@ def main():
         test_rolling_windows,
         test_burst_in_one_minute_is_counted,
         test_never_blank_current_members,
-        test_window_completeness_is_about_tracking_start,
+        test_new_member_right_after_install_is_counted,
         test_event_ledger,
         test_first_snapshot_is_not_a_join,
         test_permissions_and_help,
