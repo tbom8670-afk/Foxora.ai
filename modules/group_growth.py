@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS membership_events (
     user_id TEXT NOT NULL,
     event TEXT NOT NULL CHECK(event IN ('join', 'leave')),
     event_ts REAL NOT NULL,
-    source TEXT NOT NULL DEFAULT 'event'
+    source TEXT NOT NULL DEFAULT 'event',
+    weight INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_membership_events_group_time
     ON membership_events(group_id, event_ts);
@@ -83,7 +84,9 @@ CREATE TABLE IF NOT EXISTS membership_state (
     server_count INTEGER,
     server_count_at REAL,
     baseline_count INTEGER,
-    baseline_ids_ts REAL
+    baseline_ids_ts REAL,
+    last_count INTEGER,
+    last_count_ts REAL
 );
 """
 
@@ -115,6 +118,18 @@ def _ensure_schema():
         if "baseline_ids_ts" not in columns:
             connection.execute(
                 "ALTER TABLE membership_state ADD COLUMN baseline_ids_ts REAL")
+        if "last_count" not in columns:
+            connection.execute(
+                "ALTER TABLE membership_state ADD COLUMN last_count INTEGER")
+        if "last_count_ts" not in columns:
+            connection.execute(
+                "ALTER TABLE membership_state ADD COLUMN last_count_ts REAL")
+        event_columns = {row[1] for row in connection.execute(
+            "PRAGMA table_info(membership_events)")}
+        if "weight" not in event_columns:
+            connection.execute(
+                "ALTER TABLE membership_events ADD COLUMN weight INTEGER "
+                "NOT NULL DEFAULT 1")
         _schema_ready = True
 
 
@@ -295,15 +310,16 @@ def get_state(chat_id) -> dict:
     _ensure_schema()
     row = runtime_db.query_one(
         "SELECT tracker_since, baseline_at, baseline_complete, last_sync_ts, "
-        "server_count, server_count_at, baseline_count, baseline_ids_ts "
-        "FROM membership_state WHERE group_id=?",
+        "server_count, server_count_at, baseline_count, baseline_ids_ts, "
+        "last_count, last_count_ts FROM membership_state WHERE group_id=?",
         (group,),
     )
     if row is None:
         return {"tracker_since": None, "baseline_at": None,
                 "baseline_complete": False, "last_sync_ts": None,
                 "server_count": None, "server_count_at": None,
-                "baseline_count": None, "baseline_ids_ts": None}
+                "baseline_count": None, "baseline_ids_ts": None,
+                "last_count": None, "last_count_ts": None}
     return {
         "tracker_since": float(row[0]) if row[0] is not None else None,
         "baseline_at": float(row[1]) if row[1] is not None else None,
@@ -313,6 +329,8 @@ def get_state(chat_id) -> dict:
         "server_count_at": float(row[5]) if row[5] is not None else None,
         "baseline_count": int(row[6]) if row[6] is not None else None,
         "baseline_ids_ts": float(row[7]) if row[7] is not None else None,
+        "last_count": int(row[8]) if row[8] is not None else None,
+        "last_count_ts": float(row[9]) if row[9] is not None else None,
     }
 
 
@@ -573,6 +591,66 @@ def apply_snapshot(chat_id, ids, ts=None) -> dict:
         if record_leave(chat_id, user, stamp, source="diff"):
             result["left"] += 1
     save_member_ids(chat_id, cleaned, stamp)
+    _set_last_count(chat_id, len(incoming), stamp)
+    mark_synced(chat_id, stamp)
+    return result
+
+
+def _record_bulk(chat_id, event, count, ts, source="count") -> bool:
+    """ثبتِ یک رخدادِ «چندنفره» (بدونِ شناسهٔ کاربر)."""
+    group = normalize_chat(chat_id)
+    if count <= 0:
+        return False
+    _ensure_schema()
+    runtime_db.execute(
+        "INSERT INTO membership_events"
+        "(group_id,user_id,event,event_ts,source,weight) "
+        "VALUES(?,?,?,?,?,?)",
+        (group, "*", str(event), float(ts), str(source), int(count)),
+    )
+    return True
+
+
+def _set_last_count(chat_id, count, ts) -> None:
+    """ثبتِ آخرین تعدادِ دیده‌شدهٔ اعضا (پایهٔ مقایسهٔ بعدی)."""
+    _ensure_schema()
+    runtime_db.execute(
+        "UPDATE membership_state SET last_count=?, last_count_ts=? "
+        "WHERE group_id=?",
+        (int(count), float(ts), normalize_chat(chat_id)),
+    )
+
+
+def apply_count(chat_id, count, ts=None) -> dict:
+    """تشخیصِ ورود/خروج فقط از روی **تعدادِ اعضا**.
+
+    همان روشِ ساده‌ای که در عمل جواب می‌دهد و به دیدنِ تک‌تکِ کاربران
+    نیاز ندارد:
+
+    * تعداد از ۳۴۰ به ۳۴۱ برسد → یک نفر عضو شده است.
+    * تعداد از ۳۴۰ به ۳۳۹ برسد → دو نفر رفته‌اند.
+
+    تغییرات در طولِ زمان (بینِ دو اندازه‌گیری) انجام می‌شود؛ پس اگر ربات
+    خاموش بوده باشد، همان‌جا که روشن شود اختلاف را ثبت می‌کند. اگر هم‌زمان
+    هم ورود و هم خروج رخ داده باشد، فقط «خالصِ» تغییر معلوم است (همان
+    محدودیتِ طبیعیِ شمارش).
+    """
+    stamp = float(ts if ts is not None else now_ts())
+    stamp = min(stamp, now_ts())
+    current = int(count or 0)
+    state = get_state(chat_id)
+    previous = state.get("last_count")
+    result = {"joined": 0, "left": 0, "previous": previous, "current": current}
+    if previous is None:
+        # اولین اندازه‌گیری؛ فقط ثبت می‌شود.
+        pass
+    elif current > previous:
+        result["joined"] = current - previous
+        _record_bulk(chat_id, "join", result["joined"], stamp)
+    elif current < previous:
+        result["left"] = previous - current
+        _record_bulk(chat_id, "leave", result["left"], stamp)
+    _set_last_count(chat_id, current, stamp)
     mark_synced(chat_id, stamp)
     return result
 
@@ -630,14 +708,14 @@ def _count_events(chat_id, event: str, since: float, until=None) -> int:
     _ensure_schema()
     if until is None:
         row = runtime_db.query_one(
-            "SELECT COUNT(*) FROM membership_events WHERE group_id=? AND "
-            "event=? AND event_ts>=?",
+            "SELECT COALESCE(SUM(weight), 0) FROM membership_events "
+            "WHERE group_id=? AND event=? AND event_ts>=?",
             (group, event, float(since)),
         )
     else:
         row = runtime_db.query_one(
-            "SELECT COUNT(*) FROM membership_events WHERE group_id=? AND "
-            "event=? AND event_ts>=? AND event_ts<=?",
+            "SELECT COALESCE(SUM(weight), 0) FROM membership_events "
+            "WHERE group_id=? AND event=? AND event_ts>=? AND event_ts<=?",
             (group, event, float(since), float(until)),
         )
     return int(row[0]) if row else 0
@@ -705,6 +783,8 @@ def current_members(chat_id):
         return total
     if ledger:
         return ledger
+    if state.get("last_count") is not None:
+        return int(state["last_count"])
     return total
 
 

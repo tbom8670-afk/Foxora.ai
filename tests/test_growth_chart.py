@@ -395,6 +395,53 @@ def test_never_blank_current_members():
           not hasattr(gg, "build_insight"))
 
 
+def test_count_only_diff():
+    print("\n### ۳.۸ فقط از روی «تعدادِ اعضا»: ۳۴۰ → ۳۴۱ یعنی یک نفر آمد")
+    reset_store()
+    gg.start_tracking(CHAT)
+
+    first = gg.apply_count(CHAT, 340)
+    check("اولین اندازه‌گیری فقط ثبت می‌شود",
+          (first["joined"], first["left"]) == (0, 0), f"-> {first}")
+    check("تعداد اولیه ذخیره شد", gg.current_members(CHAT) == 340)
+
+    up = gg.apply_count(CHAT, 341)
+    check("۳۴۱ = یک نفر عضو شده", up["joined"] == 1, f"-> {up}")
+    down = gg.apply_count(CHAT, 339)
+    check("۳۳۹ = دو نفر رفته‌اند", down["left"] == 2, f"-> {down}")
+    same = gg.apply_count(CHAT, 339)
+    check("بدونِ تغییر، هیچ رخدادی ثبت نمی‌شود",
+          (same["joined"], same["left"]) == (0, 0), f"-> {same}")
+
+    text, _ = gg.build_report(CHAT)
+    cells = find_cells(text)
+    check("گزارش: تعداد فعلی = ۳۳۹", cells[0] == gg.bold_digits(339),
+          f"-> {cells[0]}")
+    check("گزارش: امروز ۱ عضو تازه", cells[1] == gg.bold_digits(1),
+          f"-> {cells[1]}")
+    check("گزارش: ریزشِ امروز ۲", cells[4] == gg.bold_digits(2),
+          f"-> {cells[4]}")
+    check("نتیجه‌گیری: افت (۲ ریزش > ۱ رشد)", gg.VERDICT_DECLINE in text)
+    check("هیچ تعداد کاربری برای تشخیص لازم نبود",
+          gg.member_ids(CHAT) == [], f"-> {gg.member_ids(CHAT)}")
+
+    # گروهِ بزرگ‌تر: ۳۶۸۸ → ۳۶۹۳ یعنی ۵ نفر آمدند
+    big = -100888777
+    gg.start_tracking(big)
+    gg.apply_count(big, 3688)
+    moved = gg.apply_count(big, 3693)
+    check("گروهِ ۳۶۸۸ نفری: ۵ ورود از تفاضلِ تعداد",
+          moved["joined"] == 5, f"-> {moved}")
+    check("گزارشِ گروهِ بزرگ هم درست است",
+          find_cells(gg.build_report(big)[0])[1] == gg.bold_digits(5))
+
+    # تغییراتِ دورهٔ خاموشی ربات هم با همان یک عدد گرفته می‌شود
+    gg.apply_count(big, 3700)
+    check("۷ ورودِ تازهٔ دورهٔ بعد هم به همان عدد اضافه شد",
+          find_cells(gg.build_report(big)[0])[1] == gg.bold_digits(12),
+          f"-> {find_cells(gg.build_report(big)[0])[1]}")
+
+
 def test_large_group_snapshot_diff():
     print("\n### ۳.۷ گروهِ بزرگ: تشخیصِ ورود/خروج از تفاضلِ فهرستِ اعضا")
     reset_store()
@@ -899,6 +946,7 @@ def main():
         test_burst_in_one_minute_is_counted,
         test_never_blank_current_members,
         test_large_group_snapshot_diff,
+        test_count_only_diff,
         test_new_member_right_after_install_is_counted,
         test_event_ledger,
         test_member_objects_are_stored_as_plain_ids,

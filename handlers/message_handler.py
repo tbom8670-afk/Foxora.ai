@@ -2111,6 +2111,26 @@ async def _growth_sync(bot, chat_id):
     """
     from modules import group_growth
 
+    # ① روشِ اصلی و ارزان: فقط **تعدادِ** اعضا. از ۳۴۰ به ۳۴۱ → یک نفر
+    #    آمده؛ به ۳۳۹ → دو نفر رفته. نه فهرستِ کامل لازم است، نه دیدنِ
+    #    تک‌تکِ کاربرها؛ در گروهِ بزرگ هم دقیقاً همین‌طور کار می‌کند.
+    total = await _growth_count_from_server(bot, chat_id)
+    if total is not None:
+        group_growth.start_tracking(chat_id)
+        diff = group_growth.apply_count(chat_id, total)
+        _growth_log(
+            bot,
+            "GROWTH COUNT DIFF "
+            f"chat_id={chat_id} now={diff['current']} "
+            f"previous={diff['previous']} "
+            f"joined={diff['joined']} left={diff['left']}",
+        )
+        # تعداد همیشه ثبت می‌شود و همان مبنای گزارش است؛ فهرستِ اعضا فقط
+        # وقتی لازم می‌شود که تعداد در دسترس نباشد.
+        group_growth.set_server_count(chat_id, total)
+        return total
+
+    # ② اگر تعداد در دسترس نبود، از فهرستِ اعضا استفاده می‌شود.
     members = await _growth_participants(bot, chat_id)
     if members:
         try:
