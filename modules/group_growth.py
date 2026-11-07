@@ -78,7 +78,9 @@ CREATE TABLE IF NOT EXISTS membership_state (
     tracker_since REAL NOT NULL,
     baseline_at REAL,
     baseline_complete INTEGER NOT NULL DEFAULT 0,
-    last_sync_ts REAL
+    last_sync_ts REAL,
+    server_count INTEGER,
+    server_count_at REAL
 );
 """
 
@@ -93,7 +95,17 @@ def _ensure_schema():
     with _schema_lock:
         if _schema_ready:
             return
-        runtime_db.connection().executescript(_SCHEMA)
+        connection = runtime_db.connection()
+        connection.executescript(_SCHEMA)
+        # ارتقای افزایشی: دیتابیس‌های ساخته‌شده با نسخهٔ اول هم باید بخوانند.
+        columns = {row[1] for row in connection.execute(
+            "PRAGMA table_info(membership_state)")}
+        if "server_count" not in columns:
+            connection.execute(
+                "ALTER TABLE membership_state ADD COLUMN server_count INTEGER")
+        if "server_count_at" not in columns:
+            connection.execute(
+                "ALTER TABLE membership_state ADD COLUMN server_count_at REAL")
         _schema_ready = True
 
 
@@ -204,6 +216,33 @@ def member_ids(chat_id) -> list:
     return sorted(members)
 
 
+def set_server_count(chat_id, total, ts=None) -> None:
+    """ثبتِ تعدادِ اعضای اعلام‌شدهٔ خودِ سروش.
+
+    فقط وقتی استفاده می‌شود که فهرست اعضا در دسترس نیست (گروهِ بزرگ یا
+    خطای شبکه). این عدد «تعداد اعضای فعلی» را واقعی نگه می‌دارد و هیچ
+    رخداد/شمارشِ بازه‌ای از آن ساخته نمی‌شود.
+    """
+    group = normalize_chat(chat_id)
+    stamp = float(ts if ts is not None else now_ts())
+    _ensure_schema()
+    runtime_db.execute(
+        "INSERT INTO membership_state(group_id,tracker_since,server_count,"
+        "server_count_at) VALUES(?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET "
+        "server_count=excluded.server_count, "
+        "server_count_at=excluded.server_count_at",
+        (group, stamp, int(total), stamp),
+    )
+
+
+def server_count(chat_id):
+    """``(total, at)`` آخرین تعدادِ اعلامیِ سروش، یا ``(None, None)``."""
+    state = get_state(chat_id)
+    if state.get("server_count") is None:
+        return (None, None)
+    return (state["server_count"], state["server_count_at"])
+
+
 def has_any_data(chat_id) -> bool:
     group = normalize_chat(chat_id)
     _ensure_schema()
@@ -223,18 +262,21 @@ def get_state(chat_id) -> dict:
     group = normalize_chat(chat_id)
     _ensure_schema()
     row = runtime_db.query_one(
-        "SELECT tracker_since, baseline_at, baseline_complete, last_sync_ts "
-        "FROM membership_state WHERE group_id=?",
+        "SELECT tracker_since, baseline_at, baseline_complete, last_sync_ts, "
+        "server_count, server_count_at FROM membership_state WHERE group_id=?",
         (group,),
     )
     if row is None:
         return {"tracker_since": None, "baseline_at": None,
-                "baseline_complete": False, "last_sync_ts": None}
+                "baseline_complete": False, "last_sync_ts": None,
+                "server_count": None, "server_count_at": None}
     return {
         "tracker_since": float(row[0]) if row[0] is not None else None,
         "baseline_at": float(row[1]) if row[1] is not None else None,
         "baseline_complete": bool(row[2]),
         "last_sync_ts": float(row[3]) if row[3] is not None else None,
+        "server_count": int(row[4]) if row[4] is not None else None,
+        "server_count_at": float(row[5]) if row[5] is not None else None,
     }
 
 
@@ -413,6 +455,11 @@ def yesterday_end(ts=None) -> float:
     return (day_start(ts) - timedelta(seconds=1)).timestamp()
 
 
+def _today_start_ts() -> float:
+    """نیمه‌شبِ امروز به‌صورتِ timestamp (مرجعِ بررسیِ کامل‌بودنِ «امروز»)."""
+    return day_start().timestamp()
+
+
 def _count_events(chat_id, event: str, since: float, until=None) -> int:
     group = normalize_chat(chat_id)
     _ensure_schema()
@@ -431,20 +478,32 @@ def _count_events(chat_id, event: str, since: float, until=None) -> int:
     return int(row[0]) if row else 0
 
 
+def _window_covered(chat_id, key: str, ts=None):
+    """آیا دادهٔ این بازه از ابتدای آن تا حالا ثبت شده است؟
+
+    برای «امروز» فقط ثبت بودن کافی نیست: اگر پایش وسطِ امروز شروع شده
+    باشد، ورودهای صبحِ همان روز در دفتر نیستند و عدد ناقص می‌شود.
+    """
+    state = ensure_tracker(chat_id, ts)
+    start = window_start(key, ts)
+    if not state["baseline_complete"]:
+        return _count_events(chat_id, "join", start) > 0 or \
+            _count_events(chat_id, "leave", start) > 0
+    tracked_from = state["baseline_at"] or 0.0
+    if tracked_from > start:
+        return False
+    if key == "day" and tracked_from > _today_start_ts():
+        # امروز کامل نیست چون پایش بعد از نیمه‌شب شروع شده است.
+        return False
+    return True
+
+
 def joins(chat_id, key: str, ts=None):
     """تعدادِ ورود در بازه — ``None`` اگر بازه کامل پوشش داده نشده باشد."""
     _ensure_schema()
-    state = ensure_tracker(chat_id, ts)
-    start = window_start(key, ts)
-    has_baseline = state["baseline_complete"]
-    if has_baseline:
-        if (state["baseline_at"] or 0.0) > start:
-            return None
-    elif _count_events(chat_id, "join", start) == 0:
-        # بدونِ اسنپ‌شات فقط رخدادهای واقعی قابلِ شمارشاند؛ بازهٔ خالی
-        # یعنی «داده‌ای نداریم»، نه «صفر عضو».
+    if not _window_covered(chat_id, key, ts):
         return None
-    return _count_events(chat_id, "join", start)
+    return _count_events(chat_id, "join", window_start(key, ts))
 
 
 def leaves(chat_id, key: str, ts=None):
@@ -453,15 +512,22 @@ def leaves(chat_id, key: str, ts=None):
     state = ensure_tracker(chat_id, ts)
     if not state["baseline_complete"] or state["baseline_at"] is None:
         return None
-    start = window_start(key, ts)
-    if state["baseline_at"] > start:
+    if not _window_covered(chat_id, key, ts):
         return None
-    return _count_events(chat_id, "leave", start)
+    return _count_events(chat_id, "leave", window_start(key, ts))
 
 
-def current_members(chat_id) -> int:
-    """تعداد اعضای فعلی (لحظه‌ای) از دفترِ رخداد."""
-    return len(member_ids(chat_id))
+def current_members(chat_id):
+    """تعداد اعضای فعلی (لحظه‌ای).
+
+    اولویت: دفترِ رخداد. اگر هیچ داده‌ای در دفتر نباشد (مثلاً فهرست اعضا
+    در دسترس نبوده) عددِ اعلامیِ خودِ سروش استفاده می‌شود. اگر هیچ‌کدام
+    نبود ``None`` — نه صفرِ جعلی.
+    """
+    if has_any_data(chat_id):
+        return len(member_ids(chat_id))
+    total, _at = server_count(chat_id)
+    return total
 
 
 def members_at_yesterday(chat_id, ts=None):
@@ -541,7 +607,7 @@ def _cell(value) -> str:
     return INCOMPLETE if value is None else bold_digits(value)
 
 
-def build_report(chat_id, ts=None) -> tuple:
+def build_report(chat_id, ts=None, title=None) -> tuple:
     """گزارشِ کاملِ «نمودار» → ``(text, entities)``.
 
     ``entities`` فهرستی از ``(offset, length, "bold" | "quote")`` با واحدِ
@@ -550,7 +616,7 @@ def build_report(chat_id, ts=None) -> tuple:
     state = ensure_tracker(chat_id, ts)
     complete = state["baseline_complete"]
 
-    current = current_members(chat_id) if has_any_data(chat_id) else None
+    current = current_members(chat_id)
     join_counts = {key: (joins(chat_id, key, ts) if complete else None)
                    for key in ("day", "week", "month")}
     leave_counts = {key: (leaves(chat_id, key, ts) if complete else None)
@@ -560,7 +626,12 @@ def build_report(chat_id, ts=None) -> tuple:
     verdict = evaluate(join_counts, leave_counts, join_nets, leave_nets)
 
     #: (متن، بولد؟، داخلِ نقل‌قول؟)
+    header = "📊 نمودار رشد و ریزش گروه"
+    if title:
+        header += f"\n« {title} »"
     lines = [
+        (header, True, False),
+        ("", False, False),
         ("⟳ تعداد اعضای فعلی : 『  " + _cell(current) + "  』", True, True),
         ("", False, False),
         ("〄 اعضای عضو شده", True, False),
@@ -602,7 +673,10 @@ def build_insight(chat_id, ts=None):
     yesterday_total = members_at_yesterday(chat_id, ts)
     if None in (today_join, today_left, yesterday_total):
         return None
-    delta = current_members(chat_id) - yesterday_total
+    today_total = current_members(chat_id)
+    if today_total is None:
+        return None
+    delta = today_total - yesterday_total
     sign = "+" if delta >= 0 else "−"
     parts = [
         "«", "وضعیت تحلیلی :",

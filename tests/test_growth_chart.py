@@ -311,6 +311,58 @@ def test_monotonic_windows():
 # ۶) دفترِ رخداد
 # ---------------------------------------------------------------------------
 
+def test_never_blank_current_members():
+    print("\n### ۳.۵ «تعداد اعضای فعلی» هرگز خالی نمی‌ماند")
+    reset_store()
+    # فهرست اعضا در دسترس نبوده؛ فقط عددِ اعلامیِ سروش را داریم.
+    gg.set_server_count(CHAT, 532)
+    text, _ = gg.build_report(CHAT, title="گروه نمونه")
+    cells = find_cells(text)
+    check("تعداد اعضای فعلی از عددِ سروش خوانده شد",
+          cells[0] == gg.bold_digits(532), f"-> {cells[0]}")
+    check("بازه‌های بدونِ داده صادقانه تکمیل‌نشده‌اند",
+          cells[1:] == [gg.INCOMPLETE] * 6, f"-> {cells[1:]}")
+    check("نتیجه‌گیری با دادهٔ ناکافی، نامشخص است", gg.VERDICT_UNKNOWN in text)
+    check("نامِ گروه در گزارش می‌آید", "« گروه نمونه »" in text)
+    check("سرتیترِ گزارش هست", "📊 نمودار رشد و ریزش گروه" in text)
+    check("عددِ سروش هیچ بازه‌ای را «کامل» نمی‌کند",
+          all(gg.joins(CHAT, key) is None for key in ("day", "week", "month")))
+    check("ریزش هم هیچ عدد جعلی ندارد",
+          all(gg.leaves(CHAT, key) is None for key in ("day", "week", "month")))
+
+    # با دادهٔ واقعی، دفترِ رخداد اولویت دارد
+    gg.save_baseline(CHAT, list(range(4000, 4500)), days_ago(10))
+    gg.record_join(CHAT, 7777, days_ago(0, 1))
+    check("با وجودِ دفترِ رخداد، عدد از دفتر خوانده می‌شود",
+          gg.current_members(CHAT) == 501, f"-> {gg.current_members(CHAT)}")
+
+    # هیچ داده‌ای نباشد → تکمیل نشده (نه صفر)
+    reset_store()
+    text, _ = gg.build_report(CHAT)
+    check("بدونِ هیچ داده‌ای، عددِ فعلی «تکمیل نشده» است",
+          find_cells(text)[0] == gg.INCOMPLETE, f"-> {find_cells(text)[0]}")
+    check("خطِ تحلیلی در نبودِ داده ساخته نمی‌شود",
+          gg.build_insight(CHAT) is None)
+
+
+def test_midday_start_is_honest():
+    print("\n### ۳.۶ شروعِ پایش در میانهٔ روز «امروز» را کامل حساب نمی‌کند")
+    reset_store()
+    # پایش همین حالا شروع شده (بعد از نیمه‌شب) و یک ورود ثبت شده است.
+    gg.save_baseline(CHAT, list(range(6000, 6100)), time.time())
+    gg.record_join(CHAT, 6101, time.time())
+    text, _ = gg.build_report(CHAT)
+    cells = find_cells(text)
+    check("«تعداد اعضای فعلی» واقعی است",
+          cells[0] == gg.bold_digits(101), f"-> {cells[0]}")
+    check("«امروز» تکمیل نشده می‌ماند (ورودهای صبح ثبت نشده‌اند)",
+          cells[1] == gg.INCOMPLETE, f"-> {cells[1]}")
+    check("«این هفته» هم تکمیل نشده می‌ماند",
+          cells[2] == gg.INCOMPLETE, f"-> {cells[2]}")
+    check("هیچ عددی از بازهٔ ناقص ساخته نشد",
+          gg.joins(CHAT, "day") is None and gg.leaves(CHAT, "day") is None)
+
+
 def test_event_ledger():
     print("\n### ۶ دفترِ رخداد ورود و خروج را درست ثبت می‌کند")
     reset_store()
@@ -472,6 +524,26 @@ def test_permissions_and_help():
 
         admin_storage.remove_admin(CHAT, ADMIN_ID)
 
+        # ۶) اگر فهرست اعضا در دسترس نباشد، هیچ اسنپ‌شاتِ جعلی ساخته نمی‌شود
+        reset_store()
+
+        async def broken_participants(*args, **kwargs):
+            raise RuntimeError("participants unavailable")
+
+        bot.client.get_participants = broken_participants
+        bot.client.__call__ = None
+        event = Ev("نمودار", owner, message_id=106)
+        await message_handler.handle_new_message(bot, event)
+        state = gg.get_state(CHAT)
+        check("شکستِ فهرست اعضا اسنپ‌شاتِ جعلی نمی‌سازد",
+              state["baseline_complete"] is False, f"-> {state}")
+        check("باز هم گزارش فرستاده می‌شود",
+              any("نتیجه گیری" in r for r in event.replies),
+              f"-> {event.replies[:1]}")
+        check("بازه‌ها در این حالت تکمیل‌نشده می‌مانند",
+              all(cell == gg.INCOMPLETE
+                  for cell in find_cells(event.replies[0])[1:]))
+
     asyncio.run(scenario())
 
     text = help_builder.ADMIN_HELP_TEXT
@@ -571,6 +643,8 @@ def main():
         test_incomplete_windows,
         test_equal_or_missing_gives_unknown,
         test_monotonic_windows,
+        test_never_blank_current_members,
+        test_midday_start_is_honest,
         test_event_ledger,
         test_first_snapshot_is_not_a_join,
         test_permissions_and_help,

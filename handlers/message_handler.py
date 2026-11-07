@@ -2014,31 +2014,68 @@ def _growth_report_entities(spans):
     return entities
 
 
-async def _growth_member_ids(bot, chat_id):
-    """فهرستِ زندهٔ شناسهٔ اعضای گروه از خودِ سروش (برای همگام‌سازی)."""
+async def _growth_participants(bot, chat_id):
+    """فهرستِ زندهٔ اعضای گروه از خودِ سروش.
+
+    اول ``get_participants`` (ساده‌ترین مسیر) و اگر نشد
+    ``GetParticipantsRequest`` مستقیم. در هر شکست، ``None`` برمی‌گردد تا
+    هیچ شکستِ شبکه‌ای به «گروه خالی» یا «شروعِ پاک» تفسیر نشود.
+    """
     try:
         entity = await bot.client.get_input_entity(chat_id)
         participants = await bot.client.get_participants(entity)
+        if participants:
+            return list(participants)
     except Exception as error:
         bot.logger.log_error(
-            f"GROWTH MEMBER LIST FAILED chat_id={chat_id} error={error!r}"
+            f"GROWTH MEMBER LIST FAILED (get_participants) "
+            f"chat_id={chat_id} error={error!r}"
         )
-        return []
-    ids = []
-    for member in participants or []:
-        user_id = getattr(member, "id", None)
-        if user_id:
-            ids.append(user_id)
-    return ids
+    try:
+        entity = await bot.client.get_input_entity(chat_id)
+        result = await bot.client(
+            functions.channels.GetParticipantsRequest(
+                channel=entity,
+                filter=types.ChannelParticipantsRecent(),
+                offset=0,
+                limit=1000,
+                hash=0,
+            )
+        )
+        users = getattr(result, "users", None) or []
+        if users:
+            return list(users)
+    except Exception as error:
+        bot.logger.log_error(
+            f"GROWTH MEMBER LIST FAILED (GetParticipantsRequest) "
+            f"chat_id={chat_id} error={error!r}"
+        )
+    return None
+
+
+async def _growth_count_from_server(bot, chat_id):
+    """تعداد اعضا مستقیم از سروش (برای گروهِ بزرگ که فهرستش کامل نمی‌آید)."""
+    try:
+        entity = await bot.client.get_input_entity(chat_id)
+        full = await bot.client(functions.channels.GetFullChannelRequest(entity))
+        count = getattr(getattr(full, "full_chat", None), "participants_count", None)
+        return int(count) if count is not None else None
+    except Exception:
+        return None
 
 
 async def _growth_sync(bot, chat_id):
-    """اسنپ‌شاتِ اول (اگر لازم است) + جبرانِ رخدادهای جاافتاده."""
+    """اسنپ‌شاتِ اول (اگر لازم است) + جبرانِ رخدادهای جاافتاده.
+
+    خروجی: ``(baseline_ok, members_seen)``. اگر فهرست اعضا به دست نیاید،
+    هیچ اسنپ‌شاتی ساخته نمی‌شود و شمارندهٔ اعضا از سرور گرفته می‌شود؛
+    در این حالت بازه‌ها صادقانه «تکمیل نشده» می‌مانند.
+    """
     from modules import group_growth
 
-    try:
-        members = await _growth_member_ids(bot, chat_id)
-        if members:
+    members = await _growth_participants(bot, chat_id)
+    if members:
+        try:
             result = group_growth.sync_members(chat_id, members)
             bot.logger.log_info(
                 "GROWTH SYNC "
@@ -2046,12 +2083,20 @@ async def _growth_sync(bot, chat_id):
                 f"joined={result['joined']} left={result['left']} "
                 f"baseline={result['baseline']}"
             )
-        else:
-            group_growth.set_baseline_incomplete(chat_id)
-    except Exception as error:
-        bot.logger.log_error(
-            f"GROWTH SYNC FAILED chat_id={chat_id} error={error!r}"
+            return True, len(members)
+        except Exception as error:
+            bot.logger.log_error(
+                f"GROWTH SYNC FAILED chat_id={chat_id} error={error!r}"
+            )
+    server_total = await _growth_count_from_server(bot, chat_id)
+    if server_total is not None:
+        group_growth.set_server_count(chat_id, server_total)
+        bot.logger.log_info(
+            f"GROWTH SERVER COUNT chat_id={chat_id} total={server_total} "
+            "reason=member_list_unavailable"
         )
+    state = group_growth.ensure_tracker(chat_id)
+    return bool(state["baseline_complete"]), len(members) if members else 0
 
 
 async def handle_growth_command(bot, event, chat_id, user_id, username=None):
@@ -2070,10 +2115,22 @@ async def handle_growth_command(bot, event, chat_id, user_id, username=None):
     bot.logger.log_info(
         f"HANDLER CALLED handler=growth_chart command='نمودار' chat_id={chat_id}"
     )
-    await _growth_sync(bot, chat_id)
+    try:
+        await _asyncio.wait_for(_growth_sync(bot, chat_id), timeout=60)
+    except Exception as error:
+        bot.logger.log_error(
+            f"GROWTH SYNC TIMEOUT/FAILED chat_id={chat_id} error={error!r}"
+        )
 
     try:
-        report, spans = group_growth.build_report(chat_id)
+        # عنوان گروه داخل گزارش می‌آید تا معلوم باشد کدام گروه است.
+        title = None
+        try:
+            chat = await event.get_chat()
+            title = getattr(chat, "title", None)
+        except Exception:
+            title = None
+        report, spans = group_growth.build_report(chat_id, title=title)
         model = group_growth.build_insight(chat_id)
         if model:
             # خطِ تحلیلی هم کاملاً Bold و داخل نقل‌قول است.
