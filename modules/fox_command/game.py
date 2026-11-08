@@ -209,7 +209,15 @@ async def start(bot, event, chat_id, user_id, sender=None, logger=None):
     """دستور شروع. ``True`` یعنی پیام مصرف شد."""
     existing = _MATCHES.get(chat_id)
     if existing and existing.get("phase") != engine.PHASE_FINISHED:
-        await _send(bot, chat_id, T.join_full(), event=event, logger=logger)
+        # ⛔ «مرکز فرماندهی» هرگز کسی را ثبت‌نام نمی‌کند؛ ثبت‌نام فقط با
+        # «شرکت» است. اگر مسابقه هنوز جا دارد، راه درست را نشانش می‌دهیم؛
+        # اگر پر شده باشد، همان پیام «ظرفیت پر است».
+        await _send(bot, chat_id,
+                    T.join_word_hint() if _join_window_open(existing)
+                    else T.join_full(),
+                    event=event, logger=logger)
+        log(logger, f"FOX COMMAND START BLOCKED chat_id={chat_id} "
+                    f"user_id={user_id} phase={existing.get('phase')}")
         return True
     try:
         from modules import entertainment_control
@@ -226,13 +234,27 @@ async def start(bot, event, chat_id, user_id, sender=None, logger=None):
     log(logger, f"FOX COMMAND START chat_id={chat_id} match_id={match_id}")
 
     await _send(bot, chat_id, T.start_prompt(), event=event, logger=logger)
-    status, player = engine.join(match, user_id, _display(sender, f"کاربر {user_id}"))
-    if status == ST_OK:
-        _save(match)
-        log(logger, f"FOX COMMAND JOIN chat_id={chat_id} user_id={user_id} "
-                    f"status={status} players=1")
+    # ⛔ اینجا هیچ ثبت‌نامی انجام نمی‌شود: حتی فرمانده‌ای که دستور شروع را زده
+    # باید «شرکت» بنویسد. ثبت‌نام فقط از مسیر «شرکت» انجام می‌شود.
     _schedule((chat_id, "join"), _join_timeout(bot, chat_id, match_id, logger))
     return True
+
+
+def _join_window_open(match) -> bool:
+    """آیا پنجرهٔ ثبت‌نام باز است؟ (نفر دوم هنوز نیامده و مهلت تمام نشده)
+
+    «مرکز فرماندهی» فقط در همین پنجره نقش «شروع بازی / ورود فرماندهٔ اول» را
+    دارد. به‌محض کامل شدن دو فرمانده، این دستور دیگر راه ورود نیست و هر کسی
+    (حتی فرماندهٔ اول) باید از «شرکت» استفاده کند.
+    """
+    if not match:
+        return False
+    if match.get("phase") != engine.PHASE_JOINING:
+        return False
+    if len(match.get("players") or []) >= PLAYERS:
+        return False
+    deadline = float(match.get("join_deadline") or 0)
+    return deadline == 0 or time.time() < deadline
 
 
 async def _join(bot, event, chat_id, user_id, sender, logger=None):
@@ -377,7 +399,12 @@ async def handle_message(bot, event, chat_id, user_id, sender, text,
 
     match = _MATCHES[chat_id]
     if normalized in START_COMMANDS:
-        await _send(bot, chat_id, T.join_full(), event=event, logger=logger)
+        # شروعِ دوباره ممنوع: «مرکز فرماندهی» نه ثبت‌نام می‌کند نه مسابقه را
+        # ری‌ست می‌کند. همه‌چیز فقط با «شرکت» (قبل از پر شدن ظرفیت) جلو می‌رود.
+        await _send(bot, chat_id,
+                    T.join_word_hint() if _join_window_open(match)
+                    else T.join_full(),
+                    event=event, logger=logger)
         return True
 
     # «شرکت» = الحاق فرماندهٔ دوم، فقط در مرحلهٔ ثبت‌نام و فقط یک بار.

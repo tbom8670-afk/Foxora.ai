@@ -182,6 +182,16 @@ def join_duplicate() -> tuple:
     return msg.build()
 
 
+def join_word_hint() -> tuple:
+    """پیام وقتی مسابقه باز است ولی ظرفیت پر نشده و کسی با «مرکز فرماندهی»
+    می‌خواهد وارد شود — ثبت‌نام فقط با «شرکت» است."""
+    msg = Message()
+    msg.title("این مسابقه باز است ⏳")
+    msg.bold(f"🌟 برای ثبت‌نام بنویسید: {JOIN_WORD}\n")
+    msg.quote("دستور «مرکز فرماندهی» فقط بازی را شروع می‌کند؛ ورود فرمانده‌ها با «شرکت» است.")
+    return msg.build()
+
+
 def join_full() -> tuple:
     msg = Message()
     msg.title("ظرفیت این مسابقه پر است ⛔")

@@ -116,6 +116,7 @@ USER_B = SimpleNamespace(id=9002, first_name="رضا", username="reza_cmd")
 USER_C = SimpleNamespace(id=9003, first_name="سارا", username="sara_cmd")
 CHAT_1 = -1009001
 CHAT_2 = -1009002
+CHAT_X = -1009003   # گروه اختصاصی تست «دستور شروع» (بدون اثر روی بقیه)
 
 
 def run(coro):
@@ -149,8 +150,14 @@ def test_01_join_and_capacity():
     bot = FakeBot()
     ok, event = run(say(bot, CHAT_1, USER_A, "مرکز فرماندهی", expect_consumed=True))
     check("پیام شروع ارسال شد", "مرکز فرماندهی روباه" in all_text(event), all_text(event))
-    check("شروع، فرماندهٔ اول را ثبت‌نام می‌کند",
-          len(fgame.match_of(CHAT_1)["players"]) == 1)
+    check("«مرکز فرماندهی» کسی را ثبت‌نام نمی‌کند",
+          len(fgame.match_of(CHAT_1)["players"]) == 0,
+          fgame.match_of(CHAT_1)["players"])
+    check("پیام شروع، ثبت‌نام با «شرکت» را آموزش می‌دهد",
+          "شرکت در بازی بنویسید" in all_text(event), all_text(event))
+    _ok, event_a = run(say(bot, CHAT_1, USER_A, "شرکت", expect_consumed=True))
+    check("«شرکت» فرماندهٔ اول را ثبت‌نام کرد",
+          len(fgame.match_of(CHAT_1)["players"]) == 1, all_text(event_a))
     _ok, event_b = run(say(bot, CHAT_1, USER_B, "شرکت", expect_consumed=True))
     check("«شرکت» فرماندهٔ دوم را ثبت‌نام کرد",
           len(fgame.match_of(CHAT_1)["players"]) == 2, all_text(event_b))
@@ -162,6 +169,63 @@ def test_01_join_and_capacity():
     check("بازیکن سوم رد شد", "پر است" in all_text(event_c), all_text(event_c))
     check("بازیکن سوم وارد نشد",
           len(fgame.match_of(CHAT_1)["players"]) == 2)
+
+
+def test_01b_start_word_never_registers():
+    print("\n### ۳۱) «مرکز فرماندهی» فقط شروع است، ثبت‌نام فقط با «شرکت»")
+    fgame.reset_all(CHAT_X)   # فقط گروه تست ۳۱ پاک می‌شود؛ بقیه دست‌نخورده
+    bot = FakeBot()
+
+    # الف) فرماندهٔ اول با «مرکز فرماندهی» ثبت‌نام نمی‌شود
+    _ok, event = run(say(bot, CHAT_X, USER_A, "مرکز فرماندهی", expect_consumed=True))
+    match = fgame.match_of(CHAT_X)
+    check("مسابقه ساخته شد", match is not None)
+    check("فرماندهٔ اول با «مرکز فرماندهی» ثبت‌نام نشد",
+          len(match["players"]) == 0, match["players"])
+    check("پیام راهنما «شرکت» را می‌گوید",
+          "شرکت در بازی بنویسید" in all_text(event), all_text(event))
+
+    # ب) تکرار «مرکز فرماندهی» توسط همان نفر هم ثبت‌نام نمی‌کند
+    _ok, event2 = run(say(bot, CHAT_X, USER_A, "مرکز فرماندهی روباه", expect_consumed=True))
+    check("تکرار دستور شروع باز هم ثبت‌نام نکرد",
+          len(fgame.match_of(CHAT_X)["players"]) == 0)
+    check("پیام «این مسابقه باز است» آمد", "این مسابقه باز است" in all_text(event2),
+          all_text(event2))
+
+    # ج) نفر دیگر هم با «مرکز فرماندهی» وارد نمی‌شود
+    _ok, event3 = run(say(bot, CHAT_X, USER_B, "مرکز فرماندهی", expect_consumed=True))
+    check("فرماندهٔ دوم با «مرکز فرماندهی» وارد نشد",
+          len(fgame.match_of(CHAT_X)["players"]) == 0)
+    check("همان‌جا هم «شرکت» تجویز شد", "شرکت" in all_text(event3), all_text(event3))
+
+    # د) فقط «شرکت» ثبت‌نام می‌کند
+    run(say(bot, CHAT_X, USER_A, "شرکت", expect_consumed=True))
+    run(say(bot, CHAT_X, USER_B, "شرکت", expect_consumed=True))
+    check("با دو «شرکت» ظرفیت کامل شد",
+          len(fgame.match_of(CHAT_X)["players"]) == 2)
+
+    # ه) بعد از پر شدن ظرفیت، «مرکز فرماندهی» هیچ‌کس را اضافه نمی‌کند
+    _ok, event4 = run(say(bot, CHAT_X, USER_C, "مرکز فرماندهی", expect_consumed=True))
+    check("نفر سوم با «مرکز فرماندهی» وارد نشد",
+          len(fgame.match_of(CHAT_X)["players"]) == 2, all_text(event4))
+    check("پیام «ظرفیت پر است» آمد", "پر است" in all_text(event4), all_text(event4))
+
+    # و) در فاز انتخاب کشور هم شروع دوباره چیزی را عوض نمی‌کند
+    match_now = fgame.match_of(CHAT_X)
+    _ok, event_country = run(say(bot, CHAT_X, USER_A, "1", expect_consumed=True))
+    check("با دو فرمانده، انتخاب کشور کار می‌کند",
+          engine.player_of(match_now, USER_A.id)["country"] == "iran",
+          all_text(event_country))
+    _ok, event_again = run(say(bot, CHAT_X, USER_B, "1", expect_consumed=True))
+    check("کشور تکراری رد شد", "انتخاب شده" in all_text(event_again),
+          all_text(event_again))
+    match_now = fgame.match_of(CHAT_X)
+    phase_before = match_now["phase"]
+    run(say(bot, CHAT_X, USER_B, "مرکز فرماندهی", expect_consumed=True))
+    check("فاز بازی با دستور شروع عوض نشد",
+          fgame.match_of(CHAT_X)["phase"] == phase_before, phase_before)
+    check("هنوز همان دو فرمانده‌اند", len(fgame.match_of(CHAT_X)["players"]) == 2)
+    fgame.reset_all(CHAT_X)
 
 
 def test_02_countries():
@@ -467,6 +531,7 @@ def test_12_end_and_reward():
     _reset_state()
     bot = FakeBot()
     run(say(bot, CHAT_2, USER_A, "مرکز فرماندهی"))
+    run(say(bot, CHAT_2, USER_A, "شرکت", expect_consumed=True))
     run(say(bot, CHAT_2, USER_B, "شرکت"))
     run(say(bot, CHAT_2, USER_A, "1"))
     run(say(bot, CHAT_2, USER_B, "3"))
@@ -508,7 +573,8 @@ def test_13_surrender():
     _reset_state()
     bot = FakeBot()
     run(say(bot, CHAT_1, USER_A, "مرکز فرماندهی"))
-    run(say(bot, CHAT_1, USER_B, "شرکت"))
+    run(say(bot, CHAT_1, USER_A, "شرکت", expect_consumed=True))
+    run(say(bot, CHAT_1, USER_B, "شرکت", expect_consumed=True))
     match = fgame.match_of(CHAT_1)
     run(say(bot, CHAT_1, USER_B, "تسلیم", expect_consumed=True))
     check("تسلیم مسابقه را بست", match["phase"] == engine.PHASE_FINISHED, match["phase"])
@@ -524,7 +590,8 @@ def test_14_restart_recovery():
     _reset_state()
     bot = FakeBot()
     run(say(bot, CHAT_1, USER_A, "مرکز فرماندهی"))
-    run(say(bot, CHAT_1, USER_B, "شرکت"))
+    run(say(bot, CHAT_1, USER_A, "شرکت", expect_consumed=True))
+    run(say(bot, CHAT_1, USER_B, "شرکت", expect_consumed=True))
     run(say(bot, CHAT_1, USER_A, "1"))
     run(say(bot, CHAT_1, USER_B, "2"))
     match = fgame.match_of(CHAT_1)
@@ -557,7 +624,9 @@ def test_15_group_isolation():
     _reset_state()
     bot = FakeBot()
     run(say(bot, CHAT_1, USER_A, "مرکز فرماندهی"))
+    run(say(bot, CHAT_1, USER_A, "شرکت", expect_consumed=True))
     run(say(bot, CHAT_2, USER_C, "مرکز فرماندهی"))
+    run(say(bot, CHAT_2, USER_C, "شرکت", expect_consumed=True))
     match_1 = fgame.match_of(CHAT_1)
     match_2 = fgame.match_of(CHAT_2)
     check("دو مسابقهٔ جدا ساخته شد",
@@ -659,6 +728,7 @@ def test_18_no_duplicate_handlers():
           fgame.claims(CHAT_1, "سلام بچه‌ها") is False)
     bot = FakeBot()
     run(say(bot, CHAT_1, USER_A, "مرکز فرماندهی"))
+    run(say(bot, CHAT_1, USER_A, "شرکت", expect_consumed=True))
     check("«شرکت» با مسابقهٔ باز مصرف می‌شود",
           fgame.claims(CHAT_1, "شرکت") is True)
     check("«فروشگاه» با مسابقهٔ باز مصرف می‌شود",
@@ -783,6 +853,7 @@ def test_19_balance_engine():
 def main():
     test_00_prices_locked()
     test_01_join_and_capacity()
+    test_01b_start_word_never_registers()
     test_02_countries()
     test_03_budget()
     test_04_shop_limits_and_budget_guard()
