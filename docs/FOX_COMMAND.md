@@ -7,6 +7,7 @@
 
 | نقش | متن |
 |---|---|
+| در «لیست بازی» ربات | `👾مرکز فرماندهی` — «پایگاه بساز و حریفتو نابود کن» (Bold) |
 | شروع مسابقه | `مرکز فرماندهی` (یا `مرکز فرماندهی روباه` / `fox command`) |
 | ثبت‌نام **هر دو** فرمانده | `شرکت` |
 
@@ -61,13 +62,13 @@ modules/fox_command/
     texts.py      متن‌ها و قالب پیام‌ها
     game.py       هستهٔ اجرایی: state، تایمرها، بازیابی، پرداخت جایزه
 handlers/fox_command_router.py   اتصال نازک به روتر بازی‌ها
-tests/test_fox_command.py        ۲۱۰ بررسی (۲۶ سناریوی سفارش + شروع + عضو عادی + تعادل + قالب)
+tests/test_fox_command.py        ۲۱۸ بررسی (۲۶ سناریوی سفارش + شروع + عضو عادی + تعادل + قالب)
 tools/probe_fox_command_balance.py   شبیه‌سازی تعادل
 ```
 
 ## اجرای تست
 
 ```bash
-PYTHONPATH=. python3 tests/test_fox_command.py          # ۲۱۰ بررسی
+PYTHONPATH=. python3 tests/test_fox_command.py          # ۲۱۸ بررسی
 PYTHONPATH=. python3 tools/probe_fox_command_balance.py # جدول تعادل
 ```

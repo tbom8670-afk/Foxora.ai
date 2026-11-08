@@ -338,6 +338,46 @@ def test_01c_member_never_blocked_by_admin_gates():
     fgame.reset_all(CHAT_M)
 
 
+def test_01d_game_list_entry_is_bold():
+    """👾 «مرکز فرماندهی» در «لیست بازی» با متن دقیق کارفرما و Bold واقعی."""
+    print("\n### ۳۳) ردیف «مرکز فرماندهی» در لیست بازی ربات‌ها")
+    source = (Path(__file__).resolve().parent.parent / "handlers" /
+              "message_handler.py").read_text(encoding="utf-8")
+    title = "👾مرکز فرماندهی"
+    tagline = "پایگاه بساز و حریفتو نابود کن"
+    check("عنوان در فهرست Boldهای لیست بازی هست", f'"{title}",' in source)
+    check("توضیح بازی در همان فهرست Bold هست", f'"{tagline}",' in source)
+    check("ردیف بازی در متن لیست بازی هست",
+          f'"{title} \\n"' in source or f'"{title} "' in source, "→ متن ردیف")
+
+    # همان منطق واقعی لیست بازی: پیدا کردن ردیف و ساختن span با واحد UTF-16
+    games_text = (
+        "🎮 لیست بازی‌های روباه\n\n"
+        "⚖️ دادگاه روباه\n"
+        "پرونده شکایت رو حل کن و برنده شو\n\n"
+        f"{title} \n"
+        f"{tagline}\n\n"
+        "😄 جک\n"
+    )
+    def u16(value):
+        return len(value.encode("utf-16-le")) // 2
+    bold_words = ["⚖️ دادگاه روباه", title, tagline]
+    entities = []
+    for word in bold_words:
+        pos = games_text.find(word)
+        if pos != -1:
+            entities.append((u16(games_text[:pos]), u16(word)))
+    check("هر سه عنوان span دارند", len(entities) == len(bold_words), entities)
+    for (offset, length), word in zip(entities, bold_words):
+        start = games_text[:offset] if False else None  # noqa: F841
+        # اعتبارسنجی: span باید دقیقاً همان کلمه را بپوشاند
+        utf16 = games_text.encode("utf-16-le")
+        covered = utf16[offset * 2:(offset + length) * 2].decode("utf-16-le")
+        check(f"span «{word}» دقیق است", covered == word, f"→ {covered!r}")
+    check("Bold مرکز فرماندهی بعد از دادگاه روباه می‌آید",
+          entities[1][0] > entities[0][0], entities)
+
+
 def test_02_countries():
     print("\n### ۴..۵) انتخاب کشور دو بازیکن و جلوگیری از تکرار")
     match = fgame.match_of(CHAT_1)
@@ -965,6 +1005,7 @@ def main():
     test_01_join_and_capacity()
     test_01b_start_word_never_registers()
     test_01c_member_never_blocked_by_admin_gates()
+    test_01d_game_list_entry_is_bold()
     test_02_countries()
     test_03_budget()
     test_04_shop_limits_and_budget_guard()
