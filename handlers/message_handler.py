@@ -1652,6 +1652,286 @@ def _queue_message_deletes(bot, chat_id, message_ids, *, priority=1):
     return _asyncio.create_task(fallback(), name="delete:fallback")
 
 
+# ---------------------------------------------------------------------------
+# 🧹 «پاک عدد» — صفِ کاملاً مستقل و موازی برای ادمین
+# ---------------------------------------------------------------------------
+# چرا جدا از bot.message_delete_queue؟ آن صف کارِ پاکسازیِ خودکار، ضدِهرزنامه،
+# بازیِ دادگاه و پیامِ مهلت را هم انجام می‌دهد و ترتیبش اولویت‌محور است؛ پس
+# «پاک ۸۰۰» پشتِ صدها حذفِ تک‌پیامی می‌ماند و کند حس می‌شود. این صف فقط
+# مالِ همین دستور است: نه چیزی جلوی آن می‌ایستد، نه چیزی پشتش صبر می‌کند.
+MANUAL_PURGE_BATCH_SIZE = 100        # اندازهٔ هر RPC (سرور سروش ۱۰۰تایی را قبول می‌کند)
+MANUAL_PURGE_PARALLEL = 4            # چند RPC هم‌زمان
+MANUAL_PURGE_RPC_TIMEOUT = 8.0
+MANUAL_PURGE_MAX_PER_ADMIN = {}      # (chat_id, admin) → لحظهٔ آزادشدن
+MANUAL_PURGE_MAX_ENTRIES = 2000
+
+
+def _manual_purge_expected_seconds(count):
+    """سقفِ زمانیِ تخمینیِ یک پاک تا ادمین بی‌جهت قفل نماند."""
+    try:
+        count = max(0, int(count))
+    except (TypeError, ValueError):
+        count = 0
+    batches = max(1, -(-count // MANUAL_PURGE_BATCH_SIZE))
+    waves = max(1, -(-batches // MANUAL_PURGE_PARALLEL))
+    return waves * (MANUAL_PURGE_RPC_TIMEOUT + 2.0) + 15.0
+
+
+def _prune_manual_purge(now=None):
+    now = _loop_now(now)
+    for key, expires_at in list(MANUAL_PURGE_MAX_PER_ADMIN.items()):
+        if expires_at <= now:
+            MANUAL_PURGE_MAX_PER_ADMIN.pop(key, None)
+    while len(MANUAL_PURGE_MAX_PER_ADMIN) > MANUAL_PURGE_MAX_ENTRIES:
+        MANUAL_PURGE_MAX_PER_ADMIN.pop(
+            next(iter(MANUAL_PURGE_MAX_PER_ADMIN)), None)
+
+
+def _manual_purge_allowed(chat_id, admin_key, *, now=None):
+    """فقط جلوی پاکِ *هم‌زمانِ همان ادمین* در همان گروه را می‌گیرد.
+
+    ادمینِ دیگرِ همان گروه بلوکه نمی‌شود؛ صفِ هر ادمین جداست و کارها روی
+    هم نمی‌افتند.
+    """
+    now = _loop_now(now)
+    expires_at = MANUAL_PURGE_MAX_PER_ADMIN.get((str(chat_id), str(admin_key)))
+    return expires_at is None or expires_at <= now
+
+
+def _manual_purge_mark(chat_id, admin_key, count, *, now=None):
+    now = _loop_now(now)
+    MANUAL_PURGE_MAX_PER_ADMIN[(str(chat_id), str(admin_key))] = (
+        now + _manual_purge_expected_seconds(count))
+    _prune_manual_purge(now)
+
+
+def _manual_purge_release(chat_id, admin_key):
+    MANUAL_PURGE_MAX_PER_ADMIN.pop((str(chat_id), str(admin_key)), None)
+
+
+def _delete_rpc_target(bot, chat_id):
+    """InputPeerِ کش‌شده این همان گروه؛ بدونِ آن، شناسهٔ خام."""
+    cache = getattr(bot, "reply_input_peer_cache", None)
+    if cache:
+        try:
+            peer = cache.get(chat_id)
+        except Exception:
+            peer = None
+        if peer is not None:
+            return peer
+        wanted = str(chat_id)
+        try:
+            for cached_id, peer in list(cache.items()):
+                if peer is not None and str(cached_id) == wanted:
+                    return peer
+        except Exception:
+            pass
+    return chat_id
+
+
+def _manual_purge_flood_seconds(error):
+    name = error.__class__.__name__.lower()
+    text = ""
+    try:
+        text = str(error).lower()
+    except Exception:
+        pass
+    if "flood" not in name and "flood" not in text:
+        return None
+    value = getattr(error, "seconds", None)
+    if value is None:
+        value = getattr(error, "value", None)
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+async def _manual_purge_ids(bot, chat_id, count, target, *, anchor_id=None):
+    """فهرستِ *دقیقِ* پیام‌هایی که باید پاک شوند (به ترتیبِ جدید→قدیم).
+
+    * ابتدا آخرین `count` پیام از خودِ سرور خوانده می‌شود — همان ۱ تا ۸۰۰
+      واقعیِ گروه، نه حدس.
+    * پیام‌های تازه‌تر از پیامِ دستور (خودِ «پاک ۸۰۰» و پیامِ گزارش) از
+      فهرست حذف می‌شوند تا از شمارش کم نشوند.
+    * اگر سرور کمتر از خواسته برگرداند (سقفِ هیستوری/شکستِ موقت)، از شناسهٔ
+      پیامِ دستور به پایین شمرده می‌شود تا همان تعداد کامل شود؛ هیچ پیامِ
+      نامربوطی وارد فهرست نمی‌شود.
+    """
+    ids = []
+    last_error = None
+    for _attempt in (1, 2):
+        try:
+            messages = await _asyncio.wait_for(
+                bot.client.get_messages(target, limit=count),
+                timeout=MANUAL_PURGE_RPC_TIMEOUT,
+            )
+        except _asyncio.CancelledError:
+            raise
+        except Exception as error:
+            last_error = error
+            await _asyncio.sleep(0)
+            continue
+        # نتیجه ممکن است لیست، شیءِ list-like یا حتی یک پیامِ تنها باشد؛
+        # هیچ‌کدام نباید استثنا بدهد و هیچ‌کدام نباید باعثِ شمارشِ غلط شود.
+        if isinstance(messages, (list, tuple)):
+            rows = messages
+        elif messages is None:
+            rows = ()
+        else:
+            rows = [messages]
+        for message in rows:
+            message_id = getattr(message, "id", None)
+            if not isinstance(message_id, int):
+                try:
+                    message_id = int(message_id)
+                except (TypeError, ValueError):
+                    continue
+            if message_id > 0:
+                ids.append(message_id)
+        if ids:
+            break
+
+    ids = list(dict.fromkeys(ids))
+    if anchor_id is not None:
+        ids = [message_id for message_id in ids if message_id < anchor_id]
+
+    if anchor_id is not None and len(ids) < count:
+        seen = set(ids)
+        candidate = anchor_id - 1
+        while candidate > 0 and len(ids) < count:
+            if candidate not in seen:
+                ids.append(candidate)
+                seen.add(candidate)
+            candidate -= 1
+
+    if len(ids) < count and last_error is not None:
+        bot.logger.log_error(
+            "MANUAL PURGE HISTORY SHORT "
+            f"chat_id={chat_id} requested={count} found={len(ids)} "
+            f"error={last_error!r}"
+        )
+    return ids[:count]
+
+
+async def _manual_purge_delete(bot, chat_id, ids, target):
+    """حذفِ موازیِ صدرصد: هر ۱۰۰ شناسه یک RPC، چند RPC هم‌زمان.
+
+    اولویت و ترتیب مهم نیست چون ترتیبِ حذف روی نتیجه اثر ندارد؛ همین باعث
+    می‌شود ۸۰۰ پیام در ۲ موجِ ۴تایی (۸ RPC) تمام شود، نه ۵۴ RPCِ پشتِ‌سرهم.
+    """
+    ids = list(ids or ())
+    if not ids:
+        return 0, []
+
+    deleted = 0
+    remaining = []
+    semaphore = _asyncio.Semaphore(MANUAL_PURGE_PARALLEL)
+    batches = [ids[start:start + MANUAL_PURGE_BATCH_SIZE]
+               for start in range(0, len(ids), MANUAL_PURGE_BATCH_SIZE)]
+
+    async def _delete_batch(batch):
+        nonlocal deleted
+        async with semaphore:
+            for attempt in (1, 2, 3):
+                try:
+                    await _asyncio.wait_for(
+                        bot.client.delete_messages(target, list(batch)),
+                        timeout=MANUAL_PURGE_RPC_TIMEOUT,
+                    )
+                    deleted += len(batch)
+                    return
+                except _asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    wait = _manual_purge_flood_seconds(error)
+                    if wait is not None and wait <= 10 and attempt < 3:
+                        await _asyncio.sleep(wait)
+                        continue
+                    if attempt < 3 and isinstance(
+                        error, (TimeoutError, ConnectionError, OSError)
+                    ):
+                        await _asyncio.sleep(0.15 * attempt)
+                        continue
+                    bot.logger.log_error(
+                        "MANUAL PURGE BATCH FAILED "
+                        f"chat_id={chat_id} count={len(batch)} "
+                        f"attempt={attempt} error={error!r}"
+                    )
+                    break
+            remaining.extend(batch)
+
+    await _asyncio.gather(*[_delete_batch(batch) for batch in batches],
+                          return_exceptions=True)
+
+    # موجِ دوم برای بازمانده‌ها: تک‌تک (با همان موازی‌سازی). چیزی داخلِ گروه
+    # جا نمی‌ماند مگر سرور واقعاً اجازه ندهد.
+    if remaining:
+        leftovers = list(dict.fromkeys(remaining))
+        remaining = []
+        await _asyncio.gather(
+            *[_delete_batch([message_id]) for message_id in leftovers],
+            return_exceptions=True,
+        )
+    return deleted, remaining
+
+
+async def _run_manual_purge(bot, event, chat_id, user_id, sender,
+                            sender_username, count, target, anchor_id=None):
+    """اجرای «پاک عدد» در تسکِ مستقل تا حلقهٔ پیام‌ها بلاک نشود."""
+    started_at = _loop_now()
+    deleted = 0
+    remaining = []
+    found = 0
+    try:
+        ids = await _manual_purge_ids(
+            bot, chat_id, count, target, anchor_id=anchor_id)
+        found = len(ids)
+        deleted, remaining = await _manual_purge_delete(
+            bot, chat_id, ids, target)
+    except _asyncio.CancelledError:
+        raise
+    except Exception as error:
+        bot.logger.log_error(
+            f"MANUAL PURGE FAILED chat_id={chat_id} error={error!r}")
+    finally:
+        _manual_purge_release(chat_id, user_id)
+
+    elapsed_ms = (_loop_now() - started_at) * 1000.0
+    try:
+        if deleted:
+            add_deleted_count(chat_id, user_id, sender_username or "", deleted)
+        admin_tools.log_action(
+            chat_id, sender, "حذف دسته‌ای پیام",
+            note=(f"درخواست {count}، یافت {found}، حذف واقعی {deleted}"
+                  + (f"، باقی‌مانده {len(remaining)}" if remaining else "")))
+        bot.logger.log_info(
+            "MANUAL PURGE DONE "
+            f"chat_id={chat_id} requested={count} found={found} "
+            f"deleted={deleted} remaining={len(remaining)} "
+            f"elapsed_ms={elapsed_ms:.0f}"
+        )
+        if remaining:
+            bot.logger.log_error(
+                f"MANUAL DELETE INCOMPLETE chat_id={chat_id} "
+                f"deleted={deleted} remaining={len(remaining)}"
+            )
+    except Exception:
+        pass
+
+    try:
+        if remaining:
+            await event.reply(
+                f"{_fullwidth_digits(deleted)} پیام پاک شد 💣\n"
+                f"⏳ {_fullwidth_digits(len(remaining))} پیام باقی ماند؛ "
+                f"دوباره «پاک {len(remaining)}» را بزنید"
+            )
+        else:
+            await event.reply(f"{_fullwidth_digits(deleted)} پیام پاک شد 💣")
+    except Exception:
+        pass
+
+
 def _spam_cleanup_incident(bot, key, event):
     """Return the one aggregate cleanup incident for a user/group spam wave."""
     incidents = getattr(bot, "_spam_cleanup_incidents", None)
@@ -7814,6 +8094,9 @@ async def handle_new_message(bot, event):
             return
 
         # حذف چند پیام آخر با پاک عدد
+        # ⚡ صفِ جدا و موازی (هستهٔ _run_manual_purge): «پاک ۸۰۰» نه پشتِ
+        # پاکسازیِ خودکار می‌ماند، نه پیام‌ها را ۱۵تایی و پشتِ‌سرهم حذف
+        # می‌کند؛ هر ۱۰۰ پیام یک RPC و ۴ RPC هم‌زمان.
         if clean_text.startswith("پاک ") and not clean_text.startswith(("پاک لیست سکوت", "پاک لیست اخراج", "پاک کامل")):
             try:
                 sender_username = getattr(sender, "username", None)
@@ -7833,48 +8116,27 @@ async def handle_new_message(bot, event):
                     await event.reply("❌ تعداد پیام باید بین 1 تا 800 باشد")
                     return
 
-                # cooldown و Lock برای کل گروه، نه فقط هر کاربر؛ تا چند
-                # ادمینِ هم‌زمان روی هم نیفتند و محدودیت ۵ ثانیه رعایت شود.
-                if not _delete_cooldown_allowed(chat_id):
+                # فقط جلوی پاکِ هم‌زمانِ *همین ادمین* گرفته می‌شود؛ ادمینِ
+                # دیگرِ همین گروه یا گروهِ دیگر آزاد است.
+                if not _manual_purge_allowed(chat_id, user_id):
                     await event.reply(
-                        "لطفا ۵ ثانیه صبر کنید تا پاکسازی قبلی کامل شود ⏳"
+                        "⏳ پاکِ قبلیِ خودتان هنوز تمام نشده؛ چند لحظه صبر کنید"
                     )
                     return
-                lock = _delete_group_lock(chat_id)
-                async with lock:
-                    messages = await bot.client.get_messages(
-                        chat_id,
-                        limit=requested_count,
-                    )
-                    message_ids = [
-                        message.id for message in messages
-                        if getattr(message, "id", None)
-                    ]
+                _manual_purge_mark(chat_id, user_id, requested_count)
 
-                    delete_future = _queue_message_deletes(
-                        bot, chat_id, message_ids, priority=0
-                    )
-
-                async def finish_manual_bulk_delete():
-                    deleted_count, remaining = await delete_future
-                    if deleted_count:
-                        add_deleted_count(
-                            chat_id, user_id, sender_username or "", deleted_count
-                        )
-                    admin_tools.log_action(
-                        chat_id, sender, "حذف دسته‌ای پیام",
-                        note=f"درخواست {len(message_ids)}، حذف واقعی {deleted_count}")
-                    if remaining:
-                        bot.logger.log_error(
-                            f"MANUAL DELETE INCOMPLETE chat_id={chat_id} "
-                            f"deleted={deleted_count} remaining={len(remaining)}"
-                        )
-                    # Report only after the queue has completed, using the
-                    # real successful count rather than the requested count.
-                    await event.reply(
-                        f"{_fullwidth_digits(deleted_count)} پیام پاک شد 💣"
-                    )
-                _asyncio.create_task(finish_manual_bulk_delete(), name="delete:bulk-finish")
+                anchor_id = getattr(event.message, "id", None)
+                if not isinstance(anchor_id, int) or anchor_id <= 0:
+                    anchor_id = None
+                target = _delete_rpc_target(bot, chat_id)
+                _asyncio.create_task(
+                    _run_manual_purge(
+                        bot, event, chat_id, user_id, sender,
+                        sender_username, requested_count, target,
+                        anchor_id=anchor_id,
+                    ),
+                    name="delete:manual-purge",
+                )
                 return
 
             except Exception as e:
