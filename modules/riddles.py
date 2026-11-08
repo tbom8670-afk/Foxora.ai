@@ -139,6 +139,11 @@ active_riddles = {}
 # می‌گرفت. حالا هر کاربر دور کامل و مستقل خودش را دارد.
 used_riddles = set()          # سازگاری با کد قدیمی؛ دیگر مبنای انتخاب نیست
 _SEEN_BY_USER = {}
+# سقفِ حافظهٔ مسیرِ بدونِ SQLite. با SQLite (حالتِ پیش‌فرض) همین سقف از قبل
+# در SeenProgressStore اعمال می‌شود (BOT_GAME_PROGRESS_CACHE_USERS، پیش‌فرض
+# ۲۰۰۰) و پیشرفتِ هر کاربر در دیتابیس می‌ماند؛ این عدد فقط برای همان مسیرِ
+# جایگزین است تا دیکشنری بی‌نهایت رشد نکند.
+MAX_CACHED_USERS = 5000
 _FALLBACK_TOKENS = count(1)
 
 # فایلِ ماندگارِ تاریخچهٔ چیستان‌های دیده‌شدهٔ هر کاربر، تا بعد از ری‌استارت
@@ -201,11 +206,26 @@ def _user_key(user_id):
     return str(user_id)
 
 
+def _cap_user_state():
+    """هرسِ ورودی‌های قدیمی مسیرِ بدونِ SQLite (همان الگوی fill_blank).
+
+    فقط وقتی سقف رد شود اجرا می‌شود. با SQLite هیچ‌وقت صدا زده نمی‌شود،
+    چون آن مسیر پیشرفت را در دیتابیس نگه می‌دارد و هرسِ حافظه در
+    SeenProgressStore انجام می‌شود.
+    """
+    while len(_SEEN_BY_USER) > MAX_CACHED_USERS:
+        _SEEN_BY_USER.pop(next(iter(_SEEN_BY_USER)), None)
+
+
 def _seen(user_id):
     key = _user_key(user_id)
     if _PROGRESS_STORE.sqlite:
         return _PROGRESS_STORE.get(key)
-    return _SEEN_BY_USER.setdefault(key, set())
+    seen = _SEEN_BY_USER.setdefault(key, set())
+    # هرس بعد از گرفتنِ دستهٔ کاربر، مثل fill_blank.py؛ اگر قبل از آن هرس
+    # شود، خودِ همین کاربر ممکن است قربانی شود و پیشرفتش ریست گردد.
+    _cap_user_state()
+    return seen
 
 
 def seen_count(user_id):
@@ -262,6 +282,11 @@ def new_riddle(chat_id, user_id):
     remaining = [item for item in RIDDLES if item[0] not in seen]
     if not remaining:
         seen.clear()
+        if _PROGRESS_STORE.sqlite:
+            # در حالتِ SQLite، _seen() یک کپی برمی‌گرداند؛ این خط ریست را
+            # بی‌درنگ در انبار می‌نشاند و به _save_progress پایین‌تر تکیه
+            # نمی‌کند (هر دو یک نتیجه می‌دهند؛ این یکی صریح‌تر است).
+            _PROGRESS_STORE.replace(key, seen)
         remaining = list(RIDDLES)
 
     question, answer = _RANDOM.choice(remaining)

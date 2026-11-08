@@ -3201,7 +3201,10 @@ ADMIN_PERMISSION_CACHE_MAX_ENTRIES = 4000
 
 def _has_group_management_permission(bot, chat_id, user_id, username):
     normalized_username = (username or "").lstrip("@").lower()
-    cache_key = (chat_id, user_id, normalized_username)
+    # کلیدِ کش با شناسهٔ نرمال‌شده ساخته می‌شود؛ همان تابعی که بقیهٔ همین فایل
+    # (native admin cache، فیلترها، سابقه‌ها) استفاده می‌کند. قبلاً شناسهٔ خام
+    # می‌رفت و همان گروه با شکلِ int و str دو کلیدِ جدا می‌ساخت.
+    cache_key = (normalize_group_id(chat_id), user_id, normalized_username)
     now = _asyncio.get_running_loop().time()
     cached = ADMIN_PERMISSION_CACHE.get(cache_key)
     if cached and cached[0] > now:
