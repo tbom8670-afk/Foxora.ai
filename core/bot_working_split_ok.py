@@ -1349,6 +1349,22 @@ class SoroushAntiSpamBot:
 
         asyncio.create_task(bio_link_watcher_loop(), name="bio-link-watcher")
 
+        # 🦊 بازی «مرکز فرماندهی روباه» — مسابقه‌های بازِ روی دیسک را برمی‌گرداند
+        # و تایمرهای حمله/دفاع را دوباره می‌چیند تا با ری‌استارت چیزی گم نشود.
+        async def fox_command_recover_loop():
+            try:
+                from handlers import fox_command_router
+                await fox_command_router.recover(self, logger=self.logger)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fox_command_error:
+                self.logger.log_error(
+                    f"FOX COMMAND RECOVER CRASHED error={fox_command_error!r}"
+                )
+
+        asyncio.create_task(fox_command_recover_loop(),
+                            name="fox-command-recover")
+
         # 🔒 ناظر «عضویت اجباری کانال» — رویداد ورود/خروج کانال + اسنپ‌شات
         # جبرانی. ثبت هندلر و راه‌اندازی ناظر کاملاً داخل خود ماژول انجام
         # می‌شود تا هستهٔ ربات دست‌نخورده بماند.

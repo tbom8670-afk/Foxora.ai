@@ -623,6 +623,21 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         profile_menu.close_session(chat_id, user_id)
         await _send(event, "❌ خطایی رخ داد؛ دوباره تلاش کنید.", logger)
         return True
+
+    # 🦊 بازی «مرکز فرماندهی روباه» — دستورهای درون‌بازی («حمله»، «دفاع»،
+    # «تعمیر پایگاه» …) پیش از رسیدن به روتر بازی‌ها همین‌جا مصرف می‌شوند تا
+    # با منوهای اقتصاد و بقیهٔ بازی‌ها تداخل نکنند. اگر مسابقه‌ای باز نباشد،
+    # این قلاب هیچ کاری نمی‌کند و مسیر قبلی دست‌نخورده است.
+    try:
+        from handlers import fox_command_router
+        if fox_command_router.claims(chat_id, text):
+            if await fox_command_router.handle_message(
+                bot, event, chat_id, user_id, sender, text, logger
+            ):
+                return True
+    except Exception as error:
+        _log_error(logger, f"FOX COMMAND HOOK FAILED chat_id={chat_id} "
+                           f"user_id={user_id} error={error!r}")
     return False
 
 

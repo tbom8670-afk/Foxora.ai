@@ -42,6 +42,7 @@ from modules.fox_games.session_core import (
 )
 # ⚖️ دادگاه روباه — بازی مستقل، وصل‌شده از همین روتر (بدون سیستم موازی).
 from handlers import court_game_router
+from handlers import fox_command_router
 # 🎮 گارد لایهٔ دوم: اگر این روتر روزی از مسیری غیر از هندلر اصلی صدا زده
 # شود، بازیِ خاموش باز هم اجرا نمی‌شود. هیچ state یا تایمری پیش از این
 # گارد ساخته نمی‌شود.
@@ -66,9 +67,15 @@ FOX_GAME_COMMANDS = frozenset({
     "گروه آخرالزمان",
     "دادگاه",
     "دادگاه روباه",
+    "مرکز فرماندهی",
+    "مرکز فرماندهی روباه",
     "شرکت",
 })
 
+
+# 🦊 نام دستور بازی «مرکز فرماندهی روباه» (بدون تداخل با دستورهای موجود).
+FOX_COMMAND_START = "مرکز فرماندهی"
+FOX_COMMAND_START_ALT = "مرکز فرماندهی روباه"
 
 MAX_ACTIVE_GAMES_PER_CHAT = 2
 LIMIT_EXCEEDED_MESSAGE = "در حال حاضر دو بازی فعال است، بعد از پایان آن‌ها دوباره تلاش کنید"
@@ -105,6 +112,7 @@ def active_game_count(chat_id):
     if zombie.is_active(chat_id):
         count += 1
     count += court_game_router.active_count(chat_id)
+    count += fox_command_router.active_count(chat_id)
     return count
 
 
@@ -1054,6 +1062,20 @@ def court_other_joining(chat_id):
     return False
 
 
+async def _fox_command_message(bot, event, chat_id, user_id, sender, text,
+                              logger):
+    """پیام‌های «مرکز فرماندهی روباه».
+
+    فقط وقتی پیام را می‌بلعد که مسابقهٔ این بازی در همین گروه باز باشد یا
+    متن، دستور شروع خودِ بازی باشد؛ بقیهٔ پیام‌ها (از جمله «شرکت» برای
+    بازی‌های دیگر) دست‌نخورده رد می‌شوند.
+    """
+    if not fox_command_router.claims(chat_id, text):
+        return False
+    return await fox_command_router.handle_message(
+        bot, event, chat_id, user_id, sender, text, logger)
+
+
 async def _court_message(bot, event, chat_id, user_id, sender, text, logger):
     other_joining = lambda: court_other_joining(chat_id)
     if court_game_router.is_active(chat_id):
@@ -1437,6 +1459,17 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
                 b, e, c, user_id, sender, l,
                 other_game_active=lambda: court_other_game_active(c)),
         ),
+        # 🦊 مرکز فرماندهی روباه — بازی جنگی دو نفره (ماژول مستقل fox_command)
+        normalize_text(FOX_COMMAND_START): (
+            fox_command_router,
+            lambda b, e, c, l: fox_command_router.start_game(
+                b, e, c, user_id, sender, l),
+        ),
+        normalize_text(FOX_COMMAND_START_ALT): (
+            fox_command_router,
+            lambda b, e, c, l: fox_command_router.start_game(
+                b, e, c, user_id, sender, l),
+        ),
     }
 
     if command in start_games:
@@ -1453,6 +1486,7 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
 
     # پیام‌های درون‌بازی — هر بازی فقط session خودش را می‌بینند.
     for responder in (
+        _fox_command_message,
         _court_message,
         _laugh_message, _survival_message, _lucky_box_message, _vampire_message,
         _maemma_message, _sentence_guess_message, _minesweeper_message,
@@ -1476,3 +1510,4 @@ def reset_all(chat_id=None):
     karagah.reset_all(chat_id)
     zombie.reset_all(chat_id)
     court_game_router.reset_all(chat_id)
+    fox_command_router.reset_all(chat_id)
