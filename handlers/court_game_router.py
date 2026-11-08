@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from modules.court_game import ai_judge, game, punishment, storage, texts
 from modules.fox_games.session_core import log, log_error, normalize_text
@@ -28,6 +29,8 @@ REWARD_CASE = {
 }
 
 _RECOVERED = [False]
+# سقفِ انتظارِ آپلود عکس (فقط همین مسیر؛ بقیهٔ دادگاه دست‌نخورده است).
+COURT_IMAGE_TIMEOUT = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +82,72 @@ async def send_quoted(bot, event, chat_id, text):
             except Exception:
                 pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# 🏛️ تصویر سالن دادگاه — یک بار در شروع بازی ارسال می‌شود
+# ---------------------------------------------------------------------------
+# مسیرِ ثابت داخل مخزن (نه لینک، نه دانلود): فایل کنارِ کد می‌ماند و
+# SPlusthon 1.1.4 آن را با ``send_file`` به‌عنوان «عکسِ واقعی» آپلود می‌کند
+# (پسوند png/jpg ⇒ ``utils.is_image`` ⇒ InputMediaUploadedPhoto).
+# JPGِ ۱۲۸۰ پیکسلی (۱۸۰KB) برای آپلودِ سریع روی موبایل؛ نسخهٔ PNG در همان
+# پوشه به‌عنوان فایلِ اصلی نگه داشته می‌شود.
+COURT_IMAGE_PATH = (Path(__file__).resolve().parent.parent
+                    / "static" / "court" / "court_hall.jpg")
+_COURT_IMAGE_MISSING_LOGGED = [False]
+
+
+def _court_image_file():
+    """فایلِ تصویر اگر موجود بود؛ وگرنه None (بازی هرگز به‌خاطر عکس نمی‌خوابد)."""
+    path = COURT_IMAGE_PATH
+    try:
+        if path.is_file() and path.stat().st_size > 1024:
+            return path
+    except OSError:
+        pass
+    if not _COURT_IMAGE_MISSING_LOGGED[0]:
+        _COURT_IMAGE_MISSING_LOGGED[0] = True
+        log_error(None, f"COURT IMAGE MISSING path={path}")
+    return None
+
+
+async def send_court_image(bot, event, chat_id, caption, logger=None):
+    """ارسالِ عکسِ سالن دادگاه همراه با متنِ شروعِ بازی (یک پیام).
+
+    * ابتدا ``client.send_file`` با ``caption`` و entityهای Bold — همان روشی
+      که ``modules/photo_download.py`` در همین پروژه استفاده می‌کند.
+    * اگر کتابخانه/شبکه اجازه نداد، همان متن به‌صورت پیام معمولی می‌رود تا
+      شروعِ بازی هرگز از دست نرود.
+    """
+    path = _court_image_file()
+    client = getattr(bot, "client", None)
+    sender = getattr(client, "send_file", None)
+    if path is not None and not callable(sender):
+        # کلاینتی که send_file ندارد (مثلاً استابِ تست یا نسخهٔ قدیمی) —
+        # این خطا نیست، فقط قابلیتِ عکس در دسترس نیست.
+        log(logger, f"COURT IMAGE SKIPPED reason=no_send_file chat_id={chat_id}")
+        sender = None
+    if path is not None and sender is not None:
+        entities = texts.bold_entities(caption)
+        try:
+            message = await asyncio.wait_for(
+                sender(
+                    chat_id, str(path),
+                    caption=caption,
+                    formatting_entities=entities,
+                ),
+                timeout=COURT_IMAGE_TIMEOUT,
+            )
+            log(logger, f"COURT IMAGE SENT chat_id={chat_id} bytes={path.stat().st_size}")
+            return message
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_error(logger, f"COURT IMAGE SEND FAILED chat_id={chat_id} "
+                              f"error={error!r}")
+    elif path is None and event is not None:
+        pass  # لاگ در خودِ _court_image_file
+    return await send_quoted(bot, event, chat_id, caption)
 
 
 async def _bot_username(bot):
@@ -415,9 +484,12 @@ async def start_game(bot, event, chat_id, user_id, sender, logger=None,
         await send_quoted(bot, event, chat_id, texts.already_running())
         return True
 
-    await send_quoted(bot, event, chat_id,
-                      texts.join_prompt(game.REQUIRED_PLAYERS,
-                                        settings["join_seconds"]))
+    # 🏛️ عکسِ سالن دادگاه + همان پیامِ شروع، در یک پیام (caption).
+    await send_court_image(
+        bot, event, chat_id,
+        texts.join_prompt(game.REQUIRED_PLAYERS, settings["join_seconds"]),
+        logger=logger,
+    )
     game.schedule(chat_id, session["session_id"],
                   _callbacks(bot, event, chat_id, logger),
                   logger=logger,
