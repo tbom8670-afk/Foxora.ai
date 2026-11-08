@@ -117,6 +117,8 @@ USER_C = SimpleNamespace(id=9003, first_name="سارا", username="sara_cmd")
 CHAT_1 = -1009001
 CHAT_2 = -1009002
 CHAT_X = -1009003   # گروه اختصاصی تست «دستور شروع» (بدون اثر روی بقیه)
+CHAT_M = -1009004   # گروه اختصاصی تست «عضو عادی»
+ADMIN_M = SimpleNamespace(id=9100, first_name="مدیر", username="admin_m")
 
 
 def run(coro):
@@ -226,6 +228,114 @@ def test_01b_start_word_never_registers():
           fgame.match_of(CHAT_X)["phase"] == phase_before, phase_before)
     check("هنوز همان دو فرمانده‌اند", len(fgame.match_of(CHAT_X)["players"]) == 2)
     fgame.reset_all(CHAT_X)
+
+
+def test_01c_member_never_blocked_by_admin_gates():
+    """🛡️ «شرکت» و دستورهای بازی برای عضو عادی هم کار می‌کند.
+
+    علت واقعی گزارش کارفرما: پیام‌های اعضای عادی در لایه‌های مدیریتی
+    (کلمهٔ ممنوع، قفل اسپم، فهرست دستورها، عضویت اجباری) بلعیده می‌شد و
+    بازی فقط برای مالک/ادمین پیش می‌رفت. در این تست همهٔ آن گیت‌ها روشن
+    است و عضو عادی باید کل مسیر را تا شلیک موشک برود.
+    """
+    print("\n### ۳۲) عضو عادی با همهٔ گیت‌های مدیریتی روشن بازی می‌کند")
+    from modules import light_spam_ingest, group_dispatch
+    from modules import entertainment_control
+
+    fgame.reset_all(CHAT_M)
+    entertainment_control.enable(CHAT_M)
+
+    class _Msg:
+        def __init__(self, text, message_id):
+            self.message = text
+            self.id = message_id
+            self.file = None
+            self.caption = None
+            self.sender_id = None
+            self.from_id = None
+            self.edit_date = None
+            self.reply_to = None
+            self.entities = None
+
+    class _MemberEvent:
+        """عضو عادی: بدون یوزرنیم، بدون نقش ادمینی، بدون bypass."""
+
+        def __init__(self, user, text, message_id):
+            self.message = _Msg(text, message_id)
+            self.chat_id = CHAT_M
+            self.is_private = False
+            self.replies = []
+            self.sender_id = user.id
+            self.sender = SimpleNamespace(id=user.id, first_name=user.first_name,
+                                          last_name=None, username=None)
+
+        async def get_chat(self):
+            return SimpleNamespace(id=CHAT_M)
+
+        async def get_sender(self):
+            return self.sender
+
+        async def reply(self, text, **kwargs):
+            self.replies.append(text)
+
+        async def respond(self, text, **kwargs):
+            self.replies.append(text)
+
+        def said(self, needle):
+            return any(needle in row for row in self.replies)
+
+    locked = {(CHAT_M, USER_A.id), (CHAT_M, USER_B.id)}
+    bot = FakeBot()
+    bot.is_spam_locked = lambda key: key in locked
+    bot.clear_spam_lock = lambda key: None
+    bot.spam_lock = {}
+    bot.punished_users = set()
+
+    # ---- گیت‌های بیرونی: هر سه باید پیام بازی را آزاد کنند ----
+    check("لایهٔ هرزنگاری: «شرکت» عضو عادی اسپم نیست",
+          light_spam_ingest.ingest(bot, CHAT_M, USER_A.id, 2, "شرکت",
+                                   event=_MemberEvent(USER_A, "شرکت", 2)
+                                   ).skip_heavy is False)
+    check("خط دستور: «شرکت» روی خط command می‌ماند",
+          group_dispatch.classify_priority("شرکت")[1] == group_dispatch.LANE_COMMAND)
+    check("claims(شرکت) در پنجرهٔ باز",
+          router.claims(CHAT_M, "شرکت") is False, "هنوز مسابقه‌ای نیست")
+
+    # ---- مسیر واقعی: شروع با دستور، ثبت‌نام دو عضو عادی ----
+    _ok, start_event = run(say(bot, CHAT_M, ADMIN_M, "مرکز فرماندهی",
+                               expect_consumed=True))
+    check("دستور شروع برای ادمین کار می‌کند",
+          "مرکز فرماندهی روباه" in all_text(start_event), all_text(start_event))
+    check("bypass برای عضو عادی در پنجرهٔ «شرکت» فعال است",
+          router.bypass(CHAT_M, USER_A.id, "شرکت") is True)
+
+    _ok, e1 = run(say(bot, CHAT_M, USER_A, "شرکت", expect_consumed=True))
+    check("عضو عادی ۱ ثبت‌نام شد", "ثبت\u200cنام شد" in all_text(e1), all_text(e1))
+    _ok, e2 = run(say(bot, CHAT_M, USER_B, "شرکت", expect_consumed=True))
+    check("عضو عادی ۲ ثبت‌نام شد", "ثبت\u200cنام شد" in all_text(e2), all_text(e2))
+    check("ظرفیت کامل شد", len(fgame.match_of(CHAT_M)["players"]) == 2)
+
+    # ---- پیام شخصی عضو عادی همچنان مسیر عادی خودش را دارد ----
+    check("پیام غیربازی عضو (before join) bypass نمی‌شود",
+          router.bypass(CHAT_M, USER_C.id, "سلام بچه‌ها") is False)
+    check("پیام عادی عضو بازی‌کننده هم bypass نمی‌شود",
+          router.bypass(CHAT_M, USER_A.id, "امروز هوا خوبه") is False)
+    check("عضو غیربازیکن نمی‌تواند دستور بازی بفرستد",
+          router.bypass(CHAT_M, USER_C.id, "فروشگاه") is False)
+
+    # ---- عضو عادی تا شلیک موشک پیش می‌رود ----
+    run(say(bot, CHAT_M, USER_A, "1", expect_consumed=True))
+    run(say(bot, CHAT_M, USER_B, "2", expect_consumed=True))
+    check("هر دو عضو عادی کشور انتخاب کردند",
+          all(p["country"] for p in fgame.match_of(CHAT_M)["players"]))
+    for step in ("فروشگاه", "1", "1"):
+        run(say(bot, CHAT_M, USER_A, step, expect_consumed=True))
+    check("خرید عضو عادی از بودجهٔ بازی کم شد",
+          fgame.match_of(CHAT_M)["players"][0]["spent"] > 0,
+          fgame.match_of(CHAT_M)["players"][0]["spent"])
+    check("کیف پول واقعی لمس نشد (خرید فقط از بودجهٔ مسابقه)",
+          fgame.match_of(CHAT_M)["players"][0]["bronze"] < 400)
+    fgame.reset_all(CHAT_M)
 
 
 def test_02_countries():
@@ -854,6 +964,7 @@ def main():
     test_00_prices_locked()
     test_01_join_and_capacity()
     test_01b_start_word_never_registers()
+    test_01c_member_never_blocked_by_admin_gates()
     test_02_countries()
     test_03_budget()
     test_04_shop_limits_and_budget_guard()

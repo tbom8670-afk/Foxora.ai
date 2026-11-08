@@ -3822,6 +3822,34 @@ async def handle_new_message(bot, event):
             not has_text_content and not is_forwarded_media and not is_gif_media
         )
 
+        # ===== 🦊 مسیر اختصاصی «مرکز فرماندهی روباه» =====
+        # «شرکت» و دستورهای درون‌بازی باید برای هر عضو عادی کار کنند. اگر این
+        # پیام‌ها از گیت‌های مدیریتی (عضویت اجباری، هرزنگاری، کلمهٔ ممنوع،
+        # قفل اسپم، فیلتر اسم) رد شوند، بازی عملاً فقط برای مالک/ادمین کار
+        # می‌کند. این بلوک فقط متن‌های خودِ بازی و فقط برای شرکت‌کننده‌های
+        # همان مسابقه را مستقیم به بازی می‌سپارد. هر پیام دیگر بی‌تغییر از
+        # همان گیت‌های قبلی می‌گذرد.
+        if not event.is_private and user_id:
+            try:
+                from handlers import fox_command_router as _fox_command
+                if _fox_command.bypass(chat_id, user_id, message_text):
+                    if await _fox_command.handle_message(
+                        bot, event, chat_id, user_id, sender, message_text,
+                        bot.logger,
+                    ):
+                        bot.logger.log_info(
+                            "FOX COMMAND DIRECT "
+                            f"chat_id={chat_id} user_id={user_id} "
+                            f"text={message_text[:20]!r}"
+                        )
+                        return
+            except Exception as _fox_direct_error:
+                bot.logger.log_error(
+                    "FOX COMMAND DIRECT FAILED "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"error={_fox_direct_error!r}"
+                )
+
         sender_username = (getattr(sender, "username", None) or "").lstrip("@").lower()
         is_vip_user = False
         if not event.is_private and user_id:
@@ -3976,8 +4004,19 @@ async def handle_new_message(bot, event):
         _banned_word_started = time.perf_counter()
         banned_precheck = False
         banned_precheck_reason = None
+        # داخل بازی «مرکز فرماندهی» متن‌هایی مثل «فروشگاه»/«حمله» نباید با
+        # فیلتر کلمات ممنوعِ گروه برخورد کنند؛ دادهٔ بازی است نه تبلیغ.
+        try:
+            from handlers import fox_command_router as _fox_cmd_words
+            _fox_game_text = bool(
+                not event.is_private
+                and _fox_cmd_words.bypass(chat_id, user_id, message_text)
+            )
+        except Exception:
+            _fox_game_text = False
         if (not skip_inspect and not event.is_private and not admin_bypass
-                and not native_admin_warn_only and not is_vip_user):
+                and not native_admin_warn_only and not is_vip_user
+                and not _fox_game_text):
             banned_precheck, banned_precheck_reason = bot.detector.check_banned_words(
                 message_text, chat_id
             )

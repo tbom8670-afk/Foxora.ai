@@ -243,6 +243,19 @@ def _is_active_game_answer(event):
     except Exception:
         return False
     user_id = _event_user_id(event)
+    # 🦊 «مرکز فرماندهی روباه»: فقط متن‌های خود بازی (ثبت‌نام/خرید/حمله/دفاع)
+    # برای شرکت‌کننده‌های همان مسابقه روی خط «دستور» می‌روند. پیام دیگرِ همان
+    # کاربر همان مسیر عادی moderation خودش را دارد.
+    try:
+        from handlers import fox_command_router as _fox_command
+        raw = ""
+        message = getattr(event, "message", None)
+        if message is not None:
+            raw = getattr(message, "message", None) or getattr(message, "caption", None) or ""
+        if _fox_command.bypass(chat_id, user_id, raw):
+            return True
+    except Exception:
+        pass
     try:
         from modules.court_game import game as court_game
         session = court_game.session_of(chat_id)

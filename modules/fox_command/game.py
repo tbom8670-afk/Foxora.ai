@@ -371,6 +371,41 @@ def claims(chat_id, text) -> bool:
     return normalized in GAME_COMMANDS or _is_number(normalized)
 
 
+def bypass(chat_id, user_id, text) -> bool:
+    """🛡️ آیا این پیام باید بی‌عبور از گیت‌های مدیریتی به بازی برسد؟
+
+    مشکل واقعی: «شرکت» و دستورهای درون‌بازیِ اعضای عادی در لایه‌های
+    عضویت اجباری / هرزنگاری / فیلتر کلمه / قفل اسپم / فیلتر اسم بلعیده
+    می‌شدند. مالک و ادمین‌ها از همین لایه‌ها معاف‌اند — یعنی بازی عملاً فقط
+    برای آن‌ها کار می‌کرد.
+
+    این تابع عمداً **بسیار محدود** است: فقط متن‌های خودِ بازی را برای
+    شرکت‌کننده‌های همان مسابقه (یا ثبت‌نام در پنجرهٔ باز) اجازه می‌دهد.
+    هر پیام دیگری از همان کاربر دقیقاً مثل قبل مسیر مدیریتی خودش را دارد.
+    """
+    match = _MATCHES.get(chat_id)
+    if not match or match.get("phase") == engine.PHASE_FINISHED:
+        return False
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    player = engine.player_of(match, user_id)
+    if normalized in START_COMMANDS:
+        # فقط «شروع یک بازی تازه» از گیت‌ها معاف است. اگر مسابقه‌ای باز باشد،
+        # تکرار دستور شروع مسیر عادی moderation خودش را دارد تا کسی نتواند با
+        # تکرار این واژه از ضداسپم فرار کند.
+        return (match.get("phase") == engine.PHASE_FINISHED
+                or len(match.get("players") or []) == 0)
+    if normalized == normalize_text(JOIN_WORD):
+        # ثبت‌نام واقعی: در پنجرهٔ باز، ظرفیت خالی و کاربر هنوز عضو نشده.
+        return (match.get("phase") == engine.PHASE_JOINING
+                and len(match.get("players") or []) < PLAYERS
+                and player is None)
+    if player is None:
+        return False
+    return normalized in GAME_COMMANDS or _is_number(normalized)
+
+
 def _is_number(text) -> bool:
     return normalize_text(text).isdigit() or _digits(normalize_text(text)) is not None
 

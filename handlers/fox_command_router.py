@@ -32,6 +32,11 @@ def phase(chat_id):
     return game.phase(chat_id)
 
 
+def bypass(chat_id, user_id, text):
+    """آیا این پیامِ همین کاربر مستقیماً به بازی برسد (بدون گیت‌های مدیریتی)؟"""
+    return game.bypass(chat_id, user_id, text)
+
+
 def claims(chat_id, text):
     return game.claims(chat_id, text)
 

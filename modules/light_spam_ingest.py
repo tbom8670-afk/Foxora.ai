@@ -204,6 +204,17 @@ def _ingest(bot, chat_id, user_id, message_id, text, *, event=None, is_private=F
     if _cheap_admin_bypass(bot, chat_id, user_id):
         return IngestResult(skip_heavy=False, detected=False)
 
+    # 🦊 پیام‌های «مرکز فرماندهی روباه» (ثبت‌نام/خرید/حمله/دفاع) دادهٔ بازی‌اند،
+    # نه پیام عمومی. بدون این بررسی، «شرکت» و پاسخ‌های اعضای عادی در همین
+    # لایه بلعیده می‌شد و بازی فقط برای مالک/ادمین کار می‌کرد.
+    try:
+        from handlers import fox_command_router as _fox_command
+        if _fox_command.bypass(chat_id, user_id, text):
+            return IngestResult(skip_heavy=False, detected=False,
+                                reason="fox_command")
+    except Exception:
+        pass
+
     # پاسخ داخل یک بازیِ در جریان (بقا/زامبی/دادگاه روباه/…) دادهٔ بازی است،
     # نه پیام عمومی. پیش از بررسی قفل هرزنگاری و incident‌ها سنجیده می‌شود
     # تا بازیکنِ عادی وسط بازی پیامش حذف/بلعیده نشود؛ پیش‌تر این بررسی
