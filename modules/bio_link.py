@@ -143,6 +143,12 @@ _TLD = (
 
 _HOST = r"[a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9][a-z0-9-]{0,62})+"
 
+# پسوندهایی که در TLD هستند ولی در متن فارسی به‌معنیِ «اسم فایل/برنامه»اند:
+# `install.sh` ، `run.sh` ، `my.app` ، `project.run` ، `user.id` — هیچ‌کدام
+# لینک نیستند. برای این‌ها فقط با پروتکل/`www`/مسیر (`host.tld/...`) لینک
+# حساب می‌شود؛ دامنهٔ برهنه‌شان نادیده گرفته می‌شود.
+_FILE_LIKE_TLDS = {"sh", "app", "run", "id", "py", "so", "md"}
+
 # لینک کامل با پروتکل — باید میزبان واقعی (حداقل یک نقطه) داشته باشد.
 _URL_SCHEME_RE = re.compile(
     r"(?:https?|ftps?|hxxps?)\s*:\s*/\s*/\s*" + _HOST, re.I
@@ -158,6 +164,8 @@ _BARE_DOMAIN_RE = re.compile(
     re.I,
 )
 _IP_LINK_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?(?:/\S*)?")
+# «نسخهٔ 1.0.0.0» ، «ver 2.0.0.0» ، «v1.2.3.4» — چهار عددِ نقطه‌ای که IP نیست.
+_VERSION_BEFORE_RE = re.compile(r"(?:نسخه|ورژن|version|ver|v)\s*[:.=]?\s*$", re.I)
 
 # دامنه‌های پیام‌رسان: بدون «مقصد» لینک حساب نمی‌شوند (t.me/ ← ناقص).
 _MESSENGER_HOSTS = (
@@ -225,15 +233,29 @@ def find_link(about: Optional[str], *, detect_username: bool = False) -> Optiona
         return "لینک دعوت"
     if _WWW_RE.search(value):
         return "لینک وب"
-    if _IP_LINK_RE.search(value):
+    for ip_match in _IP_LINK_RE.finditer(value):
+        ip_text = ip_match.group(0)
+        octets = ip_text.split("/")[0].split(":")[0].split(".")
+        # آدرسِ شبکهٔ …0 (و «نسخهٔ 1.0.0.0») لینک نیست.
+        if octets and octets[-1] == "0":
+            continue
+        if _VERSION_BEFORE_RE.search(value[:ip_match.start()]):
+            continue
         return "لینک IP"
 
-    domain = _BARE_DOMAIN_RE.search(value)
-    if domain:
+    # دامنهٔ برهنه — با پرش از «اسم فایل»هایی که پسوندشان شبیه TLD است.
+    for domain in _BARE_DOMAIN_RE.finditer(value):
         host = domain.group(1).lower()
+        tld = host.rsplit(".", 1)[-1]
+        if tld in _FILE_LIKE_TLDS:
+            # فقط با مسیر (`host.tld/…`) لینک است؛ `install.sh` لینک نیست.
+            after = value[domain.end():domain.end() + 1]
+            if after != "/":
+                continue
         # دامنهٔ برهنهٔ پیام‌رسان بدون مقصد، لینک نیست.
-        if host not in _MESSENGER_HOSTS and host not in _SOROUSH_HOSTS:
-            return "دامنه"
+        if host in _MESSENGER_HOSTS or host in _SOROUSH_HOSTS:
+            continue
+        return "دامنه"
 
     # آیدی عمومی
     username_match = _USERNAME_RE.search(value)

@@ -132,8 +132,11 @@ RETRY_AFTER_ERROR_SECONDS = _env_int("BIO_LINK_ERROR_RETRY_SECONDS", 1800, 60, 8
 # نمی‌شود. اگر رکورد «لینک دارد» از این مدت قدیمی‌تر باشد، یک‌بار (و فقط
 # یک‌بار در هر پنجره) بیو دوباره خوانده می‌شود؛ چون کاربر ممکن است لینک را
 # حذف کرده باشد و نباید تا ۶ ساعت (TTL) بابت بیوی قبلی مجازات شود.
+# ۱۲۰ ثانیه کوتاه بود: کاربری که لینک را برمی‌داشت، در همان پنجره با سه پیامِ
+# پشت‌سرهم بن می‌شد (بازتولیدشده). حالا شاهدِ «دقیقه‌ای» مجازات نمی‌کند و
+# خواندنِ زنده هم از کش نمی‌آید.
 PUNISH_FRESHNESS_SECONDS = _env_int(
-    "BIO_LINK_PUNISH_FRESHNESS_SECONDS", 120, 15, 86400
+    "BIO_LINK_PUNISH_FRESHNESS_SECONDS", 60, 15, 86400
 )
 _semaphore: Optional[asyncio.Semaphore] = None
 _group_locks: dict = {}
@@ -195,7 +198,8 @@ def _classify_error(error: Exception) -> str:
     return STATUS_ERROR
 
 
-async def fetch_about(bot, user) -> Tuple[str, Optional[str]]:
+async def fetch_about(bot, user, *,
+                      use_cache: bool = True) -> Tuple[str, Optional[str]]:
     """خواندن بیوگرافی یک کاربر از سرویس.
 
     خروجی ``(status, about)``؛ ``status`` یکی از ``ok`` ، ``empty`` ،
@@ -253,7 +257,7 @@ async def fetch_about(bot, user) -> Tuple[str, Optional[str]]:
     try:
         from modules import user_profile_cache
         user_id = getattr(user, "id", None)
-        if user_id is not None:
+        if user_id is not None and use_cache:
             value = await user_profile_cache.get_about(
                 user_id, _fetch_full_user,
                 logger=getattr(bot, "logger", None),
@@ -382,8 +386,20 @@ def needs_check(chat_id, user_id) -> bool:
 # بررسی یک کاربر
 # ---------------------------------------------------------------------------
 
-async def check_user(bot, chat_id, user, *, force: bool = False) -> Optional[dict]:
-    """بیوگرافی یک کاربر را می‌خواند و نتیجه را پایدار ذخیره می‌کند."""
+class _FreshEvidenceRequired(Exception):
+    """شاهدِ تازه لازم بود ولی سرویس جواب نداد؛ وضعیتِ قبلی نباید مجازات کند."""
+
+
+async def check_user(bot, chat_id, user, *, force: bool = False,
+                     require_live: bool = False) -> Optional[dict]:
+    """بیوگرافی یک کاربر را می‌خواند و نتیجه را پایدار ذخیره می‌کند.
+
+    ``require_live=True`` یعنی «فقط خواندنِ زندهٔ الان معتبر است» (مسیرِ
+    تصمیم مجازات): اگر پروفایل از کش بیاید یا سرویس خطا بدهد،
+    ``_FreshEvidenceRequired`` بالا می‌رود تا فراخوان با شاهدِ کهنه تصمیم
+    نگیرد. کشِ ۴۵ ثانیه‌ای اینجا قبلاً باعث می‌شد بیوی *قبلی* دوباره تأیید
+    شود و کاربری که لینک را برداشته باز هم اخطار/مجازات بگیرد.
+    """
     user_id = _safe_int(getattr(user, "id", user if isinstance(user, int) else 0))
     if not user_id:
         return None
@@ -396,6 +412,13 @@ async def check_user(bot, chat_id, user, *, force: bool = False) -> Optional[dic
 
     # معافیت محلی (مالک/ادمین ثبت‌شده/VIP) — بدون هیچ RPC.
     exempt = local_exemption(chat_id, user_id, getattr(user, "username", None))
+    if not exempt and require_live:
+        # 🔐 در تصمیمِ مجازات، نقشِ واقعی گروه هم یک‌بار خوانده می‌شود:
+        # ادمینِ گروه هرگز نباید بابت بیو اخطار/بن بگیرد.
+        try:
+            exempt = await fetch_native_role(bot, chat_id, user)
+        except Exception:
+            exempt = None
     if exempt:
         bio_link_storage.set_user(
             chat_id, user_id, link=False, label=None, status=STATUS_OK,
@@ -403,7 +426,10 @@ async def check_user(bot, chat_id, user, *, force: bool = False) -> Optional[dic
         )
         return bio_link_storage.get_user(chat_id, user_id)
 
-    status, about = await fetch_about(bot, user)
+    status, about = await fetch_about(bot, user, use_cache=not require_live)
+    if require_live and status not in {STATUS_OK, STATUS_EMPTY}:
+        # شاهدِ تازه نداریم (خطا/بدون دسترسی/فلوود) → تصمیم مجازات ممنوع.
+        raise _FreshEvidenceRequired(status)
     label = None
     if status == STATUS_OK:
         has, label = bio_link.analyze(
@@ -509,8 +535,10 @@ async def refresh_before_punish(bot, chat_id, user) -> Optional[dict]:
     _inflight.add(key)
     try:
         async with _loop_semaphore():
+            # 🧊 «شاهدِ تازه» یعنی خواندنِ همین حالا؛ نه کشِ ۴۵ ثانیه‌ای.
+            # اگر بیو در همین پنجره عوض شده باشد، فقط این خواندن می‌فهمد.
             record = await asyncio.wait_for(
-                check_user(bot, chat_id, user, force=True),
+                check_user(bot, chat_id, user, force=True, require_live=True),
                 timeout=fetch_timeout() + 1.0,
             )
         fresh = record if isinstance(record, dict) else bio_link_storage.get_user(chat_id, user_id)
@@ -527,6 +555,10 @@ async def refresh_before_punish(bot, chat_id, user) -> Optional[dict]:
         return fresh
     except asyncio.CancelledError:
         raise
+    except _FreshEvidenceRequired as no_evidence:
+        _log(bot, f"REFRESH NO FRESH EVIDENCE user_id={user_id} "
+                  f"chat_id={chat_id} status={no_evidence}")
+        return None
     except Exception as error:
         _retry_after[key] = time.time() + RETRY_AFTER_ERROR_SECONDS
         _log(
