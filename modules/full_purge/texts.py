@@ -55,11 +55,13 @@ CONFIRM_ACCEPT = "تایید 💎"
 CONFIRM_CANCEL = "لغو 💎"
 
 START_TITLE = "🔐 گروه برای پاکسازی کامل قفل شد"
-START_STATUS = "آغاز پاکسازی"
+START_STATUS = "آغاز پاکسازی خودکار"
 START_COUNT_LABEL = "تعداد پیام در حال پاک شدن"
 START_DURATION_LABEL = "مدت زمان"
 
-DONE_TITLE = "✅ پاکسازی کامل تمام شد"
+DONE_TITLE = "✅ پاکسازی کامل انجام شد"
+PARTIAL_TITLE = "⚠️ پاکسازی کامل انجام شد"
+PARTIAL_NOTE = "پیام‌های بالا توسط سرور قابل حذف نبودند"
 DONE_LOCK_NOTE = "قفل گروه به حالت قبل برگشت"
 CANCEL_TITLE = "لغو شد ❌"
 CANCEL_BODY = "پاکسازی انجام نشد و گروه دست‌نخورده ماند."
@@ -172,6 +174,16 @@ def status_text(*, state="running", deleted=0, duration=0.0,
         lines = [DONE_TITLE, ""]
         lines.append(f"{START_COUNT_LABEL} : {_fa_digits(deleted)}")
         lines.append(f"{START_DURATION_LABEL} : {format_duration(duration)}")
+        if lock_released:
+            lines.append(DONE_LOCK_NOTE)
+        return "\n".join(lines)
+    if state == "partial":
+        lines = [PARTIAL_TITLE, ""]
+        lines.append(f"{START_COUNT_LABEL} : {_fa_digits(deleted)}")
+        lines.append(f"{START_DURATION_LABEL} : {format_duration(duration)}")
+        if remaining:
+            lines.append(f"قابل‌حذف نبود : {_fa_digits(remaining)}")
+            lines.append(PARTIAL_NOTE)
         if lock_released:
             lines.append(DONE_LOCK_NOTE)
         return "\n".join(lines)

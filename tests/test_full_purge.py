@@ -13,6 +13,7 @@
 7.  قالب‌بندی: Bold و نقل‌قول با آفستِ UTF-16
 """
 import asyncio
+import itertools
 import os
 import sys
 import tempfile
@@ -65,10 +66,14 @@ class FakeChat:
     """تاریخچهٔ ساختگی؛ دقیقاً رفتارِ get_messages/delete_messages را دارد."""
 
     def __init__(self, chat_id, total, *, alive_from=1, page_cap=None,
-                 fail_plan=None, history_error=None, id_step=1, id_base=0):
+                 fail_plan=None, history_error=None, id_step=1, id_base=0,
+                 undeliverable=(), inject_after=None, inject_ids=()):
         self.chat_id = chat_id
         self.total = total
         self.id_base = id_base
+        self.undeliverable = set(undeliverable or ())
+        self.inject_after = inject_after
+        self.inject_ids = set(inject_ids or ())
         self.alive = {id_base + value
                       for value in range(alive_from, total + 1, id_step)}
         self.page_cap = page_cap
@@ -89,7 +94,10 @@ class FakeChat:
         limit = int(limit or 20)
         if self.page_cap:
             limit = min(limit, self.page_cap)
-        upper = int(max_id) - 1 if max_id else self.id_base + self.total
+        # max_id=0 یعنی «از جدیدترین پیام»؛ پیام‌های تازه هم دیده می‌شوند.
+        upper = (int(max_id) - 1 if max_id
+                 else (max(self.alive) if self.alive
+                       else self.id_base + self.total))
         floor = self.id_base + 1
         rows = []
         current = upper
@@ -117,19 +125,35 @@ class FakeChat:
                 raise ValueError("unsupported peer")
         if len(ids) > core.BATCH_SIZE:
             raise ValueError("too many ids in one request")
+        # رفتار واقعی سرور: شناسه‌های سالم حذف می‌شوند و بعد خطا برمی‌گردد
+        # (برای همین وب‌کلاینت فکر می‌کند هیچ‌کدام حذف نشده‌اند).
+        blocked = [m for m in ids if m in self.undeliverable]
         removed = 0
         for message_id in ids:
+            if message_id in blocked:
+                continue
             if message_id in self.alive:
                 self.alive.discard(message_id)
                 self.deleted_ids.append(message_id)
                 removed += 1
         self.deleted_total += removed
+        if self.inject_after is not None and self.delete_calls >= self.inject_after \
+                and self.inject_ids:
+            # پیام‌هایی که وسطِ پاکسازی می‌رسند (مثل پیام‌های سرویس/اعضا)
+            self.alive |= self.inject_ids
+            self.inject_ids = set()
+        if blocked:
+            raise BadRequestError("MESSAGE_ID_INVALID")
         return [types.SimpleNamespace(pts=removed, pts_count=removed)]
 
     async def edit_message(self, message, text, formatting_entities=None, **_k):
         self.edits = getattr(self, "edits", [])
         self.edits.append((text, list(formatting_entities or [])))
         return FakeMessage(getattr(message, "id", 1), text)
+
+
+class BadRequestError(Exception):
+    """خطای «این شناسه قابل حذف نیست» — کل batch را رد می‌کند."""
 
 
 class FloodWaitError(Exception):
@@ -150,6 +174,9 @@ class FakeLogger:
         self.errors.append(str(message))
 
 
+_REPLY_IDS = itertools.count(900001)
+
+
 class FakeEvent:
     is_private = False
 
@@ -158,10 +185,11 @@ class FakeEvent:
         self.sender = user
         self.text = text
         self.replies = []
+        self.message = FakeMessage(700100, text)   # پیامِ خودِ کاربر
 
     async def reply(self, text, formatting_entities=None, **_kwargs):
         self.replies.append((text, list(formatting_entities or [])))
-        return FakeMessage(900000 + len(self.replies), text)
+        return FakeMessage(next(_REPLY_IDS), text)
 
 
 class FakeActions:
@@ -379,7 +407,8 @@ def test_08_status_message():
     check("همان یک پیام چند بار ویرایش شد (پیام جدید نه)",
           len(edits) <= 60, f"→ {len(edits)}")
     check("شمارندهٔ نهایی در پیام وضعیت درست است",
-          any("تمام شد" in text for text, _e in edits), edits[-1][0][:40] if edits else None)
+          any("پاکسازی کامل انجام شد" in text for text, _e in edits),
+          edits[-1][0][:40] if edits else None)
     final_text = edits[-1][0] if edits else ""
     check("تعداد نهایی حذف‌شده در پیام پایانی هست",
           "۵۰۰۰" in final_text or "5000" in final_text, final_text)
@@ -510,7 +539,7 @@ def test_11_formatting():
     check("متون دقیقاً مطابق قالب کارفرما هستند",
           texts.CONFIRM_TITLE == "⚙️ : پاکسازی کامل گروہ"
           and texts.START_TITLE == "🔐 گروه برای پاکسازی کامل قفل شد"
-          and texts.START_STATUS == "آغاز پاکسازی"
+          and texts.START_STATUS == "آغاز پاکسازی خودکار"
           and texts.START_COUNT_LABEL == "تعداد پیام در حال پاک شدن"
           and texts.START_DURATION_LABEL == "مدت زمان")
 
@@ -611,6 +640,178 @@ def test_13_service_flow():
     check("بدون خطا در لاگر", not bot.logger.errors, bot.logger.errors[:2])
 
 
+
+
+# ---------------------------------------------------------------------------
+# ۱۴) پیام خودش پاک نمی‌شود + تأیید واقعیِ پایان
+# ---------------------------------------------------------------------------
+def test_14_status_message_is_never_deleted():
+    print("\n### ۱۴) پیام وضعیت/دستور هرگز حذف نمی‌شود و پایان واقعی تأیید می‌شود")
+    core.reset_all()
+    chat = FakeChat(-7001, 900)
+    bot = FakeBot(chat)
+    chat.edit_message = chat.edit_message  # همان مسیر ویرایش
+    status_message = FakeMessage(900, "status")     # شناسهٔ داخل بازهٔ پیام‌ها
+    command_message = FakeMessage(899, "cmd")
+    run(core.run(bot, -7001, status=None, logger=bot.logger,
+                 protect_ids={status_message.id, command_message.id}))
+    check("پیام وضعیت حذف نشد", status_message.id not in chat.deleted_ids,
+          chat.deleted_ids[-5:])
+    check("پیام دستور حذف نشد", command_message.id not in chat.deleted_ids)
+    check("بقیهٔ پیام‌ها حذف شدند", chat.deleted_total == 898, chat.deleted_total)
+    check("همان دو شناسه در تاریخچه ماندند", {899, 900} <= chat.alive, sorted(chat.alive)[:5])
+
+
+def test_15_server_refused_messages_are_reported():
+    print("\n### ۱۵) پیام‌های «سرور نپذیرفت» جدا می‌شوند و بقیه حذف می‌شوند")
+    core.reset_all()
+    # ۲۰ شناسهٔ غیرقابل‌حذف (شبیه پیام‌های سرویس) بین ۱۲۰۰ پیام
+    blocked = set(range(500001, 500021))   # داخلِ تاریخچه، ولی سرویس‌محور
+    chat = FakeChat(-7002, 1200, id_base=500000, undeliverable=blocked)
+    bot = FakeBot(chat)
+    result = run(core.run(bot, -7002, status=None, logger=bot.logger,
+                          on_lock=None, on_unlock=None))
+    check("همهٔ پیام‌های قابل‌حذف پاک شدند",
+          result["deleted"] == 1200 - 20, result["deleted"])
+    check("فقط پیام‌های غیرقابل‌حذف باقی ماندند",
+          chat.alive == blocked, len(chat.alive))
+    check("تعداد «قابل‌حذف نبود» گزارش شد",
+          result["remaining"] == 20, result["remaining"])
+    check("دلیل پایان، خطا نیست", not result["reason"], result["reason"])
+
+
+def test_16_thirty_thousand_messages():
+    print("\n### ۱۶) ۳۰٬۰۰۰ پیام — هیچ سقفی وسط کار متوقفش نمی‌کند")
+    core.reset_all()
+    chat = FakeChat(-7003, 30000)
+    bot = FakeBot(chat)
+    result = run(core.run(bot, -7003, status=None, logger=bot.logger))
+    check("همهٔ ۳۰٬۰۰۰ پیام حذف شد", result["deleted"] == 30000, result["deleted"])
+    check("هیچ پیامی باقی نماند", not chat.alive, len(chat.alive))
+    check("تعداد RPCها منطقی است (۳۰۰ دسته + تأیید)",
+          chat.delete_calls <= 320, chat.delete_calls)
+    check("بدون خطا", not result["reason"], result["reason"])
+
+
+def test_17_status_first_then_lock_and_protection():
+    print("\n### ۱۷) ترتیب: پیام «آغاز پاکسازی خودکار» اول، بعد قفل و حذف")
+    core.reset_all()
+    service.reset_all()
+    chat = FakeChat(-7004, 200)
+    bot = FakeBot(chat)
+    user = types.SimpleNamespace(id=99, username="admin", first_name="الف")
+    original = service.start_allowed
+    service.start_allowed = lambda *a, **k: True
+
+    async def scenario():
+        await service.handle(bot, FakeEvent(-7004, user), -7004, user.id, user,
+                             "پاکسازی کامل", bot.logger)
+        confirm_event = FakeEvent(-7004, user)
+        await service.handle(bot, confirm_event, -7004, user.id, user,
+                             "تایید", bot.logger)
+        for _ in range(6000):
+            await asyncio.sleep(0)
+            if not core.is_running(-7004) and service._TASKS.get("-7004") is None:
+                break
+        return confirm_event
+
+    try:
+        event = run(scenario())
+    finally:
+        service.start_allowed = original
+    check("پیام وضعیت پیش از قفل ارسال شد",
+          chat.calls if hasattr(chat, "calls") else True)
+    status_text = event.replies[0][0] if event.replies else ""
+    check("متن آغاز کار «آغاز پاکسازی خودکار» است",
+          "آغاز پاکسازی خودکار" in status_text, status_text)
+    edits = getattr(chat, "edits", [])
+    check("همان پیام تا پایان ویرایش شد", len(edits) >= 1)
+    check("پیام حذف‌شده‌ها درست گزارش شد", chat.deleted_total >= 198,
+          chat.deleted_total)
+
+
+def test_18_duration_and_partial_text():
+    print("\n### ۱۸) متن پایان: کامل یا جزئی")
+    done = texts.status_text(state="done", deleted=30000, duration=754,
+                             lock_released=True)
+    check("پایان کامل: شمارش نهایی", "۳۰۰۰۰" in done, done)
+    check("پایان کامل: مدت زمان", "۱۲ دقیقه و ۳۴ ثانیه" in done, done)
+    check("پایان کامل: بازگشت قفل", "قفل گروه به حالت قبل برگشت" in done)
+    partial = texts.status_text(state="partial", deleted=1197, duration=100,
+                                remaining=3, lock_released=True)
+    check("پایان جزئی: هشدار", "⚠️" in partial, partial)
+    check("پایان جزئی: تعداد ناموفق", "۳" in partial)
+
+
+# ---------------------------------------------------------------------------
+# ۱۹) پیام‌هایی که وسطِ کار می‌رسند هم پاک می‌شوند (تأییدِ پایانی)
+# ---------------------------------------------------------------------------
+def test_19_messages_arriving_mid_run_get_deleted():
+    print("\n### ۱۹) پیام‌های تازه وسطِ کار — تأییدِ پایانی آن‌ها را هم پاک می‌کند")
+    core.reset_all()
+    late = set(range(800001, 800021))
+    chat = FakeChat(-7005, 400, id_base=700000, inject_after=3, inject_ids=late)
+    bot = FakeBot(chat)
+    result = run(core.run(bot, -7005, status=None, logger=bot.logger))
+    check("پیام‌های تازه هم پاک شدند", not (chat.alive & late),
+          sorted(chat.alive)[:5])
+    check("هیچ پیامی نماند", not chat.alive, len(chat.alive))
+    check("شمارش نهایی شاملِ همان‌ها است", result["deleted"] == 420,
+          result["deleted"])
+    check("«قابل‌حذف نبود» صفر است", result["remaining"] == 0,
+          result["remaining"])
+
+
+# ---------------------------------------------------------------------------
+# ۲۰) پیامِ دستور/تأیید/وضعیت هرگز حذف نمی‌شوند: بررسیِ شناسه‌های واقعی
+# ---------------------------------------------------------------------------
+def test_20_own_messages_survive_with_real_ids_inside_history():
+    print("\n### ۲۰) شناسهٔ واقعیِ پیامِ دستور و تأیید داخل تاریخچه — حذف نمی‌شوند")
+    global _REPLY_IDS
+    _REPLY_IDS = itertools.count(900001)     # شمارندهٔ پاسخ‌ها از نو
+    core.reset_all()
+    service.reset_all()
+    # شناسه‌های ۷۰۰۱..۷۲۰۰ فعال‌اند و پیام‌های خودِ ما هم داخل همین بازه‌اند.
+    chat = FakeChat(-7006, 200, id_base=7000)
+    bot = FakeBot(chat)
+    # پیام دستور، پیام تأیید و پیام وضعیت همه داخل تاریخچهٔ فعال‌اند.
+    chat.alive |= {7005, 7006, 900001, 900002}
+    user = types.SimpleNamespace(id=99, username="admin", first_name="الف")
+    original = service.start_allowed
+    service.start_allowed = lambda *a, **k: True
+
+    async def scenario():
+        command_event = FakeEvent(-7006, user, "پاکسازی کامل")
+        command_event.message = FakeMessage(7005, "پاکسازی کامل")
+        await service.handle(bot, command_event, -7006, user.id, user,
+                             "پاکسازی کامل", bot.logger)
+        confirm_event = FakeEvent(-7006, user, "تایید")
+        confirm_event.message = FakeMessage(7006, "تایید")
+        await service.handle(bot, confirm_event, -7006, user.id, user,
+                             "تایید", bot.logger)
+        for _ in range(6000):
+            await asyncio.sleep(0)
+            if not core.is_running(-7006) and service._TASKS.get("-7006") is None:
+                break
+        return command_event, confirm_event
+
+    try:
+        command_event, confirm_event = run(scenario())
+    finally:
+        service.start_allowed = original
+
+    check("پیام دستور حذف نشد", 7005 in chat.alive, sorted(chat.alive)[:5])
+    check("پیام تأیید حذف نشد", 7006 in chat.alive, sorted(chat.alive)[:5])
+    check("پیام وضعیت و پیام تأیید حذف نشدند",
+          {900001, 900002} <= chat.alive, sorted(chat.alive)[:5])
+    check("بقیهٔ تاریخچه پاک شد",
+          all(value not in chat.alive for value in range(7007, 7201)),
+          sorted(chat.alive)[:10])
+    check("پایان با شمارش واقعی اعلام شد",
+          any("پاکسازی کامل" in text for text, _e in chat.edits),
+          [text.splitlines()[0] for text, _e in chat.edits])
+
+
 def main():
     print("=" * 62)
     print("🧬 تست «پاکسازی کامل» (FULL PURGE)")
@@ -628,6 +829,13 @@ def main():
     test_11_formatting()
     test_12_admin_list_entry()
     test_13_service_flow()
+    test_14_status_message_is_never_deleted()
+    test_15_server_refused_messages_are_reported()
+    test_16_thirty_thousand_messages()
+    test_17_status_first_then_lock_and_protection()
+    test_18_duration_and_partial_text()
+    test_19_messages_arriving_mid_run_get_deleted()
+    test_20_own_messages_survive_with_real_ids_inside_history()
     print("\n" + "=" * 62)
     print(f"passed={PASSED} failed={FAILED}")
     if FAILURES:

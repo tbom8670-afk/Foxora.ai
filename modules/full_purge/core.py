@@ -44,6 +44,8 @@ STATUS_MIN_INTERVAL = 2.0   # کمترین فاصلهٔ دو ویرایشِ پی
 STATUS_MIN_DELTA = 25       # کمترین رشدِ شمارنده برای ویرایشِ بعدی
 MAX_STATUS_FAILURES = 3     # بعد از این تعداد، ویرایشِ وضعیت کنار گذاشته می‌شود
 MAX_PAGES = 100000          # فقط برای جلوگیری از حلقهٔ بی‌نهایت در بدترین حالت
+RETRY_ROUNDS = 3            # چند موجِ تلاشِ دوباره برای شناسه‌های ردشده
+VERIFY_ROUNDS = 2           # چند بار پس از پایان، «ماندنِ چیزی» را تأیید می‌کنیم
 
 #: قفل‌های مستقلِ هر گروه (Per-Chat Lock).
 _ACTIVE: "OrderedDict[str, dict]" = OrderedDict()
@@ -192,33 +194,111 @@ async def fetch_page(bot, chat_id, *, max_id=0, page_size=PAGE_SIZE, logger=None
     return ids, None
 
 
-async def delete_batch(bot, chat_id, ids, *, logger=None):
-    """حذفِ یک دسته با Retry/Backoff. خروجی ``(deleted_count, failed_ids)``."""
-    ids = [int(value) for value in ids if value]
-    if not ids:
-        return 0, []
+async def _delete_once(bot, chat_id, ids, logger=None):
+    """یک تلاشِ حذف. خروجی ``(ok, error)``."""
     peer = _peer(bot, chat_id)
+    result, error = await _rpc(
+        bot.client.delete_messages(peer, list(ids)),
+        label="delete_messages", chat_id=chat_id, logger=logger,
+    )
+    return result is not None and error is None, error
+
+
+async def _delete_with_retry(bot, chat_id, ids, *, logger=None):
+    """حذف با Retry/Backoff برای خطاهای موقت. ``(ok, error)``."""
     attempt = 1
     while attempt <= MAX_RETRY:
-        result, error = await _rpc(
-            bot.client.delete_messages(peer, list(ids)),
-            label="delete_messages", chat_id=chat_id, logger=logger,
-        )
-        if error is None:
-            return len(ids), []
+        ok, error = await _delete_once(bot, chat_id, ids, logger)
+        if ok:
+            return True, None
         wait = flood_seconds(error)
         if wait is not None:
             if wait <= FLOOD_MAX_WAIT and attempt < MAX_RETRY:
                 await asyncio.sleep(wait + 0.5)
                 attempt += 1
                 continue
-            return 0, ids
+            return False, error
         if _is_transient(error) and attempt < MAX_RETRY:
             await asyncio.sleep(min(2.0, 0.25 * (2 ** (attempt - 1))))
             attempt += 1
             continue
+        return False, error
+    return False, None
+
+
+def _blocking_error(error):
+    """آیا این خطا یعنی «بعضی شناسه‌های همین دسته قابل حذف نیستند»؟
+
+    سرور سروش کلِ batch را رد می‌کند اگر حتی یک شناسه مشکل داشته باشد
+    (پیامِ سرویس، شناسهٔ ناشناخته، پیامِ سرویس‌های سیستمی…). برای همین باید
+    دسته را نصف کرد تا فقط شناسهٔ خراب کنار گذاشته شود.
+    """
+    if error is None:
+        return False
+    if flood_seconds(error) is not None:
+        return False
+    name = error.__class__.__name__.lower()
+    text = str(error).lower()
+    if any(marker in name or marker in text for marker in (
+        "flood", "timeout", "connection", "server", "internal", "network",
+    )):
+        return False
+    return any(marker in name or marker in text for marker in (
+        "bad", "invalid", "forbidden", "not_found", "notfound", "unknown",
+        "permission", "access", "rpc", "cannot", "can't", "cant", "id",
+    ))
+
+
+async def delete_batch(bot, chat_id, ids, *, logger=None, _depth=0):
+    """حذفِ یک دسته با Retry، و در صورت رد شدن، تقسیم تا شناسهٔ خراب پیدا شود.
+
+    خروجی ``(deleted_count, failed_ids)``. ``failed_ids`` فقط شناسه‌هایی است
+    که **تک‌تک هم** رد شدند — نه کلِ دسته.
+    """
+    ids = [int(value) for value in ids if value]
+    if not ids:
+        return 0, []
+    ok, error = await _delete_with_retry(bot, chat_id, ids, logger=logger)
+    if ok:
+        return len(ids), []
+
+    if not _blocking_error(error) or len(ids) == 1 or _depth >= 8:
+        if logger is not None:
+            try:
+                logger.log_error(
+                    "FULL PURGE UNDELETABLE "
+                    f"chat_id={chat_id} ids={ids[:10]} count={len(ids)} "
+                    f"depth={_depth} error={error!r}"
+                )
+            except Exception:
+                pass
         return 0, ids
-    return 0, ids
+
+    middle = len(ids) // 2
+    deleted_a, failed_a = await delete_batch(
+        bot, chat_id, ids[:middle], logger=logger, _depth=_depth + 1)
+    deleted_b, failed_b = await delete_batch(
+        bot, chat_id, ids[middle:], logger=logger, _depth=_depth + 1)
+    return deleted_a + deleted_b, failed_a + failed_b
+
+
+async def count_remaining(bot, chat_id, *, logger=None, max_pages=5):
+    """پس از پایان: آیا پیامِ قابل‌حذفی مانده؟ (تأییدِ واقعی، نه ادعا)
+
+    فقط برای گزارش است: اگر پیامِ جان‌مانده‌ای پیدا شود، شمارش و علتش
+    برمی‌گردد تا کاربر بداند (و دوباره دستور بزند).
+    """
+    remaining = []
+    max_id = 0
+    for _ in range(max_pages):
+        ids, error = await fetch_page(bot, chat_id, max_id=max_id, logger=logger)
+        if error is not None or not ids:
+            break
+        remaining.extend(ids)
+        max_id = min(ids)
+        if len(remaining) > 500:
+            break
+    return remaining
 
 
 class StatusEditor:
@@ -292,29 +372,34 @@ class StatusEditor:
 # ---------------------------------------------------------------------------
 async def run(bot, chat_id, *, status: StatusEditor | None = None,
               logger=None, clock=time.monotonic, on_lock=None,
-              on_unlock=None) -> dict:
+              on_unlock=None, protect_ids=(), verify=True) -> dict:
     """پاکسازیِ کاملِ یک گروه تا آخرین پیامِ قابل‌حذف.
 
-    ``on_lock``/``on_unlock`` قلاب‌های قفل/بازکردن گروه‌اند تا این ماژول به
-    لایهٔ مدیریتیِ گروه وابسته نشود (تست‌پذیرِ خالص).
+    * ``on_lock``/``on_unlock``: قلاب‌های قفل/بازکردن گروه (بدون وابستگی به
+      لایهٔ مدیریتی، تا خالص و تست‌پذیر بماند).
+    * ``protect_ids``: شناسه‌هایی که **هرگز** حذف نمی‌شوند (خودِ پیام وضعیت و
+      پیام تأییدِ همین دستور). پیش از هر RPC فیلتر می‌شوند.
+    * ``verify``: پس از پایان، یک بار دیگر تاریخچه خوانده می‌شود تا مطمئن
+      شویم چیزی نمانده؛ اگر مانده بود، یک موجِ دیگر حذف می‌شود و گزارش
+      نهایی فقط بر اساس واقعیت است.
 
-    خروجی: ``{"deleted": int, "scanned": int, "pages": int, "failed": int,
-    "cancelled": bool, "reason": str|None, "elapsed": float}``
+    خروجی: ``deleted / scanned / pages / failed / unreachable / remaining /
+    cancelled / reason / elapsed / lock_released``.
     """
     started = clock()
     state = {"running": True, "started_at": started, "deleted": 0}
     _register(chat_id, state)
 
+    protected = {int(value) for value in (protect_ids or ()) if value}
     deleted = 0
     scanned = 0
     pages = 0
-    failed_total = 0
     cancelled = False
     reason = None
     locked = False
-    pending = []                # شناسه‌هایی که حذفشان ناموفق بود
-    retried_failures = 0
-    seen_failed = set()
+    pending = []
+    undeliverable = set()
+    remaining = []
 
     async def publish(force=False, state_name="running", **extra):
         if status is None:
@@ -324,6 +409,43 @@ async def run(bot, chat_id, *, status: StatusEditor | None = None,
             force=force, **extra,
         )
 
+    async def sweep(max_id_start):
+        """یک پیمایشِ کامل از جدید به قدیم. خروجی: ``(pages, max_id, error)``."""
+        nonlocal deleted, scanned, pages
+        max_id = max_id_start
+        while pages < MAX_PAGES:
+            ids, error = await fetch_page(
+                bot, chat_id, max_id=max_id, logger=logger)
+            if error is not None:
+                return pages, max_id, error
+            ids = [value for value in ids if value not in protected]
+            if not ids:
+                return pages, max_id, None
+            pages += 1
+            scanned += len(ids)
+            max_id = min(ids)
+
+            batches = [ids[index:index + BATCH_SIZE]
+                       for index in range(0, len(ids), BATCH_SIZE)]
+            semaphore = asyncio.Semaphore(DELETE_PARALLEL)
+
+            async def _worker(batch):
+                nonlocal deleted
+                async with semaphore:
+                    ok, failed = await delete_batch(
+                        bot, chat_id, batch, logger=logger)
+                    deleted += ok
+                    for value in failed or ():
+                        if value in protected:
+                            continue
+                        pending.append(value)
+
+            await asyncio.gather(*[_worker(batch) for batch in batches],
+                                 return_exceptions=True)
+            state["deleted"] = deleted
+            await publish(total=scanned, remaining=len(pending))
+        return pages, max_id, None
+
     try:
         if on_lock is not None:
             locked = bool(await on_lock())
@@ -332,53 +454,49 @@ async def run(bot, chat_id, *, status: StatusEditor | None = None,
                                       state="locked", force=True)
         await publish(force=True)
 
-        max_id = 0
-        while pages < MAX_PAGES:
-            ids, error = await fetch_page(
-                bot, chat_id, max_id=max_id, logger=logger)
-            if error is not None:
-                # صفحهٔ اولِ ناموفق یعنی دسترسی به تاریخچه نداریم؛ ادامه بی‌معناست.
-                if not scanned and not deleted:
-                    reason = "history_unavailable"
+        # ---- موجِ اول: از جدیدترین پیام تا قدیمی‌ترین ----
+        _pages, last_max_id, error = await sweep(0)
+        if error is not None and not scanned and not deleted:
+            reason = "history_unavailable"
+
+        # ---- تلاشِ دوباره برای شناسه‌هایی که رد شدند ----
+        for _round in range(RETRY_ROUNDS):
+            if not pending:
                 break
-            if not ids:
-                break
-            pages += 1
-            scanned += len(ids)
-            max_id = min(ids)          # صفحهٔ بعدی: قدیمی‌تر از این‌ها
-
-            batches = [ids[start:start + BATCH_SIZE]
-                       for start in range(0, len(ids), BATCH_SIZE)]
-            semaphore = asyncio.Semaphore(DELETE_PARALLEL)
-
-            async def _worker(batch):
-                nonlocal deleted, failed_total
-                async with semaphore:
-                    ok, failed = await delete_batch(
-                        bot, chat_id, batch, logger=logger)
-                    deleted += ok
-                    if failed:
-                        failed_total += len(failed)
-                        pending.extend(failed)
-
-            await asyncio.gather(*[_worker(batch) for batch in batches],
-                                 return_exceptions=True)
-            state["deleted"] = deleted
-            await publish(total=scanned, remaining=len(pending))
-
-        # موجِ پایانی: تلاشِ دوباره برای همان شناسه‌هایی که سرور نپذیرفت.
-        if pending:
-            leftovers = [value for value in dict.fromkeys(pending)]
+            leftovers = [value for value in dict.fromkeys(pending)
+                         if value not in protected]
             pending = []
             for start in range(0, len(leftovers), BATCH_SIZE):
                 batch = leftovers[start:start + BATCH_SIZE]
-                ok, failed = await delete_batch(bot, chat_id, batch, logger=logger)
+                ok, failed = await delete_batch(bot, chat_id, batch,
+                                                logger=logger)
                 deleted += ok
-                retried_failures += len(failed)
-                if failed:
-                    pending.extend(failed)
-                await publish(total=scanned, remaining=len(pending))
-            seen_failed = set(pending)
+                pending.extend(value for value in (failed or ())
+                               if value not in protected)
+            await publish(total=scanned, remaining=len(pending))
+
+        # ---- تأییدِ واقعی: چیزی مانده؟ ----
+        if verify and not cancelled:
+            for _round in range(VERIFY_ROUNDS):
+                remaining = await count_remaining(bot, chat_id, logger=logger)
+                remaining = [value for value in remaining
+                             if value not in protected]
+                if not remaining:
+                    break
+                # هرچه مانده، یک بار دیگر (دسته‌ای) حذف می‌شود.
+                for start in range(0, len(remaining), BATCH_SIZE):
+                    batch = remaining[start:start + BATCH_SIZE]
+                    ok, _failed = await delete_batch(bot, chat_id, batch,
+                                                     logger=logger)
+                    deleted += ok
+                await publish(total=scanned + len(remaining),
+                              remaining=len(remaining))
+            remaining = await count_remaining(bot, chat_id, logger=logger)
+            remaining = [value for value in remaining if value not in protected]
+            undeliverable = set(remaining)
+
+        if error is not None and reason is None:
+            reason = f"read_error:{error.__class__.__name__}"
     except asyncio.CancelledError:
         cancelled = True
         reason = "cancelled"
@@ -405,27 +523,37 @@ async def run(bot, chat_id, *, status: StatusEditor | None = None,
                     except Exception:
                         pass
         if status is not None:
-            final_state = "running"
-            if cancelled or reason == "cancelled":
+            if cancelled or reason:
                 final_state = "failed"
-            elif reason == "history_unavailable":
-                final_state = "failed"
-            elif reason:
-                final_state = "failed"
+            elif undeliverable:
+                final_state = "partial"
             else:
                 final_state = "done"
             await status.maybe_update(
                 deleted=deleted, duration=elapsed, state=final_state,
-                remaining=len(pending), lock_released=released, force=True)
+                remaining=len(undeliverable), lock_released=released,
+                force=True)
         state["running"] = False
         _unregister(chat_id)
+        if logger is not None:
+            try:
+                logger.log_info(
+                    "FULL PURGE RESULT "
+                    f"chat_id={chat_id} deleted={deleted} scanned={scanned} "
+                    f"pages={pages} undeliverable={len(undeliverable)} "
+                    f"reason={reason!r} elapsed_ms={int(elapsed * 1000)}"
+                )
+            except Exception:
+                pass
 
     return {
         "deleted": deleted,
         "scanned": scanned,
         "pages": pages,
-        "failed": retried_failures,
-        "unreachable": len(seen_failed),
+        "failed": len(undeliverable),
+        "unreachable": len(undeliverable),
+        "remaining": len(undeliverable),
+        "remaining_ids": sorted(undeliverable)[:20],
         "cancelled": cancelled,
         "reason": reason,
         "elapsed": elapsed,

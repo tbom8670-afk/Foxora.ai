@@ -41,6 +41,15 @@ def is_command(text) -> bool:
     return normalize(text) == "پاکسازی کامل"
 
 
+def _set_ids(chat_id, **ids):
+    entry = _PENDING.get(str(chat_id))
+    if not isinstance(entry, dict):
+        return
+    for key, value in ids.items():
+        if isinstance(value, int) and value > 0:
+            entry[key] = value
+
+
 def pending_for(chat_id):
     entry = _PENDING.get(str(chat_id))
     if not entry:
@@ -150,21 +159,106 @@ def _lock_hooks(bot, chat_id):
     return lock, unlock
 
 
-async def run_purge(bot, chat_id, *, status_message=None, logger=None):
-    """اجرای پاکسازیِ کامل. اگر مسابقه‌ای در جریان باشد، کاری نمی‌کند."""
+class _LiveStatus:
+    """پیام وضعیت زنده + رد کردنِ خودِ پیام از فهرست حذف.
+
+    ترتیب کار عمداً این است:
+    1. اول پیامِ «آغاز پاکسازی خودکار» ارسال می‌شود،
+    2. شناسهٔ همان پیام و پیام دستور/تأیید در فهرستِ محافظت‌شده می‌نشیند،
+    3. بعد قفل و پاکسازی شروع می‌شود.
+
+    نتیجه: پاکسازی هرگز پیامِ خودش را حذف نمی‌کند و پیام وضعیت تا آخر
+    ویرایش می‌شود.
+    """
+
+    def __init__(self, bot, chat_id, message, edge_ids=(), logger=None):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message = message
+        self.protected = {int(value) for value in edge_ids if value}
+        self.protected.update(self._message_id(message))
+        self.logger = logger
+        self.last_text = None
+        self.last_at = 0.0
+        self.last_count = 0
+        self.failures = 0
+        self.edits = 0
+
+    @staticmethod
+    def _message_id(message):
+        for attr in ("id", "message_id"):
+            value = getattr(message, attr, None)
+            if isinstance(value, int) and value > 0:
+                return {value}
+        return set()
+
+    async def maybe_update(self, *, deleted, duration, state="running",
+                           remaining=None, total=None, lock_released=False,
+                           force=False):
+        if self.message is None or self.failures >= core.MAX_STATUS_FAILURES:
+            return False
+        now = time.monotonic()
+        if not force:
+            if now - self.last_at < core.STATUS_MIN_INTERVAL:
+                return False
+            if deleted - self.last_count < core.STATUS_MIN_DELTA:
+                return False
+        text = texts.status_text(state=state, deleted=deleted,
+                                 duration=duration, remaining=remaining,
+                                 total=total, lock_released=lock_released)
+        if text == self.last_text:
+            return False
+        entities = texts.status_entities(text)
+        try:
+            sent = await asyncio.wait_for(
+                self.bot.client.edit_message(
+                    self.message, text, formatting_entities=entities),
+                timeout=core.RPC_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.failures += 1
+            if self.logger is not None:
+                try:
+                    self.logger.log_error(
+                        "FULL PURGE STATUS EDIT FAILED "
+                        f"chat_id={self.chat_id} failures={self.failures} "
+                        f"error={error!r}")
+                except Exception:
+                    pass
+            return False
+        # اگر کلاینت نسخهٔ تازهٔ پیام را برگرداند، همین را برای ویرایش بعدی
+        # می‌گیریم (بعضی فورک‌ها به‌جای InputMessageID شیء پیام می‌خواهند).
+        if sent is not None and getattr(sent, "id", None) == getattr(
+                self.message, "id", None):
+            self.message = sent
+        self.last_text = text
+        self.last_at = now
+        self.last_count = deleted
+        self.edits += 1
+        return True
+
+
+async def run_purge(bot, chat_id, *, status_message=None, logger=None,
+                    protect_ids=()):
+    """اجرای پاکسازیِ کامل. اگر همان گروه در حال پاکسازی باشد، کاری نمی‌کند."""
     if core.is_running(chat_id):
         return {"deleted": 0, "reason": "already_running"}
     lock, unlock = _lock_hooks(bot, chat_id)
-    editor = core.StatusEditor(bot, chat_id, status_message, logger=logger)
-    result = await core.run(bot, chat_id, status=editor, logger=logger,
-                            on_lock=lock, on_unlock=unlock)
+    editor = _LiveStatus(bot, chat_id, status_message, edge_ids=protect_ids,
+                         logger=logger)
+    result = await core.run(bot, chat_id, status=editor,
+                            logger=logger, on_lock=lock, on_unlock=unlock,
+                            protect_ids=editor.protected)
     if logger is not None:
         try:
             logger.log_info(
                 "FULL PURGE FINISHED "
                 f"chat_id={chat_id} deleted={result.get('deleted')} "
                 f"scanned={result.get('scanned')} pages={result.get('pages')} "
-                f"failed={result.get('failed')} reason={result.get('reason')!r} "
+                f"remaining={result.get('remaining')} "
+                f"reason={result.get('reason')!r} "
                 f"elapsed_ms={int(result.get('elapsed', 0) * 1000)}"
             )
         except Exception:
@@ -222,7 +316,11 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
                          texts.status_entities(busy), logger)
             return True
         _remember(chat_id, user_id)
-        await send_confirm(bot, event, chat_id, logger)
+        command_id = getattr(getattr(event, "message", None), "id", None)
+        confirm = await send_confirm(bot, event, chat_id, logger)
+        _set_ids(chat_id,
+                 command_message_id=command_id,
+                 confirm_message_id=getattr(confirm, "id", None))
         if logger is not None:
             try:
                 logger.log_info(
@@ -258,12 +356,30 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         await _reply(bot, event, chat_id, busy, texts.status_entities(busy), logger)
         return True
 
-    # پیامِ وضعیت: همان پیامی که تا آخر ویرایش می‌شود.
+    # ۱) اول پیام وضعیت («آغاز پاکسازی خودکار») — پیش از قفل و پیش از حذف.
     status_text = texts.status_text(state="locked")
     status_message = await _reply(bot, event, chat_id, status_text,
                                   texts.status_entities(status_text), logger)
+    # ۲) شناسهٔ پیام‌های خودِ ما محافظت می‌شوند: پیام وضعیت، پیام «تایید» و
+    #    پیام دستورِ «پاکسازی کامل». (بعد از «forget» هیچ درخواست تکراری
+    #    فرستاده نمی‌شود، پس محافظت از این پیام‌ها کارِ لازمِ بی‌ضرر است.)
+    protect_ids = set()
+    candidates = [status_message, getattr(event, "message", None)]
+    for entry in (entry,):
+        if isinstance(entry, dict):
+            for key in ("command_message_id", "confirm_message_id"):
+                value = entry.get(key)
+                if isinstance(value, int) and value > 0:
+                    protect_ids.add(value)
+    for candidate in candidates:
+        for attr in ("id", "message_id"):
+            value = getattr(candidate, attr, None)
+            if isinstance(value, int) and value > 0:
+                protect_ids.add(value)
+    # ۳) حالا پاکسازی در تسکِ مستقل (که خودش اول قفل می‌کند).
     task = _spawn(
-        run_purge(bot, chat_id, status_message=status_message, logger=logger),
+        run_purge(bot, chat_id, status_message=status_message, logger=logger,
+                  protect_ids=protect_ids),
         name=f"full-purge:{chat_id}",
     )
     _track(chat_id, task)
