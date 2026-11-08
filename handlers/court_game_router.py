@@ -121,6 +121,7 @@ async def send_court_image(bot, event, chat_id, caption, logger=None):
     """
     path = _court_image_file()
     client = getattr(bot, "client", None)
+    log(logger, f"COURT IMAGE STEP start chat_id={chat_id} path={path}")
     sender = getattr(client, "send_file", None)
     if path is not None and not callable(sender):
         # کلاینتی که send_file ندارد (مثلاً استابِ تست یا نسخهٔ قدیمی) —
@@ -137,7 +138,12 @@ async def send_court_image(bot, event, chat_id, caption, logger=None):
         try:
             if hasattr(client, "_call"):
                 from modules.splusthon_upload_fix import _get_media_sender
-                await _get_media_sender(client)
+                media_sender = await _get_media_sender(client)
+                log(logger, f"COURT IMAGE MEDIA SENDER ready={media_sender is not None} "
+                            f"chat_id={chat_id}")
+            else:
+                log(logger, f"COURT IMAGE MEDIA SENDER skipped reason=no_call "
+                            f"chat_id={chat_id}")
         except asyncio.CancelledError:
             raise
         except Exception as media_error:
@@ -156,6 +162,9 @@ async def send_court_image(bot, event, chat_id, caption, logger=None):
             return message
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            log_error(logger, f"COURT IMAGE SEND TIMEOUT chat_id={chat_id} "
+                              f"timeout_s={COURT_IMAGE_TIMEOUT}")
         except Exception as error:
             log_error(logger, f"COURT IMAGE SEND FAILED chat_id={chat_id} "
                               f"error={error!r}")
