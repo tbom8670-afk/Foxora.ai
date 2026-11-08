@@ -129,6 +129,20 @@ async def send_court_image(bot, event, chat_id, caption, logger=None):
         sender = None
     if path is not None and sender is not None:
         entities = texts.bold_entities(caption)
+        # آپلود باید از sender رسانه‌ای (media DC) برود؛ بدونِ آن SPlusthon
+        # SaveFilePart را روی connection server می‌فرستد و سرور رد می‌کند
+        # (FILE_REQUEST_RECEIVED_ON_CONNECTION_SERVER). دقیقاً همان کاری که
+        # modules/photo_download.py قبل از آپلود می‌کند؛ اگر نشد، آپلودِ
+        # عادی تلاش می‌شود و در صورتِ شکست مسیرِ متنی ادامه می‌یابد.
+        try:
+            if hasattr(client, "_call"):
+                from modules.splusthon_upload_fix import _get_media_sender
+                await _get_media_sender(client)
+        except asyncio.CancelledError:
+            raise
+        except Exception as media_error:
+            log_error(logger, f"COURT IMAGE MEDIA SENDER FAILED "
+                              f"chat_id={chat_id} error={media_error!r}")
         try:
             message = await asyncio.wait_for(
                 sender(
