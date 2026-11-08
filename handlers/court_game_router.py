@@ -95,6 +95,9 @@ async def send_quoted(bot, event, chat_id, text):
 COURT_IMAGE_PATH = (Path(__file__).resolve().parent.parent
                     / "static" / "court" / "court_hall.jpg")
 _COURT_IMAGE_MISSING_LOGGED = [False]
+# نسخهٔ آنلاینِ همان تصویر (شاخهٔ main) — فقط برای مسیرِ جایگزینِ ارسال با URL.
+COURT_IMAGE_URL = ("https://raw.githubusercontent.com/tbom8670-afk/Foxora.ai/"
+                   "main/static/court/court_hall.jpg")
 
 
 def _court_image_file():
@@ -168,9 +171,41 @@ async def send_court_image(bot, event, chat_id, caption, logger=None):
         except Exception as error:
             log_error(logger, f"COURT IMAGE SEND FAILED chat_id={chat_id} "
                               f"error={error!r}")
+            # مسیرِ جایگزین: بدونِ آپلود، با InputMediaPhotoExternal از همان
+            # تصویر روی شاخهٔ main مخزن. تا وقتی آپلود روی این سرور رد
+            # می‌شود، این مسیر عکسِ واقعی را نشان می‌دهد.
+            if COURT_IMAGE_URL and callable(getattr(client, "get_input_entity", None)):
+                try:
+                    await asyncio.wait_for(
+                        _send_court_photo_by_url(client, chat_id, COURT_IMAGE_URL,
+                                                 caption, entities),
+                        timeout=COURT_IMAGE_TIMEOUT)
+                    log(logger, f"COURT IMAGE SENT via=external_url chat_id={chat_id}")
+                    return None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as url_error:
+                    log_error(logger, f"COURT IMAGE URL FALLBACK FAILED "
+                                      f"chat_id={chat_id} error={url_error!r}")
     elif path is None and event is not None:
         pass  # لاگ در خودِ _court_image_file
     return await send_quoted(bot, event, chat_id, caption)
+
+
+async def _send_court_photo_by_url(client, chat_id, url, caption, entities):
+    """عکس را با ``InputMediaPhotoExternal`` می‌فرستد (بدونِ هیچ آپلودی).
+
+    سرورِ سروش خودش تصویر را از ``url`` می‌گیرد و به‌صورتِ عکسِ واقعی در چت
+    می‌گذارد؛ بنابراین ``upload.saveFilePart`` ساخته نمی‌شود و مشکلِ
+    «آپلود از connection server» اصلاً پیش نمی‌آید. همان روشی که
+    ``modules/photo_download.py`` برای لینک‌ها استفاده می‌کند.
+    """
+    from splusthon.tl import types, functions
+    entity = await client.get_input_entity(chat_id)
+    media = types.InputMediaPhotoExternal(url=url)
+    request = functions.messages.SendMediaRequest(
+        entity, media, message=caption, entities=entities or None)
+    return await client(request)
 
 
 async def _bot_username(bot):

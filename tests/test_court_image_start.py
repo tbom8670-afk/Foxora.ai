@@ -79,6 +79,24 @@ class _Client:
         return {"username": "fox_test"}
 
 
+class _UrlClient(_Client):
+    """کلاینتی که مسیرِ InputMediaPhotoExternal را هم دارد (send_media)."""
+
+    def __init__(self, fail_file=True, fail_url=False):
+        super().__init__(fail_file=fail_file)
+        self.fail_url = fail_url
+        self.url_calls = []
+
+    async def get_input_entity(self, chat_id):
+        return ("peer", chat_id)
+
+    async def __call__(self, request):
+        if self.fail_url:
+            raise RuntimeError("external url rejected (simulated)")
+        self.url_calls.append(request)
+        return {"id": 4001}
+
+
 class _Event:
     is_private = False
 
@@ -210,6 +228,62 @@ def test_missing_file_does_not_block_game():
           len(event.replies) == 1 and texts.JOIN_WORD in event.replies[0])
 
 
+def test_url_fallback_when_upload_impossible():
+    """اگر آپلود ممکن نبود، عکس با InputMediaPhotoExternal (بدونِ آپلود) برود."""
+    _reset()
+    client = _UrlClient(fail_file=True)
+    bot = _Bot(client)
+    event = _Event()
+
+    async def scenario():
+        return await router.start_game(bot, event, CHAT, 557, {"id": 557},
+                                      logger=bot.logger)
+
+    started = asyncio.run(scenario())
+    check("بازی شروع شد", started is True, f"{started}")
+    check("مسیرِ جایگزینِ عکس یک درخواست فرستاد", len(client.url_calls) == 1,
+          f"{len(client.url_calls)}")
+    req = client.url_calls[0] if client.url_calls else None
+    media = getattr(req, "media", None)
+    check("مدیا از نوعِ InputMediaPhotoExternal است",
+          type(media).__name__ == "InputMediaPhotoExternal",
+          type(media).__name__)
+    url = getattr(media, "url", "")
+    check("آدرسِ عکس همان فایلِ مخزن است (نه لینکِ تصادفی)",
+          url.endswith("/static/court/court_hall.jpg") and url.startswith("https://"),
+          url)
+    check("caption همان متنِ شروعِ بازی است",
+          router.texts.JOIN_WORD in (getattr(req, "message", "") or ""))
+    check("entityهای Bold همراهِ caption رفتند",
+          bool(getattr(req, "entities", None)))
+    check("وقتی عکس از راهِ URL رفت، متنِ تکراری فرستاده نشد",
+          event.replies == [], f"{event.replies}")
+    check("موفقیتِ مسیرِ جایگزین لاگ شد",
+          any("COURT IMAGE SENT via=external_url" in l for l in bot.logger.lines))
+    check("تلاشِ آپلود هم ثبت شد (اول آپلود، بعد URL)",
+          len(client.send_file_calls) == 1)
+
+
+def test_url_fallback_failure_still_sends_text():
+    """اگر مسیرِ URL هم شکست خورد، بازی با متنِ معمولی ادامه پیدا کند."""
+    _reset()
+    client = _UrlClient(fail_file=True, fail_url=True)
+    bot = _Bot(client)
+    event = _Event()
+
+    async def scenario():
+        return await router.start_game(bot, event, CHAT, 558, {"id": 558},
+                                      logger=bot.logger)
+
+    started = asyncio.run(scenario())
+    check("بازی شروع شد", started is True, f"{started}")
+    check("شکستِ مسیرِ URL لاگ شد",
+          any("COURT IMAGE URL FALLBACK FAILED" in l for l in bot.logger.lines),
+          f"{bot.logger.lines[-3:]}")
+    check("متنِ شروع به‌صورت پیامِ معمولی رفت",
+          len(event.replies) == 1 and router.texts.JOIN_WORD in event.replies[0])
+
+
 def main():
     print("\n### ۱) فایلِ تصویر")
     test_image_file_is_real()
@@ -219,6 +293,10 @@ def main():
     test_fallback_when_upload_fails()
     print("\n### ۴) نبودِ فایل → بازی نباید بخوابد")
     test_missing_file_does_not_block_game()
+    print("\n### ۵) آپلود ناممکن → عکس با URL خارجی (بدون آپلود)")
+    test_url_fallback_when_upload_impossible()
+    print("\n### ۶) شکستِ مسیرِ URL → متن همچنان می‌رود")
+    test_url_fallback_failure_still_sends_text()
     print("\n" + "=" * 60)
     print(f"passed={PASSED} failed={FAILED}")
     print("=" * 60)
