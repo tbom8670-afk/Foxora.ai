@@ -3822,6 +3822,26 @@ async def handle_new_message(bot, event):
             not has_text_content and not is_forwarded_media and not is_gif_media
         )
 
+        # ===== 🧬 مسیر اختصاصی «پاکسازی کامل» =====
+        # دستور و پاسخ تأیید/لغوِ آن باید برای مالک/ادمین، و فقط برایشان، بی‌درنگ
+        # به همین قابلیت برسد. صفِ حذفِ اختصاصی داخل modules/full_purge است و
+        # هیچ صفِ موجودی را لمس نمی‌کند.
+        if not event.is_private:
+            try:
+                from modules.full_purge import service as _full_purge
+                if _full_purge.claims(chat_id, user_id, message_text):
+                    if await _full_purge.handle(
+                        bot, event, chat_id, user_id, sender, message_text,
+                        bot.logger,
+                    ):
+                        return
+            except Exception as _full_purge_error:
+                bot.logger.log_error(
+                    "FULL PURGE HOOK FAILED "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"error={_full_purge_error!r}"
+                )
+
         # ===== 🦊 مسیر اختصاصی «مرکز فرماندهی روباه» =====
         # «شرکت» و دستورهای درون‌بازی باید برای هر عضو عادی کار کنند. اگر این
         # پیام‌ها از گیت‌های مدیریتی (عضویت اجباری، هرزنگاری، کلمهٔ ممنوع،
