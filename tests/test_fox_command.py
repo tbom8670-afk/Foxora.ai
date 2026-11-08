@@ -118,6 +118,7 @@ CHAT_1 = -1009001
 CHAT_2 = -1009002
 CHAT_X = -1009003   # گروه اختصاصی تست «دستور شروع» (بدون اثر روی بقیه)
 CHAT_M = -1009004   # گروه اختصاصی تست «عضو عادی»
+CHAT_N = -1009005   # گروه اختصاصی تست «نام فرمانده»
 ADMIN_M = SimpleNamespace(id=9100, first_name="مدیر", username="admin_m")
 
 
@@ -376,6 +377,102 @@ def test_01d_game_list_entry_is_bold():
         check(f"span «{word}» دقیق است", covered == word, f"→ {covered!r}")
     check("Bold مرکز فرماندهی بعد از دادگاه روباه می‌آید",
           entities[1][0] > entities[0][0], entities)
+
+
+def test_01e_commander_name_is_real_display_name():
+    """👤 هر جای «فرمانده:» باید نام نمایشی/یوزرنیم همان کاربر باشد، نه عدد."""
+    print("\n### ۳۴) نام فرمانده در پیام‌ها: یوزرنیم یا نام نمایشی")
+    from modules.user_display import format_user
+    check("با یوزرنیم → @username",
+          format_user(SimpleNamespace(username="ali_cmd", first_name="علی"), "")
+          == "@ali_cmd")
+    check("بدون یوزرنیم → نام نمایشی",
+          format_user(SimpleNamespace(username=None, first_name="رضا",
+                                      last_name="محمدی"), "") == "رضا محمدی")
+    check("نام عددی پذیرفته نمی‌شود",
+          format_user(SimpleNamespace(username="9001", first_name="سارا"), "")
+          == "سارا")
+
+    fgame.reset_all(CHAT_N)
+    class _MsgN:
+        def __init__(self, text, mid):
+            self.message = text; self.id = mid
+            self.file = None; self.caption = None
+            self.sender_id = None; self.from_id = None
+            self.edit_date = None; self.reply_to = None; self.entities = None
+
+    class _EvN:
+        """رویدادی که get_sender ندارد؛ مثل کلاینتی که sender را resolve نکرده."""
+
+        def __init__(self, user, text, mid):
+            self.message = _MsgN(text, mid)
+            self.chat_id = CHAT_N
+            self.is_private = False
+            self.replies = []
+            self.sender_id = user.id
+            self.sender = user
+
+        async def reply(self, text, **kwargs):
+            self.replies.append((text, kwargs.get("formatting_entities") or []))
+
+    names = {
+        7001: SimpleNamespace(id=7001, username="commander_one",
+                              first_name="علی", last_name=None),
+        7002: SimpleNamespace(id=7002, username=None,
+                              first_name="رضا", last_name="محمدی"),
+    }
+
+    async def play(text, user_id):
+        event = _EvN(names[user_id], text, 1)
+        await fgame.handle_message(bot, event, CHAT_N, user_id, names[user_id],
+                                   text, bot.logger)
+        return event
+
+    bot = FakeBot()
+    run(play("مرکز فرماندهی", 7001))
+    joined_one = run(play("شرکت", 7001))
+    joined_two = run(play("شرکت", 7002))
+    check("پیام ثبت‌نام فرماندهٔ اول یوزرنیم است",
+          "@commander_one" in all_text(joined_one), all_text(joined_one))
+    check("پیام ثبت‌نام فرماندهٔ دوم نام نمایشی است",
+          "رضا محمدی" in all_text(joined_two), all_text(joined_two))
+    match = fgame.match_of(CHAT_N)
+    check("نام ذخیره‌شده در مسابقه همان نام واقعی است",
+          [p["name"] for p in match["players"]] ==
+          ["@commander_one", "رضا محمدی"],
+          [p["name"] for p in match["players"]])
+
+    # پیام «دو فرمانده آماده‌اند» هر دو نام را نشان می‌دهد
+    both = all_text(joined_two)
+    check("هر دو نام در پیام آماده‌شدن هست",
+          "@commander_one" in both and "رضا محمدی" in both, both)
+
+    # هیچ‌جا «کاربر <عدد>» دیده نشود
+    all_notes = "\n".join(
+        all_text(player_events) for player_events in (joined_one, joined_two)
+    )
+    check("هیچ‌جا «کاربر 7001»/«کاربر 7002» نیامده",
+          "کاربر 7001" not in all_notes and "کاربر 7002" not in all_notes,
+          all_notes)
+
+    # پیام پایان بازی هم نام واقعی برنده/بازنده را نشان می‌دهد
+    match = fgame.match_of(CHAT_N)
+    run(play("تسلیم", 7002))
+    finished = fgame.match_of(CHAT_N) or match
+    match = finished
+    finish_texts = []
+    winner_id = match.get("winner") or 7001
+    for player in match["players"]:
+        finish_texts.append(texts.winner_message(match, player, True)[0]
+                            if player["user_id"] == winner_id
+                            else texts.loser_message(match, player,
+                                                     match.get("end_reason"))[0])
+    check("پیام برنده نام فرمانده را دارد",
+          any("فرمانده: @" in row or "فرمانده: رضا" in row
+              for row in finish_texts), finish_texts)
+    check("هیچ پیام پایانی با «فرمانده: 🪖» بدون نام نیست",
+          all("فرمانده: 🪖" not in row for row in finish_texts))
+    fgame.reset_all(CHAT_N)
 
 
 def test_02_countries():
@@ -1006,6 +1103,7 @@ def main():
     test_01b_start_word_never_registers()
     test_01c_member_never_blocked_by_admin_gates()
     test_01d_game_list_entry_is_bold()
+    test_01e_commander_name_is_real_display_name()
     test_02_countries()
     test_03_budget()
     test_04_shop_limits_and_budget_guard()

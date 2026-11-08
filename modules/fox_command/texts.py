@@ -640,9 +640,21 @@ def war_report(match) -> tuple:
     return msg.build()
 
 
+def commander_name(player, fallback="فرمانده") -> str:
+    """نام نمایشی فرمانده — «@یوزرنیم» یا نام نمایشی، هرگز شناسهٔ عددی."""
+    if isinstance(player, dict):
+        name = player.get("name")
+    else:
+        name = getattr(player, "name", None)
+    name = str(name or "").strip()
+    if not name or name.isdigit():
+        return fallback
+    return name
+
+
 def winner_message(match, winner, prize_paid) -> tuple:
     msg = Message()
-    msg.title("فرمانده: 🪖")
+    msg.title(f"فرمانده: {commander_name(winner)} 🪖")
     msg.bold("شما برنده بازی شدید.\n")
     msg.blank()
     if prize_paid:
@@ -659,7 +671,7 @@ def winner_message(match, winner, prize_paid) -> tuple:
 
 def loser_message(match, loser, reason) -> tuple:
     msg = Message()
-    msg.title("فرمانده: 🪖")
+    msg.title(f"فرمانده: {commander_name(loser)} 🪖")
     msg.bold("شما بازنده شدید.\n")
     msg.blank()
     msg.bold("گزارش عملکرد و خسارت ⛔\n")
@@ -725,7 +737,7 @@ def nuke_blocked(reason) -> tuple:
 def surrender_done(match, opponent) -> tuple:
     msg = Message()
     msg.title("تسلیم ثبت شد 🏳")
-    msg.line(f"فرمانده: {(opponent or {}).get('name')}")
+    msg.line(f"فرمانده: {commander_name(opponent)}")
     msg.quote("مسابقه بسته می‌شود و گزارش نهایی ارسال می‌گردد.")
     return msg.build()
 

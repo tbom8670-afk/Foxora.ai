@@ -194,12 +194,35 @@ async def _send(bot, chat_id, built, *, event=None, logger=None):
 
 
 def _display(user, fallback="فرمانده"):
+    """نام نمایشی فرمانده: «@یوزرنیم» یا نام نمایشی — NEVER شناسهٔ عددی.
+
+    اگر sender از کلاینت نرسیده باشد، همین ماژول خودش مشخصات کاربر را
+    resolve می‌کند تا هرگز «کاربر 123456» در بازی دیده نشود.
+    """
     try:
         from modules.user_display import format_user
-        return format_user(user, fallback)
+        return format_user(user, "")
     except Exception:
         name = getattr(user, "username", None) or getattr(user, "first_name", None)
-        return str(name or fallback)
+        return str(name or "") or (fallback or "")
+
+
+async def _display_async(event, user, user_id, fallback="فرمانده"):
+    """نام نمایشی با تلاش برای گرفتن مشخصات واقعی از رویداد."""
+    candidates = [user, getattr(event, "sender", None)]
+    for candidate in candidates:
+        name = _display(candidate, "")
+        if name:
+            return name
+    for getter in ("get_sender", "get_from_user"):
+        try:
+            resolved = await getattr(event, getter)()
+        except Exception:
+            continue
+        name = _display(resolved, "")
+        if name:
+            return name
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +286,9 @@ async def _join(bot, event, chat_id, user_id, sender, logger=None):
     if not match:
         return False
     async with _lock(chat_id):
-        status, player = engine.join(
-            match, user_id, _display(sender, f"کاربر {user_id}"))
+        display_name = await _display_async(event, sender, user_id,
+                                           f"کاربر {user_id}")
+        status, player = engine.join(match, user_id, display_name)
         if status == ST_OK:
             _save(match)
     log(logger, f"FOX COMMAND JOIN chat_id={chat_id} user_id={user_id} "
