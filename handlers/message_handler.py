@@ -124,7 +124,13 @@ from modules.gif_spam_detector import (
     reset_gif_history,
     track_gif,
 )
-from modules.group_stats import add_kick, add_mute, make_report, add_deleted_count
+from modules.group_stats import (
+    add_kick, add_mute, make_report, add_deleted_count,
+    record_members as group_stats_record_members,
+    member_count as group_stats_member_count,
+    add_gif as group_stats_add_gif,
+)
+from modules.group_stats_report import build_report as build_group_stats_report
 from modules.spam_history import get_message_ids, get_user_history, clear_user
 from modules.web_search import can_search, search_web
 from modules.jorat_haghighat import get_jorat, get_haghighat
@@ -648,6 +654,39 @@ async def _send_moderation_notification_once(
     except Exception:
         bot.moderation_notification_guard.discard(key)
         raise
+
+
+def _record_gif_stat(bot, chat_id, user_id, sender):
+    """شمارش «تعداد کل گیف های ارسالی» گروه و کاربر — بدون RPC اضافه."""
+    if not chat_id:
+        return
+    try:
+        group_stats_add_gif(
+            chat_id, user_id,
+            getattr(sender, "username", "") or "",
+            _display_name_of(sender),
+        )
+    except Exception as error:
+        try:
+            bot.logger.log_error(
+                f"GROUP GIF STAT FAILED chat_id={chat_id} error={error!r}")
+        except Exception:
+            pass
+
+
+def _display_name_of(user):
+    """نام نمایشی برای ذخیره در آمار (یوزرنیم جدا ذخیره می‌شود)."""
+    if user is None:
+        return ""
+    first = getattr(user, "first_name", None)
+    last = getattr(user, "last_name", None)
+    if isinstance(user, dict):
+        first, last = user.get("first_name"), user.get("last_name")
+    name = " ".join(
+        str(part).strip() for part in (first, last)
+        if part and str(part).strip()
+    )
+    return " ".join(name.replace("\n", " ").replace("\r", " ").split())
 
 
 def _run_background(bot, name, callback, *args):
@@ -3954,7 +3993,16 @@ async def handle_new_message(bot, event):
                     f"message_id={getattr(event.message, 'id', None)}")
                 return
 
+        # پیامِ فقط‌رسانه‌ای (گیف/فیلم/عکس) از دروازه عبور کرد؛ برای شمارشِ
+        # «تعداد کل گیف های ارسالی» باید همان‌جا ثبت شود و بعد برگردد.
+        # (قبلاً اینجا بی‌هیچ ثبتی return می‌شد و گیف‌ها هیچ‌وقت شمرده نمی‌شدند.)
         if _media_only_message:
+            if not event.is_private and not fast_command:
+                _run_background(
+                    bot, "user_activity", record_activity,
+                    chat_id, user_id, event.message,
+                )
+                _record_gif_stat(bot, chat_id, user_id, sender)
             return
 
         _debug_log(bot,
@@ -5385,6 +5433,8 @@ async def handle_new_message(bot, event):
 
         if not fast_command and not admin_bypass:
             save_history_message(chat_id, user_id, event.message.id, message_text)
+        if not event.is_private and is_gif_media:
+            _record_gif_stat(bot, chat_id, user_id, sender)
         if not auto_punish_protected:
             if is_gif_message(event.message):
                 # مسیر مستقل GIF: ثبت، صف‌بندی و حذف دسته‌ای با تلاش مجدد.
@@ -6756,6 +6806,7 @@ async def handle_new_message(bot, event):
                     chat_id,
                     user_id,
                     getattr(sender, "username", "") or "",
+                    _display_name_of(sender),
                 )
                 record_coin_message(
                     chat_id, user_id, _format_admin_display(sender),
@@ -6902,7 +6953,7 @@ async def handle_new_message(bot, event):
                 getattr(_growth_sender, "username", None))
             return
 
-        # آمار گروه
+        # 📊 آمار گروه — قالب دقیقِ کارفرما (Bold + نقل‌قول سروش پلاس).
         if clean_text in ["آمار گپ", "آمار گروه"]:
             member_count = 0
 
@@ -6913,11 +6964,32 @@ async def handle_new_message(bot, event):
                 )
                 member_count = full.full_chat.participants_count
             except Exception as e:
-                print("MEMBER COUNT ERROR:", repr(e))
+                bot.logger.log_error(
+                    f"GROUP STATS MEMBER COUNT ERROR chat_id={chat_id} "
+                    f"error={e!r}"
+                )
                 member_count = 0
 
-            print("FINAL MEMBER COUNT:", member_count)
-            await event.reply(make_report(chat_id, member_count))
+            if member_count:
+                # آخرین عددِ واقعی ذخیره می‌شود تا اگر سرور یک‌بار پاسخ نداد،
+                # «تعداد اعضا» صفرِ دروغ نشان داده نشود.
+                try:
+                    group_stats_record_members(chat_id, member_count)
+                except Exception as stats_error:
+                    bot.logger.log_error(
+                        "GROUP STATS MEMBER SAVE FAILED "
+                        f"chat_id={chat_id} error={stats_error!r}"
+                    )
+            else:
+                try:
+                    member_count = group_stats_member_count(chat_id)
+                except Exception:
+                    member_count = 0
+
+            stats_text, stats_entities = build_group_stats_report(
+                chat_id, member_count
+            )
+            await event.reply(stats_text, formatting_entities=stats_entities)
             return
 
         # لیست بازی

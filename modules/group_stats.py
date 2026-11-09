@@ -102,38 +102,95 @@ def ensure_group(data, chat_id):
             "deleted": 0,
             "kicked": 0,
             "muted": 0,
+            "gifs": 0,
+            "members": 0,
             "users": {}
         }
 
-    return data[chat_id]
+    group = data[chat_id]
+    # گروه‌هایی که پیش از این نسخه ساخته شده‌اند این کلیدها را ندارند.
+    if not isinstance(group.get("gifs"), int):
+        group["gifs"] = 0
+    if not isinstance(group.get("members"), int):
+        group["members"] = 0
+    if not isinstance(group.get("users"), dict):
+        group["users"] = {}
+
+    return group
 
 
-def ensure_user(group, user_id, username=""):
+def ensure_user(group, user_id, username="", display_name=""):
     user_id = str(user_id)
 
     if user_id not in group["users"]:
         group["users"][user_id] = {
             "username": username or "unknown",
+            "name": display_name or "",
             "messages": 0,
             "deleted": 0
         }
 
-    elif username:
-        group["users"][user_id]["username"] = username
+    else:
+        record = group["users"][user_id]
+        if username:
+            record["username"] = username
+        if display_name:
+            record["name"] = display_name
 
     return group["users"][user_id]
 
 
-def add_message(chat_id, user_id, username=""):
+def add_message(chat_id, user_id, username="", display_name=""):
     data = load_stats()
 
     group = ensure_group(data, chat_id)
-    user = ensure_user(group, user_id, username)
+    user = ensure_user(group, user_id, username, display_name)
 
     group["messages"] += 1
     user["messages"] += 1
 
     save_stats(data)
+
+
+def add_gif(chat_id, user_id=None, username="", display_name=""):
+    """شمارش «تعداد کل گیف های ارسالی» گروه — یک شمارندهٔ واقعی، نه تخمین.
+
+    برای هر گیفِ دیده‌شده در گروه یک واحد اضافه می‌شود؛ همان مسیری که بقیهٔ
+    آمار ثبت می‌شود (حافظه + فلاش دوره‌ای). اگر شناسهٔ کاربر معلوم باشد،
+    شمارندهٔ همان کاربر هم بالا می‌رود.
+    """
+    data = load_stats()
+
+    group = ensure_group(data, chat_id)
+    group["gifs"] = int(group.get("gifs", 0)) + 1
+    if user_id:
+        user = ensure_user(group, user_id, username, display_name)
+        user["gifs"] = int(user.get("gifs", 0)) + 1
+
+    save_stats(data)
+
+
+def record_members(chat_id, member_count):
+    """ذخیرهٔ آخرین تعداد اعضای *واقعی* گروه (برای وقتی سرور پاسخ نمی‌دهد)."""
+    try:
+        member_count = int(member_count)
+    except (TypeError, ValueError):
+        return None
+    if member_count <= 0:
+        return None
+    data = load_stats()
+    group = ensure_group(data, chat_id)
+    group["members"] = member_count
+    save_stats(data)
+    return member_count
+
+
+def gif_count(chat_id):
+    return int(get_stats(chat_id).get("gifs", 0) or 0)
+
+
+def member_count(chat_id):
+    return int(get_stats(chat_id).get("members", 0) or 0)
 
 
 def add_deleted(chat_id, user_id, username=""):
@@ -184,15 +241,26 @@ def get_stats(chat_id):
 
 
 def top_users(chat_id, limit=10):
+    """کاربران بر اساس تعداد پیام ارسالی، از بیشترین به کمترین.
+
+    مرتب‌سازی کاملاً قطعی است: تعداد پیام نزولی و در صورت تساوی شناسهٔ کاربر
+    (رشته‌ای) صعودی — پس یک ورودی همیشه یک خروجی می‌دهد و هیچ‌وقت دو اجرا
+    ترتیب متفاوت نشان نمی‌دهند.
+    """
     group = get_stats(chat_id)
 
     users = group.get("users", {})
 
-    result = sorted(
-        users.items(),
-        key=lambda x: x[1].get("messages", 0),
-        reverse=True
-    )
+    def rank_key(item):
+        user_id, info = item
+        count = info.get("messages", 0)
+        try:
+            count = int(count or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return (-count, str(user_id))
+
+    result = sorted(users.items(), key=rank_key)
 
     return result[:limit]
 
