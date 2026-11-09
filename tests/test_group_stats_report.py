@@ -90,16 +90,16 @@ def test_01_exact_template():
     expected = "\n".join([
         "📊 آمار کل گروه",
         "",
-        "کل پیام‌ها: ۲",
-        "پیام های حذف شده: ۴",
-        "اخراج شده ها : ۰",
-        "سکوت شدها : ۰",
-        "تعداد اعضا گروه : ۳",
-        "تعداد کل گیف های ارسالی : ۰",
+        "کل پیام‌ها: 2",
+        "پیام های حذف شده: 4",
+        "اخراج شده ها : 0",
+        "سکوت شدها : 0",
+        "تعداد اعضا گروه : 3",
+        "تعداد کل گیف های ارسالی : 0",
         "",
         "↶ کاربران فعال گروه :",
-        "⬟ کاربر ۱ : @ali",
-    ] + [f"⬟ کاربر {report.fa_digits(i)} : ----" for i in range(2, 11)])
+        "⬟ کاربر 1 : 2 پیام | @ali",
+    ] + [f"⬟ کاربر {i} : ----" for i in range(2, 11)])
     check("متن کامل مطابق قالب است", text == expected,
           text.splitlines()[:4])
     check("عنوان درست است", text.startswith("📊 آمار کل گروه\n\n"))
@@ -108,7 +108,9 @@ def test_01_exact_template():
               "کل پیام‌ها", "پیام های حذف شده", "اخراج شده ها :",
               "سکوت شدها :", "تعداد اعضا گروه :",
               "تعداد کل گیف های ارسالی :")))
-    check("اعداد فارسی‌اند", "۰" in text and "0" not in text, text[:40])
+    check("اعداد مثل تصویر، لاتین‌اند", "کل پیام‌ها: 2" in text, text[:40])
+    check("هر ردیف با تعداد پیام شروع می‌شود",
+          "⬟ کاربر 1 : 2 پیام | @ali" in text, text.splitlines()[-11:])
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +158,17 @@ def test_03_ranking():
             group_stats.add_message(chat, user_id, f"u{user_id}", f"کاربر {user_id}")
 
     text, _entities = report.build_report(chat, member_count=10)
-    names = [line.split(" : ", 1)[1] for line in text.splitlines()
-             if line.startswith("⬟")]
+    rows = [line for line in text.splitlines() if line.startswith("⬟")]
     expected_first = ["@u502", "@u505", "@u501", "@u504", "@u503"]
+    names = [row.split(" | ", 1)[1] for row in rows if " | " in row]
+    counts = [row.split(" : ", 1)[1].split(" پیام", 1)[0] for row in rows
+              if " | " in row]
     check("ترتیب دقیقاً بر اساس بیشترین پیام است",
           names[:5] == expected_first, names[:5])
+    check("تعداد پیامِ هر ردیف درست است",
+          counts[:5] == ["30", "12", "7", "7", "1"], counts[:5])
+    check("ردیف اول دقیقاً «⬟ کاربر 1 : 30 پیام | @u502» است",
+          rows[0] == "⬟ کاربر 1 : 30 پیام | @u502", rows[0])
 
     # اجرای دوباره باید دقیقاً همان خروجی را بدهد (مرتب‌سازی قطعی)
     repeats = {report.report_text(chat, member_count=10) for _ in range(5)}
@@ -184,7 +192,8 @@ def test_04_empty_rows():
     text, _entities = report.build_report(chat, member_count=3)
     rows = [line for line in text.splitlines() if line.startswith("⬟")]
     check("همیشه ۱۰ ردیف چاپ می‌شود", len(rows) == 10, len(rows))
-    check("ردیف اول کاربر واقعی است", rows[0] == "⬟ کاربر ۱ : @only", rows[0])
+    check("ردیف اول کاربر واقعی با تعداد پیام است",
+          rows[0] == "⬟ کاربر 1 : 1 پیام | @only", rows[0])
     check("ردیف‌های خالی «----» هستند",
           all(row.endswith(" : ----") for row in rows[1:]), rows[1:])
 
@@ -214,7 +223,8 @@ def test_05_names():
     chat = fresh(-51006)
     group_stats.add_message(chat, 777, "", "نام نمایشی")
     text, _e = report.build_report(chat, member_count=1)
-    check("در قالب، نام نمایشی چاپ شده", "⬟ کاربر ۱ : نام نمایشی" in text, text)
+    check("در قالب، نام نمایشی چاپ شده",
+          "⬟ کاربر 1 : 1 پیام | نام نمایشی" in text, text)
     check("شناسهٔ عددی در هیچ ردیفی چاپ نشده", "777" not in text, text)
 
 
@@ -235,7 +245,7 @@ def test_06_gif_counter():
           group["users"]["801"]["gifs"] == 5, group["users"]["801"])
     text, _e = report.build_report(chat, member_count=2)
     check("عدد در قالب فارسی چاپ شده",
-          "تعداد کل گیف های ارسالی : ۶" in text, text)
+          "تعداد کل گیف های ارسالی : 6" in text, text)
     check("صفر پیش‌فرض برای گروه تازه",
           group_stats.gif_count(fresh(-51008)) == 0)
 
@@ -250,7 +260,7 @@ def test_07_members():
     check("خواندن همان عدد", group_stats.member_count(chat) == 17)
     text, _e = report.build_report(chat, member_count=0)
     check("با member_count=0 از عدد ذخیره‌شده استفاده می‌شود",
-          "تعداد اعضا گروه : ۱۷" in text, text)
+          "تعداد اعضا گروه : 17" in text, text)
     check("عدد نامعتبر ذخیره نمی‌شود",
           group_stats.record_members(chat, "نامعتبر") is None)
     check("عدد منفی ذخیره نمی‌شود", group_stats.record_members(chat, -3) is None)
@@ -368,8 +378,8 @@ def test_08_handler_route():
     asyncio.run(scenario2())
     body = event.replies[-1] if event.replies else ""
     check("خطای سرور: قالب باز هم ارسال می‌شود", "📊 آمار کل گروه" in body, body[:40])
-    check("خطای سرور: تعداد اعضا از حافظه (۴۲) خوانده شد",
-          "تعداد اعضا گروه : ۴۲" in body, body)
+    check("خطای سرور: تعداد اعضا از حافظه (42) خوانده شد",
+          "تعداد اعضا گروه : 42" in body, body)
 
     source = Path(mh.__file__).read_text(encoding="utf-8")
     check("هندلر از گزارش جدید استفاده می‌کند",

@@ -14,8 +14,8 @@
 
     ↶ کاربران فعال گروه :
 
-    ⬢ کاربر 1 : @username
-    ⬢ کاربر 2 : نام نمایشی
+    ⬟ کاربر 1 : 300 پیام | @username
+    ⬟ کاربر 2 : 120 پیام | نام نمایشی
     ...
 
 قواعدی که کارفرما صریح گفت:
@@ -24,6 +24,8 @@
 * هر کدام از خط‌های آماری داخل نقل‌قول سروش پلاس است، و خودِ خط
   (نه فقط عدد) — عیناً مثل عکس.
 * «تعداد کل گیف های ارسالی» یک شمارندهٔ واقعی است (``group_stats.add_gif``).
+* هر ردیفِ کاربر با تعداد پیام‌های خودش شروع می‌شود:
+  ``⬟ کاربر N : 300 پیام | @username``.
 * نام کاربر: اول یوزرنیم، اگر نبود نام نمایشی. شناسهٔ عددی هرگز چاپ نمی‌شود.
 * رتبه‌بندی فقط بر اساس تعداد پیام ارسالی، از بیشترین به کمترین، با
   شکستنِ تساوی بر اساس شناسه؛ یعنی خروجی همیشه یکسان و بی‌خطا است.
@@ -69,8 +71,13 @@ def u16(text) -> int:
     return len(str(text).encode("utf-16-le")) // 2
 
 
+def num(value) -> str:
+    """عددِ قالب آمار — با ارقام لاتین، عیناً مثل تصویر کارفرما (13 / 4 / 300)."""
+    return str(value)
+
+
 def fa_digits(value) -> str:
-    """۰۱۲۳۴۵۶۷۸۹ — مثل بقیهٔ متن‌های فارسی ربات."""
+    """۰۱۲۳۴۵۶۷۸۹ — برای جاهایی که ارقام فارسی خواسته شود."""
     return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
@@ -78,8 +85,8 @@ def _stat_line(label, value):
     # برچسب‌هایی که در تصویر با «:» تمام می‌شوند همان‌طور می‌مانند؛ بقیه یک
     # «: » می‌گیرند تا همهٔ ردیف‌ها یک‌شکل باشند.
     if label.endswith(":"):
-        return f"{label} {fa_digits(value)}"
-    return f"{label}: {fa_digits(value)}"
+        return f"{label} {num(value)}"
+    return f"{label}: {num(value)}"
 
 
 #: مقادیر جای‌نگهدارِ قدیمی که «نام واقعی» نیستند.
@@ -153,9 +160,15 @@ def build_report(chat_id, member_count=None, limit=MAX_USERS):
         if index <= len(top):
             _user_id, info = top[index - 1]
             name = display_name(info)
+            try:
+                count = int(info.get("messages", 0) or 0)
+            except (AttributeError, TypeError, ValueError):
+                count = 0
+            append(f"{RANK_MARK} کاربر {num(index)} : "
+                   f"{num(count)} پیام | {name}")
         else:
-            name = EMPTY_NAME
-        append(f"{RANK_MARK} کاربر {fa_digits(index)} : {name}")
+            # کاربری برای این رتبه نیست؛ خطِ خالی با همان نشانهٔ کارفرما.
+            append(f"{RANK_MARK} کاربر {num(index)} : {EMPTY_NAME}")
 
     text = "\n".join(body)
 
