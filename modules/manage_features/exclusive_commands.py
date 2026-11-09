@@ -15,7 +15,7 @@ import asyncio
 
 import time
 
-from modules.manage_features import access, exclusive, storage, texts
+from modules.manage_features import access, exclusive, peers, storage, texts
 from modules.manage_features.queue import PerGroupQueue
 
 #: صف مستقلِ اختصاصی — هیچ حذف پیام/زمانداری داخلش اجرا نمی‌شود.
@@ -52,14 +52,23 @@ def _target_token(text):
 
 
 async def _resolve_target(bot, event, chat_id, token):
-    """``(user_id, name, username)`` از ریپلای یا از یوزرنیمِ داده‌شده."""
+    """``(user_id, name, username)`` از ریپلای یا از یوزرنیمِ داده‌شده.
+
+    ⚠️ مسیر ریپلای دیگر هیچ RPCای نمی‌زند: SPlusthon نویسندهٔ پیامِ ریپلای
+    را روی خودِ رویداد می‌گذارد (``event.reply_to_msg_id`` + کشِ entity یا
+    ``event.message.reply_to_message``). قبلاً یک ``get_messages`` اضافه
+    انجام می‌شد که در سرور کند، پاسخ را تا یک دقیقه عقب می‌انداخت.
+    """
     reply_to = getattr(event, "reply_to", None)
     if reply_to is not None and not token:
-        # peer واقعیِ گروه: با شناسهٔ مثبت، SPlusthon آن را «کاربر» می‌گیرد
-        # و get_messages شکست می‌خورد (یعنی هیچ‌وقت مقصد پیدا نمی‌شد).
-        from modules.manage_features import peers
-
+        cached_sender = _sender_from_event(event)
+        if cached_sender is not None:
+            return (_identifier(cached_sender),
+                    display_of(cached_sender),
+                    getattr(cached_sender, "username", None) or "")
         message = await bot.client.get_messages(
+            # peer واقعیِ گروه: با شناسهٔ مثبت، SPlusthon آن را «کاربر» می‌گیرد
+            # و get_messages شکست می‌خورد (یعنی هیچ‌وقت مقصد پیدا نمی‌شد).
             peers.group_peer(bot, chat_id),
             ids=getattr(reply_to, "reply_to_msg_id", None))
         sender = await message.get_sender() if message else None
@@ -83,6 +92,24 @@ async def _resolve_target(bot, event, chat_id, token):
                 getattr(entity, "username", None) or "")
     return None
 
+
+def _sender_from_event(event):
+    """نویسندهٔ پیامِ ریپلای‌شده، اگر روی رویداد/کش موجود باشد (بدون RPC)."""
+    candidates = [
+        getattr(event, "reply_to_sender", None),
+        getattr(event, "_bot_cached_reply_sender", None),
+    ]
+    message = getattr(event, "message", None)
+    reply_message = getattr(message, "reply_to_message", None) if message else None
+    if reply_message is not None:
+        candidates.append(getattr(reply_message, "sender", None))
+        candidates.append(getattr(reply_message, "from_id", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if hasattr(candidate, "id") or hasattr(candidate, "user_id"):
+            return candidate
+    return None
 
 def _identifier(user):
     for attr in ("id", "user_id"):
@@ -129,6 +156,8 @@ def remember_lock_state(chat_id, locked):
 
 async def refresh_lock_state(bot, chat_id, logger=None):
     """خواندن وضعیت واقعی + لغو خودکارِ مجوزها اگر گروه باز شده باشد."""
+    # این مسیر خودش «بررسیِ واقعی» است؛ نباید از کشِ کوتاه‌مدت بخواند.
+    exclusive.forget_lock_state(chat_id)
     locked = await exclusive.is_group_locked(bot, chat_id)
     remember_lock_state(chat_id, locked)
     if not locked and exclusive.list_entries(chat_id):
@@ -193,6 +222,7 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
 
     revoke = cleaned.startswith("لغو اختصاصی")
     token = _target_token(text)
+    # ⚠️ سرعت: مقصد از رویداد/کش resolve می‌شود، نه با یک RPC اضافه.
     target = await _resolve_target(bot, event, chat_id, token)
     if target is None or target[0] is None:
         await _reply(bot, event,
@@ -205,26 +235,13 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
     label = ("@" + target_username) if target_username else (target_name or "----")
 
     async def job():
+        """فقط ارتقا/لغو — هیچ خواندنِ اضافی، هیچ انتظارِ تأیید."""
         if revoke:
             await exclusive.revoke(bot, chat_id, target_id)
             return "revoked"
-        try:
-            await exclusive.grant(bot, chat_id, target_id,
-                                  actor_id=user_id, name=target_name,
-                                  username=target_username)
-        except Exception as error:                   # noqa: BLE001
-            # یک تلاش دوبارهٔ سریع؛ خطاهای گذرا نباید به کاربر برسد.
-            if logger is not None:
-                try:
-                    logger.log_error(
-                        f"EXCLUSIVE GRANT RETRY chat_id={chat_id} "
-                        f"user_id={target_id} error={error!r}")
-                except Exception:                    # noqa: BLE001
-                    pass
-            await asyncio.sleep(0.6)
-            await exclusive.grant(bot, chat_id, target_id,
-                                  actor_id=user_id, name=target_name,
-                                  username=target_username)
+        await exclusive.grant(bot, chat_id, target_id,
+                              actor_id=user_id, name=target_name,
+                              username=target_username)
         return "granted"
 
     try:
@@ -232,6 +249,11 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
             key=storage.group_key(chat_id), job=job,
             dedupe_key=f"{'revoke' if revoke else 'grant'}:{target_id}",
             logger=logger)
+        if result == "granted":
+            # ✅ مهم: پاسخِ کاربر **بلافاصله** می‌رود؛ تأییدِ سرور و (در صورت
+            # نیاز) ارتقای پله‌ای بعد از آن اجرا می‌شوند تا اگر سرور «ادمینِ
+            # بی‌حق» را نپذیرفت، حالتِ حداقلی خودکار اعمال شود.
+            _spawn_verification(bot, chat_id, target_id, logger)
     except exclusive.NotLocked:
         await _reply(bot, event, texts.exclusive_message(
             username=label, kind="not_locked"), logger)
@@ -272,6 +294,20 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
 # ---------------------------------------------------------------------------
 #  بازیابی پس از ری‌استارت
 # ---------------------------------------------------------------------------
+def _spawn_verification(bot, chat_id, target_id, logger=None):
+    """اجرای تأیید در پس‌زمینه (پاسخ کاربر معطل نمی‌شود)."""
+    try:
+        task = asyncio.ensure_future(
+            exclusive._verify_in_background(bot, chat_id, target_id, None))
+    except RuntimeError:
+        return None
+    try:
+        task.set_name(f"exclusive-verify:{storage.group_key(chat_id)}")
+    except Exception:                                # noqa: BLE001
+        pass
+    return task
+
+
 def recover(bot, logger=None):
     """رکوردهای نیمه‌کاره را برمی‌گرداند تا صف دوباره بررسی‌شان کند."""
     jobs = exclusive.pending_jobs()

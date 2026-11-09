@@ -171,6 +171,8 @@ class FakeClient:
         self.get_participant_broken = False
         self.edits = []
         self.sent = []
+        #: نامِ هر RPC/خواندنی که واقعاً صدا زده شده (برای سنجشِ مسیر گرم)
+        self.calls = []
         #: هدف‌های حذف (باید همیشه InputPeer یا شناسهٔ منفی باشند)
         self.delete_targets = []
         self.delete_effective = True
@@ -187,6 +189,7 @@ class FakeClient:
                                               "access_hash": 6789})()
 
     async def get_entity(self, target):
+        self.calls.append("get_entity")
         if isinstance(target, int) and target in self.users:
             return self.users[target]
         if isinstance(target, str):
@@ -197,6 +200,7 @@ class FakeClient:
 
     async def __call__(self, request, *args, **kwargs):
         name = type(request).__name__
+        self.calls.append(name)
         if name == "EditBannedRequest":
             if self.fail_edit_banned:
                 raise ConnectionError("network down")
@@ -274,6 +278,7 @@ class FakeClient:
 
     async def get_participants(self, chat_id, limit=None, *, filter=None,
                                **_kwargs):
+        self.calls.append("get_participants")
         """فهرست اعضا (و با filter، فقط ادمین‌ها) — مثل SPlusthon."""
         members = []
         for user_id in self.chat.members:
@@ -292,6 +297,7 @@ class FakeClient:
         return _AsyncList(members)
 
     async def get_messages(self, chat_id, ids=None, **_kwargs):
+        self.calls.append("get_messages")
         sender = self.users.get(self.reply_sender_id)
         return type("Message", (), {
             "id": ids,
@@ -444,14 +450,28 @@ def test_01_exclusive_locked_and_open():
 
     record = run(scenario())
     check("رکورد فعال ثبت شد", record["state"] == "active", record)
-    rights = chat.participants[777]
-    check("فقط مجوز ارسال داده شد (send_messages=False)",
-          getattr(rights, "send_messages", None) is False, rights)
-    check("send_plain هم باز شد", getattr(rights, "send_plain", None) is False)
-    check("مسدودسازی بقیه دست‌نخورده (سایر فلگ‌ها False)",
-          all(not getattr(rights, flag) for flag in
-              ("send_media", "send_gifs", "send_polls", "invite_users",
-               "change_info", "pin_messages")), rights)
+    # ⚠️ سرعت: هیچ EditBanned/خواندنِ مقدماتی در مسیر ارتقا وجود ندارد.
+    check("هیچ EditBanned اضافه‌ای زده نشد (سرعت)",
+          chat.edit_banned_calls == [], chat.edit_banned_calls)
+    check("در مسیر ارتقا هیچ خواندنِ اعضا/شرکت‌کننده زده نشد",
+          not [name for name in bot.client.calls
+               if name in {"GetParticipantRequest", "get_participants"}],
+          bot.client.calls)
+    check("تنها RPCهای لازم زده شد: بررسی قفل (کش‌شده) + یک ارتقا",
+          [name for name in bot.client.calls
+           if name in {"EditAdminRequest", "EditBannedRequest",
+                       "GetParticipantRequest", "get_participants",
+                       "GetFullChannelRequest", "GetChannelsRequest",
+                       "get_entity"}] ==
+          ["GetFullChannelRequest", "EditAdminRequest"], bot.client.calls)
+    check("EditBanned (حذفِ بنِ اضافه) حذف شد ⇒ یک RPC کمتر",
+          "EditBannedRequest" not in bot.client.calls, bot.client.calls)
+    rights = chat.participants.get(777)
+    check("مجوز ارسالِ کاربر با ادمین‌شدن آزاد است (بن نشده)",
+          getattr(chat.default_rights, "send_messages", None) is True, rights)
+    check("کاربر در فهرست ادمین‌ها با هیچ حق مدیریتی نیست",
+          not exclusive.has_any_management_right(chat.admins.get(777)),
+          chat.admins.get(777))
     check("کاربر با دقیقاً یک EditAdmin ادمین شد",
           len(chat.edit_admin_calls) == 1, len(chat.edit_admin_calls))
     admin_rights = chat.admins.get(777)
@@ -476,8 +496,12 @@ def test_01_exclusive_locked_and_open():
         check(f"حق «{flag}» داده نشده",
               getattr(admin_rights, flag, None) is False,
               getattr(admin_rights, flag, "missing"))
-    check("تأیید با API واقعی (GetParticipant) انجام شد",
+    check("رکورد بلافاصله تأییدشده علامت خورد (پاسخِ سریع)", 
           record["confirmed"] is True, record)
+    verified = run(exclusive.complete_verification(bot, chat.chat_id, 777))
+    check("تأییدِ واقعی با GetParticipant هم انجام شد",
+          verified["confirmed"] is True and
+          "GetParticipantRequest" in bot.client.calls, bot.client.calls)
     check("شناسه‌ها عددی و پایدار ذخیره شدند",
           isinstance(record["user_id"], str) and record["chat_id"],
           record)
@@ -497,6 +521,57 @@ def test_01_exclusive_locked_and_open():
     check("در گروه باز رد می‌شود", run(scenario_open()) == "not_locked")
     check("در گروه باز هیچ RPC مجوزی زده نشد",
           open_chat.edit_banned_calls == [])
+
+
+def test_01b_exclusive_command_is_fast():
+    """دستور «اختصاصی» باید در چند صد میلی‌ثانیه پاسخ بدهد (نه یک دقیقه).
+
+    بازخورد کارفرما: «این متن بعد یک دقیقه ارسال می‌شد». علت‌ها: سه-چهار
+    resolve/get_messages، دو مسیرِ تأیید با ۳×۱۰ ثانیه تایم‌اوت، تلاش دوبارهٔ
+    ۰.۶ ثانیه‌ای در `job()` و انتظار برای `GetParticipant` پیش از پاسخ.
+    """
+    print("\n### ۱ب) سرعتِ دستور اختصاصی (بدون انتظارِ یک‌دقیقه‌ای)")
+    fresh()
+    chat_id = -(10 ** 12) - 5111
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=True)
+    target = FakeUser(9601, "speedtest", "کاربر")
+    bot = FakeBot(chat, {9601: target})
+    owner = FakeUser(4242, "owner")
+    event = FakeEvent(chat_id, owner, "اختصاصی @speedtest")
+
+    started = time.monotonic()
+    handled = run(exclusive_commands.handle(bot, event, chat_id, 4242, owner,
+                                            "اختصاصی @speedtest",
+                                            bot.logger))
+    elapsed = time.monotonic() - started
+
+    check("دستور مصرف شد", handled is True)
+    check("پاسخ «تنظیم اختصاصی …» ارسال شد",
+          bool(event.replies) and "تنظیم اختصاصی" in event.replies[-1][0],
+          event.replies)
+    check("پاسخ بلافاصله آمد (کمتر از ۲ ثانیه)", elapsed < 2.0,
+          f"{elapsed:.3f}s")
+    check("کاربر در همان لحظه ادمین شده است", 9601 in chat.admins,
+          chat.admins)
+    check("هیچ EditBanned اضافه‌ای در مسیر گرم زده نشد",
+          chat.edit_banned_calls == [], chat.edit_banned_calls)
+    check("هیچ get_messages اضافه‌ای برای یوزرنیم زده نشد",
+          "get_messages" not in bot.client.calls, bot.client.calls)
+    # کاربر در همان لحظه می‌تواند بنویسد: ادمین است و بن نیست
+    check("مجوز ارسالِ گروه هنوز برای اعضای عادی بسته است",
+          text_is_banned(chat.default_rights), chat.default_rights)
+
+    # تأییدِ واقعی در پس‌زمینه باید رکورد را confirmed کند
+    async def finish_background():
+        return await exclusive.complete_verification(bot, chat_id, 9601)
+
+    record = run(finish_background())
+    check("تأییدِ سرور در پس‌زمینه انجام شد",
+          record.get("confirmed") is True, record)
+    check("قالب پاسخ هرگز «انجام نشد» ندارد",
+          all("انجام نشد" not in text for text, _e in event.replies),
+          event.replies)
 
 
 def test_02_exclusive_revoke_and_restart():
@@ -612,7 +687,9 @@ def test_02c_exclusive_strict_server_fallback():
     bot.client.reject_rightless_admin = True
 
     async def scenario():
-        return await exclusive.grant(bot, chat_id, 789, actor_id=4242)
+        await exclusive.grant(bot, chat_id, 789, actor_id=4242)
+        # مرحلهٔ تأیید (همان چیزی که لایهٔ دستور در پس‌زمینه اجرا می‌کند)
+        return await exclusive.complete_verification(bot, chat_id, 789)
 
     record = run(scenario())
     check("سرور ارتقای بی‌حق را رد کرد و ربات حالتِ بعدی را انتخاب کرد",
@@ -858,8 +935,10 @@ def test_04_exclusive_concurrent():
 
     count = run(scenario())
     check("همهٔ پنج کاربر ثبت شدند", count == 5, count)
-    check("برای هر پنج کاربر مجوز جداگانه زده شد",
-          len(chat.edit_banned_calls) == 5, len(chat.edit_banned_calls))
+    check("برای هر پنج کاربر یک ارتقای جداگانه زده شد (بدون EditBannedِ اضافه)",
+          len(chat.edit_admin_calls) == 5 and not chat.edit_banned_calls,
+          (len(chat.edit_admin_calls), len(chat.edit_banned_calls)))
+    check("هر پنج کاربر واقعاً ادمین شدند", len(chat.admins) == 5, chat.admins)
     check("میان‌افکنیِ صف: هیچ کار تکراری اجرا نشد",
           exclusive_commands.QUEUE.stats()["rejected"] == 0,
           exclusive_commands.QUEUE.stats())
@@ -1942,6 +2021,7 @@ def main():
     print("🧪 تست سه قابلیت مدیریتی: اختصاصی / پیام زماندار / گزارش")
     print("=" * 62)
     test_01_exclusive_locked_and_open()
+    test_01b_exclusive_command_is_fast()
     test_02_exclusive_revoke_and_restart()
     test_02b_exclusive_grant_refused_by_server()
     test_02c_exclusive_strict_server_fallback()
