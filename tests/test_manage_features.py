@@ -117,12 +117,34 @@ class FakeChat:
         self.fail_next = 0
         self.deleted = []
         self.deleted_ids = []
+        #: کلِ اعضا (برای get_participants)
+        self.members = set()
+        self.creator_id = 4242
 
     def snapshot(self):
         return self.default_rights
 
     def report(self):
         return self.default_rights
+
+
+class _AsyncList:
+    """شیء شبه‌ژنراتور: هم ``async for`` و هم پیمایشِ معمولی."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __aiter__(self):
+        async def generator():
+            for item in self._items:
+                yield item
+        return generator()
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self):
+        return len(self._items)
 
 
 class FakeClient:
@@ -145,6 +167,8 @@ class FakeClient:
         self.force_toggles = False
         #: تعداد بارهایی که GetParticipant خطای گذرا می‌دهد
         self.read_participant_flaky = 0
+        #: GetParticipant همیشه خطا بدهد (سرورِ بی‌پاسخ) — مسیر دوم باید کار کند
+        self.get_participant_broken = False
         self.edits = []
         self.sent = []
 
@@ -211,6 +235,9 @@ class FakeClient:
             self.chat.admins[user_id] = rights
             return True
         if name == "GetParticipantRequest":
+            if self.get_participant_broken:
+                raise type("ChatAdminRequiredError", (Exception,), {})(
+                    "CHAT_ADMIN_REQUIRED (read)")
             if self.read_participant_flaky:
                 self.read_participant_flaky -= 1
                 raise ConnectionError("temporary read")
@@ -241,6 +268,25 @@ class FakeClient:
                                      "full_chat": type("FC", (), {
                                          "participants_count": 3})()})()
         return True
+
+    async def get_participants(self, chat_id, limit=None, *, filter=None,
+                               **_kwargs):
+        """فهرست اعضا (و با filter، فقط ادمین‌ها) — مثل SPlusthon."""
+        members = []
+        for user_id in self.chat.members:
+            member = FakeUser(user_id, getattr(
+                self.users.get(user_id), "username", None))
+            if user_id in self.chat.admins:
+                member.participant = type("ChannelParticipantAdmin", (), {})()
+                member.is_admin = True
+            elif user_id == self.chat.creator_id:
+                member.participant = type("ChannelParticipantCreator", (), {})()
+                member.is_creator = True
+            else:
+                member.participant = type("ChannelParticipant", (), {})()
+                member.is_admin = False
+            members.append(member)
+        return _AsyncList(members)
 
     async def get_messages(self, chat_id, ids=None, **_kwargs):
         sender = self.users.get(self.reply_sender_id)
@@ -660,6 +706,79 @@ def test_02e_exclusive_username_grant_never_says_failed():
     check("با خطای گذرای خواندن، رکورد باز هم فعال و تأییدشده است",
           record["state"] == "active" and record["confirmed"] is True, record)
     check("کاربر ادمین است", 992 in chat2.admins, chat2.admins)
+
+
+def test_02f_exclusive_verify_with_broken_get_participant():
+    print("\n### ۲و) GetParticipant خطا می‌دهد ولی کاربر واقعاً ادمین است")
+    fresh()
+    chat_id = -(10 ** 12) - 517
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=True)
+    target = FakeUser(993, "Melika_89899")
+    chat.members = {4242, 993}
+    bot = FakeBot(chat, {993: target})
+    bot.client.get_participant_broken = True
+    owner = FakeUser(4242, "owner")
+
+    async def scenario():
+        event = FakeEvent(chat_id, owner, "اختصاصی")
+        await exclusive_commands.handle(bot, event, chat_id, 4242, owner,
+                                        "اختصاصی @Melika_89899", bot.logger)
+        return event.replies
+
+    replies = run(scenario())
+    text = " ".join(t2 for t2, _e in replies)
+    check("کاربر واقعاً ادمین شد", 993 in chat.admins, chat.admins)
+    check("پیام «انجام نشد» ارسال نشد", "انجام نشد" not in text, replies)
+    check("پیام موفقیت ارسال شد",
+          "تنظیم اختصاصی برای شما فعال شد" in text, replies)
+    check("عنوان با یوزرنیمِ واقعی در نقل‌قول است",
+          "← کاربر : 『 @Melika_89899 』" in text, replies)
+    check("رکورد active ثبت شد",
+          (exclusive.get_entry(chat_id, 993) or {}).get("state") == "active",
+          exclusive.get_entry(chat_id, 993))
+
+    # همان مسیر برای «ریپلای» (بدون یوزرنیم)
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 518, locked=True)
+    group_storage.set_group_owner(chat2.chat_id, 4242)
+    target2 = FakeUser(994, "Melika_reply")
+    chat2.members = {4242, 994}
+    bot2 = FakeBot(chat2, {994: target2})
+    bot2.client.get_participant_broken = True
+    bot2.client.reply_sender_id = 994
+
+    async def scenario2():
+        event = FakeEvent(chat_id=-((10 ** 12) + 518), user=owner,
+                          text="اختصاصی", reply_to_id=5000)
+        await exclusive_commands.handle(
+            bot2, event, chat2.chat_id, 4242, owner, "اختصاصی", bot2.logger)
+        return event.replies
+
+    replies2 = run(scenario2())
+    text2 = " ".join(t2 for t2, _e in replies2)
+    check("مسیر ریپلای: «انجام نشد» نمی‌آید", "انجام نشد" not in text2, replies2)
+    check("مسیر ریپلای: پیام موفقیت می‌آید",
+          "تنظیم اختصاصی برای شما فعال شد" in text2, replies2)
+
+    # اگر واقعاً ادمین نشده باشد، باید همان پیام خطا بیاید
+    fresh()
+    chat3 = FakeChat(-(10 ** 12) - 519, locked=True)
+    group_storage.set_group_owner(chat3.chat_id, 4242)
+    chat3.members = {4242}
+    bot3 = FakeBot(chat3, {995: FakeUser(995, "nobody")})
+    bot3.client.get_participant_broken = True
+    bot3.client.fail_edit_admin = True
+
+    async def scenario3():
+        event = FakeEvent(chat3.chat_id, owner, "اختصاصی @nobody")
+        await exclusive_commands.handle(bot3, event, chat3.chat_id, 4242,
+                                        owner, "اختصاصی @nobody", bot3.logger)
+        return event.replies
+
+    replies3 = run(scenario3())
+    check("اگر واقعاً ارتقا انجام نشد، پیام «انجام نشد» می‌آید",
+          any("انجام نشد" in t2 for t2, _e in replies3), replies3)
 
 
 def test_03_exclusive_auto_revoke_on_unlock():
@@ -1590,6 +1709,7 @@ def main():
     test_02c_exclusive_strict_server_fallback()
     test_02d_exclusive_server_forces_toggles_and_lost_record()
     test_02e_exclusive_username_grant_never_says_failed()
+    test_02f_exclusive_verify_with_broken_get_participant()
     test_03_exclusive_auto_revoke_on_unlock()
     test_04_exclusive_concurrent()
     test_05_timed_all_durations_and_cancel()

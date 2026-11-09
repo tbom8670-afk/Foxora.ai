@@ -145,6 +145,15 @@ async def _apply_admin_rights(bot, channel, participant, preset, chat_id,
     )
 
 
+async def is_promoted(bot, chat_id, user_id) -> bool:
+    """آیا سرور می‌گوید این کاربر ادمینِ گروه است؟ (چند مسیرِ تأیید)"""
+    participant_obj = await read_participant(bot, chat_id, user_id)
+    if is_admin_participant(participant_obj):
+        return True
+    listed = await _admin_in_participants_list(bot, chat_id, user_id)
+    return bool(listed)
+
+
 async def grant_participant_rights(bot, chat_id, user_id):
     """کاربر را ادمین گروه می‌کند؛ اول بدون هیچ حق مدیریتی.
 
@@ -170,12 +179,12 @@ async def grant_participant_rights(bot, chat_id, user_id):
         log_info(bot.logger,
                  f"EXCLUSIVE GRANT APPLIED chat_id={chat_id} "
                  f"user_id={user_id} preset={name}")
-        # یک بار دیگر بخوان تا اگر تبلیغ/تأخیر سروری بود، فرصت داشته باشد.
-        participant_obj = await read_participant(bot, chat_id, user_id)
-        if not is_admin_participant(participant_obj):
-            await asyncio.sleep(0.35)
-            participant_obj = await read_participant(bot, chat_id, user_id)
-        if is_admin_participant(participant_obj):
+        # دو مسیرِ تأیید: GetParticipant، و اگر آن نشد فهرست ادمین‌های گروه.
+        if await is_promoted(bot, chat_id, user_id):
+            applied = name
+            break
+        await asyncio.sleep(0.35)
+        if await is_promoted(bot, chat_id, user_id):
             applied = name
             break
         problems.append(f"{name}:not_admin")
@@ -186,8 +195,7 @@ async def grant_participant_rights(bot, chat_id, user_id):
         # ⚠️ پیامِ «انجام نشد» نباید به‌خاطر یک خطای موقتِ خواندن بیاید:
         # وضعیتِ قفل و ادمینی یک بار دیگر با تأخیر کوتاه بررسی می‌شود.
         await asyncio.sleep(0.5)
-        participant_obj = await read_participant(bot, chat_id, user_id)
-        if is_admin_participant(participant_obj):
+        if await is_promoted(bot, chat_id, user_id):
             applied = "verified_late"
         else:
             raise RuntimeError(
@@ -226,6 +234,49 @@ async def revoke_participant_rights(bot, chat_id, user_id) -> bool:
     log_info(bot.logger,
              f"EXCLUSIVE REVOKE RPC OK chat_id={chat_id} user_id={user_id}")
     return True
+
+
+#: فیلترِ فهرست شرکت‌کنندگان = ادمین‌ها (اگر کتابخانه آن را داشته باشد).
+def _admins_filter():
+    try:
+        return types.ChannelParticipantsAdmins()
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+async def _admin_in_participants_list(bot, chat_id, user_id):
+    """آیا کاربر در فهرست **ادمین‌های** گروه دیده می‌شود؟
+
+    این مسیرِ دومِ تأیید است (بدون GetParticipant)؛ برای سرورهایی که
+    ``GetParticipant`` را با خطای دائمی رد می‌کنند و باعث می‌شد ربات
+    «انجام نشد» بدهد در حالی که کاربر واقعاً ادمین شده بود.
+    """
+    try:
+        participants = await bot.client.get_participants(
+            chat_id, filter=_admins_filter(), limit=200)
+    except TypeError:
+        try:
+            participants = await bot.client.get_participants(chat_id)
+        except Exception:                            # noqa: BLE001
+            return None
+    except Exception:                                # noqa: BLE001
+        return None
+    wanted = str(storage.user_key(user_id))
+    try:
+        async for member in participants:
+            member_id = getattr(member, "id", None)
+            if member_id is not None and str(storage.user_key(member_id)) == wanted:
+                participant = getattr(member, "participant", None)
+                cls = (participant.__class__.__name__.lower()
+                       if participant is not None else "")
+                if "admin" in cls or "creator" in cls or \
+                        getattr(member, "is_admin", False) or \
+                        getattr(member, "is_creator", False):
+                    return True
+                return False
+    except Exception:                                # noqa: BLE001
+        return None
+    return False   # در فهرست ادمین‌ها نبود
 
 
 async def read_participant(bot, chat_id, user_id):
@@ -438,7 +489,8 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
     try:
         participant_obj = await read_participant(bot, chat_id, user_id)
         confirmed = await rights_confirmed(bot, chat_id, user_id, True)
-        if not confirmed and is_admin_participant(participant_obj):
+        if not confirmed and (is_admin_participant(participant_obj)
+                              or await is_promoted(bot, chat_id, user_id)):
             # ادمین است؛ فقط توگل‌های اضافیِ سرور یا محدودیت ارسال باقی است.
             # رکورد فعال می‌ماند و توضیح در last_error ثبت می‌شود.
             confirmed = True
@@ -446,12 +498,11 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
                      f"EXCLUSIVE CONFIRMED WITH TOGGLES chat_id={chat_id} "
                      f"user_id={user_id}")
     except Exception as error:                       # noqa: BLE001
-        participant_obj = None
         try:
-            participant_obj = await read_participant(bot, chat_id, user_id)
+            promoted = await is_promoted(bot, chat_id, user_id)
         except Exception:                            # noqa: BLE001
-            participant_obj = None
-        if not is_admin_participant(participant_obj):
+            promoted = False
+        if not promoted:
             _set_state(chat_id, saved, PENDING_FLAG, {"last_error": repr(error)})
             raise
         confirmed = True
