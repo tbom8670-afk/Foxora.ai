@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 """🔐 «اختصاصی» — اجازهٔ ارسال پیام به یک کاربر در گروهِ قفل‌شده.
 
-یافتهٔ واقعیِ API (splusthon 1.1.4 — بررسی‌شده، نه حدس):
+روش اثبات‌شده روی سرور سروش (اجرای واقعی، نه حدس):
 
-* ``channels.EditBannedRequest(channel, participant, banned_rights)`` با یک
-  ``ChatBannedRights`` که **همهٔ** فلگ‌هایش ``False`` است، محدودیتِ آن کاربر را
-  برمی‌دارد و فقط برای همان کاربر مجوز ارسال می‌دهد — گروه همچنان برای بقیه
-  قفل می‌ماند (این «استثنای per-user» است، نه بازکردن گروه).
-* هیچ ارتقای ادمینی لازم نیست: نه ``EditAdminRequest`` و نه هیچ مجوز مدیریتی.
-  به همین دلیل ریسکِ «ادمین کامل شدن کاربر» صفر است.
-* مجوز با همان RPC و ``ChatBannedRights(send_messages=True, send_plain=True)``
-  لغو می‌شود (``send_plain`` هم همیشه همراه ``send_messages`` نوشته می‌شود،
-  مثل همان الگویی که در ``modules/group_actions.py`` مستند شده).
-* خواندنِ وضعیت واقعی مجوز: ``channels.GetParticipantRequest`` ⇒
-  ``ChannelParticipantBanned.banned_rights``.
+* برداشتنِ محدودیتِ ارسال به‌تنهایی (``EditBannedRequest`` با همهٔ فلگ‌ها
+  ``False``) در گروهِ قفل **کاربر را قادر به ارسال نمی‌کند**؛ ربات «انجام نشد»
+  می‌داد. پس مسیرِ نهایی، همان دستور کارفرما است:
+* **کاربر ادمینِ گروه می‌شود، ولی فقط با حق ارسال پیام**
+  (``EditAdminRequest`` + ``ChatAdminRights`` که همهٔ فلگ‌ها ``False`` است جز
+  ``edit_messages``). هیچ حقِ حذف پیام / سنجاق / افزودن ادمین / تغییر اطلاعات /
+  بن / دعوت / anonymous ندارد.
+* لغو: ``EditAdminRequest`` با ``ChatAdminRights()`` (همه False ⇒ demote) و بعد
+  دوباره اعمالِ محدودیتِ ارسال، تا کاربر به همان وضعیتِ عضو عادی برگردد.
+* تأییدِ نهایی همیشه با ``channels.GetParticipantRequest`` انجام می‌شود:
+  برای «فعال» باید نوعِ participant از خانوادهٔ Admin باشد، ارسالش مسدود
+  نباشد و هیچ حقِ مدیریتیِ اضافه نداشته باشد؛ برای «لغو» باید دیگر ادمین
+  نباشد و ارسالش مسدود باشد. اگر سرور این را تأیید نکند، هیچ موفقیتی
+  گزارش نمی‌شود و رکورد در وضعیت بازیابی می‌ماند.
 
 وضعیت گروه **از سرور** خوانده می‌شود (نه از حافظه) و بعد از هر تغییر دوباره
-خوانده و تأیید می‌شود؛ «قفل است» به معنیِ ``send_messages`` باندشده برای
-پیش‌فرضِ گروه است.
+خوانده و تأیید می‌شود؛ «قفل است» یعنی ``send_messages`` باندشده برای
+پیش‌فرضِ گروه.
 """
 from __future__ import annotations
 
@@ -35,6 +38,11 @@ except ImportError:                                  # pragma: no cover
     functions = types = None
 
 PENDING_FLAG = "pending_revoke"
+#: ارتقا هنوز از سوی سرور تأیید نشده (برای تلاش دوباره بعد از ری‌استارت).
+PENDING_GRANT_FLAG = "pending_grant"
+#: وضعیت‌هایی که باید بازیابی/تکرار شوند (فعال‌ها هم بعد از ری‌استارت
+#: دوباره با سرور تطبیق داده می‌شوند).
+RECOVERABLE = ("active", PENDING_FLAG, PENDING_GRANT_FLAG)
 
 
 # ---------------------------------------------------------------------------
@@ -94,30 +102,76 @@ async def is_group_locked(bot, chat_id) -> bool:
     return text_is_banned(rights)
 
 
+def send_only_admin_rights():
+    """حقِ ادمینیِ «فقط ارسال پیام» — همهٔ فلگ‌ها False جز ارسال/ویرایش.
+
+    این همان چیزی است که کارفرما خواسته: کاربر **ادمین گروه** می‌شود تا قفلِ
+    گروه شاملش نشود، ولی هیچ حق مدیریتیِ دیگری (حذف پیام، سنجاق، افزودن ادمین،
+    تغییر اطلاعات، بن، دعوت…) ندارد.
+    """
+    return types.ChatAdminRights(
+        change_info=False,
+        post_messages=False,
+        edit_messages=True,      # فقط پیام خودش را می‌تواند ویرایش کند
+        delete_messages=False,
+        ban_users=False,
+        invite_users=False,
+        pin_messages=False,
+        add_admins=False,
+        anonymous=False,
+        manage_call=False,
+        other=False,
+        manage_topics=False,
+        post_stories=False,
+        edit_stories=False,
+        delete_stories=False,
+    )
+
+
 async def grant_participant_rights(bot, chat_id, user_id) -> bool:
-    """تنها مجوز ارسال پیام را برای همان کاربر باز می‌کند (بدون ادمین‌شدن)."""
+    """کاربر را ادمین گروه می‌کند ولی **فقط** با حق ارسال پیام."""
     _peer, channel = await peer_and_channel(bot, chat_id)
     participant = await user_peer(bot, chat_id, user_id)
-    rights = clone_banned_rights(None)               # همهٔ فلگ‌ها False
+    # ۱) اگر محدودیت/بن دارد برداشته شود تا ارسالش آزاد شود.
     await call(
         bot.client(functions.channels.EditBannedRequest(
-            channel=channel, participant=participant, banned_rights=rights)),
+            channel=channel, participant=participant,
+            banned_rights=clone_banned_rights(None))),
+        logger=bot.logger,
+        what=f"EXCLUSIVE UNBAN chat={chat_id} user={user_id}",
+    )
+    # ۲) ارتقا به ادمین با کمترین حق ممکن.
+    await call(
+        bot.client(functions.channels.EditAdminRequest(
+            channel=channel, user_id=participant,
+            admin_rights=send_only_admin_rights(), rank="")),
         logger=bot.logger,
         what=f"EXCLUSIVE GRANT chat={chat_id} user={user_id}",
     )
     log_info(bot.logger,
-             f"EXCLUSIVE GRANT RPC OK chat_id={chat_id} user_id={user_id}")
+             f"EXCLUSIVE GRANT RPC OK chat_id={chat_id} user_id={user_id} "
+             "rights=send_only")
     return True
 
 
 async def revoke_participant_rights(bot, chat_id, user_id) -> bool:
-    """مجوز ارسالِ همان کاربر را برمی‌گرداند (مثل پیش‌فرض قفلِ گروه)."""
+    """حذف کاملِ دسترسی: هم ادمینیِ ارتقایافته، هم مجوز ارسال برداشته می‌شود."""
     _peer, channel = await peer_and_channel(bot, chat_id)
     participant = await user_peer(bot, chat_id, user_id)
-    rights = clone_banned_rights(None, send_messages=True, send_plain=True)
+    # ۱) برگرداندن به عضو عادی (همهٔ حق‌های ادمینی False ⇒ demote).
+    await call(
+        bot.client(functions.channels.EditAdminRequest(
+            channel=channel, user_id=participant,
+            admin_rights=types.ChatAdminRights(), rank="")),
+        logger=bot.logger,
+        what=f"EXCLUSIVE DEMOTE chat={chat_id} user={user_id}",
+    )
+    # ۲) و محدودیت ارسالِ پیش‌فرضِ گروه دوباره اعمال شود.
     await call(
         bot.client(functions.channels.EditBannedRequest(
-            channel=channel, participant=participant, banned_rights=rights)),
+            channel=channel, participant=participant,
+            banned_rights=clone_banned_rights(None, send_messages=True,
+                                              send_plain=True))),
         logger=bot.logger,
         what=f"EXCLUSIVE REVOKE chat={chat_id} user={user_id}",
     )
@@ -126,27 +180,72 @@ async def revoke_participant_rights(bot, chat_id, user_id) -> bool:
     return True
 
 
-async def read_participant_rights(bot, chat_id, user_id):
-    """``ChatBannedRights`` واقعیِ کاربر از سرور (تأییدِ نهایی)."""
+async def read_participant(bot, chat_id, user_id):
+    """شرکت‌کنندهٔ واقعی از سرور (برای تأیید نهایی)."""
     _peer, channel = await peer_and_channel(bot, chat_id)
     participant = await user_peer(bot, chat_id, user_id)
-    result = await call(
-        bot.client(functions.channels.GetParticipantRequest(
-            channel=channel, participant=participant)),
-        logger=bot.logger,
-        what=f"EXCLUSIVE READ chat={chat_id} user={user_id}",
-    )
+    try:
+        result = await call(
+            bot.client(functions.channels.GetParticipantRequest(
+                channel=channel, participant=participant)),
+            logger=bot.logger,
+            what=f"EXCLUSIVE READ chat={chat_id} user={user_id}",
+        )
+    except Exception as error:                       # noqa: BLE001
+        log_info(bot.logger,
+                 f"EXCLUSIVE READ FAILED chat_id={chat_id} "
+                 f"user_id={user_id} error={error!r}")
+        return None
     # GetParticipantRequest خروجی‌اش خودِ participant است (نه wrapper)؛
     # هر دو شکل را تحمل می‌کنیم تا با تغییر نسخهٔ کتابخانه نشکند.
-    participant_obj = getattr(result, "participant", result)
+    return getattr(result, "participant", result)
+
+
+async def read_participant_rights(bot, chat_id, user_id):
+    """``ChatBannedRights`` واقعیِ کاربر از سرور."""
+    participant_obj = await read_participant(bot, chat_id, user_id)
     return getattr(participant_obj, "banned_rights", None)
 
 
+def is_admin_participant(participant_obj) -> bool:
+    """آیا سرور می‌گوید این کاربر ادمینِ گروه است؟"""
+    return type(participant_obj).__name__ in {
+        "ChannelParticipantAdmin", "ChannelParticipantCreator"}
+
+
+def admin_rights_of(participant_obj):
+    return getattr(participant_obj, "admin_rights", None)
+
+
+def has_any_management_right(admin_rights) -> bool:
+    """آیا حقِ ادمینی به‌جز «ارسال/ویرایش پیام» هم دارد؟"""
+    if admin_rights is None:
+        return False
+    for flag in ("change_info", "post_messages", "delete_messages",
+                 "ban_users", "invite_users", "pin_messages", "add_admins",
+                 "anonymous", "manage_call", "other", "manage_topics"):
+        if bool(getattr(admin_rights, flag, False)):
+            return True
+    return False
+
+
 async def rights_confirmed(bot, chat_id, user_id, allowed) -> bool:
-    """آیا API واقعاً همان چیزی را می‌گوید که ما ادعا می‌کنیم؟"""
-    rights = await read_participant_rights(bot, chat_id, user_id)
-    banned = text_is_banned(rights)
-    return (not banned) if allowed else banned
+    """آیا API واقعاً همان چیزی را می‌گوید که ما ادعا می‌کنیم؟
+
+    * ``allowed=True`` ⇒ باید ادمین باشد، هیچ حق مدیریتیِ اضافه نداشته باشد و
+      ارسال برایش مسدود نباشد.
+    * ``allowed=False`` ⇒ نباید ادمین باشد و ارسال باید مسدود باشد.
+    """
+    participant = await read_participant(bot, chat_id, user_id)
+    if participant is None:
+        return False
+    admin = is_admin_participant(participant)
+    banned = text_is_banned(getattr(participant, "banned_rights", None))
+    if allowed:
+        if not admin or banned:
+            return False
+        return not has_any_management_right(admin_rights_of(participant))
+    return (not admin) and banned
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +336,8 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
     if existing and existing.get("state") == "active":
         raise AlreadyExclusive(f"user {user_id} already exclusive")
 
-    await grant_participant_rights(bot, chat_id, user_id)
+    # ۱) رکوردِ «در انتظار» **قبل** از RPC نوشته می‌شود؛ اگر ارتقا رد شود یا
+    #    اتصال قطع شود، رکورد گم نمی‌شود و در بازیابی دوباره تلاش می‌شود.
     saved = _save_entry(chat_id, {
         "user_id": storage.user_key(user_id),
         "chat_id": storage.group_key(chat_id),
@@ -247,12 +347,20 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
         "created_at": storage.now(),
         "created_at_tehran": storage.iso_tehran(),
         "updated_at": storage.now(),
-        "state": "active",
-        "granted": True,
+        "state": PENDING_GRANT_FLAG,
+        "granted": False,
         "confirmed": False,
         "last_error": "",
     })
-    # تأیید واقعی با API؛ اگر تأیید نشد، rکورد فعال نمی‌ماند.
+
+    # ۲) ارتقا به ادمین با حقِ ارسال.
+    try:
+        await grant_participant_rights(bot, chat_id, user_id)
+    except Exception as error:                       # noqa: BLE001
+        _set_state(chat_id, saved, PENDING_GRANT_FLAG, {
+            "granted": False, "confirmed": False, "last_error": repr(error)})
+        raise
+    # ۳) تأیید واقعی با API؛ اگر تأیید نشد، رکورد فعال نمی‌ماند.
     try:
         confirmed = await rights_confirmed(bot, chat_id, user_id, True)
     except Exception as error:                       # noqa: BLE001
@@ -260,7 +368,7 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
         raise
     saved = _set_state(chat_id, saved,
                        "active" if confirmed else PENDING_FLAG,
-                       {"confirmed": bool(confirmed)})
+                       {"granted": True, "confirmed": bool(confirmed)})
     log_info(bot.logger,
              f"EXCLUSIVE GRANTED chat_id={chat_id} user_id={user_id} "
              f"confirmed={confirmed}")
@@ -336,8 +444,7 @@ def pending_jobs(chat_id=None):
     for key in keys:
         record = groups.get(key) or {}
         for entry in record.get("users", {}).values():
-            if entry.get("state") in {"active", PENDING_FLAG} and \
-                    entry.get("state") != "revoked":
+            if entry.get("state") in RECOVERABLE:
                 jobs.append(dict(entry, group_key=key))
     return jobs
 

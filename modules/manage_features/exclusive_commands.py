@@ -235,6 +235,9 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
                     f"user_id={target_id} error={error!r}")
             except Exception:                        # noqa: BLE001
                 pass
+        # دلیلِ واقعیِ شکست فقط در لاگ می‌رود؛ متنِ کاربر همان قالب کارفرما
+        # می‌ماند. اگر باز هم رخ داد، لاگ («EXCLUSIVE COMMAND FAILED») دقیقاً
+        # می‌گوید کدام RPC و با چه خطایی رد شده است.
         await _reply(bot, event, texts.exclusive_message(
             username=label, kind="error"), logger)
         return True

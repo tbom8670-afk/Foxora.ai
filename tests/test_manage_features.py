@@ -111,6 +111,7 @@ class FakeChat:
         self.default_rights = ChatBannedRights(
             until_date=None, send_messages=locked, send_plain=locked)
         self.participants = {}          # user_id → ChatBannedRights
+        self.admins = {}                # user_id → ChatAdminRights
         self.edit_banned_calls = []
         self.edit_admin_calls = []
         self.fail_next = 0
@@ -135,6 +136,8 @@ class FakeClient:
         self.reply_sender_id = 7001
         #: شبیه‌سازی قطع اتصال فقط برای RPC مجوز
         self.fail_edit_banned = False
+        #: شبیه‌سازی رد شدنِ ارتقا از سوی سرور (خطای دائمی)
+        self.fail_edit_admin = False
         self.edits = []
         self.sent = []
 
@@ -169,7 +172,21 @@ class FakeClient:
             self.chat.participants[user_id] = request.banned_rights
             return True
         if name == "EditAdminRequest":
+            if self.fail_edit_admin:
+                raise type("ChatAdminRequiredError", (Exception,), {})(
+                    "CHAT_ADMIN_REQUIRED")
             self.chat.edit_admin_calls.append(request)
+            user_id = getattr(request.user_id, "user_id", request.user_id)
+            rights = request.admin_rights
+            if rights is not None and any(
+                    bool(getattr(rights, flag, False)) for flag in (
+                        "change_info", "post_messages", "edit_messages",
+                        "delete_messages", "ban_users", "invite_users",
+                        "pin_messages", "add_admins", "anonymous",
+                        "manage_call", "other", "manage_topics")):
+                self.chat.admins[user_id] = rights
+            else:
+                self.chat.admins.pop(user_id, None)      # demote
             return True
         if name == "GetParticipantRequest":
             if self.get_participant_fails:
@@ -180,8 +197,18 @@ class FakeClient:
             rights = self.chat.participants.get(
                 user_id, ChatBannedRights(until_date=None, send_messages=True,
                                           send_plain=True))
-            return type("Participant", (), {"banned_rights": rights,
-                                            "user_id": user_id})()
+            if user_id in self.chat.admins:
+                # ادمین‌بودن باید از نوعِ participant فهمیده شود (مثل API واقعی)
+                return type("ChannelParticipantAdmin", (), {
+                    "banned_rights": ChatBannedRights(until_date=None),
+                    "admin_rights": self.chat.admins[user_id],
+                    "user_id": user_id})()
+            if text_is_banned(rights):
+                return type("ChannelParticipantBanned", (), {
+                    "banned_rights": rights, "user_id": user_id})()
+            return type("ChannelParticipant", (), {
+                "banned_rights": ChatBannedRights(until_date=None),
+                "user_id": user_id})()
         if name in {"GetFullChannelRequest", "GetChannelsRequest"}:
             chat = type("Chat", (), {
                 "id": 1, "default_banned_rights": self.chat.report()})()
@@ -331,8 +358,22 @@ def test_01_exclusive_locked_and_open():
           all(not getattr(rights, flag) for flag in
               ("send_media", "send_gifs", "send_polls", "invite_users",
                "change_info", "pin_messages")), rights)
-    check("هیچ ارتقای ادمینی رخ نداده", chat.edit_admin_calls == [],
-          chat.edit_admin_calls)
+    check("کاربر با دقیقاً یک EditAdmin ادمین شد",
+          len(chat.edit_admin_calls) == 1, len(chat.edit_admin_calls))
+    admin_rights = chat.admins.get(777)
+    check("ادمین شده است (نوع participant از خانوادهٔ Admin)",
+          admin_rights is not None, chat.admins)
+    check("فقط حقِ ارسال/ویرایش دارد و هیچ حق مدیریتی ندارد",
+          admin_rights is not None and not exclusive.has_any_management_right(
+              admin_rights)
+          and getattr(admin_rights, "edit_messages", False) is True,
+          admin_rights)
+    for flag in ("change_info", "post_messages", "delete_messages",
+                 "ban_users", "invite_users", "pin_messages", "add_admins",
+                 "anonymous", "manage_call", "other", "manage_topics"):
+        check(f"حق «{flag}» داده نشده",
+              getattr(admin_rights, flag, None) is False,
+              getattr(admin_rights, flag, "missing"))
     check("تأیید با API واقعی (GetParticipant) انجام شد",
           record["confirmed"] is True, record)
     check("شناسه‌ها عددی و پایدار ذخیره شدند",
@@ -378,7 +419,16 @@ def test_02_exclusive_revoke_and_restart():
     check("مجوز واقعی برگشت (send_messages=True)",
           text_is_banned(chat.participants[783]), chat.participants[783])
     check("اجرای دوبارهٔ لغو مسدود است", second == "blocked")
-    check("هیچ ارتقای ادمینی در هیچ مرحله", chat.edit_admin_calls == [])
+    check("لغو، ادمینی را با حق‌های همه-False برداشت (demote)",
+          len(chat.edit_admin_calls) == 2
+          and not any(bool(getattr(chat.edit_admin_calls[-1].admin_rights,
+                                   flag, False))
+                      for flag in ("change_info", "post_messages",
+                                   "edit_messages", "delete_messages",
+                                   "ban_users", "invite_users",
+                                   "pin_messages", "add_admins")),
+          len(chat.edit_admin_calls))
+    check("بعد از لغو دیگر ادمین نیست", 783 not in chat.admins, chat.admins)
 
     # ری‌استارت: رکوردِ فعال باید در pending_jobs بیاید، رکورد لغوشده نه
     fresh()
@@ -392,10 +442,12 @@ def test_02_exclusive_revoke_and_restart():
         return exclusive.pending_jobs(chat2.chat_id)
 
     jobs = run(scenario2())
-    ids = {job["user_id"] for job in jobs}
-    check("پس از ری‌استارت فقط رکورد فعال در بازیابی است", ids == {"784"},
-          ids)
-    check("رکورد لغوشده در بازیابی نمی‌آید", "785" not in ids)
+    states = {job["user_id"]: job["state"] for job in jobs}
+    check("پس از ری‌استارت فقط رکورد فعال/نیمه‌کاره در بازیابی است",
+          set(states) == {"784"}, states)
+    check("رکورد فعال با وضعیت active بازیابی می‌شود",
+          states.get("784") == "active", states)
+    check("رکورد لغوشده در بازیابی نمی‌آید", "785" not in states)
 
     # قطع اتصال هنگام لغو ⇒ رکورد در «در انتظار بازیابی» می‌ماند
     fresh()
@@ -416,6 +468,34 @@ def test_02_exclusive_revoke_and_restart():
     states = {job["state"] for job in jobs3}
     check("لغو ناموفق، رکورد را برای بازیابی نگه می‌دارد",
           bool(jobs3) and "pending_revoke" in states, states)
+
+
+def test_02b_exclusive_grant_refused_by_server():
+    print("\n### ۲ب) رد شدنِ ارتقا از سوی سرور ⇒ قالب «انجام نشد» + رکورد بازیابی")
+    fresh()
+    chat_id = -(10 ** 12) - 511
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=True)
+    bot = FakeBot(chat, {788: FakeUser(788, "denied")})
+    owner = FakeUser(4242, "owner")
+
+    async def scenario():
+        # مسیر واقعیِ دستور، با خطای دائمیِ سرور روی EditAdmin
+        bot.client.fail_edit_admin = True
+        event = FakeEvent(chat_id, owner, "اختصاصی @denied")
+        await exclusive_commands.handle(bot, event, chat_id, 4242, owner,
+                                        "اختصاصی @denied", bot.logger)
+        jobs = exclusive.pending_jobs(chat_id)
+        return event.replies, jobs
+
+    replies, jobs = run(scenario())
+    check("قالب کارفرما «انجام نشد؛ دوباره تلاش می‌شود» ارسال شد",
+          bool(replies) and "انجام نشد" in replies[-1][0], replies)
+    check("عنوان با نام واقعیِ کاربر در نقل‌قول است",
+          "← کاربر : 『 @denied 』" in replies[-1][0], replies[-1][0])
+    check("رکورد برای تلاش دوباره در فهرست بازیابی ماند",
+          bool(jobs), jobs)
+    check("ادمین واقعی ساخته نشد (سرور رد کرد)", 788 not in chat.admins)
 
 
 def test_03_exclusive_auto_revoke_on_unlock():
@@ -442,8 +522,10 @@ def test_03_exclusive_auto_revoke_on_unlock():
     check("مجوز هر دو کاربر برگشت",
           all(text_is_banned(chat.participants[user_id])
               for user_id in users), chat.participants)
-    check("هیچ ارتقای ادمینی برای لغو لازم نشد",
-          chat.edit_admin_calls == [])
+    check("برای هر دو کاربر یک ارتقا و یک demote انجام شد",
+          len(chat.edit_admin_calls) == 4, len(chat.edit_admin_calls))
+    check("هیچ‌کدام بعد از باز شدن گروه ادمین نماندند",
+          not chat.admins, chat.admins)
 
 
 def test_04_exclusive_concurrent():
@@ -1076,6 +1158,7 @@ def main():
     print("=" * 62)
     test_01_exclusive_locked_and_open()
     test_02_exclusive_revoke_and_restart()
+    test_02b_exclusive_grant_refused_by_server()
     test_03_exclusive_auto_revoke_on_unlock()
     test_04_exclusive_concurrent()
     test_05_timed_all_durations_and_cancel()
