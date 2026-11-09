@@ -1093,6 +1093,28 @@ class SoroushAntiSpamBot:
             deliver_watchdog_startup_reports()
         )
 
+        # 🗂️ بازیابیِ سه قابلیت مدیریتی (اختصاصی / پیام زماندار / گزارش):
+        # زمان‌سنج‌های ذخیره‌شده بر اساس «زمان پایان» دوباره بالا می‌آیند و
+        # پرونده‌های در انتظار تصمیم مالک بازسازی می‌شوند. هیچ کدام RPC اضافه
+        # در مسیر راه‌اندازی نمی‌زند (کارها در صف اختصاصی خودشان می‌نشینند).
+        try:
+            from modules.manage_features import (exclusive_commands,
+                                                 report_commands,
+                                                 timed_commands)
+            _timed_restored = timed_commands.recover(self, self.logger)
+            _reports_restored = report_commands.recover(self, self.logger)
+            _exclusive_pending = exclusive_commands.recover(self, self.logger)
+            self.logger.log_info(
+                "MANAGE FEATURES RECOVERY "
+                f"timed={len(_timed_restored)} reports={_reports_restored} "
+                f"exclusive={len(_exclusive_pending)}"
+            )
+        except Exception as manage_recovery_error:   # noqa: BLE001
+            self.logger.log_error(
+                "MANAGE FEATURES RECOVERY FAILED "
+                f"error={manage_recovery_error!r}"
+            )
+
         self.notice_cleanup.bind_delete_queue(self.message_delete_queue)
         self.notice_cleanup.client = self.client
         if getattr(self, "admin_actions", None) is not None:

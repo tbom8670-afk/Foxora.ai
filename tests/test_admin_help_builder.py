@@ -46,8 +46,9 @@ def test_blocks_count_and_contact():
     # ۴۵ بلوک دستورات (شامل بلوک تازهٔ عضویت اجباری) + ۱ بلوک نقل‌قول
     # «تماس با سازنده» = ۴۶
     # (۴ بلوک «لینک/آیدی بیو» حذف شد — قابلیت خودکار است — و ۱ بلوک
-    # «پاک کامل» و ۱ بلوک «اضافه کردن کانال من برای عضویت اجباری» اضافه شد.)
-    assert len(bquote_entities) == 46
+    # «پاک کامل» و ۱ بلوک «اضافه کردن کانال من برای عضویت اجباری» اضافه شد.
+    # + ۲ بلوک تازهٔ سه قابلیت مدیریتی: «اختصاصی» و «پیام زماندار» = ۵۰)
+    assert len(bquote_entities) == 50
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -120,7 +121,8 @@ def test_utf16_entities_validity():
 def test_blockquotes_span_exact_lines():
     """بررسی اینکه نقل‌قول‌های n، n2 و n3 دقیقاً تعداد خطوط مربوطه را پوشش می‌دهند."""
     bquote_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBlockquote)]
-    assert len(bquote_entities) == 46
+    # ۵۰ = ۴۸ ردیفِ قبلی + ۲ نقل‌قول تازهٔ «اختصاصی» و «پیام زماندار».
+    assert len(bquote_entities) == 50
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -132,14 +134,19 @@ def test_bold_entities_content():
     """بررسی اینکه تمام بخش‌های بولد (توضیحات و عناوین) به درستی مارک شده‌اند."""
     bold_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBold)]
     # 45 عنوان بلوک + 1 هدر اولیه + 1 تماس با سازنده = 47
-    # + 2 دستور Bold داخل بلوک عضویت اجباری («راهنمای کانال»، «راهنمای اجرا») = 49
-    assert len(bold_entities) == 49
+    # + 2 دستور Bold داخل بلوک عضویت اجباری («راهنمای کانال»، «راهنمای اجرا») = 51
+    # + 2 بلوکِ تازهٔ سه قابلیت مدیریتی («اختصاصی»، «پیام زماندار») که کلِ
+    #   متن‌شان Bold است = 53
+    assert len(bold_entities) == 53
 
+    # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
         assert len(sliced.strip()) > 0
-        # نباید شامل شکست خط باشد (تمام خطوط بولد تک‌خطی هستند)
-        assert "\n" not in sliced
+        # تمام خطوط بولد تک‌خطی‌اند، جز بلوک‌های «آماده» مثل «نمودار»،
+        # «پاکسازی کامل»، «اختصاصی» و «پیام زماندار».
+        if "\n" in sliced:
+            assert sliced.startswith(("🕹️", "🔐", "🧬", "📊")), sliced
 
 
 def test_n2_and_n3_examples():

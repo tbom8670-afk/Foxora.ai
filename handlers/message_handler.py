@@ -656,6 +656,29 @@ async def _send_moderation_notification_once(
         raise
 
 
+def _manage_features():
+    """ایمپورتِ تنبلِ سه قابلیت مدیریتی (بدون هزینه در استارتاپ)."""
+    global _MANAGE_FEATURES
+    if _MANAGE_FEATURES is not None:
+        return _MANAGE_FEATURES or None
+    try:
+        from modules.manage_features import (exclusive_commands,
+                                             report_commands, timed_commands)
+    except Exception as error:                       # noqa: BLE001
+        print(f"MANAGE FEATURES IMPORT FAILED error={error!r}")
+        _MANAGE_FEATURES = False
+        return None
+    _MANAGE_FEATURES = {
+        "exclusive": exclusive_commands,
+        "timed": timed_commands,
+        "report": report_commands,
+    }
+    return _MANAGE_FEATURES
+
+
+_MANAGE_FEATURES = None
+
+
 def _record_gif_stat(bot, chat_id, user_id, sender):
     """شمارش «تعداد کل گیف های ارسالی» گروه و کاربر — بدون RPC اضافه."""
     if not chat_id:
@@ -3881,6 +3904,40 @@ async def handle_new_message(bot, event):
                     f"error={_full_purge_error!r}"
                 )
 
+        # ===== 🗂️ سه قابلیت مدیریتی: اختصاصی / پیام زماندار / گزارش =====
+        # هر سه صف، وضعیت و ذخیره‌سازی مستقل خودشان را دارند
+        # (modules/manage_features). این قلاب فقط «تشخیص» است؛ هیچ RPC‌ای در
+        # مسیر گرم انجام نمی‌شود مگر برای دستورِ خودِ قابلیت.
+        if not event.is_private:
+            _manage = _manage_features()
+            if _manage is not None:
+                try:
+                    if _manage["exclusive"].is_command(message_text):
+                        if await _manage["exclusive"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger,
+                        ):
+                            return
+                    if _manage["timed"].is_command(message_text, chat_id):
+                        if await _manage["timed"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger,
+                        ):
+                            return
+                    if _manage["report"].is_command(message_text, chat_id,
+                                                    user_id):
+                        if await _manage["report"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger,
+                        ):
+                            return
+                except Exception as _manage_error:
+                    bot.logger.log_error(
+                        "MANAGE FEATURES HOOK FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_manage_error!r}"
+                    )
+
         # ===== 🦊 مسیر اختصاصی «مرکز فرماندهی روباه» =====
         # «شرکت» و دستورهای درون‌بازی باید برای هر عضو عادی کار کنند. اگر این
         # پیام‌ها از گیت‌های مدیریتی (عضویت اجباری، هرزنگاری، کلمهٔ ممنوع،
@@ -3992,6 +4049,23 @@ async def handle_new_message(bot, event):
                     f"chat_id={chat_id} user_id={user_id} "
                     f"message_id={getattr(event.message, 'id', None)}")
                 return
+
+        # ⏳ پیام‌های بازهٔ «پیام زماندار» و 🔐 نگهبانِ «اختصاصی» — هر دو
+        # بدون RPC در مسیر گرم: زمان‌دار فقط یک خواندنِ حافظه (و در حالت
+        # فعال یک append به فایل) است و نگهبانِ اختصاصی فقط برای گروه‌هایی
+        # که رکورد اختصاصی دارند و بررسی‌شان کهنه شده، یک کار در صف می‌گذارد.
+        if not event.is_private and user_id:
+            try:
+                _manage2 = _manage_features()
+                if _manage2 is not None:
+                    _manage2["timed"].track(
+                        chat_id, getattr(event.message, "id", None), user_id)
+                    _manage2["exclusive"].watch(
+                        chat_id, {"bot": bot}, logger=bot.logger)
+            except Exception as _track_error:
+                bot.logger.log_error(
+                    "MANAGE TRACK FAILED "
+                    f"chat_id={chat_id} error={_track_error!r}")
 
         # پیامِ فقط‌رسانه‌ای (گیف/فیلم/عکس) از دروازه عبور کرد؛ برای شمارشِ
         # «تعداد کل گیف های ارسالی» باید همان‌جا ثبت شود و بعد برگردد.
@@ -7258,6 +7332,9 @@ async def handle_new_message(bot, event):
                 "برای ثبت و مدیریت پروفایل خود بنویسید:\n"
                 "ثبت پرفایل | پرفایلم | حذف پرفایل\n\n"
 
+                "⚠️: برای گزارش یک فرد متخلف به مالک گروه ریپلای کنید\n"
+                "گزارش\n\n"
+
                 "🛡️ امنیت گروه:\n\n"
                 "پیام‌های تبلیغاتی، فورواردی، تکراری و هرزنامه‌ها خودکار بررسی می‌شوند.\n\n"
                 + ADMIN_HELP_TEXT
@@ -7335,6 +7412,7 @@ async def handle_new_message(bot, event):
                 "برای دریافت تیکه کلام بنویسید:",
                 "🏆 سطح گروه:",
                 "🛒 اقتصاد و آیتم‌ها:",
+                "⚠️: برای گزارش یک فرد متخلف به مالک گروه ریپلای کنید",
                 "🛡️ امنیت گروه:",
                 # جمله‌های توضیحی
                 "برای ثبت اصل بنویسید:",
