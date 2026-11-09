@@ -138,6 +138,8 @@ class FakeClient:
         self.fail_edit_banned = False
         #: شبیه‌سازی رد شدنِ ارتقا از سوی سرور (خطای دائمی)
         self.fail_edit_admin = False
+        #: سروری که «ادمینِ بدون حق» را قبول نمی‌کند (رفتار واقعی سروش)
+        self.reject_rightless_admin = False
         self.edits = []
         self.sent = []
 
@@ -178,15 +180,23 @@ class FakeClient:
             self.chat.edit_admin_calls.append(request)
             user_id = getattr(request.user_id, "user_id", request.user_id)
             rights = request.admin_rights
-            if rights is not None and any(
-                    bool(getattr(rights, flag, False)) for flag in (
-                        "change_info", "post_messages", "edit_messages",
-                        "delete_messages", "ban_users", "invite_users",
-                        "pin_messages", "add_admins", "anonymous",
-                        "manage_call", "other", "manage_topics")):
-                self.chat.admins[user_id] = rights
-            else:
-                self.chat.admins.pop(user_id, None)      # demote
+            flags = ("change_info", "post_messages", "edit_messages",
+                     "delete_messages", "ban_users", "invite_users",
+                     "pin_messages", "add_admins", "anonymous", "manage_call",
+                     "other", "manage_topics")
+            values = {flag: getattr(rights, flag, None) for flag in flags}
+            if all(value is None for value in values.values()):
+                # همه None = درخواستِ demote (همان چیزی که سرور واقعی هم
+                # برای برداشتنِ ادمینی می‌پذیرد).
+                self.chat.admins.pop(user_id, None)
+                return True
+            # «همه False» = ارتقای بدون هیچ حق. سرورِ سخت‌گیر چنین ادمینی
+            # نمی‌سازد؛ سرورِ عادی می‌سازد.
+            if not any(bool(value) for value in values.values()):
+                if self.reject_rightless_admin:
+                    self.chat.admins.pop(user_id, None)
+                    return True
+            self.chat.admins[user_id] = rights
             return True
         if name == "GetParticipantRequest":
             if self.get_participant_fails:
@@ -363,11 +373,19 @@ def test_01_exclusive_locked_and_open():
     admin_rights = chat.admins.get(777)
     check("ادمین شده است (نوع participant از خانوادهٔ Admin)",
           admin_rights is not None, chat.admins)
-    check("فقط حقِ ارسال/ویرایش دارد و هیچ حق مدیریتی ندارد",
-          admin_rights is not None and not exclusive.has_any_management_right(
-              admin_rights)
-          and getattr(admin_rights, "edit_messages", False) is True,
+    check("ادمین با «هیچ حق مدیریتی» ساخته شد (حتی ویرایش پیام هم False)",
+          admin_rights is not None
+          and not exclusive.has_any_management_right(admin_rights)
+          and getattr(admin_rights, "edit_messages", False) is False,
           admin_rights)
+    check("حالتِ اعمال‌شده در رکورد ذخیره شد (preset=none)",
+          record.get("admin_preset") == "none", record.get("admin_preset"))
+    # همان چیزی که در اسکرین‌شاتِ تنظیماتِ مدیر دیده می‌شد نباید روشن باشد:
+    for toggle in ("change_info", "delete_messages", "ban_users",
+                   "invite_users", "pin_messages", "add_admins"):
+        check(f"توگل «{toggle}» خاموش است",
+              getattr(admin_rights, toggle, None) is False,
+              getattr(admin_rights, toggle, "missing"))
     for flag in ("change_info", "post_messages", "delete_messages",
                  "ban_users", "invite_users", "pin_messages", "add_admins",
                  "anonymous", "manage_call", "other", "manage_topics"):
@@ -498,6 +516,36 @@ def test_02b_exclusive_grant_refused_by_server():
     check("ادمین واقعی ساخته نشد (سرور رد کرد)", 788 not in chat.admins)
 
 
+def test_02c_exclusive_strict_server_fallback():
+    print("\n### ۲ج) سرورِ سخت‌گیر: ادمینِ بی‌حق را رد می‌کند ⇒ حالت حداقلی")
+    fresh()
+    chat_id = -(10 ** 12) - 512
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=True)
+    bot = FakeBot(chat, {789: FakeUser(789, "strict")})
+    bot.client.reject_rightless_admin = True
+
+    async def scenario():
+        return await exclusive.grant(bot, chat_id, 789, actor_id=4242)
+
+    record = run(scenario())
+    check("سرور ارتقای بی‌حق را رد کرد و ربات حالتِ بعدی را انتخاب کرد",
+          record.get("admin_preset") == "edit_only",
+          record.get("admin_preset"))
+    check("کاربر واقعاً ادمین شد", 789 in chat.admins, chat.admins)
+    rights = chat.admins[789]
+    for flag in ("change_info", "delete_messages", "ban_users",
+                 "invite_users", "pin_messages", "add_admins", "anonymous",
+                 "manage_call", "other", "manage_topics"):
+        check(f"در حالت حداقلی هم «{flag}» خاموش است",
+              getattr(rights, flag, None) is False,
+              getattr(rights, flag, "missing"))
+    check("در حالت حداقلی فقط ویرایشِ پیام روشن است",
+          getattr(rights, "edit_messages", None) is True, rights)
+    check("رکورد فعال و تأییدشده است",
+          record["state"] == "active" and record["confirmed"] is True, record)
+
+
 def test_03_exclusive_auto_revoke_on_unlock():
     print("\n### ۳) باز شدن گروه (هر روشی) ⇒ لغو خودکار همهٔ مجوزها")
     fresh()
@@ -593,6 +641,53 @@ def test_05_timed_all_durations_and_cancel():
     check("لغو، رکورد را غیرفعال می‌کند", record["state"] == "cancelled")
     check("لغو، زمان‌سنج را حذف می‌کند",
           storage.group_key(chat.chat_id) not in timed._TIMERS)
+
+
+def test_05b_timed_no_progress_message_on_start():
+    print("\n### ۵ب) در لحظهٔ تنظیم، پیام «شروع پاکسازی» فرستاده نمی‌شود")
+    fresh()
+    chat_id = -(10 ** 12) - 611
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=False)
+    bot = FakeBot(chat)
+    owner = FakeUser(4242, "owner")
+    sent = []
+
+    async def fake_send(target, text=None, formatting_entities=None, **kw):
+        payload_text = text if isinstance(text, str) else getattr(
+            text, "message", "")
+        sent.append(payload_text or "")
+        return type("Sent", (), {"id": 9100 + len(sent)})()
+
+    bot.client.send_message = fake_send
+
+    async def scenario():
+        event = FakeEvent(chat_id, owner, "پیام زماندار")
+        await timed_commands.handle(bot, event, chat_id, 4242, owner,
+                                    "پیام زماندار", bot.logger)
+        choice_reply = list(event.replies)
+        pick = FakeEvent(chat_id, owner, "1")
+        await timed_commands.handle(bot, pick, chat_id, 4242, owner, "1",
+                                    bot.logger)
+        return choice_reply, list(pick.replies), list(sent)
+
+    choice_reply, pick_replies, sent_texts = run(scenario())
+    check("منوی انتخاب بازه ارسال شد",
+          any("پیام های زماندار" in text for text, _e in choice_reply),
+          choice_reply)
+    check("پیام «پاکسازی زمان‌دار تنظیم شد» ارسال شد",
+          any("پاکسازی زماندار پیام ها تنظیم شد" in text
+              for text, _e in pick_replies), pick_replies)
+    check("پیام «🧹 شروع پاکسازی پیام های زماندار» در لحظهٔ تنظیم نیامد",
+          not any("شروع پاکسازی" in text for text in sent_texts)
+          and not any("شروع پاکسازی" in text for text, _e in pick_replies),
+          pick_replies)
+    check("هیچ پیام «مدت زمان : 0 ثانیه» در لحظهٔ تنظیم نیست",
+          not any("مدت زمان : 0 ثانیه" in text
+                  for text, _e in pick_replies), pick_replies)
+    check("زمان‌سنج واقعاً فعال شد و بازه ۳۰ دقیقه است",
+          timed.remaining_seconds(chat_id) > 29 * 60,
+          timed.remaining_seconds(chat_id))
 
 
 def test_06_timed_finish_deletes_only_window():
@@ -853,6 +948,62 @@ def test_09_report_decision():
 
     check("گزارش‌دهنده نمی‌تواند پروندهٔ خودش را تأیید کند",
           run(scenario_reporter()) == "blocked")
+
+
+def test_09b_report_owner_scope_and_awaiting_recovery():
+    print("\n### ۹ب) فقط مالکِ همین گروه تصمیم می‌گیرد + بازیابی از دیسک")
+    fresh()
+    chat_id = -(10 ** 12) - 712
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=False)
+    users = {9009: FakeUser(9009, "rep"), 7009: FakeUser(7009, "bad"),
+             4242: FakeUser(4242, "owner"), 5151: FakeUser(5151, "other")}
+    bot = FakeBot(chat, users)
+
+    # پرونده‌ای که مالکش 4242 است
+    case = reports.create_case(chat_id, 9009, 7009, 6100, "توهین",
+                               owner_id=4242)
+    # نگاشتِ حافظه عمداً خالی می‌ماند (شبیه‌سازی ری‌استارت)
+    report_commands.reset_all()
+    other = users[5151]
+    event = FakeEvent(chat_id, other, "تایید")
+    run(report_commands.handle(bot, event, chat_id, 5151, other, "تایید",
+                                bot.logger))
+    check("کاربر غیرمالک نمی‌تواند تأیید کند",
+          reports.get_case(chat_id, case["case_id"])["state"] == "pending",
+          reports.get_case(chat_id, case["case_id"])["state"])
+    check("به کاربر غیرمالک پیام روشن داده می‌شود",
+          any("مالک" in text for text, _e in event.replies), event.replies)
+    check("هیچ اخطاری ثبت نشد", bot.tracker.get_count(chat_id, 7009) == 0)
+
+    # حالا خود مالک، با نگاشتِ حافظهٔ خالی، تأیید می‌کند ⇒ باید کار کند
+    report_commands.reset_all()
+    owner = users[4242]
+    owner_event = FakeEvent(chat_id, owner, "تایید")
+    run(report_commands.handle(bot, owner_event, chat_id, 4242, owner,
+                                "تایید", bot.logger))
+    decided = reports.get_case(chat_id, case["case_id"])
+    check("مالکِ گروه حتی بعد از ری‌استارت می‌تواند تأیید کند",
+          decided["state"] == "approved", decided["state"])
+    check("دقیقاً دو اخطار ثبت شد", bot.tracker.get_count(chat_id, 7009) == 2,
+          bot.tracker.get_count(chat_id, 7009))
+
+    # پروندهٔ بی‌صاحب: مالک سراسری هم می‌تواند (سازگاری با نصب‌های قدیمی)
+    case2 = reports.create_case(chat_id, 9009, 7009, 6200, "اسپم")
+    check("پروندهٔ بدون مالک، owner_id ندارد", case2["owner_id"] is None)
+    report_commands.reset_all()
+    global_owner_id = 777777
+    try:
+        admin_tools.get_global_owner_id = lambda: global_owner_id  # type: ignore
+        run(report_commands.handle(
+            bot, FakeEvent(chat_id, FakeUser(global_owner_id, "g"), "تایید"),
+            chat_id, global_owner_id, FakeUser(global_owner_id, "g"), "تایید",
+            bot.logger))
+    finally:
+        import importlib
+        importlib.reload(admin_tools)
+    check("سلامت: پروندهٔ بی‌مالک مسیر خاص خودش را دارد",
+          case2["owner_id"] is None)
 
 
 def test_10_report_restart_waiting():
@@ -1159,13 +1310,16 @@ def main():
     test_01_exclusive_locked_and_open()
     test_02_exclusive_revoke_and_restart()
     test_02b_exclusive_grant_refused_by_server()
+    test_02c_exclusive_strict_server_fallback()
     test_03_exclusive_auto_revoke_on_unlock()
     test_04_exclusive_concurrent()
     test_05_timed_all_durations_and_cancel()
+    test_05b_timed_no_progress_message_on_start()
     test_06_timed_finish_deletes_only_window()
     test_07_timed_restart_and_failures()
     test_08_report_flow()
     test_09_report_decision()
+    test_09b_report_owner_scope_and_awaiting_recovery()
     test_10_report_restart_waiting()
     test_10b_report_restart_waiting_reason()
     test_11_rate_limit_persistent()

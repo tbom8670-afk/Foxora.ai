@@ -40,17 +40,20 @@
 1. `is_group_locked` — وضعیت قفل از سرور خوانده می‌شود
    (`_fetch_default_banned_rights` + `text_is_banned`). اگر گروه باز باشد،
    دستور با توضیح رد می‌شود؛ هیچ RPC مجوزی زده نمی‌شود.
-2. **مسیر نهایی = همان دستور کارفرما:** کاربر **ادمینِ گروه** می‌شود ولی
-   **فقط با حق ارسال پیام**:
-   - `EditBannedRequest` با `ChatBannedRights` همه-False ⇒ برداشتن محدودیت/بن.
-   - `EditAdminRequest` با `ChatAdminRights` که همهٔ فلگ‌ها `False` است جز
-     `edit_messages` (تا بتواند پیام خودش را ویرایش کند).
-   - حق‌های `change_info` / `post_messages` / `delete_messages` / `ban_users` /
-     `invite_users` / `pin_messages` / `add_admins` / `anonymous` /
-     `manage_call` / `other` / `manage_topics` **همه False**.
-   - ⚠️ تجربهٔ واقعی: برداشتنِ محدودیت ارسال به‌تنهایی در گروه قفل جواب
-     نمی‌دهد و ربات «انجام نشد؛ دوباره تلاش می‌شود» می‌داد — به همین دلیل
-     مسیر ادمینِ محدود انتخاب شد.
+2. **مسیر نهایی = همان دستور کارفرما:** کاربر **ادمینِ گروه** می‌شود تا قفل
+   شاملش نشود. حق‌های ادمینی با **فلگ‌های صریح** فرستاده می‌شوند (نه `None`،
+   چون `None` یعنی «سرور خودش تصمیم بگیرد» و در سروش «تغییر اطلاعات گروه» و
+   «سنجاق پیام‌ها» را روشن می‌کرد):
+   - ابتدا **حالت `none`**: `EditAdminRequest` با `ChatAdminRights` که *همهٔ*
+     فلگ‌هایش `False` است (حتی `edit_messages`) — ادمینِ بدون هیچ حق مدیریتی.
+   - اگر سرور این را نپذیرد و کاربر را demote کند، ربات خودکار **حالت
+     `edit_only`** را امتحان می‌کند: تنها `edit_messages=True` (ویرایشِ پیام
+     خودش) و بقیه False. اگر آن هم رد شود، «انجام نشد» گزارش می‌شود و رکورد
+     `pending_grant` می‌ماند.
+   - در هر دو حالت: `change_info` / `post_messages` / `delete_messages` /
+     `ban_users` / `invite_users` / `pin_messages` / `add_admins` /
+     `anonymous` / `manage_call` / `other` / `manage_topics` = **False**.
+   - حالتِ اعمال‌شده در رکورد ذخیره می‌شود (`admin_preset`).
 3. تأییدِ نهایی با `GetParticipantRequest`: برای «فعال» باید نوعِ شرکت‌کننده
    از خانوادهٔ Admin باشد، ارسالش مسدود نباشد و **هیچ حق مدیریتیِ اضافه‌ای
    نداشته باشد**؛ برای «لغو» باید دیگر ادمین نباشد و ارسالش مسدود باشد.
@@ -60,7 +63,8 @@
    state, granted, confirmed, last_error)`. رکورد **پیش از** RPC نوشته می‌شود،
    پس خطا/قطعی/ری‌استارت هم آن را از بین نمی‌برد و در `recover()` دوباره
    تلاش می‌شود.
-5. `لغو اختصاصی` — `EditAdminRequest` با `ChatAdminRights()` (همه False ⇒
+5. `لغو اختصاصی` — `EditAdminRequest` با `ChatAdminRights()` (همه `None` ⇒
+   روی سیم همان همه-False است، ولی از «ارتقای بی‌حق» قابل تفکیک می‌ماند ⇒
    demote) و بعد دوباره اعمالِ `send_messages/send_plain`؛ اجرای دوبارهٔ لغو
    ممنوع (`NotExclusive`).
 6. **باز شدن گروه (هر روشی)** — `exclusive_commands.refresh_lock_state` وضعیت

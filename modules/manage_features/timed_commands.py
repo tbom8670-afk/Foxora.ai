@@ -121,13 +121,38 @@ async def _progress_hook(bot, chat_id, *, deleted, failed, elapsed_seconds,
                          logger=logger)
 
 
-# موتور زمان‌دار برای ویرایشِ زندهٔ همان پیام به این قلاب تکیه می‌کند.
-timed.set_progress_hook(_progress_hook)
 
 
 def status_id(chat_id):
     record = timed.get_record(chat_id) or {}
     return record.get("status_message_id") or _STATUS.get(_key(chat_id))
+
+
+async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
+    """پیامِ وضعیت را فقط در **لحظهٔ پایان بازه** می‌سازد و شناسه‌اش را ثبت می‌کند.
+
+    (قبلاً همین پیام در لحظهٔ «تنظیم شد» فرستاده می‌شد و کاربر فکر می‌کرد
+    پاکسازی همین حالا شروع شده است.)
+    """
+    record = record or timed.get_record(chat_id) or {}
+    message_id = record.get("status_message_id") or status_id(chat_id)
+    if message_id:
+        return message_id
+    payload = texts.timed_progress(deleted=0, failed=0, elapsed_seconds=0,
+                                   locked=True, state="running")
+    try:
+        sent = await bot.client.send_message(chat_id, payload[0],
+                                            formatting_entities=payload[1])
+    except Exception as error:                       # noqa: BLE001
+        if logger is not None:
+            try:
+                logger.log_error(
+                    f"TIMED STATUS SEND FAILED chat_id={chat_id} "
+                    f"error={error!r}")
+            except Exception:                        # noqa: BLE001
+                pass
+        return None
+    return register_status(chat_id, getattr(sent, "id", None))
 
 
 async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked=None,
@@ -241,11 +266,9 @@ async def _activate(bot, event, chat_id, user_id, sender, index, logger=None):
         actor_username=("@" + actor_username) if actor_username else display),
         logger)
 
-    status = await _reply(bot, event, texts.timed_progress(
-        deleted=0, failed=0, elapsed_seconds=0, locked=False), logger)
-    if status is not None:
-        register_status(chat_id, getattr(status, "id", None))
-
+    # ⚠️ پیام «🧹 شروع پاکسازی …» **در لحظهٔ تنظیم** فرستاده نمی‌شود؛ این
+    # پیام فقط وقتی می‌آید که بازه تمام شده باشد. پیامِ وضعیتِ زنده هم همان‌جا
+    # ساخته می‌شود تا شمارشِ پیام‌ها و زمان از مقدار واقعی شروع شود.
     timed.schedule(bot, chat_id, logger=logger)
     if logger is not None:
         try:
@@ -287,6 +310,12 @@ async def publish_from_record(bot, chat_id, logger=None):
 
 def recover(bot, logger=None):
     return timed.recover(bot, logger)
+
+
+# موتور زمان‌دار برای ویرایشِ زندهٔ همان پیام و ساختِ آن در لحظهٔ پایان به
+# این دو قلاب تکیه می‌کند (هر دو تابع بالاتر تعریف شده‌اند).
+timed.set_progress_hook(_progress_hook)
+timed.set_status_hook(ensure_status_message)
 
 
 def reset_all(chat_id=None):

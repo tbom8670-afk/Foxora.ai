@@ -292,6 +292,10 @@ class SelfDecision(RuntimeError):
     """گزارش‌دهنده نمی‌تواند پرونده را تأیید/لغو کند."""
 
 
+class NotOwnerDecision(RuntimeError):
+    """تصمیم‌گیری فقط در اختیار مالکِ ثبت‌شدهٔ گروه است."""
+
+
 def approve(bot, chat_id, case_id, *, actor_id, actor=None, threshold=None,
             logger=None):
     """تأیید مالک: **دقیقاً دو اخطار** + سابقه + لاگ مدیریتی (idempotent)."""
@@ -302,6 +306,11 @@ def approve(bot, chat_id, case_id, *, actor_id, actor=None, threshold=None,
         raise CaseAlreadyDecided(case["state"])
     if str(actor_id) == str(case.get("reporter_id")):
         raise SelfDecision("reporter cannot decide its own case")
+    # فقط مالکِ ثبت‌شدهٔ همین گروه تصمیم می‌گیرد (ادمین عادی و مالک سراسریِ
+    # بی‌ربط نه) — همان کسی که کارت «مالک محترم» را دریافت کرده است.
+    owner_id = case.get("owner_id")
+    if owner_id is not None and str(actor_id) != str(owner_id):
+        raise NotOwnerDecision("only the registered owner can decide")
 
     # مهر زدن قبل از اعمال: اگر دو کلیک هم‌زمان برسد، فقط یکی اخطار می‌دهد.
     def mutate(data):
@@ -377,6 +386,9 @@ def reject(chat_id, case_id, *, actor_id, actor=None, logger=None):
         raise CaseAlreadyDecided(case["state"])
     if str(actor_id) == str(case.get("reporter_id")):
         raise SelfDecision("reporter cannot decide its own case")
+    owner_id = case.get("owner_id")
+    if owner_id is not None and str(actor_id) != str(owner_id):
+        raise NotOwnerDecision("only the registered owner can decide")
 
     if admin_tools is not None and actor is not None:
         try:

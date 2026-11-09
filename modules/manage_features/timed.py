@@ -50,8 +50,16 @@ _TIMERS: dict = {}
 #: قلابِ نمایش پیشرفت (``timed_commands`` آن را ثبت می‌کند تا همان پیام
 #: وضعیت ویرایش شود). تهی بودنش هیچ اثری روی موتور ندارد.
 PROGRESS_HOOK = None
+#: قلابِ ساختِ پیام وضعیت در لحظهٔ پایان (``timed_commands`` ثبتش می‌کند).
+STATUS_HOOK = None
 #: کمینهٔ فاصلهٔ بین دو ویرایش (ویرایش بیش از حد = FloodWait)
 PROGRESS_MIN_INTERVAL = 2.0
+
+
+def set_status_hook(hook):
+    global STATUS_HOOK
+    STATUS_HOOK = hook
+    return hook
 
 
 def set_progress_hook(hook):
@@ -373,6 +381,15 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
                     f"TIMED LOCK FAILED chat_id={chat_id} error={error!r}")
             except Exception:                        # noqa: BLE001
                 pass
+
+    # پیامِ وضعیتِ زنده فقط از این‌جا (لحظهٔ پایان بازه) ساخته می‌شود.
+    ensure_status = STATUS_HOOK
+    if ensure_status is not None:
+        try:
+            await ensure_status(bot, chat_id, record=record, logger=logger)
+        except Exception as error:                   # noqa: BLE001
+            log_info(logger, f"TIMED STATUS HOOK FAILED chat_id={chat_id} "
+                             f"error={error!r}")
 
     ids = tracked_ids(chat_id, record)
     record["state"] = "deleting"

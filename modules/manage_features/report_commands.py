@@ -47,8 +47,8 @@ def is_command(text, chat_id=None, user_id=None) -> bool:
         return False
     if user_id is not None and reports.pending_reason(chat_id, user_id):
         return bool(cleaned)
-    if awaiting_case(chat_id) and (cleaned in CONFIRM_WORDS
-                                   or cleaned in CANCEL_WORDS):
+    if (cleaned in CONFIRM_WORDS or cleaned in CANCEL_WORDS) and \
+            _awaiting_case(chat_id):
         return True
     return False
 
@@ -142,7 +142,7 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
 
     # ---- ۳) تأیید/لغو مالک ----
     if cleaned in CONFIRM_WORDS or cleaned in CANCEL_WORDS:
-        case_id = _AWAITING.get(storage.group_key(chat_id))
+        case_id = _awaiting_case(chat_id)
         if not case_id:
             return False
         if not access.is_owner(chat_id, user_id):
@@ -225,12 +225,36 @@ async def _decide(bot, chat_id, case_id, user_id, sender, approve, event,
         return reports.reject(chat_id, case_id, actor_id=user_id, actor=sender,
                               logger=logger)
 
+    # قبل از هر کاری: تصمیم‌گیرنده نباید خودِ گزارش‌دهنده باشد و پرونده هم
+    # باید واقعاً وجود داشته باشد. این دو بررسی ارزان‌اند و جلوی «سکوتِ»
+    # بی‌دلیل را می‌گیرند.
+    case_before = reports.get_case(chat_id, case_id)
+    if case_before is None:
+        _AWAITING.pop(storage.group_key(chat_id), None)
+        return True
+    if str(user_id) == str(case_before.get("reporter_id")):
+        message = "گزارش‌دهنده نمی‌تواند تصمیم بگیرد"
+        await _reply(bot, event,
+                     (message, [texts.MessageEntityBold(
+                         offset=0, length=texts.u16(message))]), logger)
+        return True
+    if case_before.get("state") != "pending":
+        # قبلاً تصمیم گرفته شده؛ هیچ اخطار دوباره‌ای نمی‌دهیم.
+        _AWAITING.pop(storage.group_key(chat_id), None)
+        return True
+
     try:
         case = await QUEUE.run(key=storage.group_key(chat_id), job=job,
                                dedupe_key=f"decide:{case_id}", logger=logger)
     except reports.CaseAlreadyDecided:
         return True
     except reports.CaseNotFound:
+        return True
+    except reports.NotOwnerDecision:
+        message = "فقط مالک ثبت‌شده گروه می‌تواند تصمیم بگیرد"
+        await _reply(bot, event,
+                     (message, [texts.MessageEntityBold(
+                         offset=0, length=texts.u16(message))]), logger)
         return True
     except reports.SelfDecision:
         message = "گزارش‌دهنده نمی‌تواند تصمیم بگیرد"
@@ -252,8 +276,26 @@ async def _decide(bot, chat_id, case_id, user_id, sender, approve, event,
     return True
 
 
+def _awaiting_case(chat_id):
+    """پروندهٔ منتظرِ تصمیمِ همین گروه.
+
+    اگر نگاشتِ حافظه خالی باشد (ری‌استارت/چند فرایند)، از دیسک بازسازی
+    می‌شود؛ «تایید» نباید به‌خاطر از دست رفتن حافظه بی‌اثر بماند.
+    """
+    key = storage.group_key(chat_id)
+    case_id = _AWAITING.get(key)
+    if case_id:
+        return case_id
+    pending = sorted(reports.pending_cases(chat_id),
+                     key=lambda case: case.get("created_ts", 0))
+    if pending:
+        _AWAITING[key] = pending[-1]["case_id"]
+        return _AWAITING[key]
+    return None
+
+
 def awaiting_case(chat_id):
-    return _AWAITING.get(storage.group_key(chat_id))
+    return _awaiting_case(chat_id)
 
 
 def reset_all():

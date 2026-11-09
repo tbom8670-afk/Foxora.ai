@@ -102,34 +102,53 @@ async def is_group_locked(bot, chat_id) -> bool:
     return text_is_banned(rights)
 
 
-def send_only_admin_rights():
-    """حقِ ادمینیِ «فقط ارسال پیام» — همهٔ فلگ‌ها False جز ارسال/ویرایش.
+ALL_ADMIN_FLAGS = ("change_info", "post_messages", "edit_messages",
+                   "delete_messages", "ban_users", "invite_users",
+                   "pin_messages", "add_admins", "anonymous", "manage_call",
+                   "other", "manage_topics", "post_stories", "edit_stories",
+                   "delete_stories")
 
-    این همان چیزی است که کارفرما خواسته: کاربر **ادمین گروه** می‌شود تا قفلِ
-    گروه شاملش نشود، ولی هیچ حق مدیریتیِ دیگری (حذف پیام، سنجاق، افزودن ادمین،
-    تغییر اطلاعات، بن، دعوت…) ندارد.
-    """
-    return types.ChatAdminRights(
-        change_info=False,
-        post_messages=False,
-        edit_messages=True,      # فقط پیام خودش را می‌تواند ویرایش کند
-        delete_messages=False,
-        ban_users=False,
-        invite_users=False,
-        pin_messages=False,
-        add_admins=False,
-        anonymous=False,
-        manage_call=False,
-        other=False,
-        manage_topics=False,
-        post_stories=False,
-        edit_stories=False,
-        delete_stories=False,
+#: حالت‌های ارتقا به‌ترتیبِ اولویت. همهٔ فلگ‌ها **صریح** False داده می‌شوند
+#: (None یعنی «سرور خودش تصمیم بگیرد» و در سروش باعث روشن شدنِ
+#: «تغییر اطلاعات گروه» و «سنجاق پیام‌ها» می‌شد).
+ADMIN_RIGHT_PRESETS = (
+    # ۱) ادمین بدون هیچ حق مدیریتی — دقیقاً خواستهٔ کارفرما.
+    ("none", {}),
+    # ۲) اگر سرور «ادمینِ بدون حق» را demote کرد: تنها کمترین حقِ ممکن.
+    ("edit_only", {"edit_messages": True}),
+)
+
+
+def admin_rights_for(preset):
+    """``ChatAdminRights`` با همهٔ فلگ‌های صریح برای یک حالت."""
+    values = {flag: False for flag in ALL_ADMIN_FLAGS}
+    values.update(preset or {})
+    return types.ChatAdminRights(**values)
+
+
+def send_only_admin_rights():
+    """حالتِ حداقلی (سازگاری عقب‌رو): ادمین با فقط حقِ ویرایشِ پیام خودش."""
+    return admin_rights_for(dict(ADMIN_RIGHT_PRESETS[1][1]))
+
+
+async def _apply_admin_rights(bot, channel, participant, preset, chat_id,
+                              user_id):
+    """یک بار ارتقا با حق‌های مشخص را انجام می‌دهد."""
+    await call(
+        bot.client(functions.channels.EditAdminRequest(
+            channel=channel, user_id=participant,
+            admin_rights=admin_rights_for(preset), rank="")),
+        logger=bot.logger,
+        what=f"EXCLUSIVE GRANT chat={chat_id} user={user_id}",
     )
 
 
-async def grant_participant_rights(bot, chat_id, user_id) -> bool:
-    """کاربر را ادمین گروه می‌کند ولی **فقط** با حق ارسال پیام."""
+async def grant_participant_rights(bot, chat_id, user_id):
+    """کاربر را ادمین گروه می‌کند؛ اول بدون هیچ حق مدیریتی.
+
+    ترتیب: «ادمینِ بدون حق» → (اگر سرور demote کرد) «فقط ویرایش پیام خودش».
+    خروجی: نامِ حالتی که واقعاً اعمال شد یا ``None``.
+    """
     _peer, channel = await peer_and_channel(bot, chat_id)
     participant = await user_peer(bot, chat_id, user_id)
     # ۱) اگر محدودیت/بن دارد برداشته شود تا ارسالش آزاد شود.
@@ -140,18 +159,25 @@ async def grant_participant_rights(bot, chat_id, user_id) -> bool:
         logger=bot.logger,
         what=f"EXCLUSIVE UNBAN chat={chat_id} user={user_id}",
     )
-    # ۲) ارتقا به ادمین با کمترین حق ممکن.
-    await call(
-        bot.client(functions.channels.EditAdminRequest(
-            channel=channel, user_id=participant,
-            admin_rights=send_only_admin_rights(), rank="")),
-        logger=bot.logger,
-        what=f"EXCLUSIVE GRANT chat={chat_id} user={user_id}",
-    )
+
+    applied = None
+    for name, preset in ADMIN_RIGHT_PRESETS:
+        await _apply_admin_rights(bot, channel, participant, preset, chat_id,
+                                  user_id)
+        participant_obj = await read_participant(bot, chat_id, user_id)
+        if is_admin_participant(participant_obj):
+            applied = name
+            break
+        log_info(bot.logger,
+                 f"EXCLUSIVE GRANT REJECTED BY SERVER chat_id={chat_id} "
+                 f"user_id={user_id} preset={name} — trying next preset")
+    if applied is None:
+        raise RuntimeError(
+            "server refused every admin preset (user was not promoted)")
     log_info(bot.logger,
              f"EXCLUSIVE GRANT RPC OK chat_id={chat_id} user_id={user_id} "
-             "rights=send_only")
-    return True
+             f"preset={applied}")
+    return applied
 
 
 async def revoke_participant_rights(bot, chat_id, user_id) -> bool:
@@ -162,6 +188,9 @@ async def revoke_participant_rights(bot, chat_id, user_id) -> bool:
     await call(
         bot.client(functions.channels.EditAdminRequest(
             channel=channel, user_id=participant,
+            # ⚠️ برای demote عمداً ``ChatAdminRights()`` (همه None) فرستاده
+            # می‌شود: روی سیم همان «همه False» است و از «ارتقای بی‌حق»
+            # (که همهٔ فلگ‌هایش صریح False است) قابل تفکیک می‌ماند.
             admin_rights=types.ChatAdminRights(), rank="")),
         logger=bot.logger,
         what=f"EXCLUSIVE DEMOTE chat={chat_id} user={user_id}",
@@ -355,11 +384,13 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
 
     # ۲) ارتقا به ادمین با حقِ ارسال.
     try:
-        await grant_participant_rights(bot, chat_id, user_id)
+        preset = await grant_participant_rights(bot, chat_id, user_id)
     except Exception as error:                       # noqa: BLE001
         _set_state(chat_id, saved, PENDING_GRANT_FLAG, {
             "granted": False, "confirmed": False, "last_error": repr(error)})
         raise
+    saved = _set_state(chat_id, saved, PENDING_GRANT_FLAG,
+                       {"admin_preset": preset})
     # ۳) تأیید واقعی با API؛ اگر تأیید نشد، رکورد فعال نمی‌ماند.
     try:
         confirmed = await rights_confirmed(bot, chat_id, user_id, True)

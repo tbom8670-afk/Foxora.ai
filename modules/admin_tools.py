@@ -32,6 +32,7 @@ _TEHRAN = TEHRAN
 from modules.owner_check import is_global_owner
 from modules.admin_storage import is_admin
 from modules.group_storage import get_group_owner
+from modules.owner_check import get_owner
 from modules.user_display import format_user
 from modules.group_id import CHANNEL_ID_OFFSET, normalize_group_id
 
@@ -1187,3 +1188,24 @@ async def run_cleanup_watcher(bot, logger=None, interval=None):
             except Exception:
                 pass
         await asyncio.sleep(delay)
+
+
+def get_global_owner_id():
+    """شناسهٔ عددیِ مالک سراسری ربات (یا ``None``)."""
+    try:
+        return get_owner().get("user_id")
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def is_global_owner(user_id) -> bool:
+    """مالکِ سراسری ربات؟ (پوشش امن روی همان منبع واحد پروژه)"""
+    if user_id is None:
+        return False
+    owner = get_global_owner_id()
+    if owner is None:
+        return False
+    try:
+        return int(user_id) == int(owner)
+    except (TypeError, ValueError):
+        return False
