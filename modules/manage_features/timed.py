@@ -22,7 +22,7 @@ import asyncio
 import time
 
 from modules.group_id import normalize_group_id
-from modules.manage_features import storage
+from modules.manage_features import peers, storage
 from modules.manage_features.queue import PerGroupQueue
 from modules.manage_features.rpc import call, log_info
 
@@ -44,6 +44,19 @@ MAX_RETRY_ROUNDS = 3
 
 QUEUE = PerGroupQueue("timed_message", max_pending_per_key=64,
                       max_pending_total=1024, task_timeout=300.0)
+
+#: سقفِ زمانیِ کلِ عملیاتِ پایان (قفل + حذف). بعد از این، وضعیت صریحاً
+#: «failed_timeout» می‌شود و پیامِ وضعیت هم گزارشِ همان را نشان می‌دهد؛
+#: عملیاتِ نیمه‌کاره بی‌صدا رها نمی‌شود.
+FINISH_BUDGET_SECONDS = 30 * 60.0
+#: سقفِ سختِ هر تماسِ شبکه‌ای در مسیر پایان (قفل/حذف/ویرایش).
+RPC_TIMEOUT = 15.0
+
+
+def group_peer(bot, chat_id):
+    """InputPeer گروه (پیاده‌سازی مشترک در ``modules.manage_features.peers``)."""
+    return peers.group_peer(bot, chat_id)
+
 
 _TIMERS: dict = {}
 
@@ -96,10 +109,28 @@ def get_record(chat_id):
 
 
 def _write(chat_id, record):
+    """نوشتن رکورد با ادغامِ امنِ شناسه‌های پیام.
+
+    اگر رکورد ورودی از نسخهٔ قدیمی‌تر (stale) ساخته شده باشد، نباید
+    شناسه‌های ثبت‌شده روی دیسک را پاک کند — وگرنه تعدادی از پیام‌های بازه
+    بی‌سر و صدا از فهرست حذف بیرون می‌مانند (باگِ واقعی). ادغام فقط وقتی
+    انجام می‌شود که «همان اجرا» باشد (``start_ts`` یکسان).
+    """
     def mutate(data):
         groups = data.setdefault("groups", {})
-        groups[_key(chat_id)] = record
-        return record
+        key = _key(chat_id)
+        previous = groups.get(key)
+        target = dict(record)
+        if isinstance(previous, dict) and \
+                float(previous.get("start_ts", -1)) == \
+                float(target.get("start_ts", -2)):
+            merged = list(dict.fromkeys(
+                [int(value) for value in (previous.get("message_ids") or [])] +
+                [int(value) for value in (target.get("message_ids") or [])]))
+            target["message_ids"] = merged
+            target["tracked"] = len(merged)
+        groups[key] = target
+        return target
 
     return storage.TIMED_STORAGE.update(mutate)
 
@@ -112,7 +143,8 @@ def active(chat_id) -> bool:
 
 def remaining_seconds(chat_id):
     record = get_record(chat_id)
-    if not record or record.get("state") not in {"active", "locking"}:
+    if not record or record.get("state") not in {"active", "locking",
+                                                 "deleting"}:
         return 0
     return max(0, int(round(float(record.get("end_ts", 0)) - storage.now())))
 
@@ -154,6 +186,27 @@ def track_message(chat_id, message_id, *, user_id=None, sent_ts=None):
         return True
 
     return storage.TIMED_STORAGE.update(mutate)
+
+
+def record_message_ids(chat_id, record, message_ids):
+    """شناسه‌های ضبط‌شده در حافظه را به رکوردِ پایدار اضافه می‌کند.
+
+    چرا لازم است: ممکن است موتور زمان‌دار زنده شود ولی رکورد هنوز
+    ``active`` باشد (مثلاً تسکی که تازه بالا آمده). اگر پیام‌ها فقط در حافظه
+    ثبت شوند، پایانِ بازه آن‌ها را نمی‌بیند و حذف نمی‌شوند (باگِ واقعی).
+    """
+    if not message_ids:
+        return int(record.get("tracked", 0) or 0)
+    existing = {int(value) for value in (record.get("message_ids") or [])}
+    fresh_ids = [int(value) for value in message_ids if int(value) not in existing]
+    if not fresh_ids:
+        return len(existing)
+    record.setdefault("message_ids", [])
+    record["message_ids"].extend(fresh_ids)
+    record["tracked"] = len(record["message_ids"])
+    record["updated_at"] = storage.now()
+    _write(chat_id, record)
+    return len(record["message_ids"])
 
 
 def tracked_ids(chat_id, record=None):
@@ -256,6 +309,19 @@ def _drop_timer(chat_id):
         task.cancel()
 
 
+def _same_loop(task) -> bool:
+    """آیا این تسک در حلقهٔ asyncioِ همین حالا زندگی می‌کند؟"""
+    try:
+        return task.get_loop() is asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+
+
+def _timer_alive(chat_id) -> bool:
+    task = _TIMERS.get(_key(chat_id))
+    return task is not None and not task.done() and _same_loop(task)
+
+
 def schedule(bot, chat_id, *, logger=None):
     """زمان‌سنجِ باقی‌مانده را برای همین گروه بالا می‌آورد (idempotent)."""
     record = get_record(chat_id)
@@ -264,8 +330,12 @@ def schedule(bot, chat_id, *, logger=None):
         return None
     key = _key(chat_id)
     existing = _TIMERS.get(key)
-    if existing is not None and not existing.done():
+    if existing is not None and not existing.done() and _same_loop(existing):
         return existing
+    if existing is not None:
+        # تایمری که در حلقهٔ دیگری (مرده) ساخته شده هرگز اجرا نمی‌شود.
+        existing.cancel()
+        _TIMERS.pop(key, None)
 
     delay = max(0.0, float(record.get("end_ts", 0)) - storage.now())
     # ⚠️ نباید از ``asyncio.create_task`` با ارجاعِ ضعیف استفاده کرد: حلقه
@@ -307,47 +377,132 @@ async def _timer(bot, chat_id, delay, logger):
 #  پایان بازه: قفل + حذف
 # ---------------------------------------------------------------------------
 async def lock_group(bot, chat_id, logger=None):
-    """قفل گروه با همان سیستم موجود پروژه (بدون تغییر در آن ماژول)."""
+    """قفل گروه با همان سیستم موجود پروژه (بدون تغییر در آن ماژول).
+
+    اگر InputPeer گروه در دسترس باشد به همان ماژول پاس داده می‌شود تا
+    دوباره resolve نشود.
+    """
     actions = getattr(bot, "group_actions", None)
     if actions is None:
         from modules.group_actions import GroupActions
 
         actions = GroupActions(bot.client, bot.logger)
-    locked = await actions.lock_group(chat_id)
+    peer = group_peer(bot, chat_id)
+    try:
+        locked = await asyncio.wait_for(
+            actions.lock_group(peer if peer is not None else chat_id),
+            timeout=RPC_TIMEOUT)
+    except asyncio.TimeoutError:
+        log_info(logger, f"TIMED LOCK TIMEOUT chat_id={chat_id}")
+        return False
     log_info(logger, f"TIMED LOCK chat_id={chat_id} result={locked}")
     return locked
 
 
-async def delete_batch(bot, chat_id, ids, logger=None):
-    """حذف یک دسته (حداکثر ۱۰۰ شناسه) با تلاش مجدد؛ شمارشِ واقعی."""
+async def delete_batch(bot, chat_id, ids, logger=None, peer=None):
+    """حذف یک دسته (حداکثر ۱۰۰ شناسه) با تلاش مجدد؛ شمارشِ واقعی.
+
+    تفاوت با نسخهٔ اول (که در عمل حذف نمی‌کرد):
+    * ``entity`` همان InputPeer گروه است، نه شناسهٔ مثبت.
+    * ``revoke=True`` صریح فرستاده می‌شود (حذف برای همه) — چون برای پیامِ
+      دیگران مقدار پیش‌فرض کافی نیست. اگر کلاینت این کلیدواژه را نپذیرد
+      یک بار بدون آن تلاش می‌شود.
+    * خروجی کتابخانه برای هر دستهٔ ۱۰۰تایی یک ``AffectedMessages`` است؛
+      اگر ``pts_count`` نبود، «تعداد درخواستی» شمرده می‌شود (رفتار خودِ
+      کتابخانه: خطا raise نمی‌شود).
+    """
     ids = [int(value) for value in ids if value]
     if not ids:
         return 0
+    target = peer if peer is not None else group_peer(bot, chat_id)
+    what = f"TIMED DELETE chat={chat_id} count={len(ids)}"
     try:
-        result = await call(
-            bot.client.delete_messages(chat_id, ids),
-            logger=logger,
-            what=f"TIMED DELETE chat={chat_id} count={len(ids)}")
-        # تلگرام/سروش برای هر RPC یک AffectedMessages برمی‌گرداند که تعدادِ
-        # pts_count را می‌دهد؛ اگر نبود، فرض می‌کنیم همه حذف شدند (رفتار خودِ
-        # کتابخانه هم همین است و خطا raise نمی‌شود).
-        counted = getattr(result, "pts_count", None)
-        if isinstance(counted, int) and 0 <= counted < len(ids):
-            return counted
-        return len(ids)
+        try:
+            rpc = bot.client.delete_messages(target, ids, revoke=True)
+        except TypeError as type_error:              # کلاینتِ بدون revoke
+            if "revoke" not in str(type_error).lower():
+                raise
+            rpc = bot.client.delete_messages(target, ids)
+        result = await asyncio.wait_for(rpc, timeout=RPC_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
     except Exception as error:                       # noqa: BLE001
-        if logger is not None:
-            try:
-                logger.log_error(
-                    "TIMED DELETE BATCH FAILED "
-                    f"chat_id={chat_id} count={len(ids)} error={error!r}")
-            except Exception:                        # noqa: BLE001
-                pass
-        return 0
+        # یک تلاش دوبارهٔ کوتاه (خطای گذرا/شبکه) پیش از شمارشِ «ناموفق».
+        if not _is_transient_delete_error(error):
+            log_info(logger, f"{what} FAILED error={error!r}")
+            return 0
+        await asyncio.sleep(0.4)
+        try:
+            rpc = bot.client.delete_messages(target, ids, revoke=True)
+            result = await asyncio.wait_for(rpc, timeout=RPC_TIMEOUT)
+        except Exception as retry_error:             # noqa: BLE001
+            if logger is not None:
+                try:
+                    logger.log_error(
+                        "TIMED DELETE BATCH FAILED "
+                        f"chat_id={chat_id} count={len(ids)} "
+                        f"error={retry_error!r}")
+                except Exception:                    # noqa: BLE001
+                    pass
+            return 0
+    rows = result if isinstance(result, (list, tuple)) else [result]
+    counted = 0
+    for row in rows:
+        value = getattr(row, "pts_count", None)
+        counted += int(value) if isinstance(value, int) and value >= 0 else 0
+    if counted <= 0:
+        return len(ids)
+    return min(counted, len(ids))
+
+
+def _is_transient_delete_error(error) -> bool:
+    """آیا خطای حذف موقتی است (شبکه/تایم‌اوت/سرور)؟"""
+    from modules.manage_features.rpc import flood_seconds, is_transient
+
+    if flood_seconds(error) is not None:
+        return True
+    return is_transient(error)
 
 
 async def finish(bot, chat_id, *, logger=None, now_ts=None):
-    """پایان بازه: بررسی وضعیت، قفل، حذف بازه، ثبت نتیجه. همه‌چیز idempotent."""
+    """پایان بازه: بررسی وضعیت، قفل، حذف بازه، ثبت نتیجه. همه‌چیز idempotent.
+
+    کلِ عملیات یک «بودجهٔ زمانی» دارد؛ اگر از آن گذشت (سرورِ گیرکرده)،
+    وضعیت ``failed_timeout`` ثبت و همان پیامِ وضعیت با همین گزارش ویرایش
+    می‌شود تا کارِ نیمه‌کاره پنهان نماند.
+    """
+    try:
+        return await asyncio.wait_for(
+            _finish(bot, chat_id, logger=logger, now_ts=now_ts),
+            timeout=FINISH_BUDGET_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        record = get_record(chat_id) or {}
+        record = dict(record)
+        record["state"] = "failed_timeout"
+        record["finished_at_tehran"] = storage.iso_tehran()
+        record["last_error"] = f"timeout after {FINISH_BUDGET_SECONDS}s"
+        _write(chat_id, record)
+        if logger is not None:
+            try:
+                logger.log_error(
+                    f"TIMED FINISH TIMEOUT chat_id={chat_id} "
+                    f"budget={FINISH_BUDGET_SECONDS}s")
+            except Exception:                        # noqa: BLE001
+                pass
+        await _emit(bot, chat_id, deleted=int(record.get("deleted", 0) or 0),
+                    failed=int(record.get("failed", 0) or 0),
+                    elapsed_seconds=int(FINISH_BUDGET_SECONDS),
+                    locked=bool(record.get("lock_ok", False)),
+                    state="failed_timeout", logger=logger)
+        return {"reason": "timeout", "tracked": len(tracked_ids(chat_id,
+                                                                record)),
+                "deleted": int(record.get("deleted", 0) or 0),
+                "failed": int(record.get("failed", 0) or 0)}
+
+
+async def _finish(bot, chat_id, *, logger=None, now_ts=None):
+    """بدنهٔ واقعی ``finish`` (قفل + حذف + ثبت نتیجه)."""
     record = get_record(chat_id)
     if not record:
         return {"reason": "no_record"}
@@ -391,9 +546,17 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
             log_info(logger, f"TIMED STATUS HOOK FAILED chat_id={chat_id} "
                              f"error={error!r}")
 
+    # ادغامِ شناسه‌های ضبط‌شده در حافظه (اگر رکورد هنوز active بود) با
+    # شناسه‌های پایدارِ دیسک — هیچ پیامی از بازه جا نمی‌ماند.
+    in_memory = list(record.get("message_ids") or [])
+    if in_memory and record.get("state") != "deleting":
+        record_message_ids(chat_id, record, in_memory)
     ids = tracked_ids(chat_id, record)
     record["state"] = "deleting"
     _write(chat_id, record)
+    # InputPeer یک بار resolve می‌شود و به همهٔ دسته‌ها داده می‌شود
+    # (بدون RPC تکراری برای هر دسته).
+    peer = group_peer(bot, chat_id)
 
     deleted = 0
     failed_ids = []
@@ -407,9 +570,19 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
                 logger=logger)
     last_emit = time.monotonic()
 
+    aborted = False
     for start in range(0, len(ids), DELETE_BATCH):
+        # «لغو پیام زماندار» در میانهٔ حذف: دسته‌های بعدی شروع نمی‌شوند
+        # (کارِ در جریان با امنیت تمام می‌شود و همان گروه‌ها ثبت می‌شوند).
+        current_state = (get_record(chat_id) or {}).get("state")
+        if current_state == "cancelled":
+            aborted = True
+            record["aborted_by_cancel"] = True
+            log_info(logger, f"TIMED FINISH ABORTED BY CANCEL chat_id={chat_id} "
+                             f"deleted={deleted}")
+            break
         batch = ids[start:start + DELETE_BATCH]
-        removed = await delete_batch(bot, chat_id, batch, logger)
+        removed = await delete_batch(bot, chat_id, batch, logger, peer=peer)
         deleted += removed
         if removed < len(batch):
             failed_ids.extend(batch[removed:])
@@ -428,12 +601,15 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
         failed_ids = []
         for start in range(0, len(retry), DELETE_BATCH):
             batch = retry[start:start + DELETE_BATCH]
-            removed = await delete_batch(bot, chat_id, batch, logger)
+            removed = await delete_batch(bot, chat_id, batch, logger,
+                                         peer=peer)
             deleted += removed
             if removed < len(batch):
                 failed_ids.extend(batch[removed:])
 
-    record["state"] = "finished"
+    current_state = (get_record(chat_id) or {}).get("state")
+    kept_cancelled = current_state == "cancelled"
+    record["state"] = "cancelled" if kept_cancelled else "finished"
     record["deleted"] = int(deleted)
     record["failed"] = len(failed_ids)
     record["failed_ids"] = failed_ids[:500]
@@ -443,8 +619,15 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
     record["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     _write(chat_id, record)
     await _emit(bot, chat_id, deleted=deleted, failed=len(failed_ids),
-                elapsed_seconds=_elapsed(), locked=locked, state="done",
-                logger=logger)
+                elapsed_seconds=_elapsed(), locked=locked,
+                state="cancelled" if kept_cancelled else "done", logger=logger)
+    if kept_cancelled:
+        log_info(logger, "TIMED FINISH STOPPED BY CANCEL "
+                         f"chat_id={chat_id} deleted={deleted} "
+                         f"failed={len(failed_ids)}")
+        return {"reason": "cancelled", "tracked": len(ids),
+                "deleted": deleted, "failed": len(failed_ids),
+                "locked": locked, "aborted": aborted}
     log_info(logger,
              "TIMED FINISHED "
              f"chat_id={chat_id} tracked={len(ids)} deleted={deleted} "
@@ -480,10 +663,96 @@ def recover(bot, logger=None):
     if restored:
         log_info(logger, f"TIMED RECOVERED count={len(restored)} "
                          f"runs={restored[:8]}")
+    # نگهبان همیشه بیدار می‌ماند تا اگر تایمری (به هر دلیلی) مرد یا حلقهٔ
+    # asyncio عوض شد، بازه از دست نرود.
+    try:
+        ensure_recovery_loop(bot, logger)
+    except RuntimeError:
+        pass
     return restored
 
 
+# ---------------------------------------------------------------------------
+#  نگهبانِ بازیابی (ضدِ گم‌شدنِ بازه بعد از ری‌استارت/قطعی)
+# ---------------------------------------------------------------------------
+#: هر چند ثانیه وضعیتِ ذخیره‌شده بررسی می‌شود. اگر تایمر در حافظه نبود (مثلاً
+#: حلقهٔ asyncio عوض شده یا تسک مرده) دوباره ساخته می‌شود؛ اگر پایانِ بازه
+#: گذشته و کاری شروع نشده، همان‌جا اجرا می‌شود. هیچ RPC‌ای در حالت عادی زده
+#: نمی‌شود (فقط خواندنِ حافظه/فایل با کش mtime).
+RECOVERY_INTERVAL = 60.0
+_RECOVERY = {"task": None}
+
+
+async def _recovery_loop(bot, logger=None):
+    while True:
+        try:
+            await asyncio.sleep(RECOVERY_INTERVAL)
+            await recover_once(bot, logger)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:                   # noqa: BLE001
+            log_info(logger, f"TIMED RECOVERY LOOP ERROR error={error!r}")
+
+
+async def recover_once(bot, logger=None):
+    """یک دورِ بازبینی: هر اجرای ذخیره‌شده باید تایمرِ زنده داشته باشد."""
+    data = storage.TIMED_STORAGE.load()
+    checked = 0
+    resumed = 0
+    for key, record in (data.get("groups") or {}).items():
+        if not isinstance(record, dict) or record.get("state") not in {
+                "active", "locking", "deleting"}:
+            continue
+        try:
+            chat_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        checked += 1
+        if _timer_alive(chat_id):
+            continue
+        if record.get("state") == "active" and \
+                float(record.get("end_ts", 0)) > storage.now() + 1:
+            schedule(bot, chat_id, logger=logger)
+            resumed += 1
+            continue
+        # زمان تمام شده ولی کاری در جریان نیست ⇒ همین حالا اجرا شود.
+        resumed += 1
+        try:
+            await QUEUE.submit(key=_key(chat_id),
+                               job=lambda c=chat_id: finish(
+                                   bot, c, logger=logger),
+                               dedupe_key="finish", logger=logger)
+        except Exception:                            # noqa: BLE001
+            pass
+    if resumed:
+        log_info(logger, f"TIMED RECOVERY RESUMED count={resumed} "
+                         f"checked={checked}")
+    return resumed
+
+
+def ensure_recovery_loop(bot, logger=None):
+    """اگر حلقهٔ نگهبان زنده نیست، دوباره بالا می‌آید (idempotent)."""
+    task = _RECOVERY.get("task")
+    if task is not None and not task.done():
+        if task.get_loop() is asyncio.get_running_loop():
+            return task
+    _RECOVERY["task"] = asyncio.ensure_future(_recovery_loop(bot, logger))
+    try:
+        _RECOVERY["task"].set_name("timed:recovery")
+    except Exception:                                # noqa: BLE001
+        pass
+    return _RECOVERY["task"]
+
+
+def stop_recovery_loop():
+    task = _RECOVERY.pop("task", None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
 async def shutdown():
+    """خاموشی تمیز: تایمرها و نگهبان متوقف می‌شوند (وضعیت در دیسک می‌ماند)."""
+    stop_recovery_loop()
     for task in list(_TIMERS.values()):
         task.cancel()
     _TIMERS.clear()
@@ -491,6 +760,7 @@ async def shutdown():
 
 def reset_all(chat_id=None):
     """پاک‌سازی وضعیت درون‌حافظه (تست)."""
+    stop_recovery_loop()
     if chat_id is None:
         for task in list(_TIMERS.values()):
             task.cancel()

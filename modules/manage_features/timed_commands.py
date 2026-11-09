@@ -26,6 +26,8 @@ QUEUE = PerGroupQueue("timed_message_ui", max_pending_per_key=8,
                       max_pending_total=128, task_timeout=30.0)
 
 CHOICE_TTL = 180.0
+#: آخرین زمانِ بازبینیِ نگهبان (برای پرهیز از کارِ تکراری در مسیر گرم).
+_WATCH: dict = {}
 _CHOICES: dict = {}            # chat_key → {"ts":..., "user_id":..., "message_id":...}
 _STATUS: dict = {}
 
@@ -81,10 +83,18 @@ async def _reply(bot, event, payload, logger=None):
 
 
 async def _edit(bot, chat_id, message, payload, logger=None):
+    """ویرایش همان پیامِ وضعیت — با entity واقعیِ گروه.
+
+    ⚠️ با شناسهٔ مثبتِ گروه، SPlusthon سراغ GetUsersRequestِ کاربر ۱۰۰…
+    می‌رود و ویرایش شکست می‌خورد؛ پس peer از ``timed.group_peer`` می‌آید.
+    """
     text, entities = payload
     try:
-        return await bot.client.edit_message(message, text,
-                                             formatting_entities=entities)
+        peer = timed.group_peer(bot, chat_id)
+        return await asyncio.wait_for(
+            bot.client.edit_message(peer, message, text,
+                                    formatting_entities=entities),
+            timeout=timed.RPC_TIMEOUT)
     except Exception as error:                       # noqa: BLE001
         if logger is not None:
             try:
@@ -115,10 +125,12 @@ def register_status(chat_id, message_id):
 async def _progress_hook(bot, chat_id, *, deleted, failed, elapsed_seconds,
                          locked, state, logger=None):
     """قلابِ موتورِ زمان‌دار → ویرایش همان پیام وضعیت (هرگز پیام جدید)."""
+    # وضعیت‌های موتور عیناً به لایهٔ نمایش می‌رسند (لغو/تایم‌اوت هم دیده شود).
+    mapped = state if state in {"running", "done", "cancelled",
+                                "failed_timeout"} else "running"
     await publish_status(bot, chat_id, deleted=deleted, failed=failed,
                          elapsed=elapsed_seconds, locked=locked,
-                         state="running" if state != "done" else "done",
-                         logger=logger)
+                         state=mapped, logger=logger)
 
 
 
@@ -141,8 +153,10 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
     payload = texts.timed_progress(deleted=0, failed=0, elapsed_seconds=0,
                                    locked=True, state="running")
     try:
-        sent = await bot.client.send_message(chat_id, payload[0],
-                                            formatting_entities=payload[1])
+        sent = await asyncio.wait_for(
+            bot.client.send_message(timed.group_peer(bot, chat_id), payload[0],
+                                    formatting_entities=payload[1]),
+            timeout=timed.RPC_TIMEOUT)
     except Exception as error:                       # noqa: BLE001
         if logger is not None:
             try:
@@ -312,6 +326,33 @@ def recover(bot, logger=None):
     return timed.recover(bot, logger)
 
 
+def watch(bot, logger=None):
+    """نگهبانِ ارزان: تایمرها و حلقهٔ بازیابی را زنده نگه می‌دارد.
+
+    در مسیر گرم صدا زده می‌شود (فقط چند dict lookup) تا اگر حلقهٔ asyncio
+    عوض شد یا تسک تایمر مرد، بازهٔ زمان‌دار از دست نرود و در پایان همیشه
+    اجرا شود.
+    """
+    # حداکثر هر ۳۰ ثانیه یک بار (مسیر گرم نباید هر پیام یک بازبینی کامل کند).
+    last = _WATCH.get("ts", 0.0)
+    if storage.now() - last < 30.0:
+        return
+    _WATCH["ts"] = storage.now()
+    try:
+        timed.ensure_recovery_loop(bot, logger)
+        data = storage.TIMED_STORAGE.load()
+        for key, record in (data.get("groups") or {}).items():
+            if not isinstance(record, dict):
+                continue
+            if record.get("state") != "active":
+                continue
+            if timed._timer_alive(int(key)):
+                continue
+            timed.schedule(bot, int(key), logger=logger)
+    except Exception:                                # noqa: BLE001
+        pass
+
+
 # موتور زمان‌دار برای ویرایشِ زندهٔ همان پیام و ساختِ آن در لحظهٔ پایان به
 # این دو قلاب تکیه می‌کند (هر دو تابع بالاتر تعریف شده‌اند).
 timed.set_progress_hook(_progress_hook)
@@ -320,6 +361,7 @@ timed.set_status_hook(ensure_status_message)
 
 def reset_all(chat_id=None):
     timed.reset_all(chat_id)
+    _WATCH.clear()
     if chat_id is None:
         _CHOICES.clear()
         _STATUS.clear()

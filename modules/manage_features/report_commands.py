@@ -76,8 +76,13 @@ async def _target_from_reply(bot, event, chat_id):
     reply_to = getattr(event, "reply_to", None)
     if reply_to is None:
         return None
+    # ⚠️ با شناسهٔ مثبتِ گروه این فراخوانی همان خطای «input entity» را
+    # می‌داد و «گزارش» عملاً هیچ‌وقت به پرونده نمی‌رسید.
+    from modules.manage_features import peers
+
     message = await bot.client.get_messages(
-        chat_id, ids=getattr(reply_to, "reply_to_msg_id", None))
+        peers.group_peer(bot, chat_id),
+        ids=getattr(reply_to, "reply_to_msg_id", None))
     if message is None:
         return None
     sender = await message.get_sender()

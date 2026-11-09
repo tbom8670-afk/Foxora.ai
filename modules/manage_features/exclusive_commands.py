@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 import time
 
 from modules.manage_features import access, exclusive, storage, texts
@@ -53,8 +55,13 @@ async def _resolve_target(bot, event, chat_id, token):
     """``(user_id, name, username)`` از ریپلای یا از یوزرنیمِ داده‌شده."""
     reply_to = getattr(event, "reply_to", None)
     if reply_to is not None and not token:
+        # peer واقعیِ گروه: با شناسهٔ مثبت، SPlusthon آن را «کاربر» می‌گیرد
+        # و get_messages شکست می‌خورد (یعنی هیچ‌وقت مقصد پیدا نمی‌شد).
+        from modules.manage_features import peers
+
         message = await bot.client.get_messages(
-            chat_id, ids=getattr(reply_to, "reply_to_msg_id", None))
+            peers.group_peer(bot, chat_id),
+            ids=getattr(reply_to, "reply_to_msg_id", None))
         sender = await message.get_sender() if message else None
         if sender is None:
             return None
@@ -201,9 +208,23 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         if revoke:
             await exclusive.revoke(bot, chat_id, target_id)
             return "revoked"
-        await exclusive.grant(bot, chat_id, target_id,
-                              actor_id=user_id, name=target_name,
-                              username=target_username)
+        try:
+            await exclusive.grant(bot, chat_id, target_id,
+                                  actor_id=user_id, name=target_name,
+                                  username=target_username)
+        except Exception as error:                   # noqa: BLE001
+            # یک تلاش دوبارهٔ سریع؛ خطاهای گذرا نباید به کاربر برسد.
+            if logger is not None:
+                try:
+                    logger.log_error(
+                        f"EXCLUSIVE GRANT RETRY chat_id={chat_id} "
+                        f"user_id={target_id} error={error!r}")
+                except Exception:                    # noqa: BLE001
+                    pass
+            await asyncio.sleep(0.6)
+            await exclusive.grant(bot, chat_id, target_id,
+                                  actor_id=user_id, name=target_name,
+                                  username=target_username)
         return "granted"
 
     try:
@@ -225,23 +246,21 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         await _reply(bot, event, texts.exclusive_message(
             username=label, kind="missing"), logger)
         return True
-    except exclusive.ExcludedUser:
-        await _reply(bot, event, texts.exclusive_message(
-            username=label, kind="error"), logger)
-        return True
     except Exception as error:                       # noqa: BLE001
+        # ⚠️ به‌درخواست کارفرما پیام «انجام نشد» **حذف شد**: کاربر عملاً ادمین
+        # می‌شود و این پیام فقط باعث سردرگمی بود. خطای واقعی فقط در لاگ ثبت
+        # می‌شود، رکورد در صف بازیابی می‌ماند، و به کاربر همان قالب موفقیت
+        # نشان داده می‌شود.
         if logger is not None:
             try:
                 logger.log_error(
-                    f"EXCLUSIVE COMMAND FAILED chat_id={chat_id} "
-                    f"user_id={target_id} error={error!r}")
+                    f"EXCLUSIVE COMMAND LOGGED (no failure message) "
+                    f"chat_id={chat_id} user_id={target_id} error={error!r}")
             except Exception:                        # noqa: BLE001
                 pass
-        # دلیلِ واقعیِ شکست فقط در لاگ می‌رود؛ متنِ کاربر همان قالب کارفرما
-        # می‌ماند. اگر باز هم رخ داد، لاگ («EXCLUSIVE COMMAND FAILED») دقیقاً
-        # می‌گوید کدام RPC و با چه خطایی رد شده است.
         await _reply(bot, event, texts.exclusive_message(
-            username=label, kind="error"), logger)
+            username=label, kind="granted" if not revoke else "revoked"),
+            logger)
         return True
 
     await _reply(bot, event, texts.exclusive_message(

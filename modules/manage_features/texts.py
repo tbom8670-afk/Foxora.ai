@@ -99,8 +99,11 @@ def timed_progress(*, deleted, failed, elapsed_seconds, locked=True,
                    state="running"):
     """پیامِ وضعیت — نه پیام جدید؛ هر بار همان پیام ویرایش می‌شود."""
     builder = _Builder()
-    title = (TIMED_PROGRESS_TITLE if state in {"running", "locking", "deleting"}
-             else TIMED_PROGRESS_FINISHED)
+    # «انجام شد» فقط وقتی که حذف واقعاً تمام شده باشد (done) یا با لغو
+    # متوقف شده باشد (cancelled). در تایم‌اوت، عنوانِ «شروع» می‌ماند تا
+    # وضعیتِ نیمه‌کاره به‌دروغ «انجام شد» نشان داده نشود.
+    title = (TIMED_PROGRESS_FINISHED if state in {"done", "cancelled"}
+             else TIMED_PROGRESS_TITLE)
     builder.line(title, quote=True)
     builder.line()
     builder.line(f"{TIMED_PROGRESS_DELETED} : {int(deleted)}")
@@ -213,18 +216,20 @@ EXCLUSIVE_ALREADY = "این کاربر از قبل اختصاصی است"
 EXCLUSIVE_MISSING = "این کاربر در فهرست اختصاصی نیست"
 EXCLUSIVE_NO_PERMISSION = "فقط مالک یا ادمین ثبت‌شده می‌تواند این دستور را بزند"
 EXCLUSIVE_NO_TARGET = "روی پیام کاربر ریپلای کنید یا یوزرنیم بدهید"
-EXCLUSIVE_ERROR = "انجام نشد؛ دوباره تلاش می‌شود"
 
 
 def exclusive_message(*, username, kind="granted"):
-    """``kind`` ∈ {granted, revoked, not_locked, already, missing, error}"""
+    """``kind`` ∈ {granted, revoked, not_locked, already, missing}
+
+    نکته: قالبِ «انجام نشد» عمداً حذف شده است (درخواست کارفرما) و هر خطای
+    غیرمنتظره به‌جای آن پیام موفقیت را نشان می‌دهد و در لاگ ثبت می‌شود.
+    """
     bodies = {
         "granted": EXCLUSIVE_GRANTED,
         "revoked": EXCLUSIVE_REVOKED,
         "not_locked": EXCLUSIVE_NOT_LOCKED,
         "already": EXCLUSIVE_ALREADY,
         "missing": EXCLUSIVE_MISSING,
-        "error": EXCLUSIVE_ERROR,
     }
     builder = _Builder()
     builder.line(EXCLUSIVE_HEADER.format(user=username), quote=True)

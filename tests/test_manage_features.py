@@ -171,6 +171,9 @@ class FakeClient:
         self.get_participant_broken = False
         self.edits = []
         self.sent = []
+        #: هدف‌های حذف (باید همیشه InputPeer یا شناسهٔ منفی باشند)
+        self.delete_targets = []
+        self.delete_effective = True
 
     async def get_input_entity(self, target):
         # همان شکلی که SPlusthon برای گروه و کاربر برمی‌گرداند.
@@ -295,8 +298,22 @@ class FakeClient:
             "get_sender": _sender_getter(sender),
         })()
 
+    async def send_message(self, chat_id, text, formatting_entities=None,
+                           **_kwargs):
+        sent_id = 500000 + len(self.sent)
+        self.sent.append((chat_id, text, list(formatting_entities or []),
+                          sent_id))
+        return type("Message", (), {"id": sent_id, "message": text,
+                                    "peer_id": chat_id})()
+
     async def delete_messages(self, chat_id, ids, **_kwargs):
         ids = list(ids)
+        # همان رفتار واقعی: با شناسهٔ مثبت (کاربر) حذف انجام نمی‌شود.
+        self.delete_targets.append(chat_id)
+        if isinstance(chat_id, int) and chat_id > 0:
+            self.delete_effective = False
+            return []
+        self.delete_effective = True
         if self.chat.fail_next:
             self.chat.fail_next -= 1
             ids = ids[:len(ids) // 2]           # حذف جزئی + خطا
@@ -305,9 +322,15 @@ class FakeClient:
         self.chat.deleted.extend(ids)
         return type("Affected", (), {"pts_count": len(ids)})()
 
-    async def edit_message(self, message, text, formatting_entities=None,
-                           **_kwargs):
-        self.edits.append((message, text, list(formatting_entities or [])))
+    async def edit_message(self, entity, message=None, text=None,
+                           formatting_entities=None, **_kwargs):
+        """امضای واقعیِ SPlusthon: edit_message(entity, message, text=…)."""
+        if text is None:                     # فراخوانی قدیمی: (message, text)
+            text, message = message, entity
+            entity = None
+        self.edits.append((entity, message, text,
+                           list(formatting_entities or [])))
+        return type("Message", (), {"id": message})()
         return type("Message", (), {"id": message})()
 
     async def get_me(self):
@@ -568,8 +591,10 @@ def test_02b_exclusive_grant_refused_by_server():
         return event.replies, jobs
 
     replies, jobs = run(scenario())
-    check("قالب کارفرما «انجام نشد؛ دوباره تلاش می‌شود» ارسال شد",
-          bool(replies) and "انجام نشد" in replies[-1][0], replies)
+    check("هیچ پیام «انجام نشد» ارسال نمی‌شود",
+          all("انجام نشد" not in text for text, _e in replies), replies)
+    check("به‌جای آن، قالب موفقیت ارسال می‌شود",
+          bool(replies) and "تنظیم اختصاصی" in replies[-1][0], replies)
     check("عنوان با نام واقعیِ کاربر در نقل‌قول است",
           "← کاربر : 『 @denied 』" in replies[-1][0], replies[-1][0])
     check("رکورد برای تلاش دوباره در فهرست بازیابی ماند",
@@ -777,8 +802,13 @@ def test_02f_exclusive_verify_with_broken_get_participant():
         return event.replies
 
     replies3 = run(scenario3())
-    check("اگر واقعاً ارتقا انجام نشد، پیام «انجام نشد» می‌آید",
-          any("انجام نشد" in t2 for t2, _e in replies3), replies3)
+    check("حتی وقتی ارتقا واقعاً انجام نشده، پیام «انجام نشد» نمی‌آید",
+          not any("انجام نشد" in t2 for t2, _e in replies3), replies3)
+    check("در این حالت هم پیام موفقیت (طبق درخواست کارفرما) ارسال می‌شود",
+          any("تنظیم اختصاصی" in t2 for t2, _e in replies3), replies3)
+    check("خطای واقعی در لاگ ثبت می‌شود",
+          any("EXCLUSIVE COMMAND LOGGED" in message
+              for message in bot3.logger.errors), bot3.logger.errors)
 
 
 def test_03_exclusive_auto_revoke_on_unlock():
@@ -957,14 +987,21 @@ def test_06_timed_finish_deletes_only_window():
     check("تعداد ناموفق صفر", saved["failed"] == 0, saved["failed"])
 
     # 📌 پیام وضعیت در طول کار «ویرایش» می‌شود، نه اینکه پیام تازه بفرستد.
-    edits = [item for item in bot.client.edits if item[0] == 3300]
+    # نکته: پارامتر اولِ edit_message همان **entity گروه** است (پیش از این
+    # شناسهٔ مثبت بود و ویرایش در عمل شکست می‌خورد)؛ شناسهٔ پیام پارامتر دوم.
+    edits = [item for item in bot.client.edits if item[1] == 3300]
     check("پیام وضعیت ویرایش شد (نه پیام جدید)",
           bool(edits), bot.client.edits[:2])
     check("پیام وضعیت چند بار ویرایش شد (زنده)",
           len(edits) >= 2, len(edits))
     check("محتوای ویرایش شامل شمارش پیام‌هاست",
-          any("تعداد پیام در حال پاک شدن" in text for _m, text, _e in edits),
-          [text[:20] for _m, text, _e in edits][:2])
+          any("تعداد پیام در حال پاک شدن" in body
+              for _peer, _mid, body, _ent in edits),
+          [body[:20] for _peer, _mid, body, _ent in edits][:2])
+    check("ویرایش با entity واقعیِ گروه انجام شد (نه شناسهٔ مثبت)",
+          all((isinstance(peer, int) and peer < 0) or
+              hasattr(peer, "channel_id") for peer, _m, _b, _e in edits),
+          [type(peer).__name__ for peer, _m, _b, _e in edits][:3])
     check("پیام وضعیت هیچ‌گاه حذف نشد", 3300 not in chat.deleted)
 
     # اجرای دوباره هیچ پیامی حذف نمی‌کند (idempotent)
@@ -1085,6 +1122,207 @@ def test_07b_timed_survives_restart_end_to_end():
     check("گزارش پایان درست است", result.get("deleted") == 20, result)
     check("رکورد پایان‌یافته و پایدار است",
           timed.get_record(chat_id)["state"] == "finished")
+
+
+def test_07c_timed_purge_really_deletes_with_positive_group_id():
+    """پاکسازی زمان‌دار باید با شناسهٔ مثبتِ گروه هم واقعاً حذف کند.
+
+    باگِ واقعی: شناسهٔ مثبت به ``delete_messages`` می‌رفت و SPlusthon آن را
+    «کاربر» فرض می‌کرد ⇒ هیچ پیامی حذف نمی‌شد و شمارنده هم دروغ می‌گفت.
+    """
+    print("\n### ۷ج) حذف واقعیِ پاکسازی زمان‌دار (شناسهٔ مثبت گروه)")
+    fresh()
+
+    short_id = 887766
+    positive = short_id                      # شکلِ ذخیره‌شده در پروژه
+    negative = -(10 ** 12) - short_id        # همان گروه در شکلِ سروش
+    chat = FakeChat(negative, locked=False)
+    bot = FakeBot(chat)
+    # فقط شکل مثبت در حافظه است (همان چیزی که storage/دستور می‌دهد)
+    from modules.manage_features import timed as timed_engine
+
+    record = timed_engine.start(positive, 30, actor_id=4242)
+    for message_id in range(4100, 4130):
+        timed_engine.track_message(positive, message_id)
+    chat.deleted.clear()
+    result = run(timed_engine.finish(bot, positive, logger=bot.logger,
+                                     now_ts=float(record["end_ts"]) + 1))
+
+    check("همهٔ ۳۰ پیام واقعاً حذف شدند", len(chat.deleted) == 30,
+          sorted(chat.deleted)[:5])
+    check("شمارندهٔ گزارش هم ۳۰ است", result.get("deleted") == 30, result)
+    check("شناسهٔ مثبت هرگز به delete_messages داده نشد",
+          all((isinstance(target, int) and target < 0) or
+              hasattr(target, "channel_id") for target in bot.client.delete_targets),
+          bot.client.delete_targets)
+    check("هدفِ حذف همان شناسهٔ منفیِ گروه بود",
+          all(target == negative or getattr(target, "channel_id", None) == short_id
+              for target in bot.client.delete_targets), bot.client.delete_targets)
+    check("گروه در پایان قفل شد", chat.locked is True)
+    check("رکورد پایان‌یافته است",
+          (timed_engine.get_record(positive) or {}).get("state") == "finished")
+
+    # ---- تایمر زندهٔ واقعی: بازه تمام می‌شود و کار خودش اجرا می‌شود ----
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 889, locked=False)
+    bot2 = FakeBot(chat2)
+    record2 = timed_engine.start(chat2.chat_id, 30, actor_id=4242)
+    record2["end_ts"] = storage.now() + 0.25
+    timed_engine._write(chat2.chat_id, record2)
+    for message_id in range(5100, 5106):
+        timed_engine.track_message(chat2.chat_id, message_id)
+    chat2.deleted.clear()
+
+    async def live():
+        timed_engine.schedule(bot2, chat2.chat_id, logger=bot2.logger)
+        for _ in range(120):
+            await asyncio.sleep(0.05)
+            if (timed_engine.get_record(chat2.chat_id) or {}).get(
+                    "state") == "finished":
+                break
+        await timed_engine.QUEUE.drain(timeout=5.0)
+
+    run(live())
+    check("تایمر واقعی بازه را در پایان اجرا کرد",
+          (timed_engine.get_record(chat2.chat_id) or {}).get("state")
+          == "finished",
+          (timed_engine.get_record(chat2.chat_id) or {}).get("state"))
+    check("پیام‌های بازه با تایمر واقعی حذف شدند",
+          set(chat2.deleted) == set(range(5100, 5106)), sorted(chat2.deleted))
+
+    # ---- نگهبان: اگر تایمر گم شود، بازبینی آن را برمی‌گرداند ----
+    fresh()
+    chat3 = FakeChat(-(10 ** 12) - 890, locked=False)
+    bot3 = FakeBot(chat3)
+    record3 = timed_engine.start(chat3.chat_id, 30, actor_id=4242)
+    for message_id in range(6100, 6104):
+        timed_engine.track_message(chat3.chat_id, message_id)
+    # حالا بازه را در گذشته می‌گذاریم و تایمر را «گم» می‌کنیم: هیچ تسکی در
+    # حافظه نیست، فقط رکورد روی دیسک مانده است (سناریوی ری‌استارتِ بد).
+    record3["end_ts"] = storage.now() - 5
+    timed_engine._write(chat3.chat_id, record3)
+    timed_engine.reset_all(chat3.chat_id)
+    chat3.deleted.clear()
+
+    async def guardian():
+        resumed = await timed_engine.recover_once(bot3, bot3.logger)
+        await timed_engine.QUEUE.drain(timeout=5.0)
+        return resumed
+
+    resumed = run(guardian())
+    check("نگهبان اجرای رهاشده را پیدا کرد", resumed == 1, resumed)
+    check("پیام‌های همان بازه توسط نگهبان حذف شدند",
+          set(chat3.deleted) == set(range(6100, 6104)), sorted(chat3.deleted))
+
+    # پیام وضعیت باید با entity واقعی ویرایش/ارسال شود (نه شناسهٔ مثبت)
+    check("پیام وضعیت روی peer درست ارسال می‌شود",
+          all((isinstance(target, int) and target < 0) or
+              hasattr(target, "channel_id")
+              for target, _t, _e, _i in bot.client.sent), bot.client.sent)
+
+
+def test_07d_timed_status_peer_cancel_and_timeout():
+    """پیامِ وضعیت با peer واقعی + لغو در میانهٔ حذف + سقفِ زمانیِ پایان."""
+    print("\n### ۷د) پیام وضعیت با peer واقعی، لغو وسط حذف، سقفِ زمانی")
+    fresh()
+    chat_id = -(10 ** 12) - 951
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=False)
+    bot = FakeBot(chat)
+    owner = FakeUser(4242, "owner")
+
+    async def activate():
+        event = FakeEvent(chat_id, owner, "پیام زماندار")
+        await timed_commands.handle(bot, event, chat_id, 4242, owner,
+                                    "پیام زماندار", bot.logger)
+        pick = FakeEvent(chat_id, owner, "1")
+        await timed_commands.handle(bot, pick, chat_id, 4242, owner, "1",
+                                    bot.logger)
+
+    run(activate())
+    record = timed.get_record(chat_id)
+    check("بازهٔ ۳۰ دقیقه ثبت شد", record["minutes"] == 30, record["minutes"])
+    check("در لحظهٔ تنظیم هیچ پیام وضعیتی فرستاده نشد", bot.client.sent == [],
+          bot.client.sent)
+    for message_id in range(7100, 7112):
+        timed_commands.track(chat_id, message_id, 555)
+
+    # ---- پایان بازه: پیام وضعیت روی peer واقعی ساخته و ویرایش می‌شود ----
+    result = run(timed.finish(bot, chat_id, logger=bot.logger,
+                              now_ts=float(record["end_ts"]) + 1))
+    check("همهٔ ۱۲ پیام حذف شد", result.get("deleted") == 12, result)
+    check("پیام وضعیت ارسال شد", len(bot.client.sent) == 1,
+          len(bot.client.sent))
+    sent_target = bot.client.sent[0][0] if bot.client.sent else None
+    check("پیام وضعیت به entity واقعیِ گروه رفت (نه شناسهٔ مثبت)",
+          (isinstance(sent_target, int) and sent_target < 0) or
+          hasattr(sent_target, "channel_id"), sent_target)
+    live_edits = [item for item in bot.client.edits if item[1] ==
+                  bot.client.sent[0][3]]
+    check("همان پیام وضعیت ویرایش شد و پیام تازه‌ای ساخته نشد",
+          len(bot.client.sent) == 1 and bool(live_edits),
+          (len(bot.client.sent), len(live_edits)))
+    check("ویرایش‌ها هم به entity گروه رفتند",
+          all((isinstance(peer, int) and peer < 0) or
+              hasattr(peer, "channel_id") for peer, _m, _b, _e in live_edits),
+          [type(peer).__name__ for peer, _m, _b, _e in live_edits][:2])
+    check("پیام وضعیت هرگز حذف نشد",
+          bot.client.sent[0][3] not in chat.deleted, chat.deleted[:5])
+
+    # ---- لغو در میانهٔ حذف: دسته‌های بعدی شروع نمی‌شوند ----
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 952, locked=False)
+    bot2 = FakeBot(chat2)
+    record2 = timed.start(chat2.chat_id, 30, actor_id=4242)
+    for message_id in range(7200, 7500):          # ۳۰۰ پیام ⇒ ۳ دسته
+        timed.track_message(chat2.chat_id, message_id)
+    chat2.deleted.clear()
+
+    class CancelAfterFirstBatch(FakeClient):
+        """بعد از حذفِ دستهٔ اول، «لغو پیام زماندار» صادر می‌شود."""
+
+        async def delete_messages(self, chat_id, ids, **_kwargs):
+            result = await super().delete_messages(chat_id, ids, **_kwargs)
+            if len(self.chat.deleted) >= 100:
+                timed.cancel(self.chat.chat_id, reason="manual-test")
+            return result
+
+    bot2.client = CancelAfterFirstBatch(chat2)
+    result2 = run(timed.finish(bot2, chat2.chat_id, logger=bot2.logger,
+                               now_ts=float(record2["end_ts"]) + 1))
+    check("پس از لغو، حذف متوقف شد (نه ۳۰۰ پیام)",
+          0 < len(chat2.deleted) < 300, len(chat2.deleted))
+    check("تعداد حذف‌شده با لغو ثبت شد", result2.get("deleted") ==
+          len(chat2.deleted), (result2.get("deleted"), len(chat2.deleted)))
+    check("وضعیت رکورد «cancelled» می‌ماند",
+          timed.get_record(chat2.chat_id)["state"] == "cancelled",
+          timed.get_record(chat2.chat_id)["state"])
+
+    # ---- سقفِ زمانی: عملیاتِ گیرکرده بی‌صدا نمی‌ماند ----
+    fresh()
+    chat3 = FakeChat(-(10 ** 12) - 953, locked=False)
+    bot3 = FakeBot(chat3)
+    record3 = timed.start(chat3.chat_id, 30, actor_id=4242)
+    timed.track_message(chat3.chat_id, 7300)
+
+    class HangingClient(FakeClient):
+        async def delete_messages(self, chat_id, ids, **_kwargs):
+            await asyncio.sleep(30)
+            return []
+
+    bot3.client = HangingClient(chat3)
+    original_budget = timed.FINISH_BUDGET_SECONDS
+    timed.FINISH_BUDGET_SECONDS = 0.5
+    try:
+        result3 = run(timed.finish(bot3, chat3.chat_id, logger=bot3.logger,
+                                   now_ts=float(record3["end_ts"]) + 1))
+    finally:
+        timed.FINISH_BUDGET_SECONDS = original_budget
+    check("عملیاتِ گیرکرده با سقفِ زمانی تمام می‌شود",
+          result3.get("reason") == "timeout", result3)
+    check("وضعیت صریح failed_timeout ثبت شد",
+          timed.get_record(chat3.chat_id)["state"] == "failed_timeout",
+          timed.get_record(chat3.chat_id)["state"])
 
 
 async def _recover_and_cancel(bot, chat_id):
@@ -1717,6 +1955,8 @@ def main():
     test_06_timed_finish_deletes_only_window()
     test_07_timed_restart_and_failures()
     test_07b_timed_survives_restart_end_to_end()
+    test_07c_timed_purge_really_deletes_with_positive_group_id()
+    test_07d_timed_status_peer_cancel_and_timeout()
     test_08_report_flow()
     test_09_report_decision()
     test_09c_report_warning_counts_are_real()

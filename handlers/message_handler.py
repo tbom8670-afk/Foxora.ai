@@ -4060,6 +4060,9 @@ async def handle_new_message(bot, event):
                 if _manage2 is not None:
                     _manage2["timed"].track(
                         chat_id, getattr(event.message, "id", None), user_id)
+                    # نگهبانِ زمان‌دار: اگر تایمر/حلقهٔ بازیابی مرده باشد
+                    # دوباره بالا می‌آید (حداکثر هر ۳۰ ثانیه، بدون RPC).
+                    _manage2["timed"].watch(chat_id, bot, logger=bot.logger)
                     _manage2["exclusive"].watch(
                         chat_id, {"bot": bot}, logger=bot.logger)
             except Exception as _track_error:
