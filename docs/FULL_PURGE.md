@@ -99,7 +99,7 @@ tests/test_full_purge.py     ۱۱۸ بررسی (۷ تا ۴۲۰۰ پیام، خط
 
 ```bash
 cd ~/Foxora.ai
-python3 tests/test_full_purge.py            # ۱۴۵ بررسی، بدون شبکه
+python3 tests/test_full_purge.py            # ۱۴۸ بررسی، بدون شبکه
 ```
 
 داخل گروه (فقط مالک/ادمینِ ثبت‌شده):
