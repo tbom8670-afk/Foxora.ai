@@ -47,6 +47,33 @@ QUEUE = PerGroupQueue("timed_message", max_pending_per_key=64,
 
 _TIMERS: dict = {}
 
+#: قلابِ نمایش پیشرفت (``timed_commands`` آن را ثبت می‌کند تا همان پیام
+#: وضعیت ویرایش شود). تهی بودنش هیچ اثری روی موتور ندارد.
+PROGRESS_HOOK = None
+#: کمینهٔ فاصلهٔ بین دو ویرایش (ویرایش بیش از حد = FloodWait)
+PROGRESS_MIN_INTERVAL = 2.0
+
+
+def set_progress_hook(hook):
+    global PROGRESS_HOOK
+    PROGRESS_HOOK = hook
+    return hook
+
+
+async def _emit(bot, chat_id, *, deleted, failed, elapsed_seconds, locked,
+                state, logger=None):
+    """اطلاع به لایهٔ نمایش؛ خطای آن هرگز موتور را متوقف نمی‌کند."""
+    hook = PROGRESS_HOOK
+    if hook is None:
+        return
+    try:
+        await hook(bot, chat_id, deleted=int(deleted), failed=int(failed),
+                   elapsed_seconds=int(elapsed_seconds), locked=bool(locked),
+                   state=state, logger=logger)
+    except Exception as error:                       # noqa: BLE001
+        log_info(logger, f"TIMED PROGRESS HOOK FAILED chat_id={chat_id} "
+                         f"error={error!r}")
+
 
 def _key(chat_id):
     return storage.group_key(chat_id)
@@ -353,12 +380,28 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
 
     deleted = 0
     failed_ids = []
+    last_emit = 0.0
+
+    def _elapsed():
+        return int(max(0.0, time.monotonic() - started))
+
+    await _emit(bot, chat_id, deleted=0, failed=0,
+                elapsed_seconds=_elapsed(), locked=locked, state="deleting",
+                logger=logger)
+    last_emit = time.monotonic()
+
     for start in range(0, len(ids), DELETE_BATCH):
         batch = ids[start:start + DELETE_BATCH]
         removed = await delete_batch(bot, chat_id, batch, logger)
         deleted += removed
         if removed < len(batch):
             failed_ids.extend(batch[removed:])
+        # همان پیام وضعیت، به‌صورت زنده و با فاصلهٔ حداقل ویرایش می‌شود.
+        if time.monotonic() - last_emit >= PROGRESS_MIN_INTERVAL:
+            await _emit(bot, chat_id, deleted=deleted,
+                        failed=len(failed_ids), elapsed_seconds=_elapsed(),
+                        locked=locked, state="deleting", logger=logger)
+            last_emit = time.monotonic()
 
     # تلاش دوبارهٔ کنترل‌شده برای دسته‌های ناموفق
     rounds = 0
@@ -382,6 +425,9 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
     record["retry_rounds"] = rounds
     record["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     _write(chat_id, record)
+    await _emit(bot, chat_id, deleted=deleted, failed=len(failed_ids),
+                elapsed_seconds=_elapsed(), locked=locked, state="done",
+                logger=logger)
     log_info(logger,
              "TIMED FINISHED "
              f"chat_id={chat_id} tracked={len(ids)} deleted={deleted} "

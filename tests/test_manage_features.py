@@ -544,6 +544,17 @@ def test_06_timed_finish_deletes_only_window():
     check("زمان پایان تهران ثبت شد", bool(saved.get("finished_at_tehran")))
     check("تعداد ناموفق صفر", saved["failed"] == 0, saved["failed"])
 
+    # 📌 پیام وضعیت در طول کار «ویرایش» می‌شود، نه اینکه پیام تازه بفرستد.
+    edits = [item for item in bot.client.edits if item[0] == 3300]
+    check("پیام وضعیت ویرایش شد (نه پیام جدید)",
+          bool(edits), bot.client.edits[:2])
+    check("پیام وضعیت چند بار ویرایش شد (زنده)",
+          len(edits) >= 2, len(edits))
+    check("محتوای ویرایش شامل شمارش پیام‌هاست",
+          any("تعداد پیام در حال پاک شدن" in text for _m, text, _e in edits),
+          [text[:20] for _m, text, _e in edits][:2])
+    check("پیام وضعیت هیچ‌گاه حذف نشد", 3300 not in chat.deleted)
+
     # اجرای دوباره هیچ پیامی حذف نمی‌کند (idempotent)
     before = len(chat.deleted)
     again = run(timed.finish(bot, chat.chat_id, logger=bot.logger,

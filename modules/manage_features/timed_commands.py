@@ -97,13 +97,32 @@ async def _edit(bot, chat_id, message, payload, logger=None):
 
 
 def register_status(chat_id, message_id):
-    """شناسهٔ پیامِ پیشرفت را نگه می‌دارد (همان پیام ویرایش می‌شود)."""
+    """شناسهٔ پیامِ پیشرفت را نگه می‌دارد (همان پیام ویرایش می‌شود).
+
+    ⚠️ فقط همین فیلد روی رکوردِ موجود نوشته می‌شود؛ ``timed.start`` دوباره
+    صدا زده نمی‌شود تا هرگز یک اجرای دوم/زمان‌سنج تازه ساخته نشود.
+    """
+    if message_id is None:
+        return None
     _STATUS[_key(chat_id)] = message_id
-    record = timed.get_record(chat_id)
-    if record:
-        record = dict(record)
-        record["status_message_id"] = message_id
-        timed._write(chat_id, record)
+    try:
+        timed.register_status(chat_id, message_id)
+    except Exception as error:                       # noqa: BLE001
+        return None
+    return message_id
+
+
+async def _progress_hook(bot, chat_id, *, deleted, failed, elapsed_seconds,
+                         locked, state, logger=None):
+    """قلابِ موتورِ زمان‌دار → ویرایش همان پیام وضعیت (هرگز پیام جدید)."""
+    await publish_status(bot, chat_id, deleted=deleted, failed=failed,
+                         elapsed=elapsed_seconds, locked=locked,
+                         state="running" if state != "done" else "done",
+                         logger=logger)
+
+
+# موتور زمان‌دار برای ویرایشِ زندهٔ همان پیام به این قلاب تکیه می‌کند.
+timed.set_progress_hook(_progress_hook)
 
 
 def status_id(chat_id):
@@ -111,8 +130,10 @@ def status_id(chat_id):
     return record.get("status_message_id") or _STATUS.get(_key(chat_id))
 
 
-async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked,
+async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked=None,
                          state="running", logger=None):
+    if locked is None:
+        locked = bool((timed.get_record(chat_id) or {}).get("lock_ok", False))
     message_id = status_id(chat_id)
     payload = texts.timed_progress(deleted=deleted, failed=failed,
                                    elapsed_seconds=elapsed, locked=locked,
