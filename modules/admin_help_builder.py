@@ -73,10 +73,16 @@ def build_admin_help():
         entities.append(MessageEntityBold(offset=start, length=_u16(chunk)))
         for needle in quote_texts:
             index = chunk.find(needle)
-            if index >= 0:
-                entities.append(MessageEntityBlockquote(
-                    offset=start + _u16(chunk[:index]),
-                    length=_u16(needle)))
+            if index < 0:
+                continue
+            # اگر نیدل با «\n» شروع شود یعنی «این خط، از ابتدای خط»؛ خودِ
+            # خط‌شکن داخل نقل‌قول نمی‌رود. لازم است چون عنوانِ بلوک هم می‌تواند
+            # همان عبارت را داشته باشد و نقل‌قول نباید داخل عنوان بیفتد.
+            lead = 1 if needle.startswith("\n") else 0
+            text_part = needle[lead:]
+            entities.append(MessageEntityBlockquote(
+                offset=start + _u16(chunk[:index + lead]),
+                length=_u16(text_part)))
         parts.append(trailing)
 
     blocks_before_vip = [
@@ -143,13 +149,13 @@ def build_admin_help():
         ("🗂  دیدن لیست اینکه ادمین ها چه کسی و چه پیامی را اخراج یا حذف کردند با دستور", ["لاگ مدیریتی"]),
         ("📋 برای دیدن سابقه اخراج شده ها سکوت شده ها و اخطار کاربران (۲۴ ساعت اخیر ) دستور", ["سابقه ها"]),
         ("🗑 پاکسازی خودکار پیام های گروه با دستور", ["پاکسازی خودکار"]),
-        # 🧬 متن دقیقِ کارفرما: کل بلوک Bold و خودِ دستور داخل نقل‌قول سروش پلاس.
+        # 🧬 متن دقیقِ کارفرما (دو خط، بدون تکرار): عنوان Bold و خودِ دستور
+        # داخل نقل‌قول سروش پلاس. «برای پاکسازی کامل پیام های گروه دستور»
+        # فقط یک بار نوشته می‌شود و زیرش «پاکسازی کامل».
         (READY_BLOCK, [
             "🧬برای پاکسازی کامل پیام های گروه دستور\n"
-            "پاکسازی کامل\n"
-            "برای پاکسازی کامل پیام های گروه دستور\n"
-            "« پاکسازی کامل »",
-            ("پاکسازی کامل",),
+            "پاکسازی کامل",
+            ("\nپاکسازی کامل",),
         ]),
         ("🤖 فعال کردن هوش مصنوعی گوگل با دستور", [
             "فعال کردن : هوش مصنوعی فعال",

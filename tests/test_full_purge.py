@@ -556,12 +556,23 @@ def test_12_admin_list_entry():
             if e.offset == u16(ADMIN_HELP_TEXT[:start])]
     check("کل بلوک Bold است",
           bool(bold) and bold[0].length == u16(block), (bold, u16(block)))
-    command_index = ADMIN_HELP_TEXT.find("پاکسازی کامل", start)
+    check("بلوک دقیقاً دو خط است (بدون تکرار)",
+          block.split("\n") == ["🧬برای پاکسازی کامل پیام های گروه دستور",
+                                 "پاکسازی کامل"], block)
+    check("عبارت «برای پاکسازی کامل پیام های گروه دستور» یک بار آمده",
+          ADMIN_HELP_TEXT.count("برای پاکسازی کامل پیام های گروه دستور") == 1,
+          ADMIN_HELP_TEXT.count("برای پاکسازی کامل پیام های گروه دستور"))
+    # خط دوم بلوک = خودِ دستور؛ باید دقیقاً همان داخل نقل‌قول باشد.
+    command_index = ADMIN_HELP_TEXT.index("\nپاکسازی کامل", start) + 1
+    command_offset = u16(ADMIN_HELP_TEXT[:command_index])
     quoted = [e for e in ADMIN_HELP_ENTITIES
-              if e.offset == u16(ADMIN_HELP_TEXT[:command_index])]
-    check("دستور «پاکسازی کامل» داخل نقل‌قول است",
-          any(type(e).__name__ == "MessageEntityBlockquote" for e in quoted),
-          quoted)
+              if e.offset == command_offset]
+    check("دستور «پاکسازی کامل» (خط دوم) داخل نقل‌قول است",
+          any(type(e).__name__ == "MessageEntityBlockquote"
+              and e.length == u16("پاکسازی کامل") for e in quoted), quoted)
+    check("نقل‌قول روی خودِ خط است، نه روی عنوان",
+          bool(quoted) and ADMIN_HELP_TEXT[command_index - 1] == "\n",
+          ADMIN_HELP_TEXT[command_index - 1:command_index + 15])
 
 
 def test_13_service_flow():
