@@ -143,6 +143,8 @@ class FakeClient:
         #: سرور سروش که «تغییر اطلاعات گروه» و «سنجاق» را خودش روشن می‌کند
         #: (در تست‌های مربوطه روشن می‌شود؛ پیش‌فرض خاموش)
         self.force_toggles = False
+        #: تعداد بارهایی که GetParticipant خطای گذرا می‌دهد
+        self.read_participant_flaky = 0
         self.edits = []
         self.sent = []
 
@@ -209,6 +211,9 @@ class FakeClient:
             self.chat.admins[user_id] = rights
             return True
         if name == "GetParticipantRequest":
+            if self.read_participant_flaky:
+                self.read_participant_flaky -= 1
+                raise ConnectionError("temporary read")
             if self.get_participant_fails:
                 self.get_participant_fails -= 1
                 raise ConnectionError("temporary")
@@ -608,6 +613,53 @@ def test_02d_exclusive_server_forces_toggles_and_lost_record():
     check("رکوردِ حداقلی با پرچم adopted_from_server ثبت شد",
           entry.get("adopted_from_server") is True
           and entry["state"] == "revoked", entry)
+
+
+def test_02e_exclusive_username_grant_never_says_failed():
+    print("\n### ۲ه) اختصاصی با یوزرنیم: موفقیت واقعی نباید «انجام نشد» بدهد")
+    fresh()
+    chat_id = -(10 ** 12) - 515
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=True)
+    target = FakeUser(991, "Linx_cox")
+    bot = FakeBot(chat, {991: target})
+    bot.client.force_toggles = True
+    owner = FakeUser(4242, "owner")
+
+    async def scenario():
+        event = FakeEvent(chat_id, owner, "اختصاصی @Linx_cox")
+        await exclusive_commands.handle(bot, event, chat_id, 4242, owner,
+                                        "اختصاصی @Linx_cox", bot.logger)
+        return event.replies
+
+    replies = run(scenario())
+    text = " ".join(t2 for t2, _e in replies)
+    check("پیام «انجام نشد» ارسال نشد", "انجام نشد" not in text, replies)
+    check("پیام «تنظیم اختصاصی برای شما فعال شد» ارسال شد",
+          "تنظیم اختصاصی برای شما فعال شد" in text, replies)
+    check("عنوان با یوزرنیمِ واقعی در نقل‌قول است",
+          "← کاربر : 『 @Linx_cox 』" in text, replies)
+    check("کاربر واقعاً ادمین است", 991 in chat.admins, chat.admins)
+    check("رکورد فعال ثبت شد",
+          exclusive.get_entry(chat_id, 991) is not None
+          and exclusive.get_entry(chat_id, 991)["state"] == "active",
+          exclusive.get_entry(chat_id, 991))
+
+    # خواندنِ وضعیت چند بار خطای گذرا بدهد: باز هم نباید «انجام نشد» بدهد
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 516, locked=True)
+    target2 = FakeUser(992, "Linx_two")
+    bot2 = FakeBot(chat2, {992: target2})
+    bot2.client.read_participant_flaky = 2
+
+    async def scenario2():
+        return await exclusive.grant(bot2, chat2.chat_id, 992, actor_id=4242,
+                                     username="Linx_two")
+
+    record = run(scenario2())
+    check("با خطای گذرای خواندن، رکورد باز هم فعال و تأییدشده است",
+          record["state"] == "active" and record["confirmed"] is True, record)
+    check("کاربر ادمین است", 992 in chat2.admins, chat2.admins)
 
 
 def test_03_exclusive_auto_revoke_on_unlock():
@@ -1537,6 +1589,7 @@ def main():
     test_02b_exclusive_grant_refused_by_server()
     test_02c_exclusive_strict_server_fallback()
     test_02d_exclusive_server_forces_toggles_and_lost_record()
+    test_02e_exclusive_username_grant_never_says_failed()
     test_03_exclusive_auto_revoke_on_unlock()
     test_04_exclusive_concurrent()
     test_05_timed_all_durations_and_cancel()

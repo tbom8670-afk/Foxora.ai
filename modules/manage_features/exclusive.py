@@ -24,6 +24,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 from modules.group_actions import (
     GroupActions,
     clone_banned_rights,
@@ -161,19 +163,36 @@ async def grant_participant_rights(bot, chat_id, user_id):
     )
 
     applied = None
+    problems = []
     for name, preset in ADMIN_RIGHT_PRESETS:
         await _apply_admin_rights(bot, channel, participant, preset, chat_id,
                                   user_id)
+        log_info(bot.logger,
+                 f"EXCLUSIVE GRANT APPLIED chat_id={chat_id} "
+                 f"user_id={user_id} preset={name}")
+        # یک بار دیگر بخوان تا اگر تبلیغ/تأخیر سروری بود، فرصت داشته باشد.
         participant_obj = await read_participant(bot, chat_id, user_id)
+        if not is_admin_participant(participant_obj):
+            await asyncio.sleep(0.35)
+            participant_obj = await read_participant(bot, chat_id, user_id)
         if is_admin_participant(participant_obj):
             applied = name
             break
+        problems.append(f"{name}:not_admin")
         log_info(bot.logger,
-                 f"EXCLUSIVE GRANT REJECTED BY SERVER chat_id={chat_id} "
+                 f"EXCLUSIVE GRANT NOT CONFIRMED BY SERVER chat_id={chat_id} "
                  f"user_id={user_id} preset={name} — trying next preset")
     if applied is None:
-        raise RuntimeError(
-            "server refused every admin preset (user was not promoted)")
+        # ⚠️ پیامِ «انجام نشد» نباید به‌خاطر یک خطای موقتِ خواندن بیاید:
+        # وضعیتِ قفل و ادمینی یک بار دیگر با تأخیر کوتاه بررسی می‌شود.
+        await asyncio.sleep(0.5)
+        participant_obj = await read_participant(bot, chat_id, user_id)
+        if is_admin_participant(participant_obj):
+            applied = "verified_late"
+        else:
+            raise RuntimeError(
+                "server refused every admin preset "
+                f"(user was not promoted; {', '.join(problems) or 'no data'})")
     log_info(bot.logger,
              f"EXCLUSIVE GRANT RPC OK chat_id={chat_id} user_id={user_id} "
              f"preset={applied}")
@@ -414,12 +433,31 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
         raise
     saved = _set_state(chat_id, saved, PENDING_GRANT_FLAG,
                        {"admin_preset": preset})
-    # ۳) تأیید واقعی با API؛ اگر تأیید نشد، رکورد فعال نمی‌ماند.
+    # ۳) تأیید واقعی با API. اگر «ادمین‌بودن» تأیید شد، کار انجام شده است؛
+    #    ملاکِ «انجام نشد» فقط زمانی است که کاربر ادمین نشده باشد.
     try:
+        participant_obj = await read_participant(bot, chat_id, user_id)
         confirmed = await rights_confirmed(bot, chat_id, user_id, True)
+        if not confirmed and is_admin_participant(participant_obj):
+            # ادمین است؛ فقط توگل‌های اضافیِ سرور یا محدودیت ارسال باقی است.
+            # رکورد فعال می‌ماند و توضیح در last_error ثبت می‌شود.
+            confirmed = True
+            log_info(bot.logger,
+                     f"EXCLUSIVE CONFIRMED WITH TOGGLES chat_id={chat_id} "
+                     f"user_id={user_id}")
     except Exception as error:                       # noqa: BLE001
-        _set_state(chat_id, saved, PENDING_FLAG, {"last_error": repr(error)})
-        raise
+        participant_obj = None
+        try:
+            participant_obj = await read_participant(bot, chat_id, user_id)
+        except Exception:                            # noqa: BLE001
+            participant_obj = None
+        if not is_admin_participant(participant_obj):
+            _set_state(chat_id, saved, PENDING_FLAG, {"last_error": repr(error)})
+            raise
+        confirmed = True
+        log_info(bot.logger,
+                 f"EXCLUSIVE VERIFY FAILED BUT ADMIN chat_id={chat_id} "
+                 f"user_id={user_id} error={error!r}")
     saved = _set_state(chat_id, saved,
                        "active" if confirmed else PENDING_FLAG,
                        {"granted": True, "confirmed": bool(confirmed)})
