@@ -175,6 +175,31 @@ def report_to_owner(*, owner_username, reporter_username, target_username,
 
 
 # ---------------------------------------------------------------------------
+#  ۵ب) پیام اخطار پس از «تایید» گزارش
+# ---------------------------------------------------------------------------
+REPORT_WARN_TITLE = "⚠️ کاربر : {user}"
+REPORT_WARN_BODY = "شما به دلیل دریافت گزارش رفتار نادرست"
+REPORT_WARN_LINE = "{count} اخطار دریافت کردید"
+REPORT_WARN_TOTAL = "تعداد اخطار : {count}/{threshold}"
+
+
+def report_warning(*, username, granted=2, total=2, threshold=5):
+    """قالب اخطارِ بعد از تأیید گزارش — عیناً مطابق پیام تصویر کارفرما.
+
+    عنوان («⚠️ کاربر : @…») داخل نقل‌قول، بقیه Bold. اعداد لاتین.
+    """
+    builder = _Builder()
+    builder.line(REPORT_WARN_TITLE.format(user=username), quote=True)
+    builder.line()
+    builder.line(REPORT_WARN_BODY)
+    builder.line(REPORT_WARN_LINE.format(count=int(granted)))
+    builder.line()
+    builder.line(REPORT_WARN_TOTAL.format(count=int(total),
+                                          threshold=int(threshold)))
+    return builder.build()
+
+
+# ---------------------------------------------------------------------------
 #  ۶) اختصاصی / لغو اختصاصی
 # ---------------------------------------------------------------------------
 EXCLUSIVE_HEADER = "← کاربر : 『 {user} 』"

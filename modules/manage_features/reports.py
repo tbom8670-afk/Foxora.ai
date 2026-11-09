@@ -327,6 +327,12 @@ def approve(bot, chat_id, case_id, *, actor_id, actor=None, threshold=None,
 
     count = 0
     target_user = case.get("target_id")
+    # مقدارِ پیش از تأیید: برای نمایشِ «تعداد اخطار : 2/5» و شمارشِ اخطارهایِ
+    # همین گزارش (اگر کاربر از قبل ۳ اخطار داشت: 3/5 → 5/5).
+    try:
+        before = bot.tracker.get_count(chat_id, int(target_user))
+    except Exception:                                # noqa: BLE001
+        before = 0
     try:
         for _ in range(2):
             count = bot.tracker.increment(chat_id, int(target_user))
@@ -337,7 +343,11 @@ def approve(bot, chat_id, case_id, *, actor_id, actor=None, threshold=None,
 
     try:
         if threshold is None:
-            threshold = bot.config_manager.get("spam_threshold", 5)
+            # همان منبعِ سیستم اخطار (نه مقدار خامِ config).
+            from modules import warning_threshold
+
+            threshold = warning_threshold.get_threshold(
+                chat_id, bot.config_manager.get("spam_threshold", 5))
     except Exception:                                # noqa: BLE001
         threshold = 5
 
@@ -374,7 +384,8 @@ def approve(bot, chat_id, case_id, *, actor_id, actor=None, threshold=None,
 
     return _set_state(chat_id, case_id, "approved",
                       warning_count=2, decided_by=storage.user_key(actor_id),
-                      warnings_total=count, threshold=threshold)
+                      warnings_total=count, warnings_before=before,
+                      warnings_after=count, threshold=threshold)
 
 
 def reject(chat_id, case_id, *, actor_id, actor=None, logger=None):

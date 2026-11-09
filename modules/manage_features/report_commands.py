@@ -273,7 +273,53 @@ async def _decide(bot, chat_id, case_id, user_id, sender, approve, event,
         return True
 
     _AWAITING.pop(storage.group_key(chat_id), None)
+
+    # ---- پیام اخطار در همان گروه (مطابق قالب کارفرما) ----
+    if approve and case:
+        await _announce_warning(bot, chat_id, case, event, logger)
     return True
+
+
+async def _target_label(bot, case, event=None):
+    """نامِ واقعیِ متخلف: یوزرنیم، وگرنه نام نمایشی، وگرنه ----"""
+    target_id = case.get("target_id")
+    username = (case.get("target_username") or "").lstrip("@")
+    if username:
+        return "@" + username
+    name = case.get("target_name") or ""
+    if name:
+        return name
+    try:
+        entity = await bot.client.get_entity(int(target_id))
+    except Exception:                                # noqa: BLE001
+        return "----"
+    return display_of(entity)
+
+
+async def _announce_warning(bot, chat_id, case, event, logger=None):
+    """«⚠️ کاربر : @…» + متن اخطار را در گروه می‌فرستد (بعد از تأیید مالک)."""
+    if str(case.get("state")) != "approved":
+        return None
+    label = await _target_label(bot, case, event)
+    payload = texts.report_warning(
+        username=label,
+        granted=int(case.get("warning_count", WARNINGS_PER_REPORT)),
+        total=int(case.get("warnings_after", case.get("warning_count",
+                                                      WARNINGS_PER_REPORT))),
+        threshold=int(case.get("threshold", 5) or 5),
+    )
+    text, entities = payload
+    try:
+        return await event.reply(text, formatting_entities=entities)
+    except Exception as error:                       # noqa: BLE001
+        if logger is not None:
+            try:
+                logger.log_error(
+                    f"REPORT WARNING ANNOUNCE FAILED chat_id={chat_id} "
+                    f"case={case.get('case_id')} error={error!r}")
+            except Exception:                        # noqa: BLE001
+                pass
+        return None
 
 
 def _awaiting_case(chat_id):

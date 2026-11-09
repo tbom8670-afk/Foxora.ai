@@ -220,6 +220,8 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
             username=label, kind="already"), logger)
         return True
     except exclusive.NotExclusive:
+        # «در فهرست اختصاصی نیست» فقط وقتی درست است که کاربر واقعاً نه رکورد
+        # داشته باشد و نه ادمینِ گروه باشد (این بررسی داخل خودِ revoke انجام شد).
         await _reply(bot, event, texts.exclusive_message(
             username=label, kind="missing"), logger)
         return True

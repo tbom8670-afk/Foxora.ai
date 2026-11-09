@@ -271,10 +271,31 @@ async def rights_confirmed(bot, chat_id, user_id, allowed) -> bool:
     admin = is_admin_participant(participant)
     banned = text_is_banned(getattr(participant, "banned_rights", None))
     if allowed:
+        # ⚠️ مهم: سروش روی توگل‌های این صفحه پیش‌فرض‌هایی می‌گذارد
+        # («تغییر اطلاعات گروه» و «سنجاق پیام‌ها» را خودش روشن می‌کند). اگر
+        # تأیید را به «صفر حق» مشروط کنیم، کاربری که واقعاً ادمین و قادر به
+        # ارسال است «ناموفق» شمرده می‌شود و فهرست اختصاصی خالی می‌ماند —
+        # دقیقاً همان باگِ «این کاربر در فهرست اختصاصی نیست». ملاکِ درست:
+        # ادمین بودن + نبودِ محدودیت ارسال + نداشتنِ حق‌های حساس
+        # (حذف پیام / بن / افزودن ادمین / دعوت / تغییر اطلاعات در حالت
+        #  غیرمجاز — این‌ها در همهٔ حالت‌ها باید False باشند).
         if not admin or banned:
             return False
-        return not has_any_management_right(admin_rights_of(participant))
+        return not has_sensitive_right(admin_rights_of(participant))
     return (not admin) and banned
+
+
+#: حق‌هایی که در هیچ حالتی نباید به کاربرِ «اختصاصی» داده شوند.
+SENSITIVE_ADMIN_FLAGS = ("delete_messages", "ban_users", "add_admins",
+                         "invite_users", "anonymous", "manage_call",
+                         "manage_topics", "other")
+
+
+def has_sensitive_right(admin_rights) -> bool:
+    if admin_rights is None:
+        return False
+    return any(bool(getattr(admin_rights, flag, False))
+               for flag in SENSITIVE_ADMIN_FLAGS)
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +309,13 @@ def _group_record(data, chat_id, create=False):
     return groups.get(key) or {"users": {}, "pending": []}
 
 
-def list_entries(chat_id, *, states=("active",)):
+def list_entries(chat_id, *, states=("active",) + RECOVERABLE):
     """رکوردهای این گروه که در یکی از ``states`` هستند (پیش‌فرض: فعال).
 
     منبعِ حقیقت ``state`` است؛ کلید ``active`` تنها برای خواناییِ فایل نگه داشته
-    می‌شود و هرگز جای ``state`` را نمی‌گیرد.
+    می‌شود و هرگز جای ``state`` را نمی‌گیرد. رکوردهای نیمه‌کاره
+    (``pending_grant``/``pending_revoke``) هم برگردانده می‌شوند تا «لغو»
+    هرگز به بهانهٔ «در فهرست نیست» رها نشود.
     """
     wanted = set(states)
     with storage.EXCLUSIVE_STORAGE._lock:
@@ -407,10 +430,36 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username=""):
 
 
 async def revoke(bot, chat_id, user_id, *, reason="manual"):
-    """لغو مجوز + غیرفعال کردن رکورد. اجرای چندباره ممنوع."""
+    """لغو مجوز + غیرفعال کردن رکورد. اجرای چندباره ممنوع.
+
+    اگر رکوردی در حافظه/دیسک نباشد ولی سرور بگوید این کاربر **ادمین** است،
+    باز هم demote انجام می‌شود: کاربر نباید به‌خاطر از دست رفتنِ یک فایل،
+    ادمینِ گروه بماند.
+    """
     entry = get_entry(chat_id, user_id)
     if not entry:
-        raise NotExclusive(f"user {user_id} is not exclusive")
+        participant = await read_participant(bot, chat_id, user_id)
+        if not is_admin_participant(participant):
+            raise NotExclusive(f"user {user_id} is not exclusive")
+        # رکوردِ حداقلی می‌سازیم تا تاریخچه و وضعیت پایدار بماند.
+        entry = _save_entry(chat_id, {
+            "user_id": storage.user_key(user_id),
+            "chat_id": storage.group_key(chat_id),
+            "name": "",
+            "username": "",
+            "actor_id": None,
+            "created_at": storage.now(),
+            "created_at_tehran": storage.iso_tehran(),
+            "updated_at": storage.now(),
+            "state": PENDING_GRANT_FLAG,
+            "granted": True,
+            "confirmed": False,
+            "last_error": "revoked without local record",
+            "adopted_from_server": True,
+        })
+        log_info(bot.logger,
+                 f"EXCLUSIVE ADOPTED FROM SERVER chat_id={chat_id} "
+                 f"user_id={user_id} (was admin without record)")
     if entry.get("state") == "revoked":
         raise NotExclusive(f"user {user_id} already revoked")
 

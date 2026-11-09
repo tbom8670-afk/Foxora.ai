@@ -140,6 +140,9 @@ class FakeClient:
         self.fail_edit_admin = False
         #: سروری که «ادمینِ بدون حق» را قبول نمی‌کند (رفتار واقعی سروش)
         self.reject_rightless_admin = False
+        #: سرور سروش که «تغییر اطلاعات گروه» و «سنجاق» را خودش روشن می‌کند
+        #: (در تست‌های مربوطه روشن می‌شود؛ پیش‌فرض خاموش)
+        self.force_toggles = False
         self.edits = []
         self.sent = []
 
@@ -196,6 +199,13 @@ class FakeClient:
                 if self.reject_rightless_admin:
                     self.chat.admins.pop(user_id, None)
                     return True
+            if self.force_toggles:
+                # رفتار واقعیِ سروش: «تغییر اطلاعات گروه» و «سنجاق» را
+                # خودش روشن می‌کند حتی وقتی False فرستاده شده باشد.
+                rights = type(rights)(
+                    **{flag: (True if flag in ("change_info", "pin_messages")
+                              else getattr(rights, flag, False))
+                       for flag in flags})
             self.chat.admins[user_id] = rights
             return True
         if name == "GetParticipantRequest":
@@ -546,6 +556,60 @@ def test_02c_exclusive_strict_server_fallback():
           record["state"] == "active" and record["confirmed"] is True, record)
 
 
+def test_02d_exclusive_server_forces_toggles_and_lost_record():
+    print("\n### ۲د) سرور توگل‌ها را خودش روشن می‌کند + لغو با رکوردِ ازدست‌رفته")
+    fresh()
+    chat_id = -(10 ** 12) - 513
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=True)
+    bot = FakeBot(chat, {793: FakeUser(793, "forced")})
+    bot.client.force_toggles = True
+
+    async def scenario():
+        return await exclusive.grant(bot, chat_id, 793, actor_id=4242)
+
+    record = run(scenario())
+    check("کاربر ادمین شد و ارسالش آزاد است",
+          793 in chat.admins, chat.admins)
+    check("رکورد فعال و تأییدشده ثبت شد (تأیید سخت‌گیرِ قبلی اینجا اشتباه بود)",
+          record["state"] == "active" and record["confirmed"] is True, record)
+    check("کاربر در فهرست اختصاصی دیده می‌شود",
+          any(str(item["user_id"]) == "793"
+              for item in exclusive.list_entries(chat_id)),
+          exclusive.list_entries(chat_id))
+    check("حق‌های حساس (حذف پیام/بن/افزودن ادمین/دعوت) داده نشده‌اند",
+          not exclusive.has_sensitive_right(chat.admins[793]),
+          chat.admins[793])
+    check("درخواستِ ارسال‌شده همهٔ فلگ‌ها را صریح False داشت (حتی change_info)",
+          all(getattr(chat.edit_admin_calls[0].admin_rights, flag) is False
+              for flag in ("change_info", "pin_messages", "delete_messages",
+                           "ban_users", "add_admins", "invite_users")),
+          chat.edit_admin_calls[0].admin_rights)
+
+    # لغو باید demote کند و رکورد را ببندد
+    run(exclusive.revoke(bot, chat_id, 793))
+    check("لغو اختصاصی کاربر را از ادمینی درآورد", 793 not in chat.admins,
+          chat.admins)
+    check("رکورد غیرفعال شد",
+          exclusive.get_entry(chat_id, 793) is None,
+          exclusive.get_entry(chat_id, 793))
+
+    # حتی اگر رکورد محلی نباشد ولی سرور بگوید ادمین است ⇒ باید demote شود
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 514, locked=True)
+    bot2 = FakeBot(chat2, {794: FakeUser(794, "ghost")})
+    bot2.client.force_toggles = True
+    run(exclusive.grant(bot2, chat2.chat_id, 794, actor_id=4242))
+    storage.EXCLUSIVE_STORAGE.reset()          # رکورد عمداً گم می‌شود
+    check("رکورد محلی پاک شد", exclusive.get_entry(chat2.chat_id, 794) is None)
+    entry = run(exclusive.revoke(bot2, chat2.chat_id, 794))
+    check("لغو با رکوردِ گم‌شده هم کاربر را از ادمینی درمی‌آورد",
+          794 not in chat2.admins, chat2.admins)
+    check("رکوردِ حداقلی با پرچم adopted_from_server ثبت شد",
+          entry.get("adopted_from_server") is True
+          and entry["state"] == "revoked", entry)
+
+
 def test_03_exclusive_auto_revoke_on_unlock():
     print("\n### ۳) باز شدن گروه (هر روشی) ⇒ لغو خودکار همهٔ مجوزها")
     fresh()
@@ -791,6 +855,74 @@ def test_07_timed_restart_and_failures():
 # ---------------------------------------------------------------------------
 #  ۸.. گزارش
 # ---------------------------------------------------------------------------
+def test_07b_timed_survives_restart_end_to_end():
+    print("\n### ۷ب) زمان‌دار بعد از ری‌استارت کاملِ ماژول هم ادامه می‌دهد")
+    fresh()
+    chat_id = -(10 ** 12) - 621
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=False)
+    bot = FakeBot(chat)
+    owner = FakeUser(4242, "owner")
+
+    async def activate():
+        event = FakeEvent(chat_id, owner, "پیام زماندار")
+        await timed_commands.handle(bot, event, chat_id, 4242, owner,
+                                    "پیام زماندار", bot.logger)
+        pick = FakeEvent(chat_id, owner, "2")
+        await timed_commands.handle(bot, pick, chat_id, 4242, owner, "2",
+                                    bot.logger)
+
+    run(activate())
+    record = timed.get_record(chat_id)
+    check("بازهٔ ۱ ساعته ثبت شد", record["minutes"] == 120, record["minutes"])
+    start_ts, end_ts = record["start_ts"], record["end_ts"]
+
+    # پیام‌های داخل بازه ثبت می‌شوند (مثل پیام واقعیِ اعضا)
+    for message_id in range(3000, 3020):
+        timed_commands.track(chat_id, message_id, 555)
+    check("۲۰ پیام داخل بازه ثبت شد", len(timed.tracked_ids(chat_id)) == 20,
+          len(timed.tracked_ids(chat_id)))
+
+    # ---- ری‌استارت کامل: همهٔ حافظهٔ ماژول پاک می‌شود ----
+    timed.reset_all()
+    timed_commands.reset_all()
+    check("بعد از ری‌استارت رکورد از دیسک خوانده می‌شود",
+          timed.get_record(chat_id) is not None)
+    check("زمان پایان عوض نشد (از صفر شروع نمی‌شود)",
+          float(timed.get_record(chat_id)["end_ts"]) == float(end_ts),
+          (timed.get_record(chat_id)["end_ts"], end_ts))
+    check("شناسهٔ پیام‌های ثبت‌شده حفظ شد",
+          len(timed.tracked_ids(chat_id)) == 20,
+          len(timed.tracked_ids(chat_id)))
+    remaining = timed.remaining_seconds(chat_id)
+    check("باقی‌مانده ≈ ۲ ساعت است (نه بیشتر)",
+          119 * 60 < remaining <= 120 * 60, remaining)
+
+    # ریکاوری زمان‌سنج را دوباره بالا می‌آورد
+    restored = run(_recover_and_cancel(bot, chat_id))
+    check("recover() زمان‌سنج را بالا آورد",
+          any(str(item[0]) == storage.group_key(chat_id) for item in restored),
+          restored)
+
+    # پایان بازه: فقط همان ۲۰ پیام حذف می‌شوند
+    chat.deleted.clear()
+    result = run(timed.finish(bot, chat_id, logger=bot.logger,
+                               now_ts=float(end_ts) + 1))
+    check("همهٔ پیام‌های ثبت‌شده بعد از ری‌استارت حذف شدند",
+          set(chat.deleted) == set(range(3000, 3020)),
+          sorted(chat.deleted)[:5])
+    check("گزارش پایان درست است", result.get("deleted") == 20, result)
+    check("رکورد پایان‌یافته و پایدار است",
+          timed.get_record(chat_id)["state"] == "finished")
+
+
+async def _recover_and_cancel(bot, chat_id):
+    restored = timed.recover(bot, bot.logger)
+    for task in list(timed._TIMERS.values()):
+        task.cancel()
+    return restored
+
+
 def test_08_report_flow():
     print("\n### ۸) گزارش: معتبر، بدون ریپلای، خود، تکراری، ۷ ثانیه")
     fresh()
@@ -891,14 +1023,39 @@ def test_09_report_decision():
         report_commands._AWAITING[storage.group_key(chat_id)] = case["case_id"]
         await report_commands.handle(bot, again, chat_id, 4242, owner,
                                      "تایید", bot.logger)
-        return reports.get_case(chat_id, case["case_id"])
+        return reports.get_case(chat_id, case["case_id"]), event, again
 
-    approved = run(scenario_approve())
+    approved, event, again_event = run(scenario_approve())
     check("پرونده تأیید شد", approved["state"] == "approved", approved)
     check("دقیقاً دو اخطار در سیستم اخطار ثبت شد",
           bot.tracker.get_count(chat_id, 7002) == 2,
           bot.tracker.get_count(chat_id, 7002))
     check("تعداد اخطار در پرونده = ۲", approved.get("warning_count") == 2)
+    warn_messages = [text for text, _e in event.replies
+                     if "اخطار دریافت کردید" in text]
+    check("پیام اخطار در گروه ارسال شد", bool(warn_messages), event.replies)
+    if warn_messages:
+        warning_text = warn_messages[0]
+        check("عنوان اخطار «⚠️ کاربر : @…» است",
+              warning_text.startswith("⚠️ کاربر : "), warning_text.split("\n")[0])
+        check("متن «شما به دلیل دریافت گزارش رفتار نادرست» موجود است",
+              "شما به دلیل دریافت گزارش رفتار نادرست" in warning_text,
+              warning_text)
+        check("خط «2 اخطار دریافت کردید» موجود است",
+              "2 اخطار دریافت کردید" in warning_text, warning_text)
+        check("خط «تعداد اخطار : 2/5» موجود است",
+              "تعداد اخطار : 2/5" in warning_text, warning_text)
+        ents = event.replies[[i for i, (t2, _e) in enumerate(event.replies)
+                              if t2 == warning_text][0]][1]
+        check("فقط عنوان داخل نقل‌قول است",
+              [e for e in ents
+               if type(e).__name__ == "MessageEntityBlockquote"]
+              and [e for e in ents if type(e).__name__ == "MessageEntityBlockquote"][0].offset == 0,
+              ents)
+
+    check("تأیید دوباره هیچ پیام اخطارِ تازه‌ای نمی‌فرستد",
+          not [text for text, _e in again_event.replies
+               if "اخطار دریافت کردید" in text], again_event.replies)
     check("تأیید دوباره اخطار اضافه نمی‌کند",
           bot.tracker.get_count(chat_id, 7002) == 2,
           bot.tracker.get_count(chat_id, 7002))
@@ -948,6 +1105,74 @@ def test_09_report_decision():
 
     check("گزارش‌دهنده نمی‌تواند پروندهٔ خودش را تأیید کند",
           run(scenario_reporter()) == "blocked")
+
+
+def test_09c_report_warning_counts_are_real():
+    print("\n### ۹ج) شمارشِ واقعی اخطار در پیام (۳/۵ → ۵/۵)")
+    fresh()
+    chat_id = -(10 ** 12) - 719
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=False)
+    users = {9019: FakeUser(9019, "rep"), 7019: FakeUser(7019, "bad"),
+             4242: FakeUser(4242, "owner")}
+    bot = FakeBot(chat, users)
+    for _ in range(3):
+        bot.tracker.increment(chat_id, 7019)      # سه اخطارِ قبلی
+    case = reports.create_case(chat_id, 9019, 7019, 9100, "توهین",
+                               target_username="bad", owner_id=4242)
+    report_commands._AWAITING[storage.group_key(chat_id)] = case["case_id"]
+    owner = users[4242]
+
+    async def scenario():
+        event = FakeEvent(chat_id, owner, "تایید")
+        await report_commands.handle(bot, event, chat_id, 4242, owner,
+                                     "تایید", bot.logger)
+        return event.replies
+
+    replies = run(scenario())
+    text = next((t for t, _e in replies if "اخطار دریافت کردید" in t), "")
+    check("نامِ متخلف از یوزرنیم واقعی آمده", "@bad" in text, text)
+    check("«2 اخطار دریافت کردید» (اخطارهای همین گزارش)",
+          "2 اخطار دریافت کردید" in text, text)
+    check("«تعداد اخطار : 5/5» (مجموع واقعی بعد از تأیید)",
+          "تعداد اخطار : 5/5" in text, text)
+    check("مجموعِ ثبت‌شده واقعی است",
+          bot.tracker.get_count(chat_id, 7019) == 5,
+          bot.tracker.get_count(chat_id, 7019))
+
+    # کاربر بدون اخطارِ قبلی ⇒ 2/5
+    chat2 = -(10 ** 12) - 720
+    group_storage.set_group_owner(chat2, 4242)
+    bot2 = FakeBot(FakeChat(chat2, locked=False), users)
+    case2 = reports.create_case(chat2, 9019, 7019, 9101, "توهین",
+                                target_username="bad", owner_id=4242)
+    report_commands._AWAITING[storage.group_key(chat2)] = case2["case_id"]
+
+    async def scenario2():
+        event = FakeEvent(chat2, owner, "تایید")
+        await report_commands.handle(bot2, event, chat2, 4242, owner,
+                                     "تایید", bot2.logger)
+        return event.replies
+
+    replies2 = run(scenario2())
+    text2 = next((t for t, _e in replies2 if "اخطار دریافت کردید" in t), "")
+    check("برای کاربر تازه: «تعداد اخطار : 2/5»",
+          "تعداد اخطار : 2/5" in text2, text2)
+    check("هر بار دقیقاً دو اخطار اضافه می‌شود",
+          bot2.tracker.get_count(chat2, 7019) == 2,
+          bot2.tracker.get_count(chat2, 7019))
+
+    # قالب: کل متن Bold، تنها خطِ عنوان نقل‌قول
+    text_obj, entities = texts.report_warning(username="@bad", granted=2,
+                                              total=2, threshold=5)
+    bold = [e for e in entities if isinstance(e, MessageEntityBold)]
+    quotes = [e for e in entities if isinstance(e, MessageEntityBlockquote)]
+    check("کل متن Bold است",
+          len(bold) == 1 and bold[0].length == u16(text_obj), bold)
+    check("تنها نقل‌قول، خطِ عنوان است",
+          len(quotes) == 1 and quotes[0].offset == 0
+          and slice16(text_obj, 0, quotes[0].length) == "⚠️ کاربر : @bad",
+          quotes)
 
 
 def test_09b_report_owner_scope_and_awaiting_recovery():
@@ -1311,14 +1536,17 @@ def main():
     test_02_exclusive_revoke_and_restart()
     test_02b_exclusive_grant_refused_by_server()
     test_02c_exclusive_strict_server_fallback()
+    test_02d_exclusive_server_forces_toggles_and_lost_record()
     test_03_exclusive_auto_revoke_on_unlock()
     test_04_exclusive_concurrent()
     test_05_timed_all_durations_and_cancel()
     test_05b_timed_no_progress_message_on_start()
     test_06_timed_finish_deletes_only_window()
     test_07_timed_restart_and_failures()
+    test_07b_timed_survives_restart_end_to_end()
     test_08_report_flow()
     test_09_report_decision()
+    test_09c_report_warning_counts_are_real()
     test_09b_report_owner_scope_and_awaiting_recovery()
     test_10_report_restart_waiting()
     test_10b_report_restart_waiting_reason()
