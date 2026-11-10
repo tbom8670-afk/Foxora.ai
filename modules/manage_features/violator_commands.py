@@ -3,8 +3,11 @@
 
 قواعد (مطابق خواستهٔ کارفرما):
 
-* دستور **فقط با ریپلای** روی پیامِ کاربرِ هدف کار می‌کند؛ بدون ریپلای
-  پیامِ راهنما داده می‌شود.
+* **ثبت** («متخلف») فقط با ریپلای روی پیامِ کاربرِ هدف کار می‌کند؛ بدون
+  ریپلای پیامِ راهنما داده می‌شود.
+* **لغو** («لغو متخلف») هم با ریپلای و هم با یوزرنیم کار می‌کند:
+  ``لغو متخلف @یوزرنیم``. اگر یوزرنیم داده شده باشد، یوزرنیم بر ریپلای
+  اولویت دارد (همان سیاستِ «اختصاصی»).
 * دسترسی: فقط ``access.is_registered_admin`` (مالکِ ثبت‌شده یا ادمینِ
   **ثبت‌شدهٔ ربات**). ادمینِ عادیِ خودِ سروش که در ربات ثبت نشده باشد رد
   می‌شود.
@@ -44,8 +47,25 @@ def normalize(text) -> str:
 
 
 def is_command(text) -> bool:
-    """آیا این پیام به «متخلف» مربوط است؟ (ارزان: بدون RPC)"""
-    return normalize(text) in COMMANDS
+    """آیا این پیام به «متخلف» مربوط است؟ (ارزان: بدون RPC)
+
+    ``متخلف`` / ``لغو متخلف`` تنها، یا با آرگومانِ یوزرنیم:
+    ``لغو متخلف @یوزرنیم`` (همان الگوی ``exclusive_commands``).
+    """
+    cleaned = normalize(text)
+    return cleaned in COMMANDS or cleaned.startswith(
+        ("متخلف ", "لغو متخلف "))
+
+
+def _target_token(text):
+    """یوزرنیم/شناسهٔ بعد از دستور (اگر با ریپلای نیامده باشد)."""
+    cleaned = normalize(text)
+    for prefix in ("لغو متخلف", "متخلف"):
+        if cleaned.startswith(prefix):
+            rest = cleaned[len(prefix):].strip()
+            if rest:
+                return rest.lstrip("@")
+    return None
 
 
 def _label(name, username, target_id):
@@ -82,21 +102,60 @@ def _sender_from_event(event):
     return None
 
 
-async def _resolve_target(bot, event, chat_id):
-    """``(entity, user_id, name, username)`` از ریپلای — یا ``None``.
+async def _resolve_target(bot, event, chat_id, token=None):
+    """``((entity, user_id, name, username), token_used)`` — یا ``(None, …)``.
 
-    entity در کل مسیر پاس داده می‌شود تا resolveِ دوباره («Could not find
-    the input entity») رخ ندهد.
+    * با **ریپلای** (و بدون آرگومانِ یوزرنیم): هدف از پیامِ ریپلای‌شده خوانده
+      می‌شود.
+    * با **یوزرنیم** (``لغو متخلف @یوزرنیم``): یک resolve رسمی (همان مسیرِ
+      «اختصاصی»: ``peers.resolve_user``). یوزرنیم بر ریپلای اولویت دارد.
+
+    ``token_used`` به لایهٔ بالا می‌گوید پیامِ خطا باید «یوزرنیم پیدا نشد»
+    باشد یا «روی پیام کاربر ریپلای کنید».
+    ``entity`` در کل مسیر پاس داده می‌شود تا resolveِ دوباره («Could not
+    find the input entity») رخ ندهد.
     """
-    reply_to = getattr(event, "reply_to", None)
-    if reply_to is None:
-        return None
+    token = str(token or "").strip().lstrip("@").strip()
+    if not token:
+        reply_to = getattr(event, "reply_to", None)
+        if reply_to is None:
+            return None, False
+        target = await _reply_target(bot, event, chat_id)
+        return target, False
+
+    numeric = token.lstrip("-").isdigit()
+    try:
+        entity, identifier = await peers.resolve_user(bot, token,
+                                                     chat_id=chat_id)
+    except Exception as error:                       # noqa: BLE001
+        # resolve نشد ⇒ حداقل شناسهٔ عددی را نگه می‌داریم تا لایهٔ پایین
+        # پیامِ روشن بدهد (نه «موفق»).
+        if getattr(bot, "logger", None) is not None:
+            try:
+                bot.logger.log_error(
+                    "VIOLATOR USERNAME RESOLVE FAILED "
+                    f"chat_id={chat_id} token={token!r} error={error!r}")
+            except Exception:                        # noqa: BLE001
+                pass
+        fallback_id = int(token) if numeric else None
+        if fallback_id is None:
+            return None, True
+        return (None, fallback_id, "", ""), True
+    if entity is None and identifier is None:
+        return None, True
+    return (entity, identifier, display_of(entity),
+            getattr(entity, "username", None) or ""), True
+
+
+async def _reply_target(bot, event, chat_id):
+    """``(entity, user_id, name, username)`` از پیامِ ریپلای‌شده یا ``None``."""
     cached_sender = _sender_from_event(event)
     if cached_sender is not None:
         identifier = peers.user_identifier(cached_sender)
         return (cached_sender, identifier, display_of(cached_sender),
                 getattr(cached_sender, "username", None) or "")
     # مسیر پشتیبان: یک get_messages روی peer درستِ گروه (نه شناسهٔ مثبت).
+    reply_to = getattr(event, "reply_to", None)
     try:
         message = await bot.client.get_messages(
             peers.group_peer(bot, chat_id),
@@ -186,7 +245,7 @@ async def violators_call_delete(bot, peer, message_id, *, logger=None,
 async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
     """``True`` یعنی پیام مصرف شد."""
     cleaned = normalize(text)
-    if cleaned not in COMMANDS:
+    if not is_command(text):
         return False
     if getattr(event, "is_private", False):
         return False
@@ -197,11 +256,20 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
                      _plain_bold(texts.VIOLATOR_NO_PERMISSION), logger)
         return True
 
-    revoke = cleaned == "لغو متخلف"
+    revoke = cleaned == "لغو متخلف" or cleaned.startswith("لغو متخلف ")
 
-    # ⚠️ هدف فقط از ریپلای خوانده می‌شود (خواستهٔ کارفرما).
+    # ⚠️ «ثبت» فقط با ریپلای؛ «لغو» با ریپلای یا با یوزرنیم.
+    token = _target_token(text)
+    if token and not revoke:
+        # «متخلف @یوزرنیم» پشتیبانی نمی‌شود: ثبت باید روی پیامِ خودِ کاربر
+        # ریپلای شود تا هویتِ هدف قطعی باشد.
+        await _reply(bot, event,
+                     _plain_bold(texts.VIOLATOR_NO_TARGET), logger)
+        return True
+
     try:
-        target = await _resolve_target(bot, event, chat_id)
+        target, token_used = await _resolve_target(bot, event, chat_id,
+                                                   token)
     except Exception as error:                       # noqa: BLE001
         if logger is not None:
             try:
@@ -210,10 +278,15 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
                     f"chat_id={chat_id} error={error!r}")
             except Exception:                        # noqa: BLE001
                 pass
-        target = None
+        target, token_used = None, bool(token)
     if target is None:
-        await _reply(bot, event,
-                     _plain_bold(texts.VIOLATOR_NO_TARGET), logger)
+        if token_used:
+            await _reply(bot, event,
+                         _error_payload("username_not_found",
+                                        "@" + str(token or "")), logger)
+        else:
+            await _reply(bot, event,
+                         _plain_bold(texts.VIOLATOR_NO_TARGET), logger)
         return True
 
     entity, target_id, target_name, target_username = target

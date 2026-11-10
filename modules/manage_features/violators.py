@@ -228,7 +228,12 @@ def count(chat_id) -> int:
 
 
 def _save_record(chat_id, identifier, *, actor_id=None, username=""):
-    """نوشتن رکورد با ساختارِ خواسته‌شده + تازه‌کردنِ ایندکس."""
+    """نوشتن رکورد با ساختارِ خواسته‌شده + تازه‌کردنِ ایندکس.
+
+    ``username`` نامِ کاربریِ **عامل** (ادمینِ ثبت‌کننده) است و در
+    ``set_by_username`` می‌رود. ساختارِ رکورد عیناً
+    ``{since, set_by, set_by_username}`` است و هیچ کلیدِ اضافه‌ای ندارد.
+    """
     key = storage.group_key(chat_id)
     user_key = peers.user_key(identifier)
     entry = {

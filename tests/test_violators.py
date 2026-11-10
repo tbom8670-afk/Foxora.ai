@@ -158,6 +158,8 @@ class FakeClient:
         #: نویسندهٔ پیامِ ریپلای‌شده (پیش‌فرض: کاربرِ عادی)
         self.reply_sender_id = TARGET_ID
         self.delete_calls = 0
+        #: آیا resolveِ یوزرنیم کار می‌کند؟ (برای آزمونِ «یوزرنیم پیدا نشد»)
+        self.entity_lookup_works = True
 
     # ---- خودِ ربات ----
     async def get_me(self):
@@ -257,9 +259,17 @@ class FakeClient:
         })()
 
     async def get_entity(self, target, *_args, **_kwargs):
+        self.calls.append("get_entity")
         if isinstance(target, int):
             return self.users.get(target)
-        return None
+        text = str(target).strip().lstrip("@").lower()
+        if not self.entity_lookup_works:
+            raise ValueError(f"cannot find entity {target!r}")
+        for user in self.users.values():
+            if str(getattr(user, "username", "") or "").lower() == text:
+                return user
+        # رفتار واقعیِ SPlusthon: یوزرنیمِ ناشناخته ValueError می‌دهد.
+        raise ValueError(f"cannot find entity {target!r}")
 
     async def send_message(self, chat_id, text, formatting_entities=None,
                            **_kwargs):
@@ -1124,6 +1134,189 @@ def test_23_gate_before_command_router():
 
 
 # ---------------------------------------------------------------------------
+#  ۲۴) «لغو متخلف @یوزرنیم» — بدون ریپلای
+# ---------------------------------------------------------------------------
+def test_24_unmark_by_username():
+    print("\n### ۲۴) لغو متخلف با یوزرنیم")
+    bot = fresh()
+    owner = bot.client.users[OWNER_ID]
+
+    async def scenario():
+        # اول با ریپلای ثبت می‌کنیم
+        await violator_commands.handle(
+            bot, reply_event(bot, owner, TARGET_ID), CHAT_ID, OWNER_ID,
+            owner, "متخلف", bot.logger)
+        deleted_before = list(bot.chat.deleted)
+        # بعد فقط با یوزرنیم لغو می‌کنیم (بدون ریپلای)
+        event = FakeEvent(CHAT_ID, owner, text="لغو متخلف @target_user",
+                          message_id=9400)
+        await violator_commands.handle(
+            bot, event, CHAT_ID, OWNER_ID, owner, "لغو متخلف @target_user",
+            bot.logger)
+        return event, deleted_before
+
+    event, deleted_before = run(scenario())
+    check("رکورد حذف شد", violators.get_record(CHAT_ID, TARGET_ID) is None)
+    check("پاسخ «لغو شد» داده شد",
+          any("از لیست متخلف گروه" in text for text, _ in event.replies),
+          event.replies)
+    check("پاسخ عنوان نقل‌قول‌دار دارد",
+          any(any(type(e).__name__ == "MessageEntityBlockquote"
+                  for e in entities)
+              for _text, entities in event.replies), event.replies)
+    check("resolve یوزرنیم زده شد", "get_entity" in bot.client.calls,
+          bot.client.calls)
+    check("هیچ پیامِ تازه‌ای حذف نشد (ریپلایی نبود)",
+          bot.chat.deleted == deleted_before, bot.chat.deleted)
+
+
+# ---------------------------------------------------------------------------
+#  ۲۵) «لغو متخلف @یوزرنیم» — یوزرنیمِ ناشناخته
+# ---------------------------------------------------------------------------
+def test_25_unmark_by_unknown_username():
+    print("\n### ۲۵) لغو متخلف با یوزرنیمِ ناشناخته")
+    bot = fresh()
+    owner = bot.client.users[OWNER_ID]
+    bot.client.entity_lookup_works = False
+    event = FakeEvent(CHAT_ID, owner, text="لغو متخلف @ghost_user",
+                      message_id=9410)
+
+    async def scenario():
+        return await violator_commands.handle(
+            bot, event, CHAT_ID, OWNER_ID, owner, "لغو متخلف @ghost_user",
+            bot.logger)
+
+    run(scenario())
+    check("پیام «یوزرنیم پیدا نشد» داده شد",
+          any("یوزرنیم پیدا نشد" in text for text, _ in event.replies),
+          event.replies)
+    check("هیچ رکوردی تغییر نکرد",
+          violators.get_record(CHAT_ID, TARGET_ID) is None)
+
+
+# ---------------------------------------------------------------------------
+#  ۲۶) «لغو متخلف @یوزرنیم» برای کاربرِ غیرمتخلف
+# ---------------------------------------------------------------------------
+def test_26_unmark_by_username_not_violator():
+    print("\n### ۲۶) لغو متخلف با یوزرنیمِ کاربرِ غیرمتخلف")
+    bot = fresh()
+    owner = bot.client.users[OWNER_ID]
+    event = FakeEvent(CHAT_ID, owner, text="لغو متخلف @reg_admin",
+                      message_id=9420)
+
+    async def scenario():
+        return await violator_commands.handle(
+            bot, event, CHAT_ID, OWNER_ID, owner, "لغو متخلف @reg_admin",
+            bot.logger)
+
+    run(scenario())
+    check("پیام «متخلف نیست» داده شد",
+          any("در لیست متخلف گروه نیست" in text for text, _ in
+              event.replies), event.replies)
+
+
+# ---------------------------------------------------------------------------
+#  ۲۷) «متخلف @یوزرنیم» پشتیبانی نمی‌شود — ثبت فقط با ریپلای
+# ---------------------------------------------------------------------------
+def test_27_mark_by_username_refused():
+    print("\n### ۲۷) ثبت با یوزرنیم ⇒ راهنما")
+    bot = fresh()
+    owner = bot.client.users[OWNER_ID]
+    event = FakeEvent(CHAT_ID, owner, text="متخلف @target_user",
+                      message_id=9430)
+
+    async def scenario():
+        return await violator_commands.handle(
+            bot, event, CHAT_ID, OWNER_ID, owner, "متخلف @target_user",
+            bot.logger)
+
+    run(scenario())
+    check("پیام راهنما داده شد",
+          any("ریپلای" in text for text, _ in event.replies), event.replies)
+    check("رکوردی ثبت نشد",
+          violators.get_record(CHAT_ID, TARGET_ID) is None)
+
+
+# ---------------------------------------------------------------------------
+#  ۲۸) تشخیص دستور با/بدون آرگومان
+# ---------------------------------------------------------------------------
+def test_28_is_command_variants():
+    print("\n### ۲۸) تشخیص دستور با آرگومان")
+    check("«لغو متخلف @oajwn»", violator_commands.is_command(
+        "لغو متخلف @oajwn") is True)
+    check("«لغو متخلف» تنها", violator_commands.is_command(
+        "لغو متخلف") is True)
+    check("«متخلف» تنها", violator_commands.is_command("متخلف") is True)
+    check("«متخلف @x» هم دستور است (راهنما می‌دهد)",
+          violator_commands.is_command("متخلف @x") is True)
+    check("«لغو متخلف oajwn» بدون @",
+          violator_commands.is_command("لغو متخلف oajwn") is True)
+    check("«سلام» دستور نیست", violator_commands.is_command("سلام") is False)
+    check("«لغو متخلفان» دستور نیست",
+          violator_commands.is_command("لغو متخلفان") is False)
+    check("«متخلفی» دستور نیست",
+          violator_commands.is_command("متخلفی") is False)
+
+
+# ---------------------------------------------------------------------------
+#  ۲۹) یوزرنیم بر ریپلای اولویت دارد
+# ---------------------------------------------------------------------------
+def test_29_username_priority_over_reply():
+    print("\n### ۲۹) اولویت یوزرنیم بر ریپلای")
+    bot = fresh()
+    owner = bot.client.users[OWNER_ID]
+
+    async def scenario():
+        # هر دو کاربر را متخلف می‌کنیم
+        await violator_commands.handle(
+            bot, reply_event(bot, owner, TARGET_ID), CHAT_ID, OWNER_ID,
+            owner, "متخلف", bot.logger)
+        await violator_commands.handle(
+            bot, reply_event(bot, owner, NATIVE_ADMIN_ID), CHAT_ID,
+            OWNER_ID, owner, "متخلف", bot.logger)
+        # ریپلای روی ادمینِ native، ولی آرگومانِ یوزرنیم روی target_user
+        event = reply_event(bot, owner, NATIVE_ADMIN_ID,
+                            text="لغو متخلف @target_user", reply_msg_id=4322)
+        return await violator_commands.handle(
+            bot, event, CHAT_ID, OWNER_ID, owner,
+            "لغو متخلف @target_user", bot.logger)
+
+    run(scenario())
+    check("هدفِ یوزرنیم لغو شد",
+          violators.get_record(CHAT_ID, TARGET_ID) is None)
+    check("هدفِ ریپلای دست‌نخورده ماند",
+          violators.get_record(CHAT_ID, NATIVE_ADMIN_ID) is not None)
+
+
+# ---------------------------------------------------------------------------
+#  ۳۰) لغو با یوزرنیم — بدون مجوز
+# ---------------------------------------------------------------------------
+def test_30_unmark_by_username_no_permission():
+    print("\n### ۳۰) لغو با یوزرنیم بدون مجوز")
+    bot = fresh()
+    owner = bot.client.users[OWNER_ID]
+
+    async def scenario():
+        await violator_commands.handle(
+            bot, reply_event(bot, owner, TARGET_ID), CHAT_ID, OWNER_ID,
+            owner, "متخلف", bot.logger)
+        native = bot.client.users[NATIVE_ADMIN_ID]
+        event = FakeEvent(CHAT_ID, native, text="لغو متخلف @target_user",
+                          message_id=9440)
+        await violator_commands.handle(
+            bot, event, CHAT_ID, NATIVE_ADMIN_ID, native,
+            "لغو متخلف @target_user", bot.logger)
+        return event
+
+    event = run(scenario())
+    check("ادمینِ ثبت‌نشده رد شد",
+          any("فقط مالک یا ادمین ثبت شده" in text for text, _ in
+              event.replies), event.replies)
+    check("رکورد حذف نشد",
+          violators.get_record(CHAT_ID, TARGET_ID) is not None)
+
+
+# ---------------------------------------------------------------------------
 #  اجرا
 # ---------------------------------------------------------------------------
 def main():
@@ -1152,6 +1345,13 @@ def main():
         test_22_already_and_missing,
         test_22b_failed_delete_only_logged,
         test_23_gate_before_command_router,
+        test_24_unmark_by_username,
+        test_25_unmark_by_unknown_username,
+        test_26_unmark_by_username_not_violator,
+        test_27_mark_by_username_refused,
+        test_28_is_command_variants,
+        test_29_username_priority_over_reply,
+        test_30_unmark_by_username_no_permission,
     ]
     for test in tests:
         try:

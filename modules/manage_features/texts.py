@@ -512,6 +512,8 @@ VIOLATOR_MISSING = "این کاربر در لیست متخلف گروه نیست
 VIOLATOR_PROTECTED = "این کاربر محافظت شده است و نمیتواند متخلف شود"
 VIOLATOR_NO_PERMISSION = "فقط مالک یا ادمین ثبت شده میتواند این دستور را بزند"
 VIOLATOR_NO_TARGET = "روی پیام کاربر ریپلای کنید"
+#: «لغو متخلف @یوزرنیم» وقتی یوزرنیم به هیچ کاربری resolve نشود.
+VIOLATOR_USERNAME_NOT_FOUND = "کاربری با این یوزرنیم پیدا نشد"
 VIOLATOR_BOT_NO_RIGHTS = (
     "ربات در این گروه حق حذف پیام ندارد؛\n"
     "ابتدا این حق را به ربات بدهید"
@@ -536,6 +538,7 @@ _VIOLATOR_BODIES = {
     "bot_no_rights": VIOLATOR_BOT_NO_RIGHTS,
     "creator_unknown": VIOLATOR_CREATOR_UNKNOWN,
     "no_target_entity": VIOLATOR_NO_TARGET_ENTITY,
+    "username_not_found": VIOLATOR_USERNAME_NOT_FOUND,
     "failed": VIOLATOR_FAILED,
     "timeout": VIOLATOR_TIMEOUT,
 }
@@ -545,7 +548,8 @@ def violator_message(*, username, kind="marked"):
     """قالبِ «متخلف/لغو متخلف» و خطاها — عیناً مثل تصویر کارفرما.
 
     ``kind`` ∈ {marked, unmarked, already, missing, protected,
-    bot_no_rights, creator_unknown, no_target_entity, failed, timeout}
+    bot_no_rights, creator_unknown, no_target_entity, username_not_found,
+    failed, timeout}
 
     عنوان داخل نقل‌قول، بقیهٔ متن Bold (کلِ پیام Bold است).
     """
