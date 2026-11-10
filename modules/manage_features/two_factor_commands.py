@@ -96,8 +96,8 @@ async def handle_command(bot, event, chat_id, user_id, sender, text,
     if getattr(event, "is_private", False):
         return False
 
-    if not two_factor.is_owner(chat_id, user_id):
-        # فقط مالکِ ثبت‌شده (یا مالکِ سراسری وقتی گروه مالک ندارد).
+    if not two_factor.is_registered_owner(chat_id, user_id):
+        # فقط و فقط مالکِ ثبت‌شدهٔ گروه؛ نه مالکِ سراسری، نه ادمین، نه کاربر عادی.
         has_any_owner = _has_registered_owner(chat_id)
         await _reply(bot, event, texts.two_factor_owner_required(
             registered=has_any_owner), logger)
@@ -211,8 +211,8 @@ async def handle_password(bot, event, chat_id, user_id, sender, text,
         return False
 
     # «فقط مالک»: یک بار، فقط وقتی واقعاً جریانی در جریان است (نه در مسیر گرم).
-    if not two_factor.is_owner(chat_id, user_id):
-        log_info(logger, "TWO FACTOR PASSWORD IGNORED (not owner) "
+    if not two_factor.is_registered_owner(chat_id, user_id):
+        log_info(logger, "TWO FACTOR PASSWORD IGNORED (not registered owner) "
                          f"chat_id={chat_id} user_id={user_id}")
         return False
 
@@ -309,7 +309,7 @@ async def _handle_request_password(bot, event, chat_id, user_id, text,
         return CONSUMED
 
     # مالک بودن دوباره بررسی می‌شود (ممکن است مالکیت عوض شده باشد).
-    if not two_factor.is_owner(chat_id, user_id) or str(
+    if not two_factor.is_registered_owner(chat_id, user_id) or str(
             request.get("owner_id")) != str(user_id):
         two_factor.drop_request(chat_id)
         await _send(bot, chat_id, texts.two_factor_not_registered_owner(),
@@ -428,6 +428,13 @@ def register_handler(command, callback):
     return callback
 
 
+def _failure_detail(error):
+    """دلیلِ کوتاهِ خطا برای پیامِ «انجام نشد» (بدون هیچ دادهٔ حساس)."""
+    kind = type(error).__name__
+    message = str(error) or kind
+    return f"{kind}: {message}"[:160]
+
+
 def _callback_kind(bot, command):
     normalized = two_factor.normalize(command)
     return normalized if normalized in _HANDLERS else None
@@ -449,8 +456,8 @@ async def _run_confirmed(bot, event, chat_id, user_id, request, logger=None):
                 logger, "TWO FACTOR CONFIRMED RUN FAILED "
                         f"chat_id={chat_id} user_id={user_id} "
                         f"command={command!r} error={error!r}")
-            await _send(bot, chat_id, texts.two_factor_message("failed"),
-                        logger)
+            await _send(bot, chat_id,
+                        texts.two_factor_failed(_failure_detail(error)), logger)
             return False
         await _send(bot, chat_id, texts.two_factor_message("executed"),
                     logger)
@@ -485,7 +492,8 @@ async def _run_confirmed(bot, event, chat_id, user_id, request, logger=None):
         await _send(bot, chat_id, texts.two_factor_message("failed"), logger)
         return False
     if result is False:
-        await _send(bot, chat_id, texts.two_factor_message("failed"), logger)
+        await _send(bot, chat_id, texts.two_factor_failed(
+            "مسیرِ اجرای این دستور پاسخ نداد"), logger)
         log_info(logger, "TWO FACTOR CONFIRMED ROUTE DECLINED "
                          f"chat_id={chat_id} command={command!r}")
         return False

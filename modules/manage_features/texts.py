@@ -407,14 +407,38 @@ def two_factor_not_registered_owner():
     return builder.build()
 
 
+TWO_FACTOR_NO_REGISTERED_OWNER = (
+    "▪️این گروه مالک ثبت شده ندارد؛ اول با دستور «ثبت مالک» مالک را ثبت کنید"
+)
+
+
 def two_factor_owner_required(registered=True):
-    """فرمانِ قابلیت از کسی که مالکِ ثبت‌شده نیست."""
+    """فرمانِ قابلیت از کسی که مالکِ ثبت‌شده نیست.
+
+    اگر گروه **هیچ** مالکِ ثبت‌شده‌ای ندارد، به‌جای پیامِ «شما مالک نیستید»
+    می‌گوید اول باید «ثبت مالک» انجام شود (وگرنه کاربر نمی‌فهمد چرا هیچ‌کس
+    نمی‌تواند رمز بگذارد).
+    """
+    if not registered:
+        builder = _Builder()
+        builder.line(TWO_FACTOR_NO_REGISTERED_OWNER)
+        return builder.build()
     return two_factor_not_registered_owner()
 
 
 def two_factor_gate_owner_only():
     """دستورِ خطرناک از غیرمالک وقتی قفل روشن است (عیناً پیامِ تصویر)."""
     return two_factor_ask_password()
+
+
+def two_factor_failed(detail=""):
+    """«❌ : انجام نشد» + دلیلِ کوتاه (برای عیب‌یابیِ کارفرما)."""
+    builder = _Builder()
+    builder.line(TWO_FACTOR_FAILED)
+    if detail:
+        builder.line()
+        builder.line(str(detail)[:180])
+    return builder.build()
 
 
 def two_factor_message(kind="executed"):

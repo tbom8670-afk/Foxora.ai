@@ -441,12 +441,22 @@ def failure_count(chat_id) -> int:
 # ---------------------------------------------------------------------------
 #  «فقط مالک» — یک نقطهٔ حقیقت برای همهٔ گیت‌ها
 # ---------------------------------------------------------------------------
-def is_owner(chat_id, user_id) -> bool:
-    """مالکِ ثبت‌شدهٔ گروه، یا مالکِ سراسری اگر گروه مالکِ ثبت‌شده ندارد."""
+def is_registered_owner(chat_id, user_id) -> bool:
+    """آیا این کاربر **مالکِ ثبت‌شدهٔ همین گروه** است؟ (شرطِ گذاشتن/زدنِ رمز)
+
+    ⚠️ درخواست کارفرما: «فقط مالکِ ثبت‌شده بتواند رمز بنویسد» — پس مالکِ
+    سراسریِ ربات یا ادمینِ ثبت‌شده هیچ‌وقت مجاز نیست، حتی اگر گروه مالکِ
+    ثبت‌شده نداشته باشد (در آن حالت اول باید «ثبت مالک» انجام شود).
+    """
     try:
-        return bool(access.is_owner(chat_id, user_id))
+        return bool(access.is_group_owner(chat_id, user_id))
     except Exception:                                 # noqa: BLE001
         return False
+
+
+def is_owner(chat_id, user_id) -> bool:
+    """نامِ قدیمی — حالا **فقط** مالکِ ثبت‌شدهٔ گروه (بدونِ fallback سراسری)."""
+    return is_registered_owner(chat_id, user_id)
 
 
 def gate(chat_id, user_id, text, *, confirmed=False, username=None):
@@ -475,7 +485,7 @@ def gate(chat_id, user_id, text, *, confirmed=False, username=None):
             return "ok"
     except Exception:                                 # noqa: BLE001
         return "ok"
-    if is_owner(chat_id, user_id):
+    if is_registered_owner(chat_id, user_id):
         return "owner"
     return "denied"
 

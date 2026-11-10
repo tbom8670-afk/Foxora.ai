@@ -1,5 +1,7 @@
+import asyncio
 import asyncio as _asyncio
 import contextvars
+import inspect
 from collections import Counter, deque
 from datetime import date
 import os
@@ -796,17 +798,99 @@ async def _two_factor_gate(bot, event, chat_id, user_id, sender,
         return False
 
 
-async def _two_factor_run_confirmed(bot, event, chat_id, user_id, sender,
-                                    message_text):
-    """اجرای دستورِ تأییدشده از همان روترِ اصلی (بدون نیاز به نوشتنِ دوباره)."""
+class _ConfirmedMessage:
+    """پیامِ جانشین: متن = همان دستورِ اصلی، بقیهٔ فیلدها از پیامِ رمز."""
+
+    def __init__(self, original, text, message_id=None):
+        self._original = original
+        self.message = text
+        self.id = (message_id if message_id
+                   else getattr(original, "id", None))
+
+    def __getattr__(self, name):
+        original = self.__dict__.get("_original")
+        if original is None:
+            raise AttributeError(name)
+        return getattr(original, name)
+
+
+class _ConfirmedEvent:
+    """رویدادِ جانشین برای اجرای دستورِ تأییدشده.
+
+    دلیل وجود: پیامِ اصلیِ دستور پیش‌تر مصرف شده و پیامِ رمز هم پاک شده است؛
+    برای اینکه دستور **دوباره و بی‌درنگ** اجرا شود، همین رویداد با متنِ
+    دستورِ اصلی به روتر داده می‌شود. پاسخ‌ها به‌صورت پیامِ تازه در همان گروه
+    فرستاده می‌شوند (پاسخ به پیامِ حذف‌شده خطا می‌داد).
+    """
+
+    def __init__(self, bot, event, chat_id, text, message_id=None):
+        self._bot = bot
+        self._original = event
+        self._chat_id = chat_id
+        self.chat_id = chat_id
+        self.message = _ConfirmedMessage(
+            getattr(event, "message", None), text, message_id)
+
+    def __getattr__(self, name):
+        original = self.__dict__.get("_original")
+        if original is None:
+            raise AttributeError(name)
+        return getattr(original, name)
+
+    async def _send(self, text, formatting_entities=None, buttons=None):
+        kwargs = {}
+        if formatting_entities:
+            kwargs["formatting_entities"] = formatting_entities
+        if buttons:
+            kwargs["buttons"] = buttons
+        try:
+            return await self._bot.client.send_message(
+                self._chat_id, text, **kwargs)
+        except Exception as error:                   # noqa: BLE001
+            try:
+                self._bot.logger.log_error(
+                    "TWO FACTOR CONFIRMED REPLY FAILED "
+                    f"chat_id={self._chat_id} error={error!r}")
+            except Exception:                        # noqa: BLE001
+                pass
+            return None
+
+    async def reply(self, text=None, formatting_entities=None, buttons=None,
+                    **_kwargs):
+        return await self._send(text, formatting_entities, buttons)
+
+    async def respond(self, text=None, formatting_entities=None, buttons=None,
+                      **_kwargs):
+        return await self._send(text, formatting_entities, buttons)
+
+
+async def _two_factor_run_confirmed(bot, event, chat_id, user_id, message_text):
+    """اجرای دستورِ تأییدشده از همان روترِ اصلی (بدون نیاز به نوشتنِ دوباره).
+
+    امضای این تابع با قراردادِ ``two_factor_commands.register_handler`` یکی
+    است: ``(bot, event, chat_id, user_id, text)``.
+    """
+    if not message_text:
+        return False
+    confirmed_event = _ConfirmedEvent(
+        bot, event, chat_id, message_text,
+        message_id=getattr(event, "_two_factor_source_message_id", None))
     token = _TWO_FACTOR_CONFIRMED.set(True)
     try:
-        return await handle_new_message(bot, event)
+        await handle_new_message(bot, confirmed_event)
+    except Exception as error:                       # noqa: BLE001
+        bot.logger.log_error(
+            "TWO FACTOR CONFIRMED ROUTE CRASHED "
+            f"chat_id={chat_id} user_id={user_id} "
+            f"text={message_text!r} error={error!r}")
+        return False
     finally:
         try:
             _TWO_FACTOR_CONFIRMED.reset(token)
         except Exception:                            # noqa: BLE001
             pass
+    return True
+
 
 
 def _two_factor_register_handlers():
@@ -4239,13 +4323,37 @@ async def handle_new_message(bot, event):
             try:
                 _manage2 = _manage_features()
                 if _manage2 is not None:
-                    _manage2["timed"].track(
-                        chat_id, getattr(event.message, "id", None), user_id)
+                    # امضاها متفاوت‌اند: ``track(chat_id, message_id, user_id)``
+                    # ، ``timed.watch(bot, logger=…)`` و
+                    # ``exclusive.watch(chat_id, context, logger=…)``. هر کدام
+                    # جدا فراخوانی می‌شوند تا خطای یکی بقیه را نخورد.
+                    try:
+                        _manage2["timed"].track(
+                            chat_id, getattr(event.message, "id", None), user_id)
+                    except Exception as _track_error:      # noqa: BLE001
+                        bot.logger.log_error(
+                            "MANAGE TRACK FAILED "
+                            f"chat_id={chat_id} error={_track_error!r}")
                     # نگهبانِ زمان‌دار: اگر تایمر/حلقهٔ بازیابی مرده باشد
                     # دوباره بالا می‌آید (حداکثر هر ۳۰ ثانیه، بدون RPC).
-                    _manage2["timed"].watch(chat_id, bot, logger=bot.logger)
-                    _manage2["exclusive"].watch(
-                        chat_id, {"bot": bot}, logger=bot.logger)
+                    try:
+                        _manage2["timed"].watch(bot, logger=bot.logger)
+                    except Exception as _timed_watch_error:   # noqa: BLE001
+                        bot.logger.log_error(
+                            "MANAGE TIMED WATCH FAILED "
+                            f"chat_id={chat_id} error={_timed_watch_error!r}")
+                    try:
+                        # ``watch`` یک coroutine است؛ بدون await صدا زدنش
+                        # هشدار «never awaited» می‌داد (باگِ قبلی).
+                        _watch_result = _manage2["exclusive"].watch(
+                            chat_id, {"bot": bot}, logger=bot.logger)
+                        if inspect.isawaitable(_watch_result):
+                            asyncio.create_task(_watch_result)
+                    except Exception as _exclusive_watch_error:  # noqa: BLE001
+                        bot.logger.log_error(
+                            "MANAGE EXCLUSIVE WATCH FAILED "
+                            f"chat_id={chat_id} "
+                            f"error={_exclusive_watch_error!r}")
             except Exception as _track_error:
                 bot.logger.log_error(
                     "MANAGE TRACK FAILED "

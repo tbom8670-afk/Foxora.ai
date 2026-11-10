@@ -368,6 +368,41 @@ def test_02_random_digits_go_to_games():
           event.text())
 
 
+def test_02b_all_protected_commands_execute():
+    print("\n### ۲ب) همهٔ ۹ دستور پس از رمز واقعاً اجرا می‌شوند (بدون «انجام نشد»)")
+    module = load_router()
+    bot = setup()
+    owner = User(OWNER, "osine2")
+    from handlers.message_handler import _two_factor_register_handlers
+    _two_factor_register_handlers()
+
+    for text in ("دو مرحله ای", "48271953", "48271953"):
+        send(module, bot, CHAT, owner, text)
+    check("قفل فعال شد", two_factor.is_enabled(CHAT))
+
+    failed = []
+    rejected = []
+    for command in two_factor.PROTECTED_COMMANDS:
+        send(module, bot, CHAT, owner, command)
+        if two_factor.pending_request(CHAT) is None:
+            rejected.append(command)
+            continue
+        before = len(bot.client.sent)
+        send(module, bot, CHAT, owner, "48271953")
+        replies = [t2 for _c, t2 in bot.client.sent[before:]]
+        if not any(texts.TWO_FACTOR_EXECUTED in r for r in replies):
+            failed.append((command, replies[:2]))
+        if any(texts.TWO_FACTOR_FAILED in r for r in replies):
+            failed.append((command, "FAILED MESSAGE"))
+
+    check("برای همهٔ ۹ دستور درخواستِ رمز ساخته شد", not rejected, rejected)
+    check("همهٔ ۹ دستور پس از رمز «اجرا شد» گرفتند (هیچ «انجام نشد»ی نیست)",
+          not failed, failed)
+    check("لاگ هیچ خطای اجرایی ندارد",
+          not [e for e in bot.logger.errors if "CONFIRMED" in e],
+          bot.logger.errors[-3:])
+
+
 def test_03_disabled_group_unchanged():
     print("\n### ۳) روتر: گروهِ بدون قفل ⇒ رفتار قبلی")
     module = load_router()
@@ -419,6 +454,7 @@ def main():
     try:
         test_01_router_enable_and_gate()
         test_02_random_digits_go_to_games()
+        test_02b_all_protected_commands_execute()
         test_03_disabled_group_unchanged()
         test_04_disable_restores_admins()
     finally:

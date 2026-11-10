@@ -241,6 +241,14 @@ def test_01_enable():
           "48271953" not in bot.logger.everything(), bot.logger.everything()[-200:])
     check("مسیر رمز صحیح است", two_factor.verify_password(CHAT, "48271953"))
 
+    # فقط مالکِ ثبت‌شده: ادمین و کاربر عادی هیچ‌وقت
+    check("ادمینِ ثبت‌شده نمی‌تواند رمز بگذارد",
+          not two_factor.is_registered_owner(CHAT, ADMIN)
+          and not two_factor.is_owner(CHAT, ADMIN))
+    check("کاربر عادی نمی‌تواند رمز بگذارد",
+          not two_factor.is_owner(CHAT, STRANGER))
+    check("مالکِ ثبت‌شده مجاز است", two_factor.is_registered_owner(CHAT, OWNER))
+
     # فعال‌سازی دوباره
     event7, _ = say(bot, CHAT, owner, "دو مرحله ای")
     check("فعال‌سازی دوباره ⇒ «از قبل فعال است»",
@@ -584,6 +592,46 @@ def test_08_disable():
 # ---------------------------------------------------------------------------
 #  ۹) گروه بدون قفل = رفتار قبلی
 # ---------------------------------------------------------------------------
+def test_08b_owner_policy():
+    print("\n### ۸ب) «فقط مالک ثبت‌شده» — بدونِ استثنای مالک سراسری")
+    fresh()
+    bot = Bot()
+    # گروهی که مالکِ ثبت‌شده ندارد
+    other = -(10 ** 12) - 902
+    two_factor.clear_group(other)
+    no_owner_chat = -(10 ** 12) - 903
+    two_factor.clear_group(no_owner_chat)
+
+    # «ثبت مالک» نکرده ⇒ هیچ‌کس (حتی مالک سراسری) نمی‌تواند رمز بگذارد
+    from modules import owner_check
+    original_global = owner_check.is_global_owner
+    owner_check.is_global_owner = lambda user: True
+    try:
+        check("گروهِ بدون مالک: مالکِ سراسری هم مجاز نیست",
+              not two_factor.is_registered_owner(no_owner_chat, OWNER))
+        event = Event(no_owner_chat, User(OWNER, "global_owner"), "دو مرحله ای")
+        consumed = run(two_factor_commands.handle_command(
+            bot, event, no_owner_chat, OWNER, event.sender, "دو مرحله ای",
+            bot.logger))
+        text = event.text() + " ".join(t2 for _c, t2 in bot.client.sent)
+        check("گروهِ بدون مالک: پیامِ «اول ثبت مالک»",
+              consumed and texts.TWO_FACTOR_NO_REGISTERED_OWNER in text, text)
+        check("گروهِ بدون مالک: قفل فعال نشد",
+              not two_factor.is_enabled(no_owner_chat))
+    finally:
+        owner_check.is_global_owner = original_global
+
+    # رمزِ درست هم از غیرمالک پذیرفته نمی‌شود (حتی اگر درخواست باز باشد)
+    two_factor.set_password(CHAT, "48271953", set_by=OWNER)
+    two_factor.create_request(CHAT, OWNER, "ریست آمار", "ریست آمار")
+    event = Event(CHAT, User(ADMIN, "admin"), "48271953")
+    consumed = run(two_factor_commands.handle_password(
+        bot, event, CHAT, ADMIN, event.sender, "48271953", bot.logger))
+    check("ادمین با رمزِ درست: مصرف نمی‌شود", consumed is False)
+    check("ادمین با رمزِ درست: درخواست مالک دست‌نخورده می‌ماند",
+          two_factor.pending_request(CHAT) is not None)
+
+
 def test_09_no_lock_same_behaviour():
     print("\n### ۹) گروهِ بدون قفل: رفتار دقیقاً مثل قبل")
     fresh()
@@ -735,6 +783,7 @@ def main():
     test_06_random_digits_pass_through()
     test_07_expiry_and_restart()
     test_08_disable()
+    test_08b_owner_policy()
     test_09_no_lock_same_behaviour()
     test_10_templates_match_screenshot()
     test_11_admin_help_entry()
