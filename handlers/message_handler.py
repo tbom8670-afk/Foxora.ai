@@ -1,4 +1,5 @@
 import asyncio as _asyncio
+import contextvars
 from collections import Counter, deque
 from datetime import date
 import os
@@ -657,13 +658,14 @@ async def _send_moderation_notification_once(
 
 
 def _manage_features():
-    """ایمپورتِ تنبلِ سه قابلیت مدیریتی (بدون هزینه در استارتاپ)."""
+    """ایمپورتِ تنبلِ چهار قابلیتِ مدیریتی (بدون هزینه در استارتاپ)."""
     global _MANAGE_FEATURES
     if _MANAGE_FEATURES is not None:
         return _MANAGE_FEATURES or None
     try:
         from modules.manage_features import (exclusive_commands,
-                                             report_commands, timed_commands)
+                                             report_commands, timed_commands,
+                                             two_factor_commands)
     except Exception as error:                       # noqa: BLE001
         print(f"MANAGE FEATURES IMPORT FAILED error={error!r}")
         _MANAGE_FEATURES = False
@@ -672,11 +674,153 @@ def _manage_features():
         "exclusive": exclusive_commands,
         "timed": timed_commands,
         "report": report_commands,
+        "two_factor": two_factor_commands,
     }
     return _MANAGE_FEATURES
 
 
 _MANAGE_FEATURES = None
+
+
+# ---------------------------------------------------------------------------
+#  ⏰ تأیید دو مرحله‌ای دستورات خطرناک — قلاب‌های روتر
+# ---------------------------------------------------------------------------
+# این سه تابع، تنها نقطه‌های اتصالِ قابلیت به روتر هستند و هیچ منطقی از
+# دستورهای موجود را تغییر نمی‌دهند:
+#
+# * ``_two_factor_router_claim``   — فرمان‌های «دو مرحله ای» و پیامِ ۸ رقمی
+#   (پیش از هر مسیرِ دیگر، حتی بازی‌ها؛ ولی فقط وقتی مالک/درخواست در جریان باشد).
+# * ``_two_factor_gate``           — گیتِ دستورهای خطرناک (خروجی: مصرف شد یا نه).
+# * ``_two_factor_run_confirmed``  — اجرای همان دستور پس از رمزِ درست، با
+#   پرچمِ «تأیید شد» تا گیت دوباره فعال نشود.
+#
+# همهٔ مسیرهای اجرای دستورهای خطرناک (مسیرِ عادی و مسیرِ تأییدشده) از همین
+# گیت رد می‌شوند.
+
+#: پرچمِ context-variable: در این تسک، دستورِ تأییدشده در جریان است.
+_TWO_FACTOR_CONFIRMED = contextvars.ContextVar(
+    "foxora_two_factor_confirmed", default=False)
+
+
+def _two_factor_module():
+    manage = _manage_features()
+    if not manage:
+        return None
+    return manage.get("two_factor")
+
+
+def two_factor_confirmed_active() -> bool:
+    """آیا همین الان یک دستورِ تأییدشده در حال اجراست؟ (برای گیت)"""
+    try:
+        return bool(_TWO_FACTOR_CONFIRMED.get())
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+def _two_factor_enabled(chat_id) -> bool:
+    """آیا گروه قفلِ دو مرحله‌ای دارد؟ (ارزان؛ خطای فایل = خاموش)"""
+    module = _two_factor_module()
+    if module is None:
+        return False
+    try:
+        from modules.manage_features import two_factor
+        return two_factor.is_enabled(chat_id)
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+def _two_factor_protected_key(text):
+    """کلیدِ دستورِ محافظت‌شده یا ``None`` (بدون I/O سنگین)."""
+    module = _two_factor_module()
+    if module is None:
+        return None
+    try:
+        from modules.manage_features import two_factor
+        return two_factor.protected_command(text)
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+async def _two_factor_router_claim(bot, event, chat_id, user_id, sender,
+                                   message_text, module=None):
+    """مصرفِ فرمان/رمزِ ۸ رقمیِ این قابلیت. ``True`` ⇒ بقیهٔ مسیرها اجرا نشوند.
+
+    ترتیب داخلی: فرمانِ «دو مرحله ای/لغو دو مرحله ای» → پیام ۸ رقمی.
+    گفتنی است که پیام ۸ رقمی از **غیرمالک** مصرف نمی‌شود و به مسیر خودش
+    (بازی/جستجو/…) می‌رسد.
+    """
+    module = module or _two_factor_module()
+    if module is None or getattr(event, "is_private", False):
+        return False
+    try:
+        if module.is_command(message_text):
+            return bool(await module.handle_command(
+                bot, event, chat_id, user_id, sender, message_text,
+                bot.logger))
+        return bool(await module.handle_password(
+            bot, event, chat_id, user_id, sender, message_text, bot.logger))
+    except Exception as error:                       # noqa: BLE001
+        bot.logger.log_error(
+            "TWO FACTOR ROUTER HOOK FAILED "
+            f"chat_id={chat_id} user_id={user_id} error={error!r}")
+        return False
+
+
+async def _two_factor_gate(bot, event, chat_id, user_id, sender,
+                           message_text, module=None):
+    """گیتِ دستورهای خطرناک. ``True`` ⇒ پیام مصرف شد و دستور اجرا نشود.
+
+    اگر دستورِ تأییدشده در جریان باشد یا گروه قفل نداشته باشد، فوراً
+    ``False`` برمی‌گردد (بدون هیچ I/O) تا مسیر گرم کند نشود.
+    """
+    if two_factor_confirmed_active():
+        return False
+    if getattr(event, "is_private", False):
+        return False
+    key = _two_factor_protected_key(message_text)
+    if key is None:
+        return False
+    if not _two_factor_enabled(chat_id):
+        return False
+    module = module or _two_factor_module()
+    if module is None:
+        return False
+    try:
+        return bool(await module.gate(bot, event, chat_id, user_id, sender,
+                                      message_text, bot.logger))
+    except Exception as error:                       # noqa: BLE001
+        bot.logger.log_error(
+            "TWO FACTOR GATE FAILED "
+            f"chat_id={chat_id} user_id={user_id} command={key!r} "
+            f"error={error!r}")
+        return False
+
+
+async def _two_factor_run_confirmed(bot, event, chat_id, user_id, sender,
+                                    message_text):
+    """اجرای دستورِ تأییدشده از همان روترِ اصلی (بدون نیاز به نوشتنِ دوباره)."""
+    token = _TWO_FACTOR_CONFIRMED.set(True)
+    try:
+        return await handle_new_message(bot, event)
+    finally:
+        try:
+            _TWO_FACTOR_CONFIRMED.reset(token)
+        except Exception:                            # noqa: BLE001
+            pass
+
+
+def _two_factor_register_handlers():
+    """ثبتِ مسیرهای تأییدشده برای دستورهای محافظت‌شده (یک‌بار در استارتاپ)."""
+    module = _two_factor_module()
+    if module is None:
+        return False
+    try:
+        from modules.manage_features import two_factor
+    except Exception:                                # noqa: BLE001
+        return False
+    for command in two_factor.PROTECTED_COMMANDS:
+        module.register_handler(command, _two_factor_run_confirmed)
+    return True
 
 
 def _record_gif_stat(bot, chat_id, user_id, sender):
@@ -3883,6 +4027,43 @@ async def handle_new_message(bot, event):
         _media_only_message = (
             not has_text_content and not is_forwarded_media and not is_gif_media
         )
+
+        # ===== ⏰ تأیید دو مرحله‌ای دستورات خطرناک =====
+        # یک پیش‌بررسیِ ارزان (چند عملیاتِ رشته‌ای و دو جست‌وجوی دیکشنری) که
+        # برای اکثریتِ پیام‌های عادی فوراً ``False`` است؛ بنابراین مسیر گرم
+        # هیچ هزینهٔ محسوسی نمی‌دهد. اگر «مربوط» بود:
+        #
+        # ۱) گیتِ ۹ دستورِ خطرناک (پیش از هر مسیرِ اجرایی، حتی پاکسازی کامل):
+        #    غیرمالک پیامِ «فقط مالک با رمز» می‌گیرد، مالک درخواستِ رمز.
+        # ۲) فرمان‌های «دو مرحله ای/لغو دو مرحله ای» و پیامِ رمز (پیش از
+        #    بازی‌ها/جستجو؛ پیامِ رمز از غیرمالک مصرف نمی‌شود).
+        if not event.is_private and message_text:
+            _tf_module = _two_factor_module()
+            _tf_relevant = False
+            if _tf_module is not None:
+                try:
+                    _tf_relevant = bool(_tf_module.interest(
+                        chat_id, user_id, message_text))
+                except Exception:                    # noqa: BLE001
+                    _tf_relevant = False
+            if _tf_relevant:
+                try:
+                    if await _two_factor_gate(
+                        bot, event, chat_id, user_id, sender, message_text,
+                        _tf_module,
+                    ):
+                        return
+                    if await _two_factor_router_claim(
+                        bot, event, chat_id, user_id, sender, message_text,
+                        _tf_module,
+                    ):
+                        return
+                except Exception as _two_factor_error:    # noqa: BLE001
+                    bot.logger.log_error(
+                        "TWO FACTOR HOOK FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_two_factor_error!r}"
+                    )
 
         # ===== 🧬 مسیر اختصاصی «پاکسازی کامل» =====
         # دستور و پاسخ تأیید/لغوِ آن باید برای مالک/ادمین، و فقط برایشان، بی‌درنگ

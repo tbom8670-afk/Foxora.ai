@@ -1109,6 +1109,21 @@ class SoroushAntiSpamBot:
                 f"timed={len(_timed_restored)} reports={_reports_restored} "
                 f"exclusive={len(_exclusive_pending)}"
             )
+            # ⏰ «تأیید دو مرحله‌ای»: مسیرِ اجرای تأییدشدهٔ ۹ دستورِ خطرناک
+            # همین‌جا به روتر وصل می‌شود تا پس از رمزِ درست، همان دستور با
+            # پرچمِ «تأیید شد» اجرا شود (بدون نوشتنِ دوباره).
+            try:
+                from handlers.message_handler import (
+                    _two_factor_register_handlers,
+                )
+                self.logger.log_info(
+                    "TWO FACTOR HANDLERS REGISTERED "
+                    f"ok={_two_factor_register_handlers()}"
+                )
+            except Exception as two_factor_error:    # noqa: BLE001
+                self.logger.log_error(
+                    "TWO FACTOR HANDLERS REGISTER FAILED "
+                    f"error={two_factor_error!r}")
         except Exception as manage_recovery_error:   # noqa: BLE001
             self.logger.log_error(
                 "MANAGE FEATURES RECOVERY FAILED "

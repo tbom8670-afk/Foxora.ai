@@ -280,5 +280,190 @@ def exclusive_message(*, username, kind="granted"):
     return builder.build()
 
 
+# ---------------------------------------------------------------------------
+#  ۷) تأیید دو مرحله‌ای دستورات خطرناک
+# ---------------------------------------------------------------------------
+# متن‌ها **عیناً** از اسکرین‌شات کارفرما هستند (همان اعراب‌گذاری و همان
+# نیم‌فاصله/کشیده‌ها). ارقام لاتین‌اند. هر بخشی که در عکس نقل‌قول دارد،
+# دقیقاً همان بازه به‌عنوان ``MessageEntityBlockquote`` علامت می‌خورد و کلِ
+# متن Bold است.
+
+TWO_FACTOR_HEADER = "تایید دو مرحله ای برای دستورات زیر"
+#: نُه دستورِ محافظت‌شده — «●» ابتدای هر خط، عیناً مثل تصویر.
+TWO_FACTOR_PROTECTED_START = "●"
+TWO_FACTOR_PROTECTED_LINES = (
+    "پـاکسـازی خودکـار",
+    "پـاکسـازی کـامل",
+    "پـاک لـیست اخـراج",
+    "پـاک لـیست سکـوت",
+    "ریـست آمـار",
+    "تغـییر مـجازات",
+    "تغـییر اخطـار",
+    "سـرگرمـی فعـال",
+    "لـغو کلـمـات ممـنوعه",
+)
+TWO_FACTOR_ASK_NEW = (
+    "⚙ : یک رمز 8 رقمی بنویسید و ارسال کنید\n"
+    "این رمز رو به خاطر بسپارید"
+)
+TWO_FACTOR_CREATED_TITLE = "رمـز ساختـه شـد 📨"
+TWO_FACTOR_CREATED_BODY = (
+    "از این پس برای اجرای این دستورات باید فقط رمز رو\n"
+    "وارد کنید اونم فقط توسط مالک ثبت شده نه ادمین ها"
+)
+TWO_FACTOR_ASK_DANGER = (
+    "✺ : این دستور تایید دو مرحله ای دارد\n"
+    "اگر مالـک ثبت شده هستید رمز آن را وارد کنید"
+)
+TWO_FACTOR_DISABLED_TITLE = "⚠️ : تـایید دو مـرحلـه ای لـغو شد"
+TWO_FACTOR_DISABLED_BODY = (
+    "حالا ادمین های ثبت شده هم میتوانند از سایر\n"
+    "دستورات هم استفاده کنند"
+)
+TWO_FACTOR_WRONG_TITLE = "📌 رمـز رد شد اشتباه میـباشد"
+TWO_FACTOR_NOT_OWNER = "▪️رمـز شما تـایید نشد شما مالـک ثبت شده نیستید"
+#: پیام‌های کمکی (در تصویر نبودند؛ طبق فهرستِ کلیدهای موردنیازِ کارفرما).
+TWO_FACTOR_NEW_REQUEST = TWO_FACTOR_ASK_NEW
+TWO_FACTOR_REPEAT_REQUEST = "⚙ : همان رمز 8 رقمی را یک بار دیگر ارسال کنید"
+TWO_FACTOR_INVALID = "⚙ : رمز باید دقیقاً 8 رقم باشد (فقط عدد)"
+TWO_FACTOR_OBVIOUS = "⚙ : این رمز خیلی ساده است؛ یک رمز 8 رقمیِ دیگر بگذارید"
+TWO_FACTOR_MISMATCH = "⚙ : تکرار رمز مطابقت ندارد؛ دوباره «دو مرحله ای» را بزنید"
+TWO_FACTOR_ALREADY_ON = "⚙ : تایید دو مرحله ای از قبل فعال است"
+TWO_FACTOR_NOT_ON = "⚙ : تایید دو مرحله ای فعال نیست"
+TWO_FACTOR_EXPIRED = "⏳ : درخواست منقضی شد؛ دستور را دوباره بزنید"
+TWO_FACTOR_TOO_MANY = "🚫 : سه رمز غلط ⇒ درخواست لغو شد؛ دستور را دوباره بزنید"
+TWO_FACTOR_EXECUTED = "✅ : اجرا شد"
+TWO_FACTOR_FAILED = "❌ : انجام نشد"
+TWO_FACTOR_LOCKOUT_TITLE = "⏳ : قفل موقت فعال شد"
+TWO_FACTOR_DISABLE_REQUEST = (
+    "✺ : برای لغو تایید دو مرحله ای رمز فعلی را وارد کنید"
+)
+
+
+def two_factor_activate_request():
+    """کارتِ گام ۱: عنوان + نُه دستور داخل **یک** نقل‌قول، بعد درخواست رمز.
+
+    عیناً مثل تصویر: نقل‌قول فقط عنوان و فهرست را می‌گیرد؛ «⚙ : …» بیرونِ
+    نقل‌قول است.
+    """
+    builder = _Builder()
+    # در تصویر، فقط عنوان داخل نقل‌قول است؛ فهرست با «●» بیرونِ آن می‌آید.
+    builder.line(TWO_FACTOR_HEADER, quote=True)
+    for line in TWO_FACTOR_PROTECTED_LINES:
+        builder.line(f"{TWO_FACTOR_PROTECTED_START}{line}")
+    builder.line()
+    for line in TWO_FACTOR_ASK_NEW.split("\n"):
+        builder.line(line)
+    return builder.build()
+
+
+def two_factor_created():
+    """«رمز ساخته شد» + توضیح — عنوان داخل نقل‌قول."""
+    builder = _Builder()
+    builder.line(TWO_FACTOR_CREATED_TITLE, quote=True)
+    builder.line()
+    for line in TWO_FACTOR_CREATED_BODY.split("\n"):
+        builder.line(line)
+    return builder.build()
+
+
+def two_factor_ask_password():
+    """«این دستور تایید دو مرحله ای دارد …» — بدون نقل‌قول (مثل تصویر)."""
+    builder = _Builder()
+    for line in TWO_FACTOR_ASK_DANGER.split("\n"):
+        builder.line(line)
+    return builder.build()
+
+
+def two_factor_disable_request():
+    builder = _Builder()
+    builder.line(TWO_FACTOR_DISABLE_REQUEST, quote=True)
+    return builder.build()
+
+
+def two_factor_lockout(seconds):
+    """قفل موقت پس از ۵ رمز غلط (متنِ مکمل؛ در تصویر نبود)."""
+    builder = _Builder()
+    builder.line(TWO_FACTOR_LOCKOUT_TITLE, quote=True)
+    builder.line()
+    builder.line(f"بعد از {_fa_number(max(1, int(seconds)))} ثانیه دوباره "
+                 "تلاش کنید")
+    return builder.build()
+
+
+def two_factor_wrong_password(attempts_left):
+    """«📌 رمـز رد شد اشتباه میـباشد» + تعداد تلاشِ باقی‌مانده."""
+    builder = _Builder()
+    # عیناً مثل تصویر: بدون نقل‌قول.
+    builder.line(TWO_FACTOR_WRONG_TITLE)
+    builder.line()
+    builder.line(f"تلاش باقی مانده : {_fa_number(max(0, int(attempts_left)))}")
+    return builder.build()
+
+
+def two_factor_not_registered_owner():
+    builder = _Builder()
+    builder.line(TWO_FACTOR_NOT_OWNER)
+    return builder.build()
+
+
+def two_factor_owner_required(registered=True):
+    """فرمانِ قابلیت از کسی که مالکِ ثبت‌شده نیست."""
+    return two_factor_not_registered_owner()
+
+
+def two_factor_gate_owner_only():
+    """دستورِ خطرناک از غیرمالک وقتی قفل روشن است (عیناً پیامِ تصویر)."""
+    return two_factor_ask_password()
+
+
+def two_factor_message(kind="executed"):
+    """قالب‌های تک‌خطی/دوستانه با نقل‌قولِ عنوان (مثل بقیهٔ قالب‌ها).
+
+    ``kind`` ∈ {new_request, repeat_request, invalid, obvious, mismatch,
+    already_on, not_on, disabled, wrong, not_owner, expired, too_many,
+    executed, failed}
+    """
+    titles = {
+        "new_request": TWO_FACTOR_NEW_REQUEST,
+        "repeat_request": TWO_FACTOR_REPEAT_REQUEST,
+        "invalid": TWO_FACTOR_INVALID,
+        "obvious": TWO_FACTOR_OBVIOUS,
+        "mismatch": TWO_FACTOR_MISMATCH,
+        "already_on": TWO_FACTOR_ALREADY_ON,
+        "not_on": TWO_FACTOR_NOT_ON,
+        "wrong": TWO_FACTOR_WRONG_TITLE,
+        "not_owner": TWO_FACTOR_NOT_OWNER,
+        "expired": TWO_FACTOR_EXPIRED,
+        "too_many": TWO_FACTOR_TOO_MANY,
+        "executed": TWO_FACTOR_EXECUTED,
+        "failed": TWO_FACTOR_FAILED,
+    }
+    if kind == "disabled":
+        return two_factor_disabled()
+    body = titles.get(kind, TWO_FACTOR_EXECUTED)
+    builder = _Builder()
+    for line in body.split("\n"):
+        builder.line(line)
+    return builder.build()
+
+
+def two_factor_disabled():
+    """«⚠️ : تـایید دو مـرحلـه ای لـغو شد» + توضیح — عنوان در نقل‌قول."""
+    builder = _Builder()
+    builder.line(TWO_FACTOR_DISABLED_TITLE, quote=True)
+    builder.line()
+    for line in TWO_FACTOR_DISABLED_BODY.split("\n"):
+        builder.line(line)
+    return builder.build()
+
+
+#: سطرهای «لیست ادمینی» — عیناً به همان شکلِ درخواستیِ کارفرما.
+TWO_FACTOR_HELP_TITLE = (
+    "⏰ : برای تایید دو مرحله ای دستورات خطرناک بنویسید"
+)
+TWO_FACTOR_HELP_COMMANDS = ("دو مرحله ای", "لغو دو مرحله ای")
+
+
 #: رزروِ قالب‌های آیندهٔ کارفرما (فقط جای‌گذاری؛ هیچ متنی اختراع نمی‌شود).
 FUTURE: dict = {}
