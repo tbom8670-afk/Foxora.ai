@@ -89,15 +89,31 @@ def timed_chooser(options):
 # ---------------------------------------------------------------------------
 TIMED_PROGRESS_TITLE = "🧹 شروع پاکسازی پیام های زماندار"
 TIMED_PROGRESS_DELETED = "تعداد پیام در حال پاک شدن"
+TIMED_PROGRESS_REMAINING = "پیام باقی مانده"
 TIMED_PROGRESS_FAILED = "ناموفق"
 TIMED_PROGRESS_DURATION = "مدت زمان"
+TIMED_PROGRESS_ENDED_AT = "زمان پایان"
+TIMED_PROGRESS_LATE = "تاخیر"
 TIMED_PROGRESS_LOCKED = "گروه برای پاکسازی زماندار قفل شد"
 TIMED_PROGRESS_FINISHED = "🧹 پاکسازی پیام های زماندار انجام شد"
 
 
+def _fa_number(value) -> str:
+    """عدد لاتین؛ اگر عدد نبود همان رشته."""
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def timed_progress(*, deleted, failed, elapsed_seconds, locked=True,
-                   state="running"):
-    """پیامِ وضعیت — نه پیام جدید؛ هر بار همان پیام ویرایش می‌شود."""
+                   state="running", total=None, ended_at=None, late_seconds=0):
+    """پیامِ وضعیت — نه پیام جدید؛ هر بار همان پیام ویرایش می‌شود.
+
+    به‌درخواست کارفرما تعداد **واقعی** پیام‌های پاک‌شده همیشه نوشته می‌شود
+    (حتی وقتی صفر است) و خطِ «زمان پایان» (به وقت تهران) هم می‌آید تا معلوم
+    باشد زمان‌بندی درست بوده است.
+    """
     builder = _Builder()
     # «انجام شد» فقط وقتی که حذف واقعاً تمام شده باشد (done) یا با لغو
     # متوقف شده باشد (cancelled). در تایم‌اوت، عنوانِ «شروع» می‌ماند تا
@@ -106,9 +122,17 @@ def timed_progress(*, deleted, failed, elapsed_seconds, locked=True,
              else TIMED_PROGRESS_TITLE)
     builder.line(title, quote=True)
     builder.line()
-    builder.line(f"{TIMED_PROGRESS_DELETED} : {int(deleted)}")
-    builder.line(f"{TIMED_PROGRESS_FAILED} : {int(failed)}")
-    builder.line(f"{TIMED_PROGRESS_DURATION} : {int(max(0, elapsed_seconds))} ثانیه")
+    builder.line(f"{TIMED_PROGRESS_DELETED} : {_fa_number(deleted)}")
+    if total is not None:
+        remaining = max(0, int(total) - int(deleted or 0))
+        builder.line(f"{TIMED_PROGRESS_REMAINING} : {_fa_number(remaining)}")
+    builder.line(f"{TIMED_PROGRESS_FAILED} : {_fa_number(failed)}")
+    builder.line(f"{TIMED_PROGRESS_DURATION} : "
+                 f"{_fa_number(max(0, elapsed_seconds))} ثانیه")
+    if ended_at:
+        builder.line(f"{TIMED_PROGRESS_ENDED_AT} : {ended_at}")
+    if late_seconds:
+        builder.line(f"{TIMED_PROGRESS_LATE} : {_fa_number(late_seconds)} ثانیه")
     if locked:
         builder.line(TIMED_PROGRESS_LOCKED)
     return builder.build()

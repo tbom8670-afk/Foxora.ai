@@ -1411,6 +1411,126 @@ async def _recover_and_cancel(bot, chat_id):
     return restored
 
 
+def test_07e_timed_timer_accuracy_and_counts():
+    """زمان‌بندیِ واقعی + شمارشِ واقعی در پیام وضعیت (باگِ «ساعت ۵ جای ۳»)."""
+    print("\n### ۷ه) دقتِ زمان‌بندی و شمارشِ پیام‌های پاک‌شده")
+    fresh()
+    chat_id = -(10 ** 12) - 971
+    group_storage.set_group_owner(chat_id, 4242)
+    chat = FakeChat(chat_id, locked=False)
+    bot = FakeBot(chat)
+    owner = FakeUser(4242, "owner")
+
+    # ---- ۱) زمان‌سنج باید «تیک‌دار» باشد و پایانِ بازه را از رکورد بخواند ----
+    record = timed.start(chat_id, 30, actor_id=4242)
+    check("زمان پایان = شروع + ۳۰ دقیقه",
+          abs(float(record["end_ts"]) - float(record["start_ts"]) - 1800) < 1,
+          record["end_ts"] - record["start_ts"])
+
+    async def late_wake():
+        """دستگاه/حلقه ۶ ساعت خواب بوده؛ تایمر باید همان لحظه اجرا کند."""
+        timed.reset_all()                      # همهٔ تایمرهای حافظه از بین می‌روند
+        # ابتدا پیام‌های داخل بازه ثبت می‌شوند (مثل پیام‌های واقعیِ اعضا)
+        for message_id in range(8100, 8110):
+            timed.track_message(chat_id, message_id)
+        stub = dict(record)
+        stub["end_ts"] = storage.now() - 6 * 3600    # پایان، ۶ ساعت پیش بوده
+        stub["message_ids"] = timed.tracked_ids(chat_id)
+        timed._write(chat_id, stub)
+        chat.deleted.clear()
+        # شبیه‌سازی بیدارشدن: یک تیکِ زمان‌سنج
+        timed.schedule(bot, chat_id, logger=bot.logger)
+        for _ in range(80):
+            await asyncio.sleep(0.05)
+            if (timed.get_record(chat_id) or {}).get("state") == "finished":
+                break
+        await timed.QUEUE.drain(timeout=5.0)
+        return timed.get_record(chat_id)
+
+    finished = run(late_wake())
+    check("با ۶ ساعت تأخیر، بازه بدون معطلی اجرا شد",
+          finished.get("state") == "finished", finished.get("state"))
+    # تشخیصِ ریشه‌ای‌ترین حالت: شیفتِ منطقهٔ زمانی/ساعت دیوار.
+    # اگر زمان با «ساعتِ محلی + آفست» ذخیره شود، بازه دقیقاً چند ساعت (۳:۳۰ یا
+    # ۴:۳۰) دیر اجرا می‌شد — همان چیزی که کارفرما دید (۲→۳ ساعت ۵).
+    fresh()
+    chat_tz = FakeChat(-(10 ** 12) - 974, locked=False)
+    bot_tz = FakeBot(chat_tz)
+    rec_tz = timed.start(chat_tz.chat_id, 60 if False else 30, actor_id=4242)
+    end_ts = float(rec_tz["end_ts"])
+    check("end_ts با ساعت UTC (نه ساعت محلی) ذخیره می‌شود",
+          abs(end_ts - (time.time() + 1800)) < 5, end_ts - time.time())
+    check("iso تهران با آفست +03:30 ذخیره شد",
+          "+03:30" in (rec_tz.get("end_at_tehran") or ""),
+          rec_tz.get("end_at_tehran"))
+    check("تایمر از زمان پایانِ UTC می‌خواند، نه از آفست",
+          abs(timed.remaining_seconds(chat_tz.chat_id) - 1800) < 10,
+          timed.remaining_seconds(chat_tz.chat_id))
+    # شیفتِ ۳.۵ ساعته نباید هیچ اثری روی زمان اجرا بگذارد
+    parsed = storage.parse_iso(rec_tz["end_at_tehran"])
+    check("زمانِ پایانِ ISO به همان epoch اشاره می‌کند",
+          abs(parsed.timestamp() - end_ts) < 2,
+          (parsed.timestamp(), end_ts))
+
+    check("تأخیرِ واقعی در رکورد ثبت شد تا پنهان نماند",
+          int(finished.get("late_seconds", 0)) >= 6 * 3600 - 5,
+          finished.get("late_seconds"))
+    check("همهٔ ۱۰ پیام حذف شدند", finished.get("deleted") == 10,
+          finished.get("deleted"))
+
+    # ---- ۲) شمارش در پیام وضعیت باید نوشته شود (حتی وقتی شناسه گم شده) ----
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 972, locked=False)
+    bot2 = FakeBot(chat2)
+    record2 = timed.start(chat2.chat_id, 30, actor_id=4242)
+    for message_id in range(8200, 8230):
+        timed.track_message(chat2.chat_id, message_id)
+    # پیام وضعیت بعد از تنظیم گم می‌شود (ری‌استارت/فایلِ قدیمی)
+    check("پیام وضعیت در ابتدا وجود ندارد",
+          not timed.get_record(chat2.chat_id).get("status_message_id"))
+
+    result = run(timed.finish(bot2, chat2.chat_id, logger=bot2.logger,
+                              now_ts=float(record2["end_ts"]) + 1))
+    check("همهٔ ۳۰ پیام حذف شدند", result.get("deleted") == 30, result)
+    check("پیام وضعیت در پایان ساخته شد (نتیجه گم نمی‌شود)",
+          len(bot2.client.sent) == 1, bot2.client.sent)
+    final_texts = [body for _peer, _mid, body, _ent in bot2.client.edits]
+    check("شمارشِ واقعی در پیام وضعیت نوشته شد",
+          any("تعداد پیام در حال پاک شدن : 30" in body for body in final_texts),
+          final_texts[-1][:80] if final_texts else None)
+    check("تعداد «باقی مانده» هم صفر شد",
+          any("پیام باقی مانده : 0" in body for body in final_texts),
+          final_texts[-1][:120] if final_texts else None)
+    check("زمان پایانِ تهران در پیام وضعیت آمده است",
+          any("زمان پایان :" in body for body in final_texts),
+          final_texts[-1][:160] if final_texts else None)
+    check("عنوان نهایی «انجام شد» است",
+          any("پاکسازی پیام های زماندار انجام شد" in body
+              for body in final_texts), final_texts[:1])
+
+    # ---- ۳) setTimeout نیست: لغو، تایمرِ تیک‌دار را متوقف می‌کند ----
+    fresh()
+    chat3 = FakeChat(-(10 ** 12) - 973, locked=False)
+    bot3 = FakeBot(chat3)
+    record3 = timed.start(chat3.chat_id, 30, actor_id=4242)
+    record3["end_ts"] = storage.now() + 0.4
+    timed._write(chat3.chat_id, record3)
+    timed.track_message(chat3.chat_id, 8300)
+
+    async def cancel_before_due():
+        timed.schedule(bot3, chat3.chat_id, logger=bot3.logger)
+        await asyncio.sleep(0.1)
+        timed.cancel(chat3.chat_id, reason="test")
+        await asyncio.sleep(0.8)
+        await timed.QUEUE.drain(timeout=2.0)
+        return timed.get_record(chat3.chat_id)
+
+    cancelled = run(cancel_before_due())
+    check("بعد از لغو وضعیت cancelled ماند", cancelled["state"] == "cancelled",
+          cancelled["state"])
+    check("بعد از لغو هیچ پیامی حذف نشد", chat3.deleted == [], chat3.deleted)
+
+
 def test_08_report_flow():
     print("\n### ۸) گزارش: معتبر، بدون ریپلای، خود، تکراری، ۷ ثانیه")
     fresh()
@@ -2037,6 +2157,7 @@ def main():
     test_07b_timed_survives_restart_end_to_end()
     test_07c_timed_purge_really_deletes_with_positive_group_id()
     test_07d_timed_status_peer_cancel_and_timeout()
+    test_07e_timed_timer_accuracy_and_counts()
     test_08_report_flow()
     test_09_report_decision()
     test_09c_report_warning_counts_are_real()

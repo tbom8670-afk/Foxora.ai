@@ -90,7 +90,9 @@ async def _edit(bot, chat_id, message, payload, logger=None):
     """
     text, entities = payload
     try:
-        peer = timed.group_peer(bot, chat_id)
+        # اولویت: peerِ ذخیره‌شده در رکورد (بعد از ری‌استارت هم کار می‌کند)
+        # ← کش ربات ← شناسهٔ منفیِ گروه.
+        peer = timed.resolve_peer(bot, chat_id)
         return await asyncio.wait_for(
             bot.client.edit_message(peer, message, text,
                                     formatting_entities=entities),
@@ -150,11 +152,19 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
     message_id = record.get("status_message_id") or status_id(chat_id)
     if message_id:
         return message_id
+    record_data = record or {}
+    total = record_data.get("tracked")
+    if total is None:
+        total = len(timed.tracked_ids(chat_id, record_data))
+    ended_at = record_data.get("end_at_tehran") or None
     payload = texts.timed_progress(deleted=0, failed=0, elapsed_seconds=0,
-                                   locked=True, state="running")
+                                   locked=True, state="running",
+                                   total=total, ended_at=ended_at)
     try:
         sent = await asyncio.wait_for(
-            bot.client.send_message(timed.group_peer(bot, chat_id), payload[0],
+            bot.client.send_message(timed.resolve_peer(bot, chat_id,
+                                                       record or {}),
+                                    payload[0],
                                     formatting_entities=payload[1]),
             timeout=timed.RPC_TIMEOUT)
     except Exception as error:                       # noqa: BLE001
@@ -170,13 +180,41 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
 
 
 async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked=None,
-                         state="running", logger=None):
+                         state="running", logger=None, total=None,
+                         duration_seconds=None):
+    """همان پیامِ وضعیت را با شمارشِ واقعی ویرایش می‌کند (هرگز پیام جدید).
+
+    اطلاعات از **رکوردِ پایدار** خوانده می‌شود (نه از حافظه): تعداد کل
+    شناسه‌های ثبت‌شده، زمان پایانِ ذخیره‌شده و تاخیر — تا اگر ربات/دستگاه خواب
+    بوده باشد، در همان پیام دیده شود.
+    """
+    record = timed.get_record(chat_id) or {}
     if locked is None:
-        locked = bool((timed.get_record(chat_id) or {}).get("lock_ok", False))
-    message_id = status_id(chat_id)
+        locked = bool(record.get("lock_ok", False))
+    if total is None:
+        total = record.get("tracked") if record.get("tracked") is not None \
+            else len(timed.tracked_ids(chat_id, record))
+    if duration_seconds is None and record.get("start_ts") and record.get("end_ts"):
+        duration_seconds = int(float(record["end_ts"]) -
+                               float(record["start_ts"]))
+    ended_at = record.get("end_at_tehran") or (
+        storage.iso_tehran(float(record["end_ts"]))
+        if record.get("end_ts") else None)
+    late = int(record.get("late_seconds", 0) or 0)
+    if state in {"done", "cancelled"}:
+        late = 0
+
+    message_id = status_id(chat_id) or record.get("status_message_id")
     payload = texts.timed_progress(deleted=deleted, failed=failed,
                                    elapsed_seconds=elapsed, locked=locked,
-                                   state=state)
+                                   state=state, total=total, ended_at=ended_at,
+                                   late_seconds=late)
+    if not message_id:
+        # اگر شناسهٔ پیام وضعیت به هر دلیلی نبود (ری‌استارتِ بد/فایلِ قدیمی)،
+        # همان‌جا یک پیام ساخته و ویرایش‌های بعدی روی آن انجام می‌شود — پیامِ
+        # نتیجه هرگز نباید بی‌صدا از دست برود.
+        message_id = await ensure_status_message(bot, chat_id, record=record,
+                                                 logger=logger)
     if not message_id:
         return None
     # شناسهٔ عددیِ پیام برای edit_message کافی است (همان پیامی که فرستادیم).
@@ -261,9 +299,19 @@ async def _activate(bot, event, chat_id, user_id, sender, index, logger=None):
     display = " ".join(part for part in (
         getattr(sender, "first_name", None), getattr(sender, "last_name", None))
         if part) or ""
+    # InputPeerِ گروه همان‌جا (وقتی همه‌چیز گرم است) گرفته و در رکورد
+    # ذخیره می‌شود؛ بعد از ری‌استارت بدون resolve و بدون شکست کار می‌کند.
+    peer = None
+    try:
+        cached = getattr(bot, "reply_input_peer_cache", None) or {}
+        peer = cached.get(chat_id)
+        if peer is None:
+            peer = await bot.client.get_input_entity(chat_id)
+    except Exception:                                # noqa: BLE001
+        peer = None
     try:
         record = timed.start(chat_id, minutes, actor_id=user_id, name=display,
-                             username=actor_username)
+                             username=actor_username, peer=peer)
     except (timed.AlreadyActive, timed.InvalidDuration):
         return True
 
@@ -307,8 +355,6 @@ def track(chat_id, message_id, user_id=None):
 async def publish_from_record(bot, chat_id, logger=None):
     """وضعیت نهایی را روی همان پیام وضعیت می‌نویسد."""
     record = timed.get_record(chat_id) or {}
-    if not record.get("status_message_id"):
-        return None
     started = float(record.get("start_ts", 0) or 0)
     elapsed = int(max(0, float(record.get("end_ts", 0) or 0) - started))
     return await publish_status(

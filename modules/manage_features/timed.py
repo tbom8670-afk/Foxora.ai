@@ -51,6 +51,13 @@ QUEUE = PerGroupQueue("timed_message", max_pending_per_key=64,
 FINISH_BUDGET_SECONDS = 30 * 60.0
 #: سقفِ سختِ هر تماسِ شبکه‌ای در مسیر پایان (قفل/حذف/ویرایش).
 RPC_TIMEOUT = 15.0
+#: تیکِ زمان‌سنج. خوابِ یک‌جا (مثلاً ۲۴ ساعت) در برابر تغییرِ ساعتِ دیوار و
+#: بیدارشدنِ دیرهنگامِ حلقه آسیب‌پذیر است؛ پس هر ۳۰ ثانیه بیدار می‌شویم و
+#: زمان را از **ساعت واقعی/زمانِ پایانِ ذخیره‌شده** می‌سنجیم.
+TICK_SECONDS = 30.0
+#: اگر بیشتر از این مقدار از زمانِ پایان گذشته باشد، زمان‌سنج «تاخیر» خورده
+#: و در پیام وضعیت گزارش می‌شود (کلید تشخیص باگ).
+LATE_WARN_SECONDS = 60.0
 
 
 def group_peer(bot, chat_id):
@@ -106,6 +113,41 @@ def _key(chat_id):
 def get_record(chat_id):
     data = storage.TIMED_STORAGE.load()
     return dict((data.get("groups") or {}).get(_key(chat_id)) or {}) or None
+
+
+def _serialize_peer(peer):
+    """InputPeer را به dictِ قابل‌ذخیره در JSON تبدیل می‌کند."""
+    if peer is None:
+        return None
+    channel_id = getattr(peer, "channel_id", None)
+    access_hash = getattr(peer, "access_hash", None)
+    if channel_id is None or access_hash is None:
+        return None
+    return {"channel_id": int(channel_id), "access_hash": int(access_hash),
+            "type": type(peer).__name__}
+
+
+def peer_from_record(record):
+    """InputPeer ذخیره‌شده در رکورد (اگر بود)."""
+    data = (record or {}).get("peer")
+    if not isinstance(data, dict):
+        return None
+    try:
+        from splusthon.tl import types
+
+        return types.InputPeerChannel(int(data["channel_id"]),
+                                      int(data["access_hash"]))
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def resolve_peer(bot, chat_id, record=None):
+    """peer گروه به «بهترین شکلِ ممکن»: رکورد ← کش ← شناسهٔ منفی."""
+    peer = peer_from_record(record if record is not None
+                            else get_record(chat_id))
+    if peer is not None:
+        return peer
+    return group_peer(bot, chat_id)
 
 
 def _write(chat_id, record):
@@ -230,7 +272,7 @@ class InvalidDuration(RuntimeError):
 
 
 def start(chat_id, minutes, *, actor_id=None, name="", username="",
-          status_message_id=None):
+          status_message_id=None, peer=None):
     """شروع زمان‌سنج. فقط یک اجرای هم‌زمان برای هر گروه."""
     if int(minutes) not in DURATIONS:
         raise InvalidDuration(f"duration {minutes} is not allowed")
@@ -249,6 +291,10 @@ def start(chat_id, minutes, *, actor_id=None, name="", username="",
         "actor_name": name or "",
         "actor_username": (username or "").lstrip("@"),
         "status_message_id": status_message_id,
+        # InputPeer گروه در همان لحظهٔ راه‌اندازی ذخیره می‌شود؛ بعد از
+        # ری‌استارت (که کشِ حافظه خالی است) بدون resolve و بدون شکست
+        # قابل استفاده است.
+        "peer": _serialize_peer(peer),
         "message_ids": [],
         "tracked": 0,
         "senders": {},
@@ -352,15 +398,51 @@ def schedule(bot, chat_id, *, logger=None):
     return task
 
 
-async def _timer(bot, chat_id, delay, logger):
+async def _timer(bot, chat_id, _delay, logger):
+    """تیکِ زمان‌سنج: هر ۳۰ ثانیه بیدار می‌شود و «زمان پایانِ ذخیره‌شده» را
+    می‌سنجد.
+
+    چرا تیک‌دار (و نه یک ``sleep`` یک‌جا):
+    * ``asyncio.sleep(3600)`` با تغییرِ ساعتِ دیوار یا خوابِ دستگاه/حلقه
+      دقیق نیست و می‌تواند ساعت‌ها دیر اجرا شود (باگِ گزارش‌شده: بازهٔ ۲→۳
+      ساعت ۵ اجرا شد).
+    * در هر تیک دوباره رکورد از دیسک خوانده می‌شود؛ پس «لغو»، «تمدید» و
+      تغییرِ وضعیت بلافاصله دیده می‌شوند و هیچ اجرای مرده‌ای باقی نمی‌ماند.
+    * تأخیرِ واقعی نسبت به ``end_ts`` در رکورد و لاگ ثبت می‌شود
+      (``TIMED LATE``) تا اگر سرور/دستگاه خواب بوده، پنهان نماند.
+    """
+    key = _key(chat_id)
     try:
-        if delay > 0:
-            await asyncio.sleep(delay)
+        while True:
+            record = get_record(chat_id)
+            if not record:
+                return
+            state = record.get("state")
+            if state not in {"active", "locking", "deleting"}:
+                return
+            if state == "active":
+                remaining = float(record.get("end_ts", 0)) - storage.now()
+                if remaining > 0:
+                    await asyncio.sleep(min(TICK_SECONDS, max(0.05, remaining)))
+                    continue
+                late = -remaining
+                if late >= LATE_WARN_SECONDS:
+                    log_info(logger,
+                             f"TIMED LATE chat_id={chat_id} late_seconds="
+                             f"{int(late)} end_at={record.get('end_at_tehran')}")
+                    try:
+                        current = get_record(chat_id) or record
+                        current["late_seconds"] = int(late)
+                        _write(chat_id, current)
+                    except Exception:                # noqa: BLE001
+                        pass
+            # بازه تمام شده (یا اجرای نیمه‌کاره از قبل) ⇒ همان‌جا اجرا شود.
+            await QUEUE.submit(key=key, job=lambda: finish(bot, chat_id,
+                                                           logger=logger),
+                               dedupe_key="finish", logger=logger)
+            return
     except asyncio.CancelledError:
         raise
-    try:
-        await QUEUE.submit(key=_key(chat_id), job=lambda: finish(
-            bot, chat_id, logger=logger), dedupe_key="finish", logger=logger)
     except Exception as error:                       # noqa: BLE001
         if logger is not None:
             try:
@@ -370,7 +452,7 @@ async def _timer(bot, chat_id, delay, logger):
             except Exception:                        # noqa: BLE001
                 pass
     finally:
-        _TIMERS.pop(_key(chat_id), None)
+        _TIMERS.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +469,7 @@ async def lock_group(bot, chat_id, logger=None):
         from modules.group_actions import GroupActions
 
         actions = GroupActions(bot.client, bot.logger)
-    peer = group_peer(bot, chat_id)
+    peer = resolve_peer(bot, chat_id)
     try:
         locked = await asyncio.wait_for(
             actions.lock_group(peer if peer is not None else chat_id),
@@ -482,6 +564,7 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
         record["state"] = "failed_timeout"
         record["finished_at_tehran"] = storage.iso_tehran()
         record["last_error"] = f"timeout after {FINISH_BUDGET_SECONDS}s"
+        record["timeout_retries"] = int(record.get("timeout_retries", 0) or 0) + 1
         _write(chat_id, record)
         if logger is not None:
             try:
@@ -537,6 +620,11 @@ async def _finish(bot, chat_id, *, logger=None, now_ts=None):
             except Exception:                        # noqa: BLE001
                 pass
 
+    # شناسهٔ پیام وضعیت: اگر در رکورد نیست از دیسک گرفته می‌شود.
+    disk_record = get_record(chat_id) or {}
+    if not record.get("status_message_id") and disk_record.get("status_message_id"):
+        record["status_message_id"] = disk_record["status_message_id"]
+
     # پیامِ وضعیتِ زنده فقط از این‌جا (لحظهٔ پایان بازه) ساخته می‌شود.
     ensure_status = STATUS_HOOK
     if ensure_status is not None:
@@ -545,18 +633,28 @@ async def _finish(bot, chat_id, *, logger=None, now_ts=None):
         except Exception as error:                   # noqa: BLE001
             log_info(logger, f"TIMED STATUS HOOK FAILED chat_id={chat_id} "
                              f"error={error!r}")
+    if not record.get("status_message_id"):
+        log_info(logger, f"TIMED STATUS MESSAGE MISSING chat_id={chat_id} "
+                         f"(counts will still be recorded)")
 
-    # ادغامِ شناسه‌های ضبط‌شده در حافظه (اگر رکورد هنوز active بود) با
-    # شناسه‌های پایدارِ دیسک — هیچ پیامی از بازه جا نمی‌ماند.
-    in_memory = list(record.get("message_ids") or [])
-    if in_memory and record.get("state") != "deleting":
-        record_message_ids(chat_id, record, in_memory)
-    ids = tracked_ids(chat_id, record)
+    # ادغامِ شناسه‌ها: رکوردِ روی دیسک مرجع است (ممکن است بین راه‌اندازی و
+    # پایان، پیام‌های تازه‌ای ثبت شده باشد) و شناسه‌های نسخهٔ درون‌حافظه هم
+    # اضافه می‌شوند — هیچ پیامی از بازه جا نمی‌ماند.
+    on_disk = get_record(chat_id) or {}
+    merged = list(dict.fromkeys(
+        [int(value) for value in (on_disk.get("message_ids") or [])] +
+        [int(value) for value in (record.get("message_ids") or [])] +
+        [int(value) for value in (record.get("pending_ids") or [])]))
+    if merged:
+        record["message_ids"] = merged
+        record["tracked"] = len(merged)
+    ids = merged
     record["state"] = "deleting"
     _write(chat_id, record)
     # InputPeer یک بار resolve می‌شود و به همهٔ دسته‌ها داده می‌شود
-    # (بدون RPC تکراری برای هر دسته).
-    peer = group_peer(bot, chat_id)
+    # (بدون RPC تکراری برای هر دسته). اولویت: رکورد (ذخیره‌شده در لحظهٔ
+    # راه‌اندازی) ← کش ربات ← شناسهٔ منفی.
+    peer = resolve_peer(bot, chat_id, record)
 
     deleted = 0
     failed_ids = []
@@ -617,6 +715,8 @@ async def _finish(bot, chat_id, *, logger=None, now_ts=None):
     record["finished_at_tehran"] = storage.iso_tehran()
     record["retry_rounds"] = rounds
     record["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    record["end_ts"] = float(record.get("end_ts", 0) or 0)
+    record["finished_ts"] = storage.now()
     _write(chat_id, record)
     await _emit(bot, chat_id, deleted=deleted, failed=len(failed_ids),
                 elapsed_seconds=_elapsed(), locked=locked,
@@ -700,8 +800,13 @@ async def recover_once(bot, logger=None):
     checked = 0
     resumed = 0
     for key, record in (data.get("groups") or {}).items():
-        if not isinstance(record, dict) or record.get("state") not in {
-                "active", "locking", "deleting"}:
+        if not isinstance(record, dict):
+            continue
+        state = record.get("state")
+        retryable = state in {"active", "locking", "deleting"} or (
+            state == "failed_timeout"
+            and int(record.get("timeout_retries", 0) or 0) < 3)
+        if not retryable:
             continue
         try:
             chat_id = int(key)
