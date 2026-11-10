@@ -660,14 +660,15 @@ async def _send_moderation_notification_once(
 
 
 def _manage_features():
-    """ایمپورتِ تنبلِ چهار قابلیتِ مدیریتی (بدون هزینه در استارتاپ)."""
+    """ایمپورتِ تنبلِ قابلیت‌های مدیریتی (بدون هزینه در استارتاپ)."""
     global _MANAGE_FEATURES
     if _MANAGE_FEATURES is not None:
         return _MANAGE_FEATURES or None
     try:
         from modules.manage_features import (exclusive_commands,
                                              report_commands, timed_commands,
-                                             two_factor_commands)
+                                             two_factor_commands,
+                                             violator_commands)
     except Exception as error:                       # noqa: BLE001
         print(f"MANAGE FEATURES IMPORT FAILED error={error!r}")
         _MANAGE_FEATURES = False
@@ -677,8 +678,29 @@ def _manage_features():
         "timed": timed_commands,
         "report": report_commands,
         "two_factor": two_factor_commands,
+        "violators": violator_commands,
     }
     return _MANAGE_FEATURES
+
+
+_VIOLATORS_MODULE = None
+
+
+def _violators_module():
+    """ایمپورتِ تنبلِ موتور «متخلف» برای گیتِ مسیر گرم (کش‌شده).
+
+    عمداً از ``_manage_features`` جداست: گیتِ حذف در **هر** پیام اجرا
+    می‌شود و نباید منتظرِ ایمپورتِ بقیهٔ قابلیت‌ها بماند.
+    """
+    global _VIOLATORS_MODULE
+    if _VIOLATORS_MODULE is None:
+        try:
+            from modules.manage_features import violators as _engine
+            _VIOLATORS_MODULE = _engine
+        except Exception as error:                   # noqa: BLE001
+            print(f"VIOLATORS IMPORT FAILED error={error!r}")
+            _VIOLATORS_MODULE = False
+    return _VIOLATORS_MODULE or None
 
 
 _MANAGE_FEATURES = None
@@ -4056,6 +4078,35 @@ async def handle_new_message(bot, event):
             except Exception:
                 pass
 
+        # ===== ⛔️ گیت «متخلف» — اولین نقطهٔ خط لولهٔ پیام =====
+        # پیش از ضد اسپم، بازی‌ها، آمار، فیلترها و روتر دستورها: اگر
+        # فرستنده در این گروه «متخلف» باشد، پیام بلافاصله حذف و پردازش
+        # متوقف می‌شود (حتی اگر ادمینِ گروه یا ادمینِ ثبت‌شده باشد، و حتی
+        # برای پیامِ ویرایش‌شده/رسانه/استیکر/فوروارد/via-bot). پیام‌های
+        # گروه‌های دیگر اصلاً بررسی نمی‌شوند (رکوردها per-group هستند).
+        # توقفِ پردازش با ``return`` انجام می‌شود: ربات دقیقاً یک هندلرِ
+        # NewMessage/MessageEdited ثبت کرده (``new_message_handler`` در
+        # core/bot_working_split_ok.py) و بالا روي آن هیچ هندلرِ دیگری
+        # برای همین رویداد وجود ندارد؛ ``events.StopPropagation`` عمداً
+        # raise نمی‌شود چون دیسپچرِ core آن را در ``except Exception``
+        # به‌عنوان «MESSAGE HANDLER CRASHED» لاگ می‌کرد.
+        if not event.is_private and chat_id and user_id:
+            _violators_engine = _violators_module()
+            if _violators_engine is not None:
+                try:
+                    if await _violators_engine.gate_message(
+                        bot, event, chat_id, user_id, sender,
+                        getattr(event.message, "id", None),
+                        logger=bot.logger,
+                    ):
+                        return
+                except Exception as _violator_gate_error:
+                    bot.logger.log_error(
+                        "VIOLATOR GATE FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_violator_gate_error!r}"
+                    )
+
         # Big-spam incidents are the sole opt-in per-message ID registry.
         # Capture before any later return/lock branch can race this event.
         _capture_big_spam_message(
@@ -4169,14 +4220,20 @@ async def handle_new_message(bot, event):
                     f"error={_full_purge_error!r}"
                 )
 
-        # ===== 🗂️ سه قابلیت مدیریتی: اختصاصی / پیام زماندار / گزارش =====
-        # هر سه صف، وضعیت و ذخیره‌سازی مستقل خودشان را دارند
+        # ===== 🗂️ قابلیت‌های مدیریتی: اختصاصی / پیام زماندار / گزارش / متخلف =====
+        # هر کدام صف، وضعیت و ذخیره‌سازی مستقل خودشان را دارند
         # (modules/manage_features). این قلاب فقط «تشخیص» است؛ هیچ RPC‌ای در
         # مسیر گرم انجام نمی‌شود مگر برای دستورِ خودِ قابلیت.
         if not event.is_private:
             _manage = _manage_features()
             if _manage is not None:
                 try:
+                    if _manage["violators"].is_command(message_text):
+                        if await _manage["violators"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger,
+                        ):
+                            return
                     if _manage["exclusive"].is_command(message_text):
                         if await _manage["exclusive"].handle(
                             bot, event, chat_id, user_id, sender, message_text,

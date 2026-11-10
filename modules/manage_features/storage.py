@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""🗄️ ذخیره‌سازی پایدارِ سه قابلیت جدید مدیریتی.
+"""🗄️ ذخیره‌سازی پایدارِ قابلیت‌های جدید مدیریتی.
 
-سه فایل مستقل در ``config/`` (برای اینکه خرابیِ یکی به بقیه سرایت نکند):
+چهار فایل مستقل در ``config/`` (برای اینکه خرابیِ یکی به بقیه سرایت نکند):
 
 * ``exclusive_access.json``  — فهرست کاربران «اختصاصی» هر گروه
 * ``timed_message.json``     — زمان‌سنج‌ها و پیام‌های ثبت‌شدهٔ هر اجرا
 * ``user_reports.json``      — پرونده‌های «گزارش» و محدودیت ۷ ثانیه
+* ``violators.json``         — متخلفانِ هر گروه
+                                (``{chat_id: {user_id: {since, set_by,
+                                set_by_username}}}``)
 
 قواعد مشترک (الزامات ماموریت):
 
@@ -205,6 +208,9 @@ def user_key(user_id) -> str:
 EXCLUSIVE_STORAGE = Storage("exclusive_access.json", {"groups": {}})
 TIMED_STORAGE = Storage("timed_message.json", {"groups": {}})
 REPORT_STORAGE = Storage("user_reports.json", {"groups": {}, "limits": {}})
+#: «متخلف» — ساختارِ دقیقاً مطابق خواستهٔ کارفرما:
+#: ``{chat_id: {user_id: {since, set_by, set_by_username}}}``
+VIOLATORS_STORAGE = Storage("violators.json", {})
 
 
 def reset_all():
@@ -212,3 +218,4 @@ def reset_all():
     EXCLUSIVE_STORAGE.reset()
     TIMED_STORAGE.reset()
     REPORT_STORAGE.reset()
+    VIOLATORS_STORAGE.reset()

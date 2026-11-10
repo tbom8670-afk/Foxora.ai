@@ -1093,21 +1093,25 @@ class SoroushAntiSpamBot:
             deliver_watchdog_startup_reports()
         )
 
-        # 🗂️ بازیابیِ سه قابلیت مدیریتی (اختصاصی / پیام زماندار / گزارش):
-        # زمان‌سنج‌های ذخیره‌شده بر اساس «زمان پایان» دوباره بالا می‌آیند و
-        # پرونده‌های در انتظار تصمیم مالک بازسازی می‌شوند. هیچ کدام RPC اضافه
-        # در مسیر راه‌اندازی نمی‌زند (کارها در صف اختصاصی خودشان می‌نشینند).
+        # 🗂️ بازیابیِ قابلیت‌های مدیریتی (اختصاصی / پیام زماندار / گزارش /
+        # متخلف): زمان‌سنج‌های ذخیره‌شده بر اساس «زمان پایان» دوباره بالا
+        # می‌آیند، پرونده‌های در انتظار تصمیم مالک بازسازی می‌شوند و رکوردهای
+        # «متخلف» با ایندکسِ حافظه‌ای بازسازی می‌شوند. هیچ‌کدام RPC اضافه در
+        # مسیر راه‌اندازی نمی‌زنند (کارها در صف اختصاصی خودشان می‌نشینند).
         try:
             from modules.manage_features import (exclusive_commands,
                                                  report_commands,
-                                                 timed_commands)
+                                                 timed_commands,
+                                                 violators as _violators_engine)
             _timed_restored = timed_commands.recover(self, self.logger)
             _reports_restored = report_commands.recover(self, self.logger)
             _exclusive_pending = exclusive_commands.recover(self, self.logger)
+            _violators_state = _violators_engine.recover(self, self.logger)
             self.logger.log_info(
                 "MANAGE FEATURES RECOVERY "
                 f"timed={len(_timed_restored)} reports={_reports_restored} "
-                f"exclusive={len(_exclusive_pending)}"
+                f"exclusive={len(_exclusive_pending)} "
+                f"violators={_violators_state.get('users', 0)}"
             )
             # ⏰ «تأیید دو مرحله‌ای»: مسیرِ اجرای تأییدشدهٔ ۹ دستورِ خطرناک
             # همین‌جا به روتر وصل می‌شود تا پس از رمزِ درست، همان دستور با

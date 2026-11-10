@@ -104,6 +104,7 @@ def ensure_group(data, chat_id):
             "muted": 0,
             "gifs": 0,
             "members": 0,
+            "violator_deleted": 0,
             "users": {}
         }
 
@@ -115,6 +116,9 @@ def ensure_group(data, chat_id):
         group["members"] = 0
     if not isinstance(group.get("users"), dict):
         group["users"] = {}
+    # شمارندهٔ جدأ حذف‌های قابلیت «متخلف» (کلیدهای قدیمی را هم پوشش می‌دهد).
+    if not isinstance(group.get("violator_deleted"), int):
+        group["violator_deleted"] = 0
 
     return group
 
@@ -228,6 +232,28 @@ def add_mute(chat_id):
     save_stats(data)
 
 
+def add_violator_deleted(chat_id, user_id=None, username="", count=1):
+    """شمارندهٔ **جدا** برای حذف‌های قابلیت «متخلف».
+
+    این شمارنده عمداً از ``deleted`` (حذف دستی/خودکار) و از هر مسیرِ
+    اسپم/اخطار جدا است تا حذف‌های خودکارِ متخلفان با آمار مدیریتی قاطی
+    نشوند. مقدارش از طریق ``get_stats(chat_id)["violator_deleted"]``
+    خواندنی است. (افزودنِ این کلید روی ساختار موجودِ آمار اثری ندارد؛
+    ``make_report`` و ``group_stats_report`` فقط کلیدهای خودشان را
+    می‌خوانند.)
+    """
+    count = max(0, int(count or 0))
+    if count <= 0:
+        return 0
+    data = load_stats()
+
+    group = ensure_group(data, chat_id)
+    group["violator_deleted"] = int(group.get("violator_deleted", 0)) + count
+
+    save_stats(data)
+    return group["violator_deleted"]
+
+
 def get_stats(chat_id):
     data = load_stats()
     return data.get(normalize_group_id(chat_id), {
@@ -236,6 +262,7 @@ def get_stats(chat_id):
         "kicked": 0,
         "muted": 0,
         "members": 0,
+        "violator_deleted": 0,
         "users": {}
     })
 

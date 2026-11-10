@@ -47,8 +47,9 @@ def test_blocks_count_and_contact():
     # «تماس با سازنده» = ۴۶
     # (۴ بلوک «لینک/آیدی بیو» حذف شد — قابلیت خودکار است — و ۱ بلوک
     # «پاک کامل» و ۱ بلوک «اضافه کردن کانال من برای عضویت اجباری» اضافه شد.
-    # + ۲ بلوک «اختصاصی» و «پیام زماندار» + ۱ بلوک «تأیید دو مرحله‌ای» = ۵۱)
-    assert len(bquote_entities) == 51
+    # + ۲ بلوک «اختصاصی» و «پیام زماندار» + ۱ بلوک «تأیید دو مرحله‌ای» = ۵۱
+    # + ۱ بلوک «متخلف/لغو متخلف» (پایینِ لیست) = ۵۲)
+    assert len(bquote_entities) == 52
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -121,9 +122,10 @@ def test_utf16_entities_validity():
 def test_blockquotes_span_exact_lines():
     """بررسی اینکه نقل‌قول‌های n، n2 و n3 دقیقاً تعداد خطوط مربوطه را پوشش می‌دهند."""
     bquote_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBlockquote)]
-    # ۵۱ = ۴۸ ردیفِ قبلی + ۲ نقل‌قولِ «اختصاصی»/«پیام زماندار»
-    # + ۱ نقل‌قولِ «تأیید دو مرحله‌ای دستورات خطرناک».
-    assert len(bquote_entities) == 51
+    # ۵۲ = ۴۸ ردیفِ قبلی + ۲ نقل‌قولِ «اختصاصی»/«پیام زماندار»
+    # + ۱ نقل‌قولِ «تأیید دو مرحله‌ای دستورات خطرناک»
+    # + ۱ نقل‌قولِ «متخلف/لغو متخلف».
+    assert len(bquote_entities) == 52
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -138,7 +140,8 @@ def test_bold_entities_content():
     # + 2 دستور Bold داخل بلوک عضویت اجباری («راهنمای کانال»، «راهنمای اجرا») = 51
     # + 2 بلوکِ «اختصاصی»/«پیام زماندار» که کلِ متن‌شان Bold است
     # + 1 بلوکِ «تأیید دو مرحله‌ای دستورات خطرناک» = 54
-    assert len(bold_entities) == 54
+    # + 1 بلوکِ «متخلف/لغو متخلف» (کلِ متن Bold) = 55
+    assert len(bold_entities) == 55
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
@@ -147,8 +150,9 @@ def test_bold_entities_content():
         # تمام خطوط بولد تک‌خطی‌اند، جز بلوک‌های «آماده» مثل «نمودار»،
         # «پاکسازی کامل»، «اختصاصی» و «پیام زماندار».
         if "\n" in sliced:
-            # «تأیید دو مرحله‌ای دستورات خطرناک» هم یک بلوکِ آمادهٔ چندخطی است.
-            assert sliced.startswith(("🕹️", "🔐", "🧬", "📊", "⏰")), sliced
+            # «تأیید دو مرحله‌ای دستورات خطرناک» و «متخلف» هم بلوکِ آمادهٔ
+            # چندخطی‌اند (کلِ بلوک Bold، دستورها داخل یک نقل‌قول).
+            assert sliced.startswith(("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️")), sliced
 
 
 def test_n2_and_n3_examples():

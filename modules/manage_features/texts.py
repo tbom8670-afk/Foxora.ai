@@ -491,3 +491,76 @@ TWO_FACTOR_HELP_COMMANDS = ("دو مرحله ای", "لغو دو مرحله ای
 
 #: رزروِ قالب‌های آیندهٔ کارفرما (فقط جای‌گذاری؛ هیچ متنی اختراع نمی‌شود).
 FUTURE: dict = {}
+
+
+# ---------------------------------------------------------------------------
+#  ۹) «متخلف» / «لغو متخلف» — عیناً مطابق اسکرین‌شات کارفرما
+# ---------------------------------------------------------------------------
+# در تصویر کارفرما: خطِ عنوان («⛔️ کاربر : @…») داخل نقل‌قول سروش‌پلاس و
+# کلِ متن Bold است (همان قاعدهٔ باقی قالب‌ها). ارقام لاتین.
+VIOLATOR_HEADER = "⛔️ کاربر : {user}"
+VIOLATOR_MARKED_BODY = (
+    "در لیست متخلف گروه از این پس پیام های کاربری پاک خواهد شد"
+)
+VIOLATOR_UNMARKED_BODY = (
+    "از لیست متخلف گروه از این پس کاربر میتواند پیام ارسال کند"
+)
+#: پیام‌های خطای دقیق — هر خطا پیامِ فارسیِ خودش را دارد و «موفق» فقط با
+#: RPC/ثبتِ بی‌خطا اعلام می‌شود.
+VIOLATOR_ALREADY = "این کاربر از قبل در لیست متخلف گروه است"
+VIOLATOR_MISSING = "این کاربر در لیست متخلف گروه نیست"
+VIOLATOR_PROTECTED = "این کاربر محافظت شده است و نمیتواند متخلف شود"
+VIOLATOR_NO_PERMISSION = "فقط مالک یا ادمین ثبت شده میتواند این دستور را بزند"
+VIOLATOR_NO_TARGET = "روی پیام کاربر ریپلای کنید"
+VIOLATOR_BOT_NO_RIGHTS = (
+    "ربات در این گروه حق حذف پیام ندارد؛\n"
+    "ابتدا این حق را به ربات بدهید"
+)
+VIOLATOR_CREATOR_UNKNOWN = "مالک گروه خوانده نشد؛ ثبت انجام نشد"
+VIOLATOR_NO_TARGET_ENTITY = "کاربر پیدا نشد؛ روی پیام خودش ریپلای کنید"
+VIOLATOR_FAILED = "ثبت انجام نشد؛ دوباره تلاش میشود"
+VIOLATOR_TIMEOUT = "سرور پاسخ نداد؛ دوباره تلاش میشود"
+#: اطلاعٍ ساعتی به مالک وقتی ربات حقِ حذف را از دست داده است.
+VIOLATOR_RIGHTS_LOST_TITLE = "⛔️ ربات حق حذف پیام متخلفان را ندارد"
+VIOLATOR_RIGHTS_LOST_BODY = (
+    "حذف پیام های کاربران متخلف انجام نمیشود؛\n"
+    "مالک محترم حق حذف پیام ها را به ربات بدهید"
+)
+
+_VIOLATOR_BODIES = {
+    "marked": VIOLATOR_MARKED_BODY,
+    "unmarked": VIOLATOR_UNMARKED_BODY,
+    "already": VIOLATOR_ALREADY,
+    "missing": VIOLATOR_MISSING,
+    "protected": VIOLATOR_PROTECTED,
+    "bot_no_rights": VIOLATOR_BOT_NO_RIGHTS,
+    "creator_unknown": VIOLATOR_CREATOR_UNKNOWN,
+    "no_target_entity": VIOLATOR_NO_TARGET_ENTITY,
+    "failed": VIOLATOR_FAILED,
+    "timeout": VIOLATOR_TIMEOUT,
+}
+
+
+def violator_message(*, username, kind="marked"):
+    """قالبِ «متخلف/لغو متخلف» و خطاها — عیناً مثل تصویر کارفرما.
+
+    ``kind`` ∈ {marked, unmarked, already, missing, protected,
+    bot_no_rights, creator_unknown, no_target_entity, failed, timeout}
+
+    عنوان داخل نقل‌قول، بقیهٔ متن Bold (کلِ پیام Bold است).
+    """
+    builder = _Builder()
+    builder.line(VIOLATOR_HEADER.format(user=username), quote=True)
+    body = _VIOLATOR_BODIES.get(kind, VIOLATOR_MARKED_BODY)
+    for body_line in body.split("\n"):
+        builder.line(body_line)
+    return builder.build()
+
+
+def violator_rights_lost():
+    """اطلاع به مالک: ربات حقِ حذف پیام را ندارد (عنوان در نقل‌قول)."""
+    builder = _Builder()
+    builder.line(VIOLATOR_RIGHTS_LOST_TITLE, quote=True)
+    for body_line in VIOLATOR_RIGHTS_LOST_BODY.split("\n"):
+        builder.line(body_line)
+    return builder.build()
