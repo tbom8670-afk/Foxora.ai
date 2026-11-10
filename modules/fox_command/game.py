@@ -137,8 +137,16 @@ def match_of(chat_id):
 
 
 def is_active(chat_id):
+    """آیا مسابقهٔ این گروه باز است؟
+
+    مسابقهٔ کهنه (بدون بازیکن با مهلت گذشته) «فعال» شمرده نمی‌شود تا سقف
+    «دو بازی هم‌زمان» و سایر بررسی‌ها را اشغال نکند؛ همین مسابقه با اولین
+    دستور شروع یا «شرکت» کنار گذاشته می‌شود.
+    """
     match = _MATCHES.get(chat_id)
-    return bool(match) and match.get("phase") != engine.PHASE_FINISHED
+    if not match or match.get("phase") == engine.PHASE_FINISHED:
+        return False
+    return not _is_stale(match)
 
 
 def active_count(chat_id=None):
@@ -230,17 +238,32 @@ async def _display_async(event, user, user_id, fallback="فرمانده"):
 # ---------------------------------------------------------------------------
 async def start(bot, event, chat_id, user_id, sender=None, logger=None):
     """دستور شروع. ``True`` یعنی پیام مصرف شد."""
-    existing = _MATCHES.get(chat_id)
+    existing = _fresh(chat_id)
     if existing and existing.get("phase") != engine.PHASE_FINISHED:
         # ⛔ «مرکز فرماندهی» هرگز کسی را ثبت‌نام نمی‌کند؛ ثبت‌نام فقط با
         # «شرکت» است. اگر مسابقه هنوز جا دارد، راه درست را نشانش می‌دهیم؛
         # اگر پر شده باشد، همان پیام «ظرفیت پر است».
-        await _send(bot, chat_id,
-                    T.join_word_hint() if _join_window_open(existing)
-                    else T.join_full(),
-                    event=event, logger=logger)
+        #
+        # 🐞 باگ گزارش‌شده: مسابقهٔ کهنه‌ای با صفر بازیکن (مهلتش گذشته یا
+        # ربات ری‌استارت شده) در حافظه مانده بود و مالک/فرمانده پیام
+        # «ظرفیت این مسابقه پر است» می‌گرفت. این حالت دیگر ممکن نیست:
+        # کهنه‌ها در ``_fresh`` بسته می‌شوند و «پر است» فقط وقتی می‌آید که
+        # واقعاً دو فرمانده داشته باشیم؛ فرماندهٔ همان مسابقه پیام
+        # «همین حالا داخل مسابقه هستید» می‌گیرد.
+        if engine.player_of(existing, user_id) is not None:
+            # خودِ فرمانده دستور شروع را زده؛ گفتن «ظرفیت پر است» به او غلط
+            # بود (باگ گزارش‌شده). او باید بداند داخل مسابقه است.
+            text = T.already_in_match()
+        elif _is_full(existing):
+            text = T.join_full()
+        elif _join_window_open(existing):
+            text = T.join_word_hint()
+        else:
+            text = T.already_in_match()
+        await _send(bot, chat_id, text, event=event, logger=logger)
         log(logger, f"FOX COMMAND START BLOCKED chat_id={chat_id} "
-                    f"user_id={user_id} phase={existing.get('phase')}")
+                    f"user_id={user_id} phase={existing.get('phase')} "
+                    f"players={len(existing.get('players') or [])}")
         return True
     try:
         from modules import entertainment_control
@@ -281,9 +304,19 @@ def _join_window_open(match) -> bool:
 
 
 async def _join(bot, event, chat_id, user_id, sender, logger=None):
-    """الحاق فرماندهٔ دوم با «شرکت» (تکرار ثبت‌نام و نفر سوم رد می‌شوند)."""
-    match = _MATCHES.get(chat_id)
+    """الحاق فرماندهٔ دوم با «شرکت» (تکرار ثبت‌نام و نفر سوم رد می‌شوند).
+
+    🎯 اگر بازی دیگری (بقا، خون‌آشام، …) هم در همین گروه ثبت‌نام باز کرده
+    باشد، ``game_ownership`` تعیین می‌کند این «شرکت» مالِ کدام بازی است.
+    اگر مالِ بازی دیگر باشد، اینجا هیچ پیامی فرستاده نمی‌شود (نه «ظرفیت پر
+    است»، نه «قبلاً ثبت‌نام») تا آن بازی بتواند بی‌مزاحم ثبت‌نام کند.
+    """
+    match = _fresh(chat_id)
     if not match:
+        return False
+    if not _join_is_mine(chat_id, user_id):
+        log(logger, f"FOX COMMAND JOIN RELEASED chat_id={chat_id} "
+                    f"user_id={user_id} owner=other_game")
         return False
     async with _lock(chat_id):
         display_name = await _display_async(event, sender, user_id,
@@ -379,6 +412,87 @@ async def _join_timeout(bot, chat_id, match_id, logger=None):
 # ---------------------------------------------------------------------------
 # پردازش پیام‌ها
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 🔄 مسابقهٔ کهنه (stale) — ریشهٔ پیام اشتباه «ظرفیت این مسابقه پر است ⛔»
+# ---------------------------------------------------------------------------
+JOIN_GRACE_SECONDS = 5
+
+
+def _join_expired(match) -> bool:
+    """آیا مهلت ثبت‌نام این مسابقه تمام شده است؟
+
+    مسابقه‌ای که هنوز هیچ فرمانده‌ای ندارد و مهلتش گذشته، مرده است؛ حتی اگر
+    تایمرش (به‌خاطر ری‌استارت) اجرا نشده باشد. تا وقتی کسی در آن نیست،
+    ادامهٔ همان مسابقه هیچ فایده‌ای ندارد و باید از نو ساخته شود.
+    """
+    if not match:
+        return False
+    if match.get("phase") != engine.PHASE_JOINING:
+        return False
+    deadline = float(match.get("join_deadline") or 0)
+    if not deadline:
+        return False
+    return time.time() > deadline + JOIN_GRACE_SECONDS
+
+
+def _is_stale(match) -> bool:
+    """مسابقهٔ بازِ بدون بازیکن که مهلتش گذشته = کهنه."""
+    if not match:
+        return False
+    if match.get("phase") == engine.PHASE_FINISHED:
+        return True
+    return _join_expired(match) and not (match.get("players") or [])
+
+
+def _is_full(match) -> bool:
+    return len((match or {}).get("players") or []) >= PLAYERS
+
+
+def _drop(chat_id, match, reason="stale"):
+    """بستن یک مسابقهٔ کهنه در حافظه (آرشیو روی دیسک دست‌نخورده می‌ماند)."""
+    try:
+        if match is not None:
+            match["phase"] = engine.PHASE_FINISHED
+            match["end_reason"] = reason
+            match["finished_at"] = time.time()
+            _save(match)
+            try:
+                storage.archive_match(match)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _MATCHES.pop(chat_id, None)
+    _pending_pop(chat_id)
+    for key in [k for k in _TASKS if k[0] == chat_id]:
+        _cancel(key)
+    return True
+
+
+def _fresh(chat_id):
+    """مسابقهٔ قابل‌استفادهٔ این گروه: کهنه‌ها همین‌جا کنار می‌روند."""
+    match = _MATCHES.get(chat_id)
+    if match and _is_stale(match):
+        _drop(chat_id, match, "stale")
+        return None
+    return match
+
+
+def join_owner(chat_id, user_id=None):
+    """«شرکت» در این گروه مالِ کدام بازی است؟ (``None`` = آزاد)"""
+    try:
+        from modules import game_ownership
+        return game_ownership.join_owner(chat_id, user_id)
+    except Exception:
+        return None
+
+
+def _join_is_mine(chat_id, user_id) -> bool:
+    """آیا «شرکت» باید به این بازی برسد؟ (تداخل با بقا/خون‌آشام/… حل می‌شود)"""
+    owner = join_owner(chat_id, user_id)
+    return owner is None or owner == GAME_KEY
+
+
 def claims(chat_id, text) -> bool:
     """آیا این پیام مربوط به بازی «مرکز فرماندهی» است؟
 
@@ -391,6 +505,9 @@ def claims(chat_id, text) -> bool:
     if not is_active(chat_id):
         return False
     if normalized == normalize_text(JOIN_WORD):
+        # ⚠️ وقتی چند بازی هم‌زمان در حال ثبت‌نام‌اند، «شرکت» فقط یک بار
+        # خورده می‌شود؛ این تابع می‌گوید «ممکن است مالِ من باشد» و تصمیم
+        # واقعی در ``_join`` با ``game_ownership`` گرفته می‌شود.
         return True
     return normalized in GAME_COMMANDS or _is_number(normalized)
 
@@ -456,20 +573,35 @@ async def handle_message(bot, event, chat_id, user_id, sender, text,
             return await start(bot, event, chat_id, user_id, sender, logger)
         return False
 
-    match = _MATCHES[chat_id]
+    match = _fresh(chat_id)
+    if not match or not is_active(chat_id):
+        # مسابقهٔ کهنه همین حالا بسته شد؛ دستور شروع همان بازی تازه را می‌سازد.
+        if normalized in START_COMMANDS:
+            return await start(bot, event, chat_id, user_id, sender, logger)
+        if normalized == normalize_text(JOIN_WORD):
+            return False
+        return False
     if normalized in START_COMMANDS:
         # شروعِ دوباره ممنوع: «مرکز فرماندهی» نه ثبت‌نام می‌کند نه مسابقه را
         # ری‌ست می‌کند. همه‌چیز فقط با «شرکت» (قبل از پر شدن ظرفیت) جلو می‌رود.
-        await _send(bot, chat_id,
-                    T.join_word_hint() if _join_window_open(match)
-                    else T.join_full(),
-                    event=event, logger=logger)
+        if engine.player_of(match, user_id) is not None:
+            text = T.already_in_match()
+        elif _is_full(match):
+            text = T.join_full()
+        elif _join_window_open(match):
+            text = T.join_word_hint()
+        else:
+            text = T.already_in_match()
+        await _send(bot, chat_id, text, event=event, logger=logger)
         return True
 
     # «شرکت» = الحاق فرماندهٔ دوم، فقط در مرحلهٔ ثبت‌نام و فقط یک بار.
     if normalized == normalize_text(JOIN_WORD):
         if match.get("phase") == engine.PHASE_JOINING:
             return await _join(bot, event, chat_id, user_id, sender, logger)
+        if not _join_is_mine(chat_id, user_id):
+            # «شرکت» مالِ بازی دیگری است؛ اینجا ساکت می‌مانیم.
+            return False
         await _send(bot, chat_id, T.join_full(), event=event, logger=logger)
         return True
 

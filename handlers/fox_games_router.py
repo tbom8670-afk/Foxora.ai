@@ -47,6 +47,8 @@ from handlers import fox_command_router
 # شود، بازیِ خاموش باز هم اجرا نمی‌شود. هیچ state یا تایمری پیش از این
 # گارد ساخته نمی‌شود.
 from modules import entertainment_control
+# 🎯 مالکیت مشترک «شرکت» بین بازی‌ها (یک قاعده برای همه، بدون منطق تکراری).
+from modules import game_ownership
 
 # دستورهایی که این روتر مالک آن‌هاست.
 FOX_GAME_COMMANDS = frozenset({
@@ -229,6 +231,41 @@ async def _quote_reply(event, text, parts):
 # ---------------------------------------------------------------------------
 # 😂 بخند یا بباز
 # ---------------------------------------------------------------------------
+GAME_LABELS = {
+    "survival": "بقا",
+    "vampire": "خون‌آشام",
+    "karagah": "کارگاه",
+    "zombie": "زامبی",
+    "battle": "نبرد",
+    "court": "دادگاه",
+    "fox_command": "مرکز فرماندهی",
+}
+
+
+def _joining_games(chat_id):
+    """بازی‌هایی که همین حالا در این گروه پنجرهٔ ثبت‌نام باز دارند."""
+    return [status.key for status in game_ownership.evaluate(chat_id)
+            if status.joining]
+
+
+async def _join_hint(event, chat_id, *, join_word="شرکت", extra_seconds=None):
+    """خطِ کوتاه «چند بازی هم‌زمان باز است» تا کاربر بداند «شرکت» به کدام می‌رسد.
+
+    فقط وقتی اضافه می‌شود که واقعاً بیش از یک بازی در حال ثبت‌نام باشد.
+    برای یک بازی، متن بازی هیچ تغییری نمی‌کند.
+    """
+    others = [key for key in _joining_games(chat_id)]
+    if len(others) < 2:
+        return
+    names = "، ".join(GAME_LABELS.get(key, key) for key in others)
+    await event.reply(
+        "🎯 چند بازی هم‌زمان در این گروه باز است:\n"
+        f"{names}\n\n"
+        f"واژهٔ «{join_word}» اکنون به تازه‌ترین بازیِ باز می‌رسد؛ برای بازی "
+        "دیگر صبر کنید یا آن را تازه شروع کنید."
+    )
+
+
 async def _start_laugh(bot, event, chat_id, logger):
     if laugh_or_lose.is_active(chat_id):
         await event.reply(laugh_or_lose.ALREADY_RUNNING)
@@ -1078,6 +1115,11 @@ async def _fox_command_message(bot, event, chat_id, user_id, sender, text,
 
 async def _court_message(bot, event, chat_id, user_id, sender, text, logger):
     other_joining = lambda: court_other_joining(chat_id)
+    if (not court_game_router.is_active(chat_id)
+            and game_ownership.is_join_word(text)
+            and game_ownership.blocked_by_other(chat_id, user_id, "court")):
+        # «شرکت» مالِ بازی دیگری است؛ پروندهٔ ذخیره‌شده هم نباید آن را بگیرد.
+        return False
     if court_game_router.is_active(chat_id):
         return await court_game_router.handle_message(
             bot, event, chat_id, user_id, sender, text, logger,
@@ -1478,26 +1520,65 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
             log(logger, f"FOX GAME BLOCKED chat_id={chat_id} command={command!r}")
             return True
         game_module, starter = start_games[command]
-        if not game_module.is_active(chat_id):
+        was_active = game_module.is_active(chat_id)
+        if not was_active:
             if active_game_count(chat_id) >= MAX_ACTIVE_GAMES_PER_CHAT:
                 await event.reply(LIMIT_EXCEEDED_MESSAGE)
                 return True
+        if not was_active:
+            result = await starter(bot, event, chat_id, logger)
+            if result:
+                # 🎯 اگر با این شروع دو بازی هم‌زمان در حال ثبت‌نام شوند،
+                # یک خط راهنما می‌گوید «شرکت» به کدام بازی می‌رسد. برای
+                # حالت تک‌بازی هیچ پیام اضافه‌ای فرستاده نمی‌شود.
+                await _join_hint(event, chat_id)
+            return result
+        # بازی از قبل باز است: دقیقاً مثل قبل، پیام را می‌سپاریم به خودِ بازی.
         return await starter(bot, event, chat_id, logger)
 
     # پیام‌های درون‌بازی — هر بازی فقط session خودش را می‌بینند.
-    for responder in (
-        _fox_command_message,
-        _court_message,
-        _laugh_message, _survival_message, _lucky_box_message, _vampire_message,
-        _maemma_message, _sentence_guess_message, _minesweeper_message,
-        _best_answer_message, _battle_message, _karagah_message, _zombie_message,
+    #
+    # 🎯 «شرکت» تنها واژه‌ای است که چند بازی هم‌زمان می‌شناسند. اگر در یک
+    # گروه دو بازی در پنجرهٔ ثبت‌نام باز باشد، فقط بازیِ صاحبِ «شرکت»
+    # (طبق ``modules/game_ownership``) اجازهٔ بلعیدن این پیام را دارد؛
+    # بقیه در این نوبت ساکت می‌مانند تا نه «قبلاً ثبت‌نام» غلط بفرستند و نه
+    # بازیکن را از بازی دیگر بدزدند. برای هر پیام دیگر همه مثل قبل‌اند.
+    join_word = game_ownership.is_join_word(text)
+    owner = game_ownership.join_owner(chat_id, user_id) if join_word else None
+    joining = set()
+    if join_word:
+        joining = {status.key for status in game_ownership.evaluate(chat_id, user_id)
+                   if status.joining}
+        log(logger, f"FOX GAME JOIN OWNER chat_id={chat_id} "
+                    f"user_id={user_id} owner={owner!r} joining={sorted(joining)}")
+
+    for key, responder in (
+        ("fox_command", _fox_command_message),
+        ("court", _court_message),
+        ("laugh_or_lose", _laugh_message),
+        ("survival", _survival_message),
+        ("lucky_box", _lucky_box_message),
+        ("vampire", _vampire_message),
+        ("maemma", _maemma_message),
+        ("sentence_guess", _sentence_guess_message),
+        ("minesweeper", _minesweeper_message),
+        ("best_answer", _best_answer_message),
+        ("battle", _battle_message),
+        ("karagah", _karagah_message),
+        ("zombie", _zombie_message),
     ):
+        # فقط بازیِ صاحبِ «شرکت» اجازهٔ ثبت‌نام دارد؛ بازی‌های دیگری که
+        # پنجرهٔ ثبت‌نامشان باز است در همین نوبت ساکت می‌مانند. پیام‌های
+        # درون‌بازیِ بقیه (حمله/دفاع/پاسخ/…) دست‌نخورده می‌مانند.
+        if join_word and owner is not None and key != owner and key in joining:
+            continue
         if await responder(bot, event, chat_id, user_id, sender, text, logger):
             return True
     return False
 
 
 def reset_all(chat_id=None):
+    game_ownership.reset_all(chat_id)
     laugh_or_lose.reset_all(chat_id)
     survival.reset_all(chat_id)
     lucky_box.reset_all(chat_id)
