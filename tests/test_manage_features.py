@@ -43,8 +43,8 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("BOT_INSTANCE", "test")
 os.environ.setdefault("BOT_HOME", tempfile.mkdtemp(prefix="foxora-manage-"))
 
-from splusthon.tl.types import (ChatBannedRights, MessageEntityBlockquote,
-                                MessageEntityBold)
+from splusthon.tl.types import (ChatAdminRights, ChatBannedRights,
+                                MessageEntityBlockquote, MessageEntityBold)
 
 from modules import admin_tools, group_storage
 from modules.group_actions import text_is_banned
@@ -173,9 +173,25 @@ class FakeClient:
         self.sent = []
         #: نامِ هر RPC/خواندنی که واقعاً صدا زده شده (برای سنجشِ مسیر گرم)
         self.calls = []
+        #: شناسهٔ خودِ ربات (برای پیش‌بررسیِ حقوقِ ربات در «اختصاصی»)
+        self.bot_id = 999
+        #: آیا ربات حق «افزودن ادمین» دارد؟ (تستِ سناریوی بدونِ حق)
+        self.bot_can_add_admins = True
         #: هدف‌های حذف (باید همیشه InputPeer یا شناسهٔ منفی باشند)
         self.delete_targets = []
         self.delete_effective = True
+
+    async def get_me(self):
+        return FakeUser(self.bot_id, "foxora_bot")
+
+    def _bot_rights(self):
+        flags = ("change_info", "post_messages", "edit_messages",
+                 "delete_messages", "ban_users", "invite_users", "pin_messages",
+                 "add_admins", "anonymous", "manage_call", "other",
+                 "manage_topics")
+        return ChatAdminRights(**{
+            flag: (flag == "add_admins" and self.bot_can_add_admins)
+            for flag in flags})
 
     async def get_input_entity(self, target):
         # همان شکلی که SPlusthon برای گروه و کاربر برمی‌گرداند.
@@ -206,7 +222,7 @@ class FakeClient:
                 raise ConnectionError("network down")
             self.chat.edit_banned_calls.append(request)
             participant = request.participant
-            user_id = getattr(participant, "user_id", participant)
+            user_id = _fake_user_id(participant)
             self.chat.participants[user_id] = request.banned_rights
             return True
         if name == "EditAdminRequest":
@@ -214,7 +230,7 @@ class FakeClient:
                 raise type("ChatAdminRequiredError", (Exception,), {})(
                     "CHAT_ADMIN_REQUIRED")
             self.chat.edit_admin_calls.append(request)
-            user_id = getattr(request.user_id, "user_id", request.user_id)
+            user_id = _fake_user_id(request.user_id)
             rights = request.admin_rights
             flags = ("change_info", "post_messages", "edit_messages",
                      "delete_messages", "ban_users", "invite_users",
@@ -252,10 +268,28 @@ class FakeClient:
                 self.get_participant_fails -= 1
                 raise ConnectionError("temporary")
             participant = request.participant
-            user_id = getattr(participant, "user_id", participant)
+            user_id = _fake_user_id(participant)
+            if user_id == self.bot_id:
+                # حقوقِ خودِ ربات (پیش‌بررسیِ «افزودن ادمین»)
+                flags = ("change_info", "post_messages", "edit_messages",
+                         "delete_messages", "ban_users", "invite_users",
+                         "pin_messages", "add_admins", "anonymous",
+                         "manage_call", "other", "manage_topics")
+                bot_rights = ChatAdminRights(**{
+                    flag: (flag == "add_admins" and self.bot_can_add_admins)
+                    for flag in flags})
+                return type("ChannelParticipantAdmin", (), {
+                    "banned_rights": ChatBannedRights(until_date=None),
+                    "admin_rights": bot_rights,
+                    "user_id": user_id})()
             rights = self.chat.participants.get(
                 user_id, ChatBannedRights(until_date=None, send_messages=True,
                                           send_plain=True))
+            if user_id == self.bot_id and user_id not in self.chat.admins:
+                return type("ChannelParticipantAdmin", (), {
+                    "banned_rights": ChatBannedRights(until_date=None),
+                    "admin_rights": self._bot_rights(),
+                    "user_id": user_id})()
             if user_id in self.chat.admins:
                 # ادمین‌بودن باید از نوعِ participant فهمیده شود (مثل API واقعی)
                 return type("ChannelParticipantAdmin", (), {
@@ -281,11 +315,16 @@ class FakeClient:
         self.calls.append("get_participants")
         """فهرست اعضا (و با filter، فقط ادمین‌ها) — مثل SPlusthon."""
         members = []
-        for user_id in self.chat.members:
+        member_ids = set(self.chat.members) | {self.bot_id}
+        for user_id in member_ids:
             member = FakeUser(user_id, getattr(
                 self.users.get(user_id), "username", None))
             if user_id in self.chat.admins:
                 member.participant = type("ChannelParticipantAdmin", (), {})()
+                member.is_admin = True
+            elif user_id == self.bot_id:
+                member.participant = type("ChannelParticipantAdmin", (), {
+                    "admin_rights": self._bot_rights()})()
                 member.is_admin = True
             elif user_id == self.chat.creator_id:
                 member.participant = type("ChannelParticipantCreator", (), {})()
@@ -337,10 +376,21 @@ class FakeClient:
         self.edits.append((entity, message, text,
                            list(formatting_entities or [])))
         return type("Message", (), {"id": message})()
-        return type("Message", (), {"id": message})()
 
     async def get_me(self):
-        return type("Me", (), {"username": "foxora_bot"})()
+        return FakeUser(self.bot_id, "foxora_bot")
+
+
+def _fake_user_id(value):
+    """شناسهٔ عددی از هر شکلِ آرگومان (عدد، InputPeerUser، User، FakeUser).
+
+    SPlusthon واقعی هم همین کار را می‌کند (``utils.get_input_peer``)؛ فیک هم
+    باید entity را بپذیرد تا مسیرِ واقعیِ پاس دادن entity تست شود.
+    """
+    from modules.manage_features import peers as _peers
+
+    identifier = _peers.user_identifier(value)
+    return identifier if identifier is not None else value
 
 
 def _sender_getter(user):
@@ -453,17 +503,14 @@ def test_01_exclusive_locked_and_open():
     # ⚠️ سرعت: هیچ EditBanned/خواندنِ مقدماتی در مسیر ارتقا وجود ندارد.
     check("هیچ EditBanned اضافه‌ای زده نشد (سرعت)",
           chat.edit_banned_calls == [], chat.edit_banned_calls)
-    check("در مسیر ارتقا هیچ خواندنِ اعضا/شرکت‌کننده زده نشد",
-          not [name for name in bot.client.calls
-               if name in {"GetParticipantRequest", "get_participants"}],
-          bot.client.calls)
-    check("تنها RPCهای لازم زده شد: بررسی قفل (کش‌شده) + یک ارتقا",
+    check("فهرست اعضا برای تأییدِ هدف خوانده نشد (سرعت)",
+          "get_participants" not in bot.client.calls, bot.client.calls)
+    check("تنها یک EditAdmin در مسیر ارتقا زده شد",
           [name for name in bot.client.calls
-           if name in {"EditAdminRequest", "EditBannedRequest",
-                       "GetParticipantRequest", "get_participants",
-                       "GetFullChannelRequest", "GetChannelsRequest",
-                       "get_entity"}] ==
-          ["GetFullChannelRequest", "EditAdminRequest"], bot.client.calls)
+           if name == "EditAdminRequest"] == ["EditAdminRequest"],
+          bot.client.calls)
+    check("پیش از ارتقا حقوق خودِ ربات خوانده شد (الزام)",
+          "GetParticipantRequest" in bot.client.calls, bot.client.calls)
     check("EditBanned (حذفِ بنِ اضافه) حذف شد ⇒ یک RPC کمتر",
           "EditBannedRequest" not in bot.client.calls, bot.client.calls)
     rights = chat.participants.get(777)
@@ -499,8 +546,9 @@ def test_01_exclusive_locked_and_open():
         check(f"حق «{flag}» داده نشده",
               getattr(admin_rights, flag, None) is False,
               getattr(admin_rights, flag, "missing"))
-    check("رکورد بلافاصله تأییدشده علامت خورد (پاسخِ سریع)", 
-          record["confirmed"] is True, record)
+    check("رکورد بلافاصله «ارسال‌شده» علامت خورد ولی تأیید در پس‌زمینه است",
+          record["granted"] is True and record["confirmed"] is False
+          and record.get("verified") == "pending", record)
     verified = run(exclusive.complete_verification(bot, chat.chat_id, 777))
     check("تأییدِ واقعی با GetParticipant هم انجام شد",
           verified["confirmed"] is True and
@@ -596,8 +644,11 @@ def test_02_exclusive_revoke_and_restart():
 
     entry, second = run(scenario())
     check("رکورد غیرفعال شد", entry["state"] == "revoked", entry)
-    check("مجوز واقعی برگشت (send_messages=True)",
-          text_is_banned(chat.participants[783]), chat.participants[783])
+    # ⚠️ قرارداد جدید: لغو، محدودیتِ شخصی روی کاربر نمی‌گذارد (وگرنه بعد از
+    # باز شدنِ گروه هم mute می‌ماند). عضو عادی از پیش‌فرضِ گروه ارث می‌برد.
+    check("هیچ محدودیتِ شخصی روی کاربر گذاشته نشد (mute نمی‌شود)",
+          783 not in chat.participants
+          or not text_is_banned(chat.participants[783]), chat.participants)
     check("اجرای دوبارهٔ لغو مسدود است", second == "blocked")
     check("لغو، ادمینی را با حق‌های همه-False برداشت (demote)",
           len(chat.edit_admin_calls) == 2
@@ -669,10 +720,13 @@ def test_02b_exclusive_grant_refused_by_server():
         return event.replies, jobs
 
     replies, jobs = run(scenario())
-    check("هیچ پیام «انجام نشد» ارسال نمی‌شود",
-          all("انجام نشد" not in text for text, _e in replies), replies)
-    check("به‌جای آن، قالب موفقیت ارسال می‌شود",
-          bool(replies) and "تنظیم اختصاصی" in replies[-1][0], replies)
+    # ⚠️ قرارداد جدید (الزام کارفرما): «موفق» فقط با RPCِ بی‌خطا. چون سرور
+    # ارتقا را رد کرده، پیامِ شکستِ روشن می‌آید — نه قالبِ موفقیت.
+    check("پیامِ موفقیت ارسال نمی‌شود (RPC واقعاً شکست خورد)",
+          all("تنظیم اختصاصی برای شما فعال شد" not in text for text, _e
+              in replies), replies)
+    check("پیامِ شکستِ روشن ارسال شد",
+          bool(replies) and "ارتقا انجام نشد" in replies[-1][0], replies)
     check("عنوان با نام واقعیِ کاربر در نقل‌قول است",
           "← کاربر : 『 @denied 』" in replies[-1][0], replies[-1][0])
     check("رکورد برای تلاش دوباره در فهرست بازیابی ماند",
@@ -727,8 +781,9 @@ def test_02d_exclusive_server_forces_toggles_and_lost_record():
     record = run(scenario())
     check("کاربر ادمین شد و ارسالش آزاد است",
           793 in chat.admins, chat.admins)
-    check("رکورد فعال و تأییدشده ثبت شد (تأیید سخت‌گیرِ قبلی اینجا اشتباه بود)",
-          record["state"] == "active" and record["confirmed"] is True, record)
+    check("رکورد active ثبت شد و تأیید در پس‌زمینه می‌ماند",
+          record["state"] == "active" and record["granted"] is True
+          and record.get("verified") == "pending", record)
     check("کاربر در فهرست اختصاصی دیده می‌شود",
           any(str(item["user_id"]) == "793"
               for item in exclusive.list_entries(chat_id)),
@@ -754,8 +809,8 @@ def test_02d_exclusive_server_forces_toggles_and_lost_record():
     run(exclusive.revoke(bot, chat_id, 793))
     check("لغو اختصاصی کاربر را از ادمینی درآورد", 793 not in chat.admins,
           chat.admins)
-    check("رکورد غیرفعال شد",
-          exclusive.get_entry(chat_id, 793) is None,
+    check("رکورد غیرفعال شد (state=revoked، برای تاریخچه می‌ماند)",
+          (exclusive.get_entry(chat_id, 793) or {}).get("state") == "revoked",
           exclusive.get_entry(chat_id, 793))
 
     # حتی اگر رکورد محلی نباشد ولی سرور بگوید ادمین است ⇒ باید demote شود
@@ -816,8 +871,12 @@ def test_02e_exclusive_username_grant_never_says_failed():
                                      username="Linx_two")
 
     record = run(scenario2())
+    # تأیید عمداً در پس‌زمینه است تا پاسخِ کاربر معطل نشود؛ این‌جا خودش را
+    # صریح صدا می‌زنیم و «سه‌حالته» بودن را می‌سنجیم.
+    verified = run(exclusive.complete_verification(bot2, chat2.chat_id, 992))
     check("با خطای گذرای خواندن، رکورد باز هم فعال و تأییدشده است",
-          record["state"] == "active" and record["confirmed"] is True, record)
+          record["state"] == "active" and verified["confirmed"] is True
+          and verified["state"] == "active", verified)
     check("کاربر ادمین است", 992 in chat2.admins, chat2.admins)
 
 
@@ -890,12 +949,15 @@ def test_02f_exclusive_verify_with_broken_get_participant():
         return event.replies
 
     replies3 = run(scenario3())
-    check("حتی وقتی ارتقا واقعاً انجام نشده، پیام «انجام نشد» نمی‌آید",
-          not any("انجام نشد" in t2 for t2, _e in replies3), replies3)
-    check("در این حالت هم پیام موفقیت (طبق درخواست کارفرما) ارسال می‌شود",
-          any("تنظیم اختصاصی" in t2 for t2, _e in replies3), replies3)
-    check("خطای واقعی در لاگ ثبت می‌شود",
-          any("EXCLUSIVE COMMAND LOGGED" in message
+    # الزام کارفرما: «موفق» فقط با RPCِ بی‌خطا؛ خطای واقعی به پیامِ فارسی
+    # نگاشت می‌شود و «انجام نشد» فقط وقتی است که واقعاً انجام نشده باشد.
+    check("وقتی ارتقا واقعاً انجام نشده، پیام موفقیت ارسال نمی‌شود",
+          not any("تنظیم اختصاصی برای شما فعال شد" in t2 for t2, _e in replies3),
+          replies3)
+    check("پیامِ شکستِ روشن ارسال می‌شود",
+          any("ارتقا انجام نشد" in t2 for t2, _e in replies3), replies3)
+    check("خطای واقعی با پروندهٔ کامل در لاگ ثبت می‌شود",
+          any("EXCLUSIVE GRANT REJECTED" in message
               for message in bot3.logger.errors), bot3.logger.errors)
 
 
@@ -920,9 +982,13 @@ def test_03_exclusive_auto_revoke_on_unlock():
     before, after = run(scenario())
     check("قبل از باز شدن: دو رکورد فعال", before == 2, before)
     check("بعد از باز شدن: هیچ رکورد فعالی نمی‌ماند", after == 0, after)
-    check("مجوز هر دو کاربر برگشت",
-          all(text_is_banned(chat.participants[user_id])
-              for user_id in users), chat.participants)
+    # قرارداد جدید: لغو، ban شخصی نمی‌گذارد؛ فقط ادمینی برداشته می‌شود.
+    check("مجوز هر دو کاربر برگشت (ادمین نیستند و محدودیتِ شخصی ندارند)",
+          all(user_id not in chat.admins for user_id in users)
+          and all(user_id not in chat.participants
+                  or not text_is_banned(chat.participants[user_id])
+                  for user_id in users),
+          {"admins": chat.admins, "participants": chat.participants})
     check("برای هر دو کاربر یک ارتقا و یک demote انجام شد",
           len(chat.edit_admin_calls) == 4, len(chat.edit_admin_calls))
     check("هیچ‌کدام بعد از باز شدن گروه ادمین نماندند",

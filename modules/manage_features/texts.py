@@ -240,13 +240,25 @@ EXCLUSIVE_ALREADY = "این کاربر از قبل اختصاصی است"
 EXCLUSIVE_MISSING = "این کاربر در فهرست اختصاصی نیست"
 EXCLUSIVE_NO_PERMISSION = "فقط مالک یا ادمین ثبت‌شده می‌تواند این دستور را بزند"
 EXCLUSIVE_NO_TARGET = "روی پیام کاربر ریپلای کنید یا یوزرنیم بدهید"
+#: پیام‌های خطای دقیق (بازخورد کارفرما: هر خطا باید پیامِ روشنِ خودش را
+#: داشته باشد و فقط وقتی «موفق» گفته شود که RPC واقعاً انجام شده باشد).
+EXCLUSIVE_BANNED_USER = "این کاربر از طرف ربات اخراج/بن شده؛ ابتدا «آزاد» کنید"
+EXCLUSIVE_BOT_NO_RIGHTS = (
+    "ربات در این گروه حق «افزودن ادمین» ندارد؛ ابتدا این حق را به ربات بدهید"
+)
+EXCLUSIVE_NO_TARGET_ENTITY = (
+    "کاربر پیدا نشد؛ روی پیام خودش ریپلای کنید یا یوزرنیم را درست بدهید"
+)
+EXCLUSIVE_FAILED = "ارتقا انجام نشد؛ دوباره تلاش می‌شود"
+EXCLUSIVE_TIMEOUT = "سرور پاسخ نداد؛ دوباره تلاش می‌شود"
 
 
 def exclusive_message(*, username, kind="granted"):
-    """``kind`` ∈ {granted, revoked, not_locked, already, missing}
+    """``kind`` ∈ {granted, revoked, not_locked, already, missing,
+    banned_user, bot_no_rights, no_target_entity, failed, timeout}
 
-    نکته: قالبِ «انجام نشد» عمداً حذف شده است (درخواست کارفرما) و هر خطای
-    غیرمنتظره به‌جای آن پیام موفقیت را نشان می‌دهد و در لاگ ثبت می‌شود.
+    هر خطا پیامِ فارسیِ خودش را دارد و «موفق» فقط با RPCِ بی‌خطا اعلام
+    می‌شود؛ هیچ خطایی با قالبِ موفقیت پنهان نمی‌شود.
     """
     bodies = {
         "granted": EXCLUSIVE_GRANTED,
@@ -254,6 +266,11 @@ def exclusive_message(*, username, kind="granted"):
         "not_locked": EXCLUSIVE_NOT_LOCKED,
         "already": EXCLUSIVE_ALREADY,
         "missing": EXCLUSIVE_MISSING,
+        "banned_user": EXCLUSIVE_BANNED_USER,
+        "bot_no_rights": EXCLUSIVE_BOT_NO_RIGHTS,
+        "no_target_entity": EXCLUSIVE_NO_TARGET_ENTITY,
+        "failed": EXCLUSIVE_FAILED,
+        "timeout": EXCLUSIVE_TIMEOUT,
     }
     builder = _Builder()
     builder.line(EXCLUSIVE_HEADER.format(user=username), quote=True)

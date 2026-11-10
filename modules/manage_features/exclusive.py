@@ -10,28 +10,48 @@
   (``EditAdminRequest`` + ``ChatAdminRights`` که همهٔ فلگ‌ها ``False`` است جز
   ``edit_messages``). هیچ حقِ حذف پیام / سنجاق / افزودن ادمین / تغییر اطلاعات /
   بن / دعوت / anonymous ندارد.
-* لغو: ``EditAdminRequest`` با ``ChatAdminRights()`` (همه False ⇒ demote) و بعد
-  دوباره اعمالِ محدودیتِ ارسال، تا کاربر به همان وضعیتِ عضو عادی برگردد.
-* تأییدِ نهایی همیشه با ``channels.GetParticipantRequest`` انجام می‌شود:
-  برای «فعال» باید نوعِ participant از خانوادهٔ Admin باشد، ارسالش مسدود
-  نباشد و هیچ حقِ مدیریتیِ اضافه نداشته باشد؛ برای «لغو» باید دیگر ادمین
-  نباشد و ارسالش مسدود باشد. اگر سرور این را تأیید نکند، هیچ موفقیتی
-  گزارش نمی‌شود و رکورد در وضعیت بازیابی می‌ماند.
+* لغو: ``EditAdminRequest`` با ``ChatAdminRights()`` (همه None ⇒ demote).
+  **محدودیتِ شخصی (mute) روی کاربر گذاشته نمی‌شود**: عضو عادی در گروه قفل از
+  پیش‌فرضِ گروه ارث می‌برد و بعد از «باز شدن» گروه باید بتواند بنویسد.
+  اگر از قبل محدودیتِ شخصی داشت، با ``banned_rights`` همه-False پاک می‌شود.
+* تأییدِ نهایی با ``channels.GetParticipantRequest`` انجام می‌شود و
+  **سه‌حالته** است: ``True`` (ادمین است) / ``False`` (ادمین نیست) /
+  ``None`` (نامعلوم: خطای خواندن یا تأخیرِ سرور). در حالت نامعلوم **هیچ RPCِ
+  تغییردهنده‌ای** زده نمی‌شود؛ رکورد در وضعیت بازیکابی می‌ماند.
 
-وضعیت گروه **از سرور** خوانده می‌شود (نه از حافظه) و بعد از هر تغییر دوباره
-خوانده و تأیید می‌شود؛ «قفل است» یعنی ``send_messages`` باندشده برای
-پیش‌فرضِ گروه.
+⚠️ اصلاحات مهمِ این نسخه (هر کدام با شمارهٔ گزارشِ کارفرما):
+
+1. پریستِ ``none`` حذف شد: روی سیم همان «عزل ادمین» بود (``EditAdminRequest``
+   با همهٔ فلگ‌های ``None``). ترتیبِ پریست‌ها این‌جا معنادار نیست؛ فقط یک
+   پریستِ صریح (``edit_only``) استفاده می‌شود و «موفق» فقط با RPCِ بدونِ خطا +
+   تأییدِ سرور اعلام می‌شود.
+2. تأییدِ سه‌حالته با backoffِ چندمرحله‌ای (نه ۰٫۳ ثانیه).
+3. ``get_participants`` خروجی‌اش **لیست** است (``TotalList``)، نه async
+   iterator؛ و به‌جای ``chat_id`` مثبت، ``InputPeer`` کانال داده می‌شود.
+4. لایهٔ دستور خطاها را به پیامِ فارسی نگاشت می‌کند (اینجا نوع‌های خطای
+   معنادار تعریف شده‌اند).
+5. ``entity``/``InputPeer`` کاربر در کل مسیر پاس داده می‌شود (بدون resolveِ
+   دوباره با ``get_input_entity(int)``).
+6. اگر رکورد ``active`` بود ولی سرور می‌گوید ادمین نیست ⇒ دوباره grant.
+7. هیچ ``call(client(req))`` با coroutineِ آماده: همه‌جا ``lambda``/factory.
+8. لغو، کاربر را mute نمی‌کند و ``rights_confirmed(allowed=False)`` فقط
+   «دیگر ادمین نیست» را بررسی می‌کند.
+9. قبل از grant، حقوقِ خودِ ربات خوانده می‌شود؛ اگر ``add_admins`` ندارد
+   پیام روشن داده می‌شود و ارتقای بی‌اثر «موفق» شمرده نمی‌شود.
+10. فلگ‌های ``ChatAdminRights`` با امضای واقعیِ نصب‌شده فیلتر می‌شوند،
+    ``user_peer`` خطای فنی را از «کاربر بن است» جدا می‌کند و کشِ قفل واحد است.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 from modules.group_actions import (
     GroupActions,
     clone_banned_rights,
     text_is_banned,
 )
-from modules.manage_features import storage
+from modules.manage_features import peers, storage
 from modules.manage_features.rpc import (call, flood_seconds, is_transient,
                                          log_info)
 
@@ -40,6 +60,7 @@ try:
 except ImportError:                                  # pragma: no cover
     functions = types = None
 
+
 PENDING_FLAG = "pending_revoke"
 #: ارتقا هنوز از سوی سرور تأیید نشده (برای تلاش دوباره بعد از ری‌استارت).
 PENDING_GRANT_FLAG = "pending_grant"
@@ -47,55 +68,18 @@ PENDING_GRANT_FLAG = "pending_grant"
 #: دوباره با سرور تطبیق داده می‌شوند).
 RECOVERABLE = ("active", PENDING_FLAG, PENDING_GRANT_FLAG)
 
+#: وضعیت‌های نتیجهٔ تأیید (سه‌حالته).
+VERIFIED = True
+NOT_VERIFIED = False
+UNKNOWN = None
 
-# ---------------------------------------------------------------------------
-#  دسترسی به گروه (فقط خواندن؛ هیچ تغییری در گروه_اکشنز موجود نمی‌دهیم)
-# ---------------------------------------------------------------------------
-def _actions(bot):
-    return GroupActions(bot.client, bot.logger)
-
-
-async def peer_and_channel(bot, chat_id):
-    """``(peer, input_channel)`` — اول کشِ peer، بدون resolveِ اضافه.
-
-    قبلاً هر فراخوانی یک resolve تازه می‌گرفت و در مسیر «اختصاصی» سه-چهار
-    بار تکرار می‌شد (بخشی از کندیِ ~۵۰ ثانیه‌ای). حالا هر گروه یک کشِ کوچک
-    دارد و کشِ خودِ ربات هم اولویت دارد.
-    """
-    actions = _actions(bot)
-    peer = _cached_channel_peer(bot, chat_id)
-    if peer is None:
-        peer = await actions._group_peer(chat_id)
-        _remember_channel_peer(bot, chat_id, peer)
-    if not (hasattr(peer, "channel_id") and hasattr(peer, "access_hash")):
-        raise ValueError("chat is not a channel/supergroup")
-    return peer, types.InputChannel(peer.channel_id, peer.access_hash)
-
-
-#: ``chat_key`` → ``InputPeer`` کانال (برای پرهیز از resolveِ تکراری)
-_CHANNEL_PEERS: dict = {}
-_CHANNEL_PEERS_MAX = 256
-
-
-def _cached_channel_peer(bot, chat_id):
-    from modules.manage_features import peers
-
-    peer = _CHANNEL_PEERS.get(storage.group_key(chat_id))
-    if peer is not None and hasattr(peer, "channel_id"):
-        return peer
-    candidate = peers.group_peer(bot, chat_id)
-    if candidate is not None and hasattr(candidate, "channel_id"):
-        return candidate
-    return None
-
-
-def _remember_channel_peer(bot, chat_id, peer):
-    if peer is None or not hasattr(peer, "channel_id"):
-        return peer
-    _CHANNEL_PEERS[storage.group_key(chat_id)] = peer
-    while len(_CHANNEL_PEERS) > _CHANNEL_PEERS_MAX:
-        _CHANNEL_PEERS.pop(next(iter(_CHANNEL_PEERS)), None)
-    return peer
+#: مهلتِ هر RPC در مسیر «اختصاصی» — کارفرما انتظارِ چند ثانیه‌ای دارد، نه دقیقه.
+GRANT_RPC_TIMEOUT = 6.0
+#: مهلتِ خواندن‌های تأیید (کمی بیشتر؛ خواندنِ وضعیت سبک است).
+VERIFY_RPC_TIMEOUT = 8.0
+#: backoffِ خواندنِ تأیید (ثانیه). قبلاً یک ``sleep(0.3)`` بود که برای سرورِ
+#: سروش کافی نیست؛ این ترتیب جمعاً ~۴٫۵ ثانیه صبر می‌کند.
+VERIFY_BACKOFF = (0.0, 0.5, 1.5, 2.5)
 
 
 class ExcludedUser(RuntimeError):
@@ -106,67 +90,101 @@ class ExcludedUser(RuntimeError):
     """
 
 
-async def user_peer(bot, chat_id, user_id):
-    """«آزاد نشده» بودن کاربر را چک می‌کند و InputPeer او را می‌دهد."""
-    from modules import banned_storage
+class GrantRejected(RuntimeError):
+    """سرور ارتقا را رد کرد (خطای قطعی، بدون ابهام)."""
 
-    try:
-        if banned_storage.is_banned(chat_id, user_id):
-            raise ExcludedUser(
-                f"user {user_id} is still banned by the bot in {chat_id}")
-    except ExcludedUser:
-        raise
-    except Exception:                                # noqa: BLE001
-        # اگر خودِ بررسی خطا داد، اجازه نمی‌دهیم (fail-closed).
-        raise ExcludedUser("ban check failed; refusing to grant rights")
 
-    peer, _channel = await peer_and_channel(bot, chat_id)
-    try:
-        return await bot.client.get_input_entity(int(user_id))
-    except Exception:                                # noqa: BLE001
-        # آخرین تلاش: شناسهٔ عددی خام (SPlusthon خودش resolve می‌کند)
-        return int(user_id)
+class BotLacksRights(RuntimeError):
+    """ربات خودش حقِ لازم را در گروه ندارد (مثلاً «افزودن ادمین»).
+
+    در این حالت هیچ درخواستی فرستاده نمی‌شود؛ «ارتقای بی‌اثر» هرگز موفق
+    شمرده نمی‌شود.
+    """
+
+
+class TargetChanged(RuntimeError):
+    """هدف پیدا نشد/کش نشد (entity نامعتبر) — نباید «موفق» اعلام شود."""
+
+
+class NotLocked(RuntimeError):
+    """گروه قفل نیست ⇒ استثنا معنا ندارد."""
+
+
+class AlreadyExclusive(RuntimeError):
+    pass
+
+
+class NotExclusive(RuntimeError):
+    pass
 
 
 # ---------------------------------------------------------------------------
-#  وضعیت واقعیِ گروه و مجوز
+#  دسترسی به گروه (فقط خواندن؛ هیچ تغییری در group_actions نمی‌دهیم)
 # ---------------------------------------------------------------------------
-#: مدت اعتبارِ نتیجهٔ «گروه قفل است». برای دستورِ «اختصاصی» کوتاه است تا پس
-#: از باز شدنِ گروه، ثبتِ جدید اشتباهاً مجاز نشود؛ ولی همان یک بار هم کافی است
-#: که مسیر گرم (بررسی هر پیام) هیچ RPCای نزند.
-LOCK_CACHE_TTL = 20.0
-#: مهلتِ هر RPC در مسیر «اختصاصی» — کارفرما انتظارِ چند ثانیه‌ای دارد، نه دقیقه.
-GRANT_RPC_TIMEOUT = 6.0
-#: ``chat_key`` → ``(ts_monotonic, locked)``
-_LOCKED_CACHE: dict = {}
+def _actions(bot):
+    return GroupActions(bot.client, bot.logger)
 
 
+def _cached_channel(bot, chat_id):
+    """InputPeerِ کانال از کش (بدون RPC) یا ``None``."""
+    return peers.channel_peer(bot, chat_id)
+
+
+def _remember_channel(bot, chat_id, peer):
+    return peers.remember_channel_peer(bot, chat_id, peer)
+
+
+async def _require_channel(bot, chat_id):
+    """``(peer, InputChannel)`` با خطای **واضح** اگر گروه کانال/سوپرگروه نبود.
+
+    ``EditAdminRequest`` فقط ``InputChannel`` می‌پذیرد؛ اگر peer از نوع چتِ
+    معمولی باشد نتیجه TypeError/خطای مبهم است. این‌جا یک استثنای معنادار
+    می‌دهیم تا لایهٔ دستور پیامِ فارسیِ درست بدهد.
+    """
+    # ترتیب: ۱) کشِ کانالِ این ماژول، ۲) کشِ ربات + resolveِ واقعی، ۳) خطا.
+    peer = _cached_channel(bot, chat_id)
+    if peer is None:
+        try:
+            peer = await _actions(bot)._group_peer(chat_id)
+        except Exception as error:                   # noqa: BLE001
+            raise TargetChanged(
+                f"could not resolve group peer for {chat_id}: {error!r}"
+            ) from error
+    if not (hasattr(peer, "channel_id") and hasattr(peer, "access_hash")):
+        raise TargetChanged(
+            "group peer is not a channel/supergroup "
+            f"(type={type(peer).__name__}); EditAdmin needs InputChannel "
+            "⇒ گروه باید سوپرگروه/کانال باشد و ربات باید آن را resolve کند")
+    _remember_channel(bot, chat_id, peer)
+    return peer, types.InputChannel(peer.channel_id, peer.access_hash)
+
+
+async def peer_and_channel(bot, chat_id):
+    """``(peer, input_channel)`` — امضای قدیمی، حالا با خطای واضح."""
+    return await _require_channel(bot, chat_id)
+
+
+# ---------------------------------------------------------------------------
+#  وضعیت قفل (کشِ واحد در peers)
+# ---------------------------------------------------------------------------
 def lock_state_cached(chat_id):
-    entry = _LOCKED_CACHE.get(storage.group_key(chat_id))
-    if not entry:
-        return None
-    stamp, locked = entry
-    if storage.monotonic() - stamp > LOCK_CACHE_TTL:
-        _LOCKED_CACHE.pop(storage.group_key(chat_id), None)
-        return None
-    return bool(locked)
+    return peers.lock_state_cached(chat_id)
 
 
 def remember_lock_state(chat_id, locked):
-    _LOCKED_CACHE[storage.group_key(chat_id)] = (storage.monotonic(),
-                                                 bool(locked))
-    return locked
+    return peers.remember_lock_state(chat_id, locked)
 
 
 def forget_lock_state(chat_id):
-    _LOCKED_CACHE.pop(storage.group_key(chat_id), None)
+    return peers.forget_lock_state(chat_id)
 
 
 async def is_group_locked(bot, chat_id) -> bool:
     """آیا گروه الان برای اعضای عادی قفل است؟ (پاسخ از سرور)
 
-    ⚠️ سرعت: اگر نتیجهٔ تازه (< ۲ دقیقه) در حافظه باشد، همان استفاده می‌شود؛
-    فقط یک بار در هر دو دقیقه (و فقط هنگام ثبتِ اختصاصی جدید) خوانده می‌شود.
+    ⚠️ سرعت: اگر نتیجهٔ تازه (< ``peers.LOCK_CACHE_TTL``) در حافظه باشد، همان
+    استفاده می‌شود؛ فقط یک بار در هر دوره (و فقط هنگام ثبتِ اختصاصی جدید)
+    خوانده می‌شود.
     """
     cached = lock_state_cached(chat_id)
     if cached is not None:
@@ -181,254 +199,238 @@ async def is_group_locked(bot, chat_id) -> bool:
 
 async def _group_peer_fast(bot, chat_id):
     """``InputPeer`` گروه از کش یا (در بدترین حالت) یک resolve."""
-    from modules.manage_features import peers
-
-    cached = peers.group_peer(bot, chat_id)
-    if cached is not None and hasattr(cached, "channel_id"):
+    cached = _cached_channel(bot, chat_id)
+    if cached is not None:
         return cached
     return await _actions(bot)._group_peer(chat_id)
 
 
-ALL_ADMIN_FLAGS = ("change_info", "post_messages", "edit_messages",
-                   "delete_messages", "ban_users", "invite_users",
-                   "pin_messages", "add_admins", "anonymous", "manage_call",
-                   "other", "manage_topics", "post_stories", "edit_stories",
-                   "delete_stories")
+# ---------------------------------------------------------------------------
+#  حقوق ادمینی — فقط فلگ‌های واقعیِ نسخهٔ نصب‌شده
+# ---------------------------------------------------------------------------
+def _admin_rights_signature():
+    """نامِ فلگ‌های واقعیِ ``ChatAdminRights`` در نسخهٔ نصب‌شده.
 
-#: حالت‌های ارتقا به‌ترتیبِ اولویت. همهٔ فلگ‌ها **صریح** False داده می‌شوند
-#: (None یعنی «سرور خودش تصمیم بگیرد» و در سروش باعث روشن شدنِ
-#: «تغییر اطلاعات گروه» و «سنجاق پیام‌ها» می‌شد).
-#: نامِ presetِ پیش‌فرض: ادمینِ واقعی با فقط «ویرایشِ پیام خودش».
-#: ⚠️ بازخورد کارفرما: «باید ادمینِ واقعیِ گروه بشه و دسترسی پیام دادن داشته
-#: باشه». «ارسال پیام» در سروش یک حقِ ادمینیِ جدا ندارد؛ انتخابِ `edit_messages`
-#: (بدون `post_messages`) کاری می‌کند که آیکون «ارسال» برای کاربر باز شود، بدونِ
-#: آنکه بتواند در کانال پست کند. `change_info`/`pin_messages`/`delete_messages` و
-#: بقیهٔ حق‌های مدیریتی صریحاً False می‌مانند.
+    اگر کتابخانه در دسترس نباشد، فهرستِ محافظه‌کارانهٔ زیر استفاده می‌شود.
+    """
+    fallback = ("change_info", "post_messages", "edit_messages",
+                "delete_messages", "ban_users", "invite_users", "pin_messages",
+                "add_admins", "anonymous", "manage_call", "other",
+                "manage_topics")
+    if types is None:
+        return fallback
+    try:
+        params = inspect.signature(types.ChatAdminRights.__init__).parameters
+    except (TypeError, ValueError):                   # pragma: no cover
+        return fallback
+    names = [name for name in params if name != "self"]
+    return tuple(names) if names else fallback
+
+
+#: همهٔ فلگ‌های معتبرِ همین نسخه (شامل post_stories/… اگر وجود داشته باشند).
+ALL_ADMIN_FLAGS = _admin_rights_signature()
+
+#: حق‌هایی که در هیچ حالتی به کاربرِ «اختصاصی» داده نمی‌شوند.
+SENSITIVE_ADMIN_FLAGS = tuple(
+    flag for flag in ALL_ADMIN_FLAGS
+    if flag not in {"edit_messages"}
+)
+#: حق‌هایی که واقعاً برای «فقط ارسال پیام» لازم است.
+SEND_ONLY_FLAGS = {"edit_messages": True}
+
+#: تنها پریستِ مجاز. ``none`` (همه False) روی سیم = **عزلِ ادمین** است و
+#: هرگز نباید در مسیر ارتقا استفاده شود.
+ADMIN_RIGHT_PRESETS = (("edit_only", dict(SEND_ONLY_FLAGS)),)
 PRIMARY_PRESET = "edit_only"
 
-ADMIN_RIGHT_PRESETS = (
-    # فقط ویرایشِ پیام خودش ⇒ ارسال برای کاربر باز می‌شود (پیش‌فرض).
-    ("edit_only", {"edit_messages": True}),
-    # پشتیبانِ سرورهای سخت‌گیر که این حالت را demote می‌کنند.
-    ("none", {}),
-)
 
+def admin_rights_for(preset=None):
+    """``ChatAdminRights`` با فلگ‌های **صریح** برای حالتِ ``edit_only``.
 
-def admin_rights_for(preset):
-    """``ChatAdminRights`` با همهٔ فلگ‌های صریح برای یک حالت."""
+    همهٔ فلگ‌های شناخته‌شده صریح ``False`` هستند (نه ``None``)، چون ``None``
+    یعنی «سرور خودش تصمیم بگیرد» و در سروش «تغییر اطلاعات گروه» و «سنجاق
+    پیام‌ها» را روشن می‌کند.
+    """
     values = {flag: False for flag in ALL_ADMIN_FLAGS}
-    values.update(preset or {})
+    values.update(SEND_ONLY_FLAGS)
     return types.ChatAdminRights(**values)
 
 
 def send_only_admin_rights():
-    """حالتِ حداقلی (سازگاری عقب‌رو): ادمین با فقط حقِ ویرایشِ پیام خودش."""
-    return admin_rights_for(dict(ADMIN_RIGHT_PRESETS[1][1]))
+    """سازگاری عقب‌رو: همان پریستِ ``edit_only``."""
+    return admin_rights_for(PRIMARY_PRESET)
 
 
-async def _apply_admin_rights(bot, channel, participant, preset, chat_id,
-                              user_id):
-    """یک بار ارتقا با حق‌های مشخص را انجام می‌دهد."""
-    await call(
-        bot.client(functions.channels.EditAdminRequest(
-            channel=channel, user_id=participant,
-            admin_rights=admin_rights_for(preset), rank="")),
-        logger=bot.logger,
-        what=f"EXCLUSIVE GRANT chat={chat_id} user={user_id}",
-    )
+def has_sensitive_right(admin_rights) -> bool:
+    """آیا حقِ حساسی (به‌جز ویرایشِ پیامِ خودش) روشن است؟"""
+    if admin_rights is None:
+        return False
+    return any(bool(getattr(admin_rights, flag, False))
+               for flag in SENSITIVE_ADMIN_FLAGS)
 
 
-async def is_promoted(bot, chat_id, user_id) -> bool:
-    """آیا سرور می‌گوید این کاربر ادمینِ گروه است؟ (چند مسیرِ تأیید)"""
-    participant_obj = await read_participant(bot, chat_id, user_id)
-    if is_admin_participant(participant_obj):
-        return True
-    listed = await _admin_in_participants_list(bot, chat_id, user_id)
-    return bool(listed)
+def has_any_management_right(admin_rights) -> bool:
+    """آیا حقِ ادمینی به‌جز «ارسال/ویرایش پیام» هم دارد؟ (نام قدیمی)"""
+    return has_sensitive_right(admin_rights)
 
 
-#: حداقل زمانِ صبر برای تأییدِ «ادمین شد» — کوتاه است تا پاسخ کند نباشد.
-FAST_VERIFY_WAIT = 0.3
+# ---------------------------------------------------------------------------
+#  کاربر: entity و InputUser
+# ---------------------------------------------------------------------------
+async def user_peer(bot, chat_id, user_id, *, entity=None):
+    """InputUser/entity کاربر + بررسی «آزاد نشده».
 
-
-async def _edit_admin(bot, channel, participant, preset, chat_id, user_id):
-    """یک ``EditAdminRequest`` با مهلتِ کوتاه (بدون سه-بار تلاشِ پیش‌فرض)."""
-    return await asyncio.wait_for(
-        bot.client(functions.channels.EditAdminRequest(
-            channel=channel, user_id=participant,
-            admin_rights=admin_rights_for(preset), rank="")),
-        timeout=GRANT_RPC_TIMEOUT)
-
-
-async def grant_participant_rights(bot, chat_id, user_id):
-    """کاربر را ادمین گروه می‌کند و **بی‌درنگ** نتیجه را برمی‌گرداند.
-
-    ⚠️ بازنویسیِ سرعت (بازخورد کارفرما: «این متن بعد یک دقیقه ارسال می‌شد»):
-
-    * هیچ خواندنِ مقدماتی (GetParticipant / فهرست اعضا / وضعیت قفل) پیش از
-      RPC وجود ندارد؛ فقط یک ``EditAdminRequest``.
-    * ``EditBanned`` غیرضروری حذف شد: کاربرِ عادی در گروه قفل، در
-      ``banned_rights`` بن نشده است و ارتقا به ادمین کافی است.
-    * مهلتِ هر RPC کوتاه است (``GRANT_RPC_TIMEOUT``) و تلاش دوباره فقط برای
-      خطای گذرا — قبلاً هر RPC می‌توانست ۳ بار × ۱۰ ثانیه = ۳۰ ثانیه صبر کند
-      و دو مسیرِ تأیید هم پشتِ هم ۳۰ ثانیهٔ دیگر می‌خوردند.
-    * «موفق» یعنی ربات درخواست را **بدون خطا** فرستاد (ادمین‌شدن را کاربر در
-      همان لحظه می‌بیند)؛ تأییدِ کاملِ سمتِ سرور در پس‌زمینه انجام می‌شود.
+    * خطای **فنی**ِ ``banned_storage`` دیگر با «کاربر واقعاً بن است» قاطی
+      نمی‌شود: اگر خواندنِ وضعیت بن شکست بخورد فقط لاگ می‌شود و جلوی کار را
+      نمی‌گیرد (fail-open در برابر خرابیِ فایل، ولی با لاگِ صریح).
+    * اگر ``entity`` از قبل داریم، هیچ RPCای زده نمی‌شود.
+    * شناسه‌های ``str``/``int`` نرمال می‌شوند.
     """
-    peer = _cached_channel_peer(bot, chat_id)
-    if peer is None:
-        peer = await _actions(bot)._group_peer(chat_id)
-    _remember_channel_peer(bot, chat_id, peer)
-    channel = types.InputChannel(peer.channel_id, peer.access_hash)
-    participant = await user_peer(bot, chat_id, user_id)
+    from modules import banned_storage
 
-    applied = None
+    identifier = peers.user_identifier(entity) if entity is not None \
+        else peers.user_identifier(user_id)
+    if identifier is None:
+        raise TargetChanged(f"invalid user identity: {user_id!r}")
+
+    try:
+        banned = banned_storage.is_banned(chat_id, identifier)
+    except Exception as error:                       # noqa: BLE001
+        # خطای فنی (فایل/SQLite) — «بن است» نیست، فقط لاگ می‌شود.
+        log_info(bot.logger,
+                 "EXCLUSIVE BAN CHECK FAILED (technical, continuing) "
+                 f"chat_id={chat_id} user_id={identifier} error={error!r}")
+        banned = False
+    if banned:
+        raise ExcludedUser(
+            f"user {identifier} is still banned by the bot in {chat_id}")
+
+    resolved, resolved_id = await peers.resolve_user(bot, entity if entity
+                                                     is not None
+                                                     else identifier,
+                                                     chat_id=chat_id)
+    if resolved is None:
+        raise TargetChanged(f"could not resolve user {identifier}")
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+#  خواندنِ وضعیت واقعی (سه‌حالته)
+# ---------------------------------------------------------------------------
+async def read_participant(bot, chat_id, user_id, *, entity=None,
+                           attempts=2, backoff=(0.0, 0.5)):
+    """شرکت‌کنندهٔ واقعی از سرور یا ``None`` (و «نمی‌دانم» را از «خطا» جدا می‌کند).
+
+    خروجی: ``(participant_or_None, error_or_None)``.
+
+    * ``(obj, None)``    ⇒ خواندن موفق بود.
+    * ``(None, error)``  ⇒ خطا (شبکه/مجوز) — یعنی وضعیت **نامعلوم** است.
+    """
+    _peer, channel = await _require_channel(bot, chat_id)
+    participant = await user_peer(bot, chat_id, user_id, entity=entity)
     last_error = None
-    for name, preset in ADMIN_RIGHT_PRESETS:
-        attempt = 0
-        while attempt < 2:
-            attempt += 1
-            try:
-                await _edit_admin(bot, channel, participant, preset, chat_id,
-                                  user_id)
-                applied = name
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:               # noqa: BLE001
-                last_error = error
-                seconds = flood_seconds(error)
-                if seconds is not None and seconds <= 2 and attempt < 2:
-                    await asyncio.sleep(seconds)
-                    continue
-                if is_transient(error) and attempt < 2:
-                    await asyncio.sleep(0.2)
-                    continue
-                log_info(bot.logger,
-                         f"EXCLUSIVE GRANT RPC FAILED chat_id={chat_id} "
-                         f"user_id={user_id} preset={name} error={error!r}")
-                break
-        if applied is not None:
-            log_info(bot.logger,
-                     f"EXCLUSIVE GRANT RPC OK chat_id={chat_id} "
-                     f"user_id={user_id} preset={applied}")
-            return applied
-    # همهٔ حالت‌ها رد شدند؛ اگر خطای دائمی داشته‌ایم همان را بالا می‌دهیم.
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(f"server refused every admin preset for {user_id}")
-
-
-async def verify_promotion(bot, chat_id, user_id, *, wait=FAST_VERIFY_WAIT):
-    """تأییدِ کوتاهِ «ادمین شد» (فقط برای لاگ/ثباتِ رکورد؛ مسیر کاربر نیست)."""
-    for delay in (0.0, wait):
+    for index, delay in enumerate(tuple(backoff)[:max(1, attempts)]):
         if delay:
             await asyncio.sleep(delay)
         try:
-            if await is_promoted(bot, chat_id, user_id):
-                return True
-        except Exception:                            # noqa: BLE001
+            # ⚠️ factory (lambda) نه coroutine آماده: هر تلاش باید بتواند
+            # درخواستِ تازه بسازد (وگرنه RuntimeError).
+            result = await call(
+                (lambda: bot.client(functions.channels.GetParticipantRequest(
+                    channel=channel, participant=participant))),
+                logger=bot.logger,
+                timeout=VERIFY_RPC_TIMEOUT,
+                max_retry=1,
+                what=f"EXCLUSIVE READ chat={chat_id} user={user_id}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:                   # noqa: BLE001
+            last_error = error
+            log_info(bot.logger,
+                     "EXCLUSIVE READ FAILED "
+                     f"chat_id={chat_id} user_id={user_id} "
+                     f"attempt={index + 1} error={error!r}")
             continue
-    return False
-
-
-async def revoke_participant_rights(bot, chat_id, user_id) -> bool:
-    """حذف کاملِ دسترسی: هم ادمینیِ ارتقایافته، هم مجوز ارسال برداشته می‌شود."""
-    _peer, channel = await peer_and_channel(bot, chat_id)
-    participant = await user_peer(bot, chat_id, user_id)
-    # ۱) برگرداندن به عضو عادی (همهٔ حق‌های ادمینی False ⇒ demote).
-    await call(
-        bot.client(functions.channels.EditAdminRequest(
-            channel=channel, user_id=participant,
-            # ⚠️ برای demote عمداً ``ChatAdminRights()`` (همه None) فرستاده
-            # می‌شود: روی سیم همان «همه False» است و از «ارتقای بی‌حق»
-            # (که همهٔ فلگ‌هایش صریح False است) قابل تفکیک می‌ماند.
-            admin_rights=types.ChatAdminRights(), rank="")),
-        logger=bot.logger,
-        what=f"EXCLUSIVE DEMOTE chat={chat_id} user={user_id}",
-    )
-    # ۲) و محدودیت ارسالِ پیش‌فرضِ گروه دوباره اعمال شود.
-    await call(
-        bot.client(functions.channels.EditBannedRequest(
-            channel=channel, participant=participant,
-            banned_rights=clone_banned_rights(None, send_messages=True,
-                                              send_plain=True))),
-        logger=bot.logger,
-        what=f"EXCLUSIVE REVOKE chat={chat_id} user={user_id}",
-    )
-    log_info(bot.logger,
-             f"EXCLUSIVE REVOKE RPC OK chat_id={chat_id} user_id={user_id}")
-    return True
-
-
-#: فیلترِ فهرست شرکت‌کنندگان = ادمین‌ها (اگر کتابخانه آن را داشته باشد).
-def _admins_filter():
-    try:
-        return types.ChannelParticipantsAdmins()
-    except Exception:                                # noqa: BLE001
-        return None
+        # خروجیِ GetParticipantRequest یک ``channels.ChannelParticipant`` است
+        # که فیلد ``participant`` دارد؛ شکل‌های دیگر هم تحمل می‌شوند.
+        return getattr(result, "participant", result), None
+    return None, last_error
 
 
 async def _admin_in_participants_list(bot, chat_id, user_id):
-    """آیا کاربر در فهرست **ادمین‌های** گروه دیده می‌شود؟
+    """تأییدِ دوم: آیا کاربر در فهرست **ادمین‌های** گروه است؟
 
-    این مسیرِ دومِ تأیید است (بدون GetParticipant)؛ برای سرورهایی که
-    ``GetParticipant`` را با خطای دائمی رد می‌کنند و باعث می‌شد ربات
-    «انجام نشد» بدهد در حالی که کاربر واقعاً ادمین شده بود.
+    خروجی سه‌حالته: ``True`` / ``False`` / ``None`` (نامعلوم).
+
+    ⚠️ اصلاح باگِ واقعی: ``client.get_participants(...)`` در SPlusthon یک
+    **``TotalList``** برمی‌گرداند (نه async-iterator)؛ پیمایش با ``async for``
+    در نسخهٔ قبلی ``TypeError`` می‌داد و چون خفه می‌شد، همیشه «نامعلوم»
+    می‌شد. هم‌چنین به‌جای ``chat_id`` مثبت باید ``InputPeer`` کانال داده شود.
     """
-    try:
-        participants = await bot.client.get_participants(
-            chat_id, filter=_admins_filter(), limit=200)
-    except TypeError:
+    peer = await _group_peer_fast(bot, chat_id)
+    wanted = peers.user_key(user_id)
+    kwargs_variants = (
+        {"filter": types.ChannelParticipantsAdmins(), "limit": 200},
+        {"limit": 200},
+        {},
+    )
+    last_error = None
+    participants = None
+    for kwargs in kwargs_variants:
         try:
-            participants = await bot.client.get_participants(chat_id)
-        except Exception:                            # noqa: BLE001
-            return None
-    except Exception:                                # noqa: BLE001
-        return None
-    wanted = str(storage.user_key(user_id))
-    try:
-        async for member in participants:
-            member_id = getattr(member, "id", None)
-            if member_id is not None and str(storage.user_key(member_id)) == wanted:
-                participant = getattr(member, "participant", None)
-                cls = (participant.__class__.__name__.lower()
-                       if participant is not None else "")
-                if "admin" in cls or "creator" in cls or \
-                        getattr(member, "is_admin", False) or \
-                        getattr(member, "is_creator", False):
-                    return True
-                return False
-    except Exception:                                # noqa: BLE001
-        return None
-    return False   # در فهرست ادمین‌ها نبود
-
-
-async def read_participant(bot, chat_id, user_id):
-    """شرکت‌کنندهٔ واقعی از سرور (برای تأیید نهایی)."""
-    _peer, channel = await peer_and_channel(bot, chat_id)
-    participant = await user_peer(bot, chat_id, user_id)
-    try:
-        result = await call(
-            bot.client(functions.channels.GetParticipantRequest(
-                channel=channel, participant=participant)),
-            logger=bot.logger,
-            what=f"EXCLUSIVE READ chat={chat_id} user={user_id}",
-        )
-    except Exception as error:                       # noqa: BLE001
+            participants = await call(
+                (lambda kw=dict(kwargs): bot.client.get_participants(
+                    peer, **kw)),
+                logger=bot.logger,
+                timeout=VERIFY_RPC_TIMEOUT,
+                max_retry=1,
+                what=f"EXCLUSIVE LIST ADMINS chat={chat_id}",
+            )
+            break
+        except asyncio.CancelledError:
+            raise
+        except TypeError as error:                   # فیلترِ ناموجود در این نسخه
+            last_error = error
+            continue
+        except Exception as error:                   # noqa: BLE001
+            last_error = error
+            break
+    if participants is None:
         log_info(bot.logger,
-                 f"EXCLUSIVE READ FAILED chat_id={chat_id} "
-                 f"user_id={user_id} error={error!r}")
-        return None
-    # GetParticipantRequest خروجی‌اش خودِ participant است (نه wrapper)؛
-    # هر دو شکل را تحمل می‌کنیم تا با تغییر نسخهٔ کتابخانه نشکند.
-    return getattr(result, "participant", result)
+                 "EXCLUSIVE LIST ADMINS FAILED "
+                 f"chat_id={chat_id} user_id={user_id} error={last_error!r}")
+        return UNKNOWN
 
+    # TotalList ⇒ لیستِ ساده؛ اما هر شکلِ قابلِ پیمایش یا async را هم می‌پذیریم.
+    members = participants
+    if hasattr(participants, "__aiter__") and not isinstance(
+            participants, (list, tuple)):
+        try:
+            members = [member async for member in participants]
+        except Exception as error:                   # noqa: BLE001
+            log_info(bot.logger,
+                     "EXCLUSIVE LIST ADMINS ITER FAILED "
+                     f"chat_id={chat_id} error={error!r}")
+            return UNKNOWN
+    try:
+        rows = list(members)
+    except TypeError:
+        rows = [participants]
 
-async def read_participant_rights(bot, chat_id, user_id):
-    """``ChatBannedRights`` واقعیِ کاربر از سرور."""
-    participant_obj = await read_participant(bot, chat_id, user_id)
-    return getattr(participant_obj, "banned_rights", None)
+    for member in rows:
+        member_id = peers.user_identifier(member)
+        if member_id is None or peers.user_key(member_id) != wanted:
+            continue
+        participant = getattr(member, "participant", None)
+        cls = (type(participant).__name__.lower()
+               if participant is not None else "")
+        if "admin" in cls or "creator" in cls or \
+                getattr(member, "is_admin", False) or \
+                getattr(member, "is_creator", False):
+            return True
+        return False
+    return False   # در فهرستِ برگشتی نبود ⇒ (در فهرست ادمین‌ها) نیست
 
 
 def is_admin_participant(participant_obj) -> bool:
@@ -441,57 +443,352 @@ def admin_rights_of(participant_obj):
     return getattr(participant_obj, "admin_rights", None)
 
 
-def has_any_management_right(admin_rights) -> bool:
-    """آیا حقِ ادمینی به‌جز «ارسال/ویرایش پیام» هم دارد؟"""
-    if admin_rights is None:
-        return False
-    for flag in ("change_info", "post_messages", "delete_messages",
-                 "ban_users", "invite_users", "pin_messages", "add_admins",
-                 "anonymous", "manage_call", "other", "manage_topics"):
-        if bool(getattr(admin_rights, flag, False)):
-            return True
-    return False
+async def promotion_state(bot, chat_id, user_id, *, entity=None,
+                          attempts=3, backoff=VERIFY_BACKOFF):
+    """وضعیتِ «ادمین بودنِ» کاربر با سه مقدار: ``True`` / ``False`` / ``None``.
+
+    ترتیب: ``GetParticipant`` → (اگر خطا/نامعلوم) فهرستِ ادمین‌ها → تکرار با
+    backoff. **در حالت نامعلوم هیچ تصمیمِ تغییردهنده‌ای گرفته نمی‌شود.**
+    """
+    delays = tuple(backoff)[:max(1, attempts)]
+    for index, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        participant, error = await read_participant(
+            bot, chat_id, user_id, entity=entity, attempts=1, backoff=(0.0,))
+        if participant is not None:
+            if is_admin_participant(participant):
+                return VERIFIED
+            # ⚠️ ایمنیِ مهم: ``GetParticipant`` در بعضی حالت‌ها (ادمینِ
+            # سراسری، دیر رسیدنِ به‌روزرسانی) «ادمین نیست» می‌گوید در حالی
+            # که کاربر ادمین است. اگر بر اساسِ همین نتیجه دوباره ارتقا بدهیم،
+            # ممکن است ارتقای موجود **عزل** شود. پس «ادمین نیست» فقط وقتی
+            # قطعی است که مسیرِ دوم (فهرستِ ادمین‌ها) هم صریحاً بگوید نه.
+            listed = await _admin_in_participants_list(bot, chat_id, user_id)
+            if listed is UNKNOWN:
+                log_info(bot.logger,
+                         "EXCLUSIVE PROMOTION UNKNOWN (list failed) "
+                         f"chat_id={chat_id} user_id={user_id} "
+                         f"attempt={index + 1} read_error={error!r}")
+                continue
+            if listed:
+                return VERIFIED
+            # هر دو مسیر می‌گویند ادمین نیست ⇒ همین را برمی‌گردانیم (با
+            # اطمینان) ولی تصمیمِ تغییردهنده با لایهٔ بالاست.
+            return NOT_VERIFIED
+        # خواندنِ اول ناموفق ⇒ مسیر دوم را امتحان کن (ممکن است سالم باشد).
+        listed = await _admin_in_participants_list(bot, chat_id, user_id)
+        if listed is UNKNOWN:
+            log_info(bot.logger,
+                     "EXCLUSIVE PROMOTION UNKNOWN (both paths failed) "
+                     f"chat_id={chat_id} user_id={user_id} "
+                     f"attempt={index + 1} error={error!r}")
+            continue
+        # اگر مسیرِ دوم می‌گوید «ادمین است» ⇒ قطعاً تأییدشده.
+        if listed:
+            return VERIFIED
+        # «ادمین نیست» از یک مسیرِ تنها برای ادامهٔ کار کافی نیست (ممکن است
+        # دسترسیِ ربات به فهرست ناقص باشد) ⇒ باز هم تلاش می‌کنیم.
+        log_info(bot.logger,
+                 "EXCLUSIVE PROMOTION NOT CONFIRMED (retrying) "
+                 f"chat_id={chat_id} user_id={user_id} "
+                 f"attempt={index + 1}")
+        log_info(bot.logger,
+                 "EXCLUSIVE PROMOTION UNKNOWN "
+                 f"chat_id={chat_id} user_id={user_id} "
+                 f"attempt={index + 1} error={error!r}")
+    return UNKNOWN
 
 
-async def rights_confirmed(bot, chat_id, user_id, allowed) -> bool:
+async def is_promoted(bot, chat_id, user_id, *, entity=None):
+    """سازگاری عقب‌رو: ``True`` فقط وقتی سرور قطعاً می‌گوید ادمین است."""
+    return (await promotion_state(bot, chat_id, user_id, entity=entity)) \
+        is VERIFIED
+
+
+async def verify_promotion(bot, chat_id, user_id, *, entity=None,
+                           wait=None, attempts=None, backoff=None):
+    """تأییدِ ارتقا (نامِ قدیمی). خروجی: ``True``/``False``/``None``.
+
+    ``wait`` برای سازگاری نگه داشته شده است: اگر عدد باشد، به‌عنوان فاصلهٔ
+    backoffِ دوم استفاده می‌شود (قبلاً ``sleep(0.3)`` بود).
+    """
+    if backoff is None and wait is not None:
+        backoff = (0.0, float(wait), 1.5, 2.5)
+    kwargs = {}
+    if attempts is not None:
+        kwargs["attempts"] = attempts
+    if backoff is not None:
+        kwargs["backoff"] = backoff
+    return await promotion_state(bot, chat_id, user_id, entity=entity, **kwargs)
+
+
+async def read_participant_rights(bot, chat_id, user_id, *, entity=None):
+    """``ChatBannedRights`` واقعیِ کاربر از سرور (یا ``None``)."""
+    participant_obj, _error = await read_participant(
+        bot, chat_id, user_id, entity=entity)
+    return getattr(participant_obj, "banned_rights", None)
+
+
+async def rights_confirmed(bot, chat_id, user_id, allowed, *, entity=None):
     """آیا API واقعاً همان چیزی را می‌گوید که ما ادعا می‌کنیم؟
 
-    * ``allowed=True`` ⇒ باید ادمین باشد، هیچ حق مدیریتیِ اضافه نداشته باشد و
-      ارسال برایش مسدود نباشد.
-    * ``allowed=False`` ⇒ نباید ادمین باشد و ارسال باید مسدود باشد.
+    * ``allowed=True`` ⇒ باید ادمین باشد، ارسالش مسدود نباشد و هیچ حقِ حساسی
+      نداشته باشد.
+    * ``allowed=False`` ⇒ **فقط** «دیگر ادمین نیست». (قبلاً «ارسال باید مسدود
+      باشد» هم شرط بود؛ همین باعث می‌شد کاربر بعد از باز شدنِ گروه mute بماند
+      و لغو نیمه‌کاره گزارش شود.)
+
+    خروجی: ``True``/``False``/``None`` (نامعلوم).
     """
-    participant = await read_participant(bot, chat_id, user_id)
+    participant, error = await read_participant(bot, chat_id, user_id,
+                                                entity=entity)
     if participant is None:
-        return False
+        log_info(bot.logger,
+                 "EXCLUSIVE RIGHTS CHECK UNKNOWN "
+                 f"chat_id={chat_id} user_id={user_id} error={error!r}")
+        return UNKNOWN
     admin = is_admin_participant(participant)
+    if not allowed:
+        return not admin
     banned = text_is_banned(getattr(participant, "banned_rights", None))
-    if allowed:
-        # ⚠️ مهم: سروش روی توگل‌های این صفحه پیش‌فرض‌هایی می‌گذارد
-        # («تغییر اطلاعات گروه» و «سنجاق پیام‌ها» را خودش روشن می‌کند). اگر
-        # تأیید را به «صفر حق» مشروط کنیم، کاربری که واقعاً ادمین و قادر به
-        # ارسال است «ناموفق» شمرده می‌شود و فهرست اختصاصی خالی می‌ماند —
-        # دقیقاً همان باگِ «این کاربر در فهرست اختصاصی نیست». ملاکِ درست:
-        # ادمین بودن + نبودِ محدودیت ارسال + نداشتنِ حق‌های حساس
-        # (حذف پیام / بن / افزودن ادمین / دعوت / تغییر اطلاعات در حالت
-        #  غیرمجاز — این‌ها در همهٔ حالت‌ها باید False باشند).
-        if not admin or banned:
-            return False
-        return not has_sensitive_right(admin_rights_of(participant))
-    return (not admin) and banned
+    if not admin or banned:
+        return NOT_VERIFIED
+    return not has_sensitive_right(admin_rights_of(participant))
 
 
-#: حق‌هایی که در هیچ حالتی نباید به کاربرِ «اختصاصی» داده شوند.
-SENSITIVE_ADMIN_FLAGS = ("delete_messages", "ban_users", "add_admins",
-                         "invite_users", "anonymous", "manage_call",
-                         "manage_topics", "other", "post_messages",
-                         "change_info", "pin_messages")
+# ---------------------------------------------------------------------------
+#  حقوقِ خودِ ربات در گروه (قبل از هر ارتقا)
+# ---------------------------------------------------------------------------
+async def bot_admin_rights(bot, chat_id):
+    """``ChatAdminRights`` ربات در گروه، یا ``None`` اگر خواندنش ممکن نبود.
+
+    * اگر ``GetParticipantRequest`` برای خودِ ربات کار کند ⇒ همان.
+    * وگرنه (اگر ربات ادمین باشد) از ``GetParticipants`` با فیلترِ ادمین‌ها
+      استفاده می‌شود.
+    * اگر هیچ‌کدام کار نکرد ⇒ ``None`` = «نامعلوم» (نه «بدون حق»).
+    """
+    peer, channel = await _require_channel(bot, chat_id)
+    me = None
+    my_id = None
+    try:
+        me = await bot.client.get_me()
+        my_id = peers.user_identifier(me)
+    except Exception as error:                       # noqa: BLE001
+        log_info(bot.logger,
+                 f"EXCLUSIVE BOT SELF READ FAILED chat_id={chat_id} "
+                 f"error={error!r}")
+    if my_id is None:
+        # شناسهٔ ربات از هر منبعِ قابل‌اعتمادِ دیگری (بدون RPC).
+        for candidate in (getattr(bot, "bot_account_id", None),
+                          getattr(bot.client, "bot_id", None),
+                          getattr(getattr(bot, "me", None), "id", None)):
+            my_id = peers.user_identifier(candidate)
+            if my_id is not None:
+                break
+
+    if channel is not None:
+        try:
+            # ⚠️ خودِ شیءِ ``get_me()`` یک entity معتبر است (access_hash دارد)
+            # ⇒ بدون get_entity و بدون RPC اضافه — **فقط اگر** شناسه‌اش
+            # خواندنی باشد؛ وگرنه شناسهٔ عددی/InputPeerSelf.
+            if me is not None and peers.user_identifier(me) is not None:
+                target = me
+            elif my_id is not None:
+                target = peers.as_input_user(my_id) or my_id
+            else:
+                target = types.InputPeerSelf()
+            result = await call(
+                (lambda: bot.client(functions.channels.GetParticipantRequest(
+                    channel=channel, participant=target))),
+                logger=bot.logger,
+                timeout=VERIFY_RPC_TIMEOUT,
+                max_retry=1,
+                what=f"EXCLUSIVE BOT RIGHTS chat={chat_id}",
+            )
+            participant = getattr(result, "participant", result)
+            if is_admin_participant(participant):
+                return admin_rights_of(participant) or types.ChatAdminRights()
+            # ربات ادمین نیست ⇒ حقِ افزودن ادمین هم ندارد.
+            return types.ChatAdminRights(**{flag: False
+                                            for flag in ALL_ADMIN_FLAGS})
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:                   # noqa: BLE001
+            log_info(bot.logger,
+                     "EXCLUSIVE BOT RIGHTS READ FAILED (trying list) "
+                     f"chat_id={chat_id} error={error!r}")
+
+    if my_id is not None:
+        try:
+            listed = await call(
+                (lambda: bot.client.get_participants(
+                    peer, filter=types.ChannelParticipantsAdmins(),
+                    limit=200)),
+                logger=bot.logger,
+                timeout=VERIFY_RPC_TIMEOUT,
+                max_retry=1,
+                what=f"EXCLUSIVE BOT RIGHTS LIST chat={chat_id}",
+            )
+            rows = list(listed) if not hasattr(listed, "__aiter__") else [
+                member async for member in listed]
+            wanted = peers.user_key(my_id)
+            for member in rows:
+                if peers.user_key(member) != wanted:
+                    continue
+                participant = getattr(member, "participant", None)
+                rights = admin_rights_of(participant)
+                if rights is not None:
+                    return rights
+                return types.ChatAdminRights()   # ادمین است، جزئیات نامعلوم
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:                   # noqa: BLE001
+            log_info(bot.logger,
+                     "EXCLUSIVE BOT RIGHTS LIST FAILED "
+                     f"chat_id={chat_id} error={error!r}")
+    return None
 
 
-def has_sensitive_right(admin_rights) -> bool:
-    if admin_rights is None:
+async def ensure_bot_can_promote(bot, chat_id):
+    """قبل از ارتقا مطمئن شو ربات **حقِ افزودن ادمین** دارد.
+
+    * ``True``  ⇒ مطمئنیم حق دارد.
+    * ``False`` ⇒ مطمئنیم حق **ندارد** ⇒ ``BotLacksRights`` بالا می‌رود.
+    * ``None``  ⇒ نامعلوم ⇒ جلوی کار گرفته **نمی‌شود** (فقط لاگ)، چون ممکن
+      است خطای خواندن موقتی باشد و رد کردنِ دستور بدتر از تلاشِ بی‌خطر است.
+    """
+    rights = await bot_admin_rights(bot, chat_id)
+    if rights is None:
+        log_info(bot.logger,
+                 f"EXCLUSIVE BOT RIGHTS UNKNOWN chat_id={chat_id} "
+                 "(proceeding)")
+        return None
+    can_add = bool(getattr(rights, "add_admins", False))
+    log_info(bot.logger,
+             f"EXCLUSIVE BOT RIGHTS chat_id={chat_id} add_admins={can_add}")
+    if not can_add:
+        raise BotLacksRights(
+            f"bot cannot add admins in {chat_id} (add_admins={can_add})")
+    return True
+
+
+# ---------------------------------------------------------------------------
+#  ارتقا
+# ---------------------------------------------------------------------------
+async def _edit_admin(bot, channel, participant, chat_id, user_id):
+    """یک ``EditAdminRequest`` با مهلتِ کوتاه و پریستِ ``edit_only``."""
+    return await asyncio.wait_for(
+        bot.client(functions.channels.EditAdminRequest(
+            channel=channel, user_id=participant,
+            admin_rights=admin_rights_for(PRIMARY_PRESET), rank="")),
+        timeout=GRANT_RPC_TIMEOUT)
+
+
+async def grant_participant_rights(bot, chat_id, user_id, *, entity=None):
+    """کاربر را ادمینِ گروه می‌کند (فقط حقِ ارسال) و نامِ پریست را برمی‌گرداند.
+
+    «موفق» یعنی RPC **بدون خطا** برگشت. هیچ پریستِ جایگزینی (به‌ویژه
+    ``none`` که روی سیم = عزل است) امتحان نمی‌شود؛ اگر سرور رد کند
+    ``GrantRejected`` بالا می‌رود و رکورد برای بازیابی می‌ماند.
+    """
+    _peer, channel = await _require_channel(bot, chat_id)
+    participant = await user_peer(bot, chat_id, user_id, entity=entity)
+
+    attempt = 0
+    last_error = None
+    while attempt < 2:
+        attempt += 1
+        try:
+            await _edit_admin(bot, channel, participant, chat_id, user_id)
+            log_info(bot.logger,
+                     f"EXCLUSIVE GRANT RPC OK chat_id={chat_id} "
+                     f"user_id={user_id} preset={PRIMARY_PRESET}")
+            return PRIMARY_PRESET
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:                   # noqa: BLE001
+            last_error = error
+            seconds = flood_seconds(error)
+            if seconds is not None and seconds <= 2 and attempt < 2:
+                await asyncio.sleep(seconds)
+                continue
+            if is_transient(error) and attempt < 2:
+                await asyncio.sleep(0.2)
+                continue
+            log_info(bot.logger,
+                     f"EXCLUSIVE GRANT RPC FAILED chat_id={chat_id} "
+                     f"user_id={user_id} preset={PRIMARY_PRESET} "
+                     f"error={error!r}")
+            break
+    raise GrantRejected(
+        f"server refused admin promotion for {user_id}: {last_error!r}")
+
+
+async def revoke_participant_rights(bot, chat_id, user_id, *, entity=None):
+    """لغو کامل: demote + پاک کردنِ محدودیتِ شخصیِ احتمالی.
+
+    ⚠️ اصلاح باگِ «بعد از باز شدن گروه کاربر mute می‌ماند»:
+    قبلاً بعد از demote یک ``EditBannedRequest`` با
+    ``send_messages=True/send_plain=True`` فرستاده می‌شد؛ یعنی یک **محدودیتِ
+    شخصی دائمی** که با باز شدنِ گروه هم پاک نمی‌شد. حالا:
+
+    * اگر کاربر از قبل محدودیتِ شخصی داشت ⇒ با ``banned_rights`` **همه False**
+      پاک می‌شود (BACK TO NORMAL).
+    * اگر محدودیتِ شخصی ندارد ⇒ هیچ ``EditBanned`` زده نمی‌شود.
+    """
+    _peer, channel = await _require_channel(bot, chat_id)
+    participant = await user_peer(bot, chat_id, user_id, entity=entity)
+
+    await call(
+        (lambda: bot.client(functions.channels.EditAdminRequest(
+            channel=channel, user_id=participant,
+            # برای demote عمداً ``ChatAdminRights()`` (همه None) فرستاده
+            # می‌شود: روی سیم دقیقاً همان «عزل» است.
+            admin_rights=types.ChatAdminRights(), rank=""))),
+        logger=bot.logger,
+        timeout=GRANT_RPC_TIMEOUT,
+        what=f"EXCLUSIVE DEMOTE chat={chat_id} user={user_id}",
+    )
+    log_info(bot.logger,
+             f"EXCLUSIVE DEMOTE RPC OK chat_id={chat_id} user_id={user_id}")
+
+    # محدودیتِ شخصیِ قبلی (اگر بود) پاک شود تا کاربر عضوِ عادیِ سالم باشد.
+    banned_rights = await read_participant_rights(bot, chat_id, user_id,
+                                                  entity=entity)
+    if _has_personal_restriction(banned_rights):
+        await call(
+            (lambda: bot.client(functions.channels.EditBannedRequest(
+                channel=channel, participant=participant,
+                banned_rights=clone_banned_rights(None)))),
+            logger=bot.logger,
+            timeout=GRANT_RPC_TIMEOUT,
+            what=f"EXCLUSIVE CLEAR RESTRICTION chat={chat_id} user={user_id}",
+        )
+        log_info(bot.logger,
+                 "EXCLUSIVE PERSONAL RESTRICTION CLEARED "
+                 f"chat_id={chat_id} user_id={user_id}")
+    else:
+        log_info(bot.logger,
+                 "EXCLUSIVE NO PERSONAL RESTRICTION (skipping EditBanned) "
+                 f"chat_id={chat_id} user_id={user_id}")
+    return True
+
+
+def _has_personal_restriction(banned_rights) -> bool:
+    """آیا کاربر محدودیتِ شخصی (غیر از پیش‌فرضِ گروه) دارد؟"""
+    if banned_rights is None:
         return False
-    return any(bool(getattr(admin_rights, flag, False))
-               for flag in SENSITIVE_ADMIN_FLAGS)
+    try:
+        flags = inspect.signature(types.ChatBannedRights.__init__).parameters
+    except (TypeError, ValueError):                   # pragma: no cover
+        flags = ("send_messages", "send_plain", "send_media")
+    for flag in flags:
+        if flag in {"self", "until_date"}:
+            continue
+        if bool(getattr(banned_rights, flag, False)):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -513,39 +810,35 @@ def list_entries(chat_id, *, states=("active",) + RECOVERABLE):
     (``pending_grant``/``pending_revoke``) هم برگردانده می‌شوند تا «لغو»
     هرگز به بهانهٔ «در فهرست نیست» رها نشود.
     """
-    wanted = set(states)
-    with storage.EXCLUSIVE_STORAGE._lock:
-        record = _group_record(storage.EXCLUSIVE_STORAGE._data(), chat_id)
-        return [dict(entry) for entry in record.get("users", {}).values()
-                if entry.get("state") in wanted]
+    data = storage.EXCLUSIVE_STORAGE.load()
+    record = _group_record(data, chat_id)
+    result = []
+    for entry in (record.get("users") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("state") in states:
+            result.append(dict(entry))
+    return result
 
 
 def is_exclusive(chat_id, user_id) -> bool:
-    wanted = storage.user_key(user_id)
-    return any(storage.user_key(item.get("user_id")) == wanted
-               for item in list_entries(chat_id))
+    entry = get_entry(chat_id, user_id)
+    return bool(entry) and entry.get("state") == "active"
 
 
 def get_entry(chat_id, user_id):
-    wanted = storage.user_key(user_id)
-    for entry in list_entries(chat_id):
-        if storage.user_key(entry.get("user_id")) == wanted:
-            return entry
-    return None
+    data = storage.EXCLUSIVE_STORAGE.load()
+    record = _group_record(data, chat_id)
+    return (record.get("users") or {}).get(peers.user_key(user_id))
 
 
 def _save_entry(chat_id, entry):
+    entry = dict(entry)
+
     def mutate(data):
         record = _group_record(data, chat_id, create=True)
         users = record.setdefault("users", {})
-        users[storage.user_key(entry["user_id"])] = entry
-        # فهرست در انتظارِ لغو (برای بازیابی پس از قطعی/ری‌استارت)
-        pending = [item for item in record.get("pending", [])
-                   if storage.user_key(item) != storage.user_key(entry["user_id"])]
-        entry["active"] = entry.get("state") == "active"
-        if entry.get("state") in {"active", PENDING_FLAG}:
-            pending.append(storage.user_key(entry["user_id"]))
-        record["pending"] = pending
+        users[peers.user_key(entry.get("user_id"))] = entry
         return entry
 
     return storage.EXCLUSIVE_STORAGE.update(mutate)
@@ -563,40 +856,55 @@ def _set_state(chat_id, entry, state, extra=None):
 # ---------------------------------------------------------------------------
 #  عملیات «اختصاصی» / «لغو اختصاصی»
 # ---------------------------------------------------------------------------
-class NotLocked(RuntimeError):
-    """گروه قفل نیست ⇒ استثنا معنا ندارد."""
-
-
-class AlreadyExclusive(RuntimeError):
-    pass
-
-
-class NotExclusive(RuntimeError):
-    pass
-
-
 async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username="",
-                verify=False):
+                entity=None, verify=False):
     """ثبت کاربر در فهرست اختصاصی + ارتقا به ادمین (بی‌درنگ).
 
-    ⚠️ ترتیبِ جدید بر اساس بازخورد کارفرما («باید سریع ارسال شود»):
+    ترتیب:
 
-    ۱) رکورد پایدار در حالت ``pending_grant`` (قبل از RPC، تا گم نشود)
-    ۲) یک ``EditAdminRequest`` با مهلتِ کوتاه  ⇒ همین‌جا «موفق» اعلام می‌شود
-    ۳) تأییدِ واقعی از سرور **در پس‌زمینه** (بدون تأخیر دادن به پاسخ کاربر)
+    ۱) ``is_group_locked`` (کش‌شده؛ فقط یک خواندن در هر دوره)
+    ۲) اگر رکورد ``active`` هست ⇒ **وضعیت واقعی از سرور** خوانده می‌شود:
+       اگر واقعاً ادمین است ⇒ ``AlreadyExclusive``؛ وگرنه ادامه می‌دهیم و
+       دوباره ارتقا می‌دهیم (باگِ «یک‌بار ادمین شد، بعد خطا داد»).
+    ۳) حقوقِ خودِ ربات بررسی می‌شود (``add_admins``).
+    ۴) رکورد ``pending_grant`` + یک ``EditAdminRequest`` با مهلتِ کوتاه.
+    ۵) رکورد ``active`` ⇒ پاسخِ کاربر همین‌جا آزاد می‌شود.
+    ۶) تأییدِ سه‌حالته در پس‌زمینه (``complete_verification``).
 
-    پیش‌فرض ``verify=False`` است: لایهٔ دستور (`commands`) خودش بعد از ارسالِ
-    پاسخ، تأیید را در پس‌زمینه اجرا می‌کند (``complete_verification``).
+    ``verify=False`` پیش‌فرض است: لایهٔ دستور خودش تأیید را در پس‌زمینه اجرا
+    می‌کند. اگر ``True`` باشد همین‌جا (بعد از رکورد) تأیید هم انجام می‌شود.
     """
     if not await is_group_locked(bot, chat_id):
         raise NotLocked(f"group {chat_id} is not locked")
 
-    existing = get_entry(chat_id, user_id)
+    identifier = peers.user_identifier(entity) if entity is not None \
+        else peers.user_identifier(user_id)
+    if identifier is None:
+        raise TargetChanged(f"invalid user identity: {user_id!r}")
+
+    existing = get_entry(chat_id, identifier)
     if existing and existing.get("state") == "active":
-        raise AlreadyExclusive(f"user {user_id} already exclusive")
+        state = await promotion_state(bot, chat_id, identifier, entity=entity,
+                                      attempts=2, backoff=(0.0, 0.5))
+        if state is VERIFIED:
+            raise AlreadyExclusive(f"user {identifier} already exclusive")
+        if state is UNKNOWN:
+            # نمی‌دانیم ادمین است یا نه ⇒ هیچ تغییری نمی‌دهیم (ضدِ عزلِ تصادفی).
+            log_info(bot.logger,
+                     "EXCLUSIVE GRANT SKIPPED (state unknown) "
+                     f"chat_id={chat_id} user_id={identifier}")
+            raise AlreadyExclusive(
+                f"user {identifier} state unknown; not touching it")
+        # قطعاً ادمین نیست ⇒ رکورد کهنه است؛ دوباره ارتقا می‌دهیم.
+        log_info(bot.logger,
+                 "EXCLUSIVE RE-GRANT (record active but server says not admin) "
+                 f"chat_id={chat_id} user_id={identifier}")
+
+    # ۳) حقوقِ ربات
+    await ensure_bot_can_promote(bot, chat_id)
 
     saved = _save_entry(chat_id, {
-        "user_id": storage.user_key(user_id),
+        "user_id": storage.user_key(identifier),
         "chat_id": storage.group_key(chat_id),
         "name": name or "",
         "username": (username or "").lstrip("@"),
@@ -610,87 +918,100 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username="",
         "last_error": "",
     })
 
-    # ⚠️ ارتقا: فقط یک RPC. اگر سرور رد کند رکورد برای بازیابی می‌ماند.
     try:
-        preset = await grant_participant_rights(bot, chat_id, user_id)
+        preset = await grant_participant_rights(bot, chat_id, identifier,
+                                                entity=entity)
     except Exception as error:                       # noqa: BLE001
         _set_state(chat_id, saved, PENDING_GRANT_FLAG, {
             "granted": False, "confirmed": False, "last_error": repr(error)})
         raise
 
-    # «ادمین شد» بلافاصله قطعی است (RPC بدون خطا برگشت)؛ رکورد فعال می‌شود.
     saved = _set_state(chat_id, saved, "active",
-                       {"granted": True, "confirmed": True,
+                       {"granted": True,
+                        # «بدون خطا» است، ولی «تأیید سرور» هنوز نه.
+                        "confirmed": False,
+                        "verified": "pending",
                         "admin_preset": preset,
-                        "confirmed_at": storage.now()})
+                        "granted_at": storage.now()})
     log_info(bot.logger,
-             f"EXCLUSIVE GRANTED chat_id={chat_id} user_id={user_id} "
+             f"EXCLUSIVE GRANTED chat_id={chat_id} user_id={identifier} "
              f"preset={preset}")
     if verify:
         try:
             asyncio.ensure_future(_verify_in_background(bot, chat_id,
-                                                        user_id, saved))
+                                                        identifier, saved))
         except RuntimeError:
             pass
     return saved
 
 
-async def complete_verification(bot, chat_id, user_id, entry=None):
-    """تأییدِ واقعی + (در صورت نیاز) ارتقای پله‌ای به حالت بعدی.
+async def complete_verification(bot, chat_id, user_id, entry=None, *,
+                                entity=None):
+    """تأییدِ سه‌حالته + (در صورت لزوم) تلاش دوباره.
 
-    این تابع عمداً **بعد از** ارسالِ پیامِ موفقیت اجرا می‌شود تا پاسخ به
-    کارفرما سریع باشد؛ اگر سرور «ادمینِ بی‌حق» را نپذیرد، همین‌جا حالتِ
-    حداقلی (`edit_only`) اعمال و رکورد به‌روزرسانی می‌شود. برای ریکاوریِ
-    استارتاپ هم قابل استفاده است.
+    * ``VERIFIED``     ⇒ رکورد ``active``/``confirmed=True``.
+    * ``NOT_VERIFIED`` ⇒ **یک بار** تلاش دوبارهٔ ارتقا (اگر ربات حق دارد)، سپس
+      تأیید دوباره؛ اگر باز هم نه ⇒ ``pending_grant`` برای بازیابی.
+    * ``UNKNOWN``      ⇒ **هیچ RPC تغییردهنده‌ای**؛ رکورد در ``pending_grant``
+      می‌ماند تا ریکاوری/نگهبان بعداً بررسی کند.
     """
     entry = entry or get_entry(chat_id, user_id) or {}
-    applied = entry.get("admin_preset") or PRIMARY_PRESET
-    if await verify_promotion(bot, chat_id, user_id):
-        current = get_entry(chat_id, user_id) or entry
+    identifier = peers.user_identifier(user_id) or user_id
+    state = await promotion_state(bot, chat_id, identifier, entity=entity)
+
+    if state is VERIFIED:
+        current = get_entry(chat_id, identifier) or entry
         _set_state(chat_id, current, "active",
-                   {"granted": True, "confirmed": True,
+                   {"granted": True, "confirmed": True, "verified": "yes",
                     "verified_at": storage.now()})
         log_info(bot.logger,
-                 f"EXCLUSIVE VERIFIED chat_id={chat_id} user_id={user_id} "
-                 f"preset={applied}")
-        return get_entry(chat_id, user_id)
+                 f"EXCLUSIVE VERIFIED chat_id={chat_id} user_id={identifier}")
+        return get_entry(chat_id, identifier)
 
-    names = [name for name, _preset in ADMIN_RIGHT_PRESETS]
-    start_index = names.index(applied) + 1 if applied in names else 1
-    peer = _cached_channel_peer(bot, chat_id)
-    if peer is None:
-        peer = await _actions(bot)._group_peer(chat_id)
-    _remember_channel_peer(bot, chat_id, peer)
-    channel = types.InputChannel(peer.channel_id, peer.access_hash)
-    participant = await user_peer(bot, chat_id, user_id)
-    for name, preset in ADMIN_RIGHT_PRESETS[start_index:]:
-        try:
-            await _edit_admin(bot, channel, participant, preset, chat_id,
-                              user_id)
-        except Exception as error:                   # noqa: BLE001
-            log_info(bot.logger,
-                     f"EXCLUSIVE PRESET FAILED chat_id={chat_id} "
-                     f"user_id={user_id} preset={name} error={error!r}")
-            continue
-        if await verify_promotion(bot, chat_id, user_id):
-            current = get_entry(chat_id, user_id) or entry
+    if state is UNKNOWN:
+        current = get_entry(chat_id, identifier) or entry
+        _set_state(chat_id, current, PENDING_GRANT_FLAG, {
+            "granted": True, "confirmed": False, "verified": "unknown",
+            "last_error": "promotion state unknown (read failed/late)",
+            "unverified_at": storage.now()})
+        log_info(bot.logger,
+                 "EXCLUSIVE VERIFY UNKNOWN (no change RPC; kept pending) "
+                 f"chat_id={chat_id} user_id={identifier}")
+        return get_entry(chat_id, identifier)
+
+    # ---- NOT_VERIFIED: حداکثر یک تلاش دوباره، و فقط اگر ربات حق دارد ----
+    try:
+        await ensure_bot_can_promote(bot, chat_id)
+        await grant_participant_rights(bot, chat_id, identifier, entity=entity)
+    except BotLacksRights as error:
+        log_info(bot.logger,
+                 "EXCLUSIVE RETRY SKIPPED (bot lacks rights) "
+                 f"chat_id={chat_id} user_id={identifier} error={error!r}")
+    except Exception as error:                       # noqa: BLE001
+        log_info(bot.logger,
+                 "EXCLUSIVE RETRY GRANT FAILED "
+                 f"chat_id={chat_id} user_id={identifier} error={error!r}")
+    else:
+        state = await promotion_state(bot, chat_id, identifier, entity=entity)
+        if state is VERIFIED:
+            current = get_entry(chat_id, identifier) or entry
             _set_state(chat_id, current, "active",
-                       {"granted": True, "confirmed": True,
-                        "admin_preset": name, "verified_at": storage.now()})
+                       {"granted": True, "confirmed": True, "verified": "yes",
+                        "verified_at": storage.now()})
             log_info(bot.logger,
-                     f"EXCLUSIVE VERIFIED WITH FALLBACK chat_id={chat_id} "
-                     f"user_id={user_id} preset={name}")
-            return get_entry(chat_id, user_id)
+                     "EXCLUSIVE VERIFIED AFTER RETRY "
+                     f"chat_id={chat_id} user_id={identifier}")
+            return get_entry(chat_id, identifier)
 
-    current = get_entry(chat_id, user_id) or entry
+    current = get_entry(chat_id, identifier) or entry
     _set_state(chat_id, current, PENDING_GRANT_FLAG, {
-        "granted": True, "confirmed": False,
-        "last_error": "promotion not confirmed by server yet",
+        "granted": True, "confirmed": False, "verified": "no",
+        "last_error": "server does not report the user as admin",
         "unverified_at": storage.now()})
     log_info(bot.logger,
-             f"EXCLUSIVE NOT VERIFIED (kept pending) chat_id={chat_id} "
-             f"user_id={user_id}")
-    return get_entry(chat_id, user_id)
+             "EXCLUSIVE NOT VERIFIED (kept pending) "
+             f"chat_id={chat_id} user_id={identifier}")
+    return get_entry(chat_id, identifier)
 
 
 async def _verify_in_background(bot, chat_id, user_id, saved):
@@ -704,21 +1025,30 @@ async def _verify_in_background(bot, chat_id, user_id, saved):
         return None
 
 
-async def revoke(bot, chat_id, user_id, *, reason="manual"):
+async def revoke(bot, chat_id, user_id, *, reason="manual", entity=None):
     """لغو مجوز + غیرفعال کردن رکورد. اجرای چندباره ممنوع.
 
     اگر رکوردی در حافظه/دیسک نباشد ولی سرور بگوید این کاربر **ادمین** است،
     باز هم demote انجام می‌شود: کاربر نباید به‌خاطر از دست رفتنِ یک فایل،
-    ادمینِ گروه بماند.
+    ادمینِ گروه بماند. اگر وضعیت **نامعلوم** باشد، هیچ تغییری انجام نمی‌شود.
     """
-    entry = get_entry(chat_id, user_id)
+    identifier = peers.user_identifier(entity) if entity is not None \
+        else peers.user_identifier(user_id)
+    if identifier is None:
+        raise TargetChanged(f"invalid user identity: {user_id!r}")
+
+    entry = get_entry(chat_id, identifier)
     if not entry:
-        participant = await read_participant(bot, chat_id, user_id)
-        if not is_admin_participant(participant):
-            raise NotExclusive(f"user {user_id} is not exclusive")
+        state = await promotion_state(bot, chat_id, identifier, entity=entity,
+                                      attempts=2, backoff=(0.0, 0.5))
+        if state is UNKNOWN:
+            raise TargetChanged(
+                f"cannot read state of user {identifier}; nothing changed")
+        if state is NOT_VERIFIED:
+            raise NotExclusive(f"user {identifier} is not exclusive")
         # رکوردِ حداقلی می‌سازیم تا تاریخچه و وضعیت پایدار بماند.
         entry = _save_entry(chat_id, {
-            "user_id": storage.user_key(user_id),
+            "user_id": storage.user_key(identifier),
             "chat_id": storage.group_key(chat_id),
             "name": "",
             "username": "",
@@ -734,29 +1064,41 @@ async def revoke(bot, chat_id, user_id, *, reason="manual"):
         })
         log_info(bot.logger,
                  f"EXCLUSIVE ADOPTED FROM SERVER chat_id={chat_id} "
-                 f"user_id={user_id} (was admin without record)")
+                 f"user_id={identifier} (was admin without record)")
     if entry.get("state") == "revoked":
-        raise NotExclusive(f"user {user_id} already revoked")
+        raise NotExclusive(f"user {identifier} already revoked")
 
     try:
-        await revoke_participant_rights(bot, chat_id, user_id)
+        await revoke_participant_rights(bot, chat_id, identifier,
+                                        entity=entity)
     except Exception as error:                       # noqa: BLE001
         # قطعی/خطای گذرا: رکورد در «در انتظار لغو» می‌ماند تا ریکاوریِ
         # استارتاپ دوباره تلاش کند؛ پرونده هرگز گم نمی‌شود.
         _set_state(chat_id, entry, PENDING_FLAG, {"last_error": repr(error)})
         raise
-    try:
-        confirmed = await rights_confirmed(bot, chat_id, user_id, False)
-    except Exception as error:                       # noqa: BLE001
-        _set_state(chat_id, entry, PENDING_FLAG, {"last_error": repr(error)})
-        raise
+
+    confirmed = await rights_confirmed(bot, chat_id, identifier, False,
+                                       entity=entity)
+    if confirmed is UNKNOWN:
+        # نتیجه نامعلوم ⇒ رکورد در «در انتظار لغو» می‌ماند (نباید ادعای
+        # موفقیت کنیم)، ولی demote انجام شده است.
+        entry = _set_state(chat_id, entry, PENDING_FLAG,
+                           {"last_error": "revoke state unknown",
+                            "revoked_at": storage.now(),
+                            "revoke_reason": reason})
+        log_info(bot.logger,
+                 "EXCLUSIVE REVOKE UNCONFIRMED (kept for recovery) "
+                 f"chat_id={chat_id} user_id={identifier}")
+        return entry
+
     entry = _set_state(chat_id, entry,
                        "revoked" if confirmed else PENDING_FLAG,
-                       {"confirmed": bool(confirmed), "revoked_at": storage.now(),
+                       {"confirmed": bool(confirmed),
+                        "revoked_at": storage.now(),
                         "revoked_at_tehran": storage.iso_tehran(),
                         "revoke_reason": reason})
     log_info(bot.logger,
-             f"EXCLUSIVE REVOKED chat_id={chat_id} user_id={user_id} "
+             f"EXCLUSIVE REVOKED chat_id={chat_id} user_id={identifier} "
              f"reason={reason} confirmed={confirmed}")
     return entry
 
@@ -765,12 +1107,15 @@ async def revoke_all(bot, chat_id, *, reason="group_unlocked", logger=None):
     """لغو همهٔ مجوزهای موقتِ این گروه (وقتی گروه باز شد).
 
     خروجی: ``(revoked, failed_entries)``. خطای هر کاربر بقیه را متوقف نمی‌کند و
-    در فهرستِ بازیابی می‌نشیند.
+    در فهرستِ بازیابی می‌نشیند. هیچ کاربری mute نمی‌شود (بعد از باز شدنِ گروه
+    باید بتواند بنویسد).
     """
     revoked, failed = [], []
     for entry in list_entries(chat_id):
         try:
             await revoke(bot, chat_id, entry["user_id"], reason=reason)
+            revoked.append(entry["user_id"])
+        except NotExclusive:
             revoked.append(entry["user_id"])
         except Exception as error:                   # noqa: BLE001
             try:
@@ -806,6 +1151,7 @@ def pending_jobs(chat_id=None):
 
 def forget_group(chat_id):
     """پاک‌سازی رکوردهای یک گروه (تست/ری‌ست)."""
+
     def mutate(data):
         data.setdefault("groups", {}).pop(storage.group_key(chat_id), None)
 
