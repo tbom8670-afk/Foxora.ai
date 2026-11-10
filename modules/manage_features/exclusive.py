@@ -198,11 +198,19 @@ ALL_ADMIN_FLAGS = ("change_info", "post_messages", "edit_messages",
 #: حالت‌های ارتقا به‌ترتیبِ اولویت. همهٔ فلگ‌ها **صریح** False داده می‌شوند
 #: (None یعنی «سرور خودش تصمیم بگیرد» و در سروش باعث روشن شدنِ
 #: «تغییر اطلاعات گروه» و «سنجاق پیام‌ها» می‌شد).
+#: نامِ presetِ پیش‌فرض: ادمینِ واقعی با فقط «ویرایشِ پیام خودش».
+#: ⚠️ بازخورد کارفرما: «باید ادمینِ واقعیِ گروه بشه و دسترسی پیام دادن داشته
+#: باشه». «ارسال پیام» در سروش یک حقِ ادمینیِ جدا ندارد؛ انتخابِ `edit_messages`
+#: (بدون `post_messages`) کاری می‌کند که آیکون «ارسال» برای کاربر باز شود، بدونِ
+#: آنکه بتواند در کانال پست کند. `change_info`/`pin_messages`/`delete_messages` و
+#: بقیهٔ حق‌های مدیریتی صریحاً False می‌مانند.
+PRIMARY_PRESET = "edit_only"
+
 ADMIN_RIGHT_PRESETS = (
-    # ۱) ادمین بدون هیچ حق مدیریتی — دقیقاً خواستهٔ کارفرما.
-    ("none", {}),
-    # ۲) اگر سرور «ادمینِ بدون حق» را demote کرد: تنها کمترین حقِ ممکن.
+    # فقط ویرایشِ پیام خودش ⇒ ارسال برای کاربر باز می‌شود (پیش‌فرض).
     ("edit_only", {"edit_messages": True}),
+    # پشتیبانِ سرورهای سخت‌گیر که این حالت را demote می‌کنند.
+    ("none", {}),
 )
 
 
@@ -475,7 +483,8 @@ async def rights_confirmed(bot, chat_id, user_id, allowed) -> bool:
 #: حق‌هایی که در هیچ حالتی نباید به کاربرِ «اختصاصی» داده شوند.
 SENSITIVE_ADMIN_FLAGS = ("delete_messages", "ban_users", "add_admins",
                          "invite_users", "anonymous", "manage_call",
-                         "manage_topics", "other")
+                         "manage_topics", "other", "post_messages",
+                         "change_info", "pin_messages")
 
 
 def has_sensitive_right(admin_rights) -> bool:
@@ -635,7 +644,7 @@ async def complete_verification(bot, chat_id, user_id, entry=None):
     استارتاپ هم قابل استفاده است.
     """
     entry = entry or get_entry(chat_id, user_id) or {}
-    applied = entry.get("admin_preset") or ADMIN_RIGHT_PRESETS[0][0]
+    applied = entry.get("admin_preset") or PRIMARY_PRESET
     if await verify_promotion(bot, chat_id, user_id):
         current = get_entry(chat_id, user_id) or entry
         _set_state(chat_id, current, "active",

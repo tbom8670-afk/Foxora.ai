@@ -477,13 +477,16 @@ def test_01_exclusive_locked_and_open():
     admin_rights = chat.admins.get(777)
     check("ادمین شده است (نوع participant از خانوادهٔ Admin)",
           admin_rights is not None, chat.admins)
-    check("ادمین با «هیچ حق مدیریتی» ساخته شد (حتی ویرایش پیام هم False)",
+    check("ادمینِ واقعی شد و فقط حق «ویرایش/ارسال پیام خودش» دارد",
           admin_rights is not None
-          and not exclusive.has_any_management_right(admin_rights)
-          and getattr(admin_rights, "edit_messages", False) is False,
+          and getattr(admin_rights, "edit_messages", False) is True
+          and getattr(admin_rights, "post_messages", False) is False,
           admin_rights)
-    check("حالتِ اعمال‌شده در رکورد ذخیره شد (preset=none)",
-          record.get("admin_preset") == "none", record.get("admin_preset"))
+    check("هیچ حق مدیریتیِ دیگری ندارد (حذف/بن/دعوت/تغییر اطلاعات/سنجاق)",
+          not exclusive.has_sensitive_right(admin_rights), admin_rights)
+    check("حالتِ اعمال‌شده در رکورد ذخیره شد (preset=edit_only)",
+          record.get("admin_preset") == "edit_only",
+          record.get("admin_preset"))
     # همان چیزی که در اسکرین‌شاتِ تنظیماتِ مدیر دیده می‌شد نباید روشن باشد:
     for toggle in ("change_info", "delete_messages", "ban_users",
                    "invite_users", "pin_messages", "add_admins"):
@@ -730,8 +733,16 @@ def test_02d_exclusive_server_forces_toggles_and_lost_record():
           any(str(item["user_id"]) == "793"
               for item in exclusive.list_entries(chat_id)),
           exclusive.list_entries(chat_id))
-    check("حق‌های حساس (حذف پیام/بن/افزودن ادمین/دعوت) داده نشده‌اند",
-          not exclusive.has_sensitive_right(chat.admins[793]),
+    # نکته: در این سناریو خودِ سرور «تغییر اطلاعات گروه» و «سنجاق» را روشن
+    # می‌کند (رفتار واقعی سروش)، پس فقط حق‌هایی بررسی می‌شوند که در اختیار ماست.
+    check("حق‌های حساس (حذف پیام/بن/افزودن ادمین/دعوت/پست) داده نشده‌اند",
+          all(not bool(getattr(chat.admins[793], flag, False))
+              for flag in ("delete_messages", "ban_users", "add_admins",
+                           "invite_users", "post_messages", "anonymous",
+                           "manage_call", "other")),
+          chat.admins[793])
+    check("ولی حق ویرایش/ارسال پیام دارد (ادمینِ واقعیِ کارآمد)",
+          getattr(chat.admins[793], "edit_messages", False) is True,
           chat.admins[793])
     check("درخواستِ ارسال‌شده همهٔ فلگ‌ها را صریح False داشت (حتی change_info)",
           all(getattr(chat.edit_admin_calls[0].admin_rights, flag) is False
@@ -1531,6 +1542,69 @@ def test_07e_timed_timer_accuracy_and_counts():
     check("بعد از لغو هیچ پیامی حذف نشد", chat3.deleted == [], chat3.deleted)
 
 
+def test_07f_timed_single_status_message():
+    """پیام وضعیت باید **یکی** باشد (باگِ سه کارتِ تکراری)."""
+    print("\n### ۷و) فقط یک پیام وضعیت (نه سه کارت تکراری)")
+    fresh()
+    chat_id = -(10 ** 12) - 981
+    chat = FakeChat(chat_id, locked=False)
+    bot = FakeBot(chat)
+    record = timed.start(chat_id, 30, actor_id=4242)
+    for message_id in range(9100, 9140):
+        timed.track_message(chat_id, message_id)
+
+    # سه مسیرِ هم‌زمان که قبلاً هر کدام یک پیام می‌ساختند:
+    # ۱) قلابِ وضعیت در لحظهٔ پایان  ۲) انتشار پیشرفت  ۳) انتشار نتیجه
+    async def scenario():
+        for _ in range(3):
+            import modules.manage_features.timed_commands as tc
+            await tc.ensure_status_message(bot, chat_id, record=None,
+                                          logger=bot.logger)
+        await asyncio.gather(*[
+            timed_commands.ensure_status_message(bot, chat_id,
+                                                 record=record,
+                                                 logger=bot.logger)
+            for _ in range(4)
+        ])
+        await timed_commands.publish_status(bot, chat_id, deleted=5, failed=0,
+                                            elapsed=3, state="deleting",
+                                            logger=bot.logger)
+        await timed_commands.publish_status(bot, chat_id, deleted=40, failed=0,
+                                            elapsed=9, state="done",
+                                            logger=bot.logger)
+        await timed.finish(bot, chat_id, logger=bot.logger,
+                           now_ts=float(record["end_ts"]) + 1)
+        return list(bot.client.sent)
+
+    sent = run(scenario())
+    check("فقط یک پیام وضعیت ارسال شد (نه چند کارت)", len(sent) == 1,
+          len(sent))
+    check("همان یک پیام چند بار ویرایش شد",
+          len([item for item in bot.client.edits if item[1] == sent[0][3]]) >= 2,
+          len(bot.client.edits))
+    final_texts = [body for _p, _m, body, _e in bot.client.edits]
+    check("پیام نهایی شمارشِ واقعی ۴۰ را دارد",
+          any("تعداد پیام در حال پاک شدن : 40" in body for body in final_texts),
+          final_texts[-1][:80] if final_texts else None)
+    check("پیام وضعیت حذف نشد", sent[0][3] not in chat.deleted)
+
+    # سناریوی ری‌استارت: شناسه روی دیسک می‌ماند ⇒ هیچ پیام تازه‌ای
+    fresh()
+    chat2 = FakeChat(-(10 ** 12) - 982, locked=False)
+    bot2 = FakeBot(chat2)
+    record2 = timed.start(chat2.chat_id, 30, actor_id=4242)
+    timed.register_status(chat2.chat_id, 4444)
+    timed_commands.reset_all(chat2.chat_id)      # حافظه پاک، دیسک سالم
+
+    async def after_restart():
+        await timed_commands.ensure_status_message(bot2, chat2.chat_id,
+                                                  logger=bot2.logger)
+        return list(bot2.client.sent)
+
+    sent2 = run(after_restart())
+    check("بعد از ری‌استارت پیام وضعیت تازه ساخته نشد", sent2 == [], sent2)
+
+
 def test_08_report_flow():
     print("\n### ۸) گزارش: معتبر، بدون ریپلای، خود، تکراری، ۷ ثانیه")
     fresh()
@@ -2158,6 +2232,7 @@ def main():
     test_07c_timed_purge_really_deletes_with_positive_group_id()
     test_07d_timed_status_peer_cancel_and_timeout()
     test_07e_timed_timer_accuracy_and_counts()
+    test_07f_timed_single_status_message()
     test_08_report_flow()
     test_09_report_decision()
     test_09c_report_warning_counts_are_real()

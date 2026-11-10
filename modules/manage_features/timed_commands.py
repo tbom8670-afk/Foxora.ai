@@ -142,41 +142,76 @@ def status_id(chat_id):
     return record.get("status_message_id") or _STATUS.get(_key(chat_id))
 
 
-async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
-    """پیامِ وضعیت را فقط در **لحظهٔ پایان بازه** می‌سازد و شناسه‌اش را ثبت می‌کند.
+#: قفلِ ساختِ پیام وضعیت به‌ازای هر گروه — جلوگیری از پیام‌های تکراری.
+_ENSURE_LOCKS: dict = {}
 
-    (قبلاً همین پیام در لحظهٔ «تنظیم شد» فرستاده می‌شد و کاربر فکر می‌کرد
-    پاکسازی همین حالا شروع شده است.)
+
+def _message_key(chat_id):
+    return storage.group_key(chat_id)
+
+
+async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
+    """پیامِ وضعیت را **دقیقاً یک بار** می‌سازد و شناسه‌اش را ثبت می‌کند.
+
+    ⚠️ باگِ واقعی: قلابِ ساخت پیام وضعیت هم از مسیر «پایان بازه» صدا زده
+    می‌شد و هم از مسیر پیشرفت؛ چون هنوز شناسه‌ای روی رکورد نبود، هر بار یک
+    پیام **تازه** ساخته می‌شد (کاربر سه پیام دید). این‌جا:
+
+    * قفلِ ``asyncio`` به‌ازای هر گروه ⇒ هیچ ساختِ هم‌زمانِ دوتایی نداریم.
+    * بعد از گرفتن قفل، رکورد **از دیسک** دوباره خوانده می‌شود؛ اگر شناسه
+      نوشته شده باشد همان برگردانده می‌شود.
+    * شناسه در حافظه هم نگه داشته می‌شود تا حتی اگر نوشتن روی دیسک شکست
+      بخورد، پیام دوم ساخته نشود.
     """
+    key = _message_key(chat_id)
+    in_memory = _STATUS.get(key)
+    if in_memory:
+        return in_memory
     record = record or timed.get_record(chat_id) or {}
-    message_id = record.get("status_message_id") or status_id(chat_id)
+    message_id = record.get("status_message_id")
     if message_id:
+        _STATUS[key] = message_id
         return message_id
-    record_data = record or {}
-    total = record_data.get("tracked")
-    if total is None:
-        total = len(timed.tracked_ids(chat_id, record_data))
-    ended_at = record_data.get("end_at_tehran") or None
-    payload = texts.timed_progress(deleted=0, failed=0, elapsed_seconds=0,
-                                   locked=True, state="running",
-                                   total=total, ended_at=ended_at)
-    try:
-        sent = await asyncio.wait_for(
-            bot.client.send_message(timed.resolve_peer(bot, chat_id,
-                                                       record or {}),
-                                    payload[0],
-                                    formatting_entities=payload[1]),
-            timeout=timed.RPC_TIMEOUT)
-    except Exception as error:                       # noqa: BLE001
-        if logger is not None:
-            try:
-                logger.log_error(
-                    f"TIMED STATUS SEND FAILED chat_id={chat_id} "
-                    f"error={error!r}")
-            except Exception:                        # noqa: BLE001
-                pass
-        return None
-    return register_status(chat_id, getattr(sent, "id", None))
+
+    lock = _ENSURE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ENSURE_LOCKS[key] = lock
+    async with lock:
+        # بازبینیِ دوباره زیرِ قفل (ممکن است کارِ هم‌زمان ساخته باشد).
+        if _STATUS.get(key):
+            return _STATUS[key]
+        fresh = timed.get_record(chat_id) or {}
+        if fresh.get("status_message_id"):
+            _STATUS[key] = fresh["status_message_id"]
+            return fresh["status_message_id"]
+
+        total = fresh.get("tracked")
+        if total is None:
+            total = len(timed.tracked_ids(chat_id, fresh))
+        payload = texts.timed_progress(deleted=0, failed=0, elapsed_seconds=0,
+                                       locked=True, state="running",
+                                       total=total,
+                                       ended_at=fresh.get("end_at_tehran"))
+        try:
+            sent = await asyncio.wait_for(
+                bot.client.send_message(timed.resolve_peer(bot, chat_id, fresh),
+                                        payload[0],
+                                        formatting_entities=payload[1]),
+                timeout=timed.RPC_TIMEOUT)
+        except Exception as error:                   # noqa: BLE001
+            if logger is not None:
+                try:
+                    logger.log_error(
+                        f"TIMED STATUS SEND FAILED chat_id={chat_id} "
+                        f"error={error!r}")
+                except Exception:                    # noqa: BLE001
+                    pass
+            return None
+        message_id = getattr(sent, "id", None)
+        if message_id is None:
+            return None
+        return register_status(chat_id, message_id)
 
 
 async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked=None,
@@ -210,9 +245,8 @@ async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked=None,
                                    state=state, total=total, ended_at=ended_at,
                                    late_seconds=late)
     if not message_id:
-        # اگر شناسهٔ پیام وضعیت به هر دلیلی نبود (ری‌استارتِ بد/فایلِ قدیمی)،
-        # همان‌جا یک پیام ساخته و ویرایش‌های بعدی روی آن انجام می‌شود — پیامِ
-        # نتیجه هرگز نباید بی‌صدا از دست برود.
+        # ⚠️ دقیقاً یک بار (با قفلِ داخلی). انتشارهای بعدی (پیشرفت) دیگر پیام
+        # تازه نمی‌سازند؛ شناسه در حافظه/دیسک می‌ماند.
         message_id = await ensure_status_message(bot, chat_id, record=record,
                                                  logger=logger)
     if not message_id:
@@ -411,6 +445,7 @@ def reset_all(chat_id=None):
     if chat_id is None:
         _CHOICES.clear()
         _STATUS.clear()
+        _ENSURE_LOCKS.clear()
     else:
         clear_choice(chat_id)
         _STATUS.pop(_key(chat_id), None)
