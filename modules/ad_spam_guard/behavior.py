@@ -57,6 +57,12 @@ TRAIL_WINDOW = P.TRAIL_WINDOW
 TRAIL_MAX = P.TRAIL_MAX
 MAX_KEYS = P.BEHAVIOR_MAX_KEYS
 MAX_RECORDS = P.BEHAVIOR_MAX_RECORDS
+FAST_GAP = P.FAST_GAP
+FAST_MESSAGES = P.FAST_MESSAGES
+LOW_VOCAB_MIN = P.LOW_VOCAB_MIN
+LOW_VOCAB_RATIO = P.LOW_VOCAB_RATIO
+BIO_BAIT_MAX_LEN = P.BIO_BAIT_MAX_LEN
+BIO_BAIT_COUNT = P.BIO_BAIT_COUNT
 
 _URL_OR_CONTACT_RE = re.compile(
     r"(@[A-Za-z0-9_]{4,}|t\.me/|telegram\.me/|wa\.me/|whatsapp|"
@@ -137,6 +143,9 @@ class BehaviorTracker:
             "cta": bool(strong),
             "contact": contact,
             "chatter": is_chatter,
+            "greet": bool(chit) and len(normalized) <= BIO_BAIT_MAX_LEN and (
+                "سلام" in normalized or normalized in P.GREETING_PHRASES
+            ),
             "target": None if target_user_id is None else str(target_user_id),
         }
         bucket.append(record)
@@ -161,6 +170,44 @@ class BehaviorTracker:
             if r["mid"] is not None and now - r["ts"] <= TRAIL_WINDOW
         ]
 
+        window_records = [r for r in bucket if now - r["ts"] <= WINDOW]
+
+        # «سریع‌سریع ریپلای می‌کند»: چند پیام با فاصلهٔ خیلی کم.
+        gaps = [
+            window_records[i]["ts"] - window_records[i - 1]["ts"]
+            for i in range(1, len(window_records))
+        ]
+        fast_count = sum(1 for gap in gaps if gap <= FAST_GAP) + (
+            1 if window_records else 0
+        )
+        fast_replying = bool(gaps) and (
+            sum(1 for gap in gaps if gap <= FAST_GAP) >= FAST_MESSAGES - 1
+        )
+
+        # «حرف‌هایش تکراری است و تمام نمی‌شود»: تنوعِ واژگانِ پایین.
+        texts_in_window = [r["text"] for r in window_records if r["text"]]
+        unique_count = len(set(texts_in_window))
+        total_count = len(texts_in_window)
+        low_vocabulary = (
+            total_count >= LOW_VOCAB_MIN
+            and unique_count / float(total_count) <= LOW_VOCAB_RATIO
+        )
+
+        # «فقط یک سلام می‌فرستد تا بیو را ببینید» (bio-bait).
+        greeting_only = bool(chit) and len(normalized) <= BIO_BAIT_MAX_LEN and (
+            "سلام" in normalized or normalized in P.GREETING_PHRASES
+        )
+        greeting_count = sum(
+            1 for r in window_records
+            if r["greet"] and now - r["ts"] <= WINDOW
+        )
+        greeting_targets = {
+            r["target"] for r in window_records
+            if r["greet"] and r["target"] and now - r["ts"] <= WINDOW
+        }
+
+        short_text = 0 < len(normalized) <= P.CHATTER_MAX_LEN
+
         return {
             "cta": bool(strong),
             "cta_phrase": strong,
@@ -175,6 +222,15 @@ class BehaviorTracker:
             "targets_count": len(targets),
             "repeat": repeat_count >= REPEAT_COUNT,
             "repeat_count": repeat_count,
+            "short_text": short_text,
+            "fast_replying": fast_replying,
+            "fast_count": fast_count,
+            "low_vocabulary": low_vocabulary,
+            "unique_count": unique_count,
+            "window_count": total_count,
+            "greeting_bait": greeting_count >= BIO_BAIT_COUNT,
+            "greeting_count": greeting_count,
+            "greeting_targets": len(greeting_targets),
             "trail": trail[-TRAIL_MAX:],
             "window": WINDOW,
         }
@@ -203,6 +259,26 @@ def decide(signals: dict) -> list:
         or signals.get("chatter")
         or signals.get("repeat")
     )
+    # ── «رباتِ گپ‌زن»: متنِ تکراری/کوتاه + ریپلای به کاربرانِ مختلف ──
+    if (signals.get("repeat") and signals.get("short_text")
+            and signals.get("targets_count", 0) >= 1):
+        # یک «سلام 👋» را عمداً چند بار به شکلِ ریپلای می‌فرستد.
+        reasons.append("repeat-short-reply")
+    if (signals.get("repeat") and signals.get("targets_count", 0) >= 2):
+        reasons.append("repeat-to-many")
+    if (signals.get("greeting_bait")
+            and (signals.get("greeting_targets", 0) >= 2
+                 or signals.get("greeting_count", 0) >= BIO_BAIT_COUNT + 1)):
+        # «سلام»های کوتاه به چند نفر ⇒ بیو-چک.
+        reasons.append("bio-bait")
+    if (signals.get("low_vocabulary")
+            and signals.get("targets_count", 0) >= 1):
+        # حرف‌های تکراری که تمام نمی‌شوند.
+        reasons.append("low-vocabulary")
+    if (signals.get("fast_replying") and signals.get("chatter")
+            and signals.get("targets_count", 0) >= 1):
+        # سریع‌سریع به بقیه جواب می‌دهد و حرفش هم الکی است.
+        reasons.append("fast-replier")
     if signals.get("cta") and behavioural:
         reasons.append("cta+behavior")
     if (signals.get("cta_weak") and signals.get("contact") and behavioural):
@@ -213,7 +289,9 @@ def decide(signals: dict) -> list:
     if signals.get("repeat_count", 0) >= P.REPEAT_HARD_COUNT:
         reasons.append("repeat-loop")
     if (signals.get("targets_count", 0) >= P.REPLY_BOT_TARGETS
-            and signals.get("burst_count", 0) >= P.REPLY_BOT_BURST):
-        # رباتِ ریپلای‌زن: به ۴ کاربرِ مختلف در ۲ دقیقه جواب می‌دهد.
+            and signals.get("burst_count", 0) >= P.REPLY_BOT_BURST
+            and (signals.get("chatter") or signals.get("low_vocabulary"))):
+        # رباتِ ریپلای‌زن: به ۳ کاربرِ مختلف در ۲ دقیقه جواب می‌دهد و
+        # حرفش هم «گپِ الکی» است (وگرنه ممکن است کاربرِ عادی باشد).
         reasons.append("reply-bot")
     return reasons

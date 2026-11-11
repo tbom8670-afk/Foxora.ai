@@ -142,8 +142,10 @@ def test_sequence_from_screenshot():
         handled.append(run(detector.guard_message(
             bot, event, CHAT, 777, sender, 500 + index)))
 
-    check("گپ‌های اولیه چیزی را حذف نمی‌کنند",
-          handled[:-1] == [False] * (len(handled) - 1), handled)
+    check("سه پیامِ اول (شروعِ گپ) چیزی را حذف نمی‌کنند",
+          handled[:3] == [False, False, False], handled)
+    check("از چهارمی به بعد (الگویِ رباتی) گرفته می‌شود",
+          all(handled[3:]), handled)
     check("پیامِ «خدمات میدم» گرفته شد", handled[-1] is True, handled)
     check("همان پیام حذف شد", 505 in bot.client.deleted, bot.client.deleted)
     check("ردِ کمپین (۵ پیامِ قبلی) هم پاک شد",
@@ -267,6 +269,93 @@ def test_memory_bounds():
     check("forget_chat وضعیتِ گروه را پاک می‌کند", len(tracker._store) == 0)
 
 
+
+def test_bio_bait_single_greeting():
+    print("\n=== ۷. «سلام»ِ تکراری برای بیو-چک ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+    bot = FakeBot()
+    sender = SimpleNamespace(id=910, first_name="نیکا", username="nika_1990")
+
+    # یک «سلام»ِ تنها ⇒ دست‌نخورده
+    clock[0] = 0.0
+    event = FakeEvent("سلام 👋", message_id=1000, reply_to_user=11)
+    check("یک سلامِ تنها حذف نمی‌شود",
+          run(detector.guard_message(bot, event, CHAT, 910, sender, 1000)) is False)
+
+    # همان «سلام» به کاربرِ دوم ⇒ تشخیص
+    clock[0] = 12.0
+    event = FakeEvent("سلام 👋", message_id=1001, reply_to_user=12)
+    check("تکرارِ همان سلام برای نفرِ دوم گرفته می‌شود",
+          run(detector.guard_message(bot, event, CHAT, 910, sender, 1001)) is True,
+          bot.client.deleted)
+
+
+def test_endless_repetitive_chatter():
+    print("\n=== ۸. گپِ تکراریِ بی‌پایان (بدونِ کلمهٔ تبلیغ) ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+    bot = FakeBot()
+    sender = SimpleNamespace(id=911, first_name="n", username="n")
+    seq = ["اوف", "داغم", "اوف", "گرمه", "اوف", "داغم"]
+    results = []
+    for index, text in enumerate(seq):
+        clock[0] = index * 20.0
+        event = FakeEvent(text, message_id=1100 + index, reply_to_user=11)
+        results.append(run(detector.guard_message(
+            bot, event, CHAT, 911, sender, 1100 + index)))
+    check("گپِ تکراریِ بی‌پایان گرفته می‌شود", any(results), results)
+    check("پیام‌ها پاک شدند", bool(bot.client.deleted), bot.client.deleted)
+
+
+def test_fast_replier():
+    print("\n=== ۹. ریپلای‌های سریعِ پشتِ‌سرهم ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+    bot = FakeBot()
+    sender = SimpleNamespace(id=912, first_name="n", username="n")
+    seq = [("سلام", 11), ("خوبی", 12), ("چخبر", 13), ("خاخ", 14)]
+    results = []
+    for index, (text, target) in enumerate(seq):
+        clock[0] = index * 2.0          # هر ۲ ثانیه یک پیام
+        event = FakeEvent(text, message_id=1200 + index, reply_to_user=target)
+        results.append(run(detector.guard_message(
+            bot, event, CHAT, 912, sender, 1200 + index)))
+    check("ریپلایِ سریع به چند نفر گرفته می‌شود", any(results), results)
+
+
+def test_warn_template():
+    print("\n=== ۱۰. قالبِ پیام هشدار (مطابقِ اسکرین‌شات) ===")
+    from modules.ad_spam_guard import texts
+
+    text, entities = texts.warn_payload("@Linx_cox", 1)
+    expected = (
+        "⚠️ کاربر  @Linx_cox\n"
+        "پیام شما پاک شد | دلیل : تبلیغات گروهی\n"
+        "\n"
+        "تعداد اخطار : 1\n"
+        "انجام دهنده : هوش مصنوعی ضد تبلیغ"
+    )
+    check("متنِ هشدار دقیقاً همان عکس است", text == expected, repr(text))
+    check("فقط یک entity (نقل‌قول) دارد",
+          [type(e).__name__ for e in entities] == ["MessageEntityBlockquote"],
+          [type(e).__name__ for e in entities])
+    check("نقل‌قول فقط خطِ عنوان را می‌گیرد",
+          entities and entities[0].offset == 0
+          and entities[0].length == len("⚠️ کاربر  @Linx_cox".encode("utf-16-le")) // 2,
+          entities)
+    check("هیچ بخشی Bold نیست",
+          not any(type(e).__name__ == "MessageEntityBold" for e in entities))
+    check("دلیل قابلِ تغییر است",
+          "دلیل : کلمه ممنوعه" in texts.render_warn("@x", 2, "کلمه ممنوعه"))
+
+
 def main():
     print("=" * 62)
     print("تستِ تشخیصِ رفتارِ ربات‌های کاربرنما")
@@ -277,6 +366,10 @@ def main():
     test_reply_bot_without_cta()
     test_admin_exempt()
     test_memory_bounds()
+    test_bio_bait_single_greeting()
+    test_endless_repetitive_chatter()
+    test_fast_replier()
+    test_warn_template()
     print("\n" + "=" * 62)
     print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
     print("=" * 62)

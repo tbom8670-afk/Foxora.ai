@@ -75,15 +75,32 @@ CANCELLED_MESSAGE = "▫️لغو شد."
 # ۳) پیام هشدار هنگام حذف پیام تبلیغاتی
 #    {user}   — نمایش کاربر (مثل @username)
 #    {count}  — تعداد اخطارهای کاربر
+#    {reason} — دلیلِ حذف (پیش‌فرض: تبلیغات گروهی)
 # ---------------------------------------------------------------------------
+# قالب — عیناً مطابقِ اسکرین‌شاتِ کارفرما:
+#
+#   ┌ نقل‌قول ────────────────────────────────┐
+#   │ ⚠️ کاربر  @user                         │   ← فقط همین خط Blockquote است
+#   └─────────────────────────────────────────┘
+#   پیام شما پاک شد | دلیل : تبلیغات گروهی        ← بدونِ خطِ خالی، چسبیده به نقل‌قول
+#                                                  ← یک خطِ خالی
+#   تعداد اخطار : 1
+#   انجام دهنده : هوش مصنوعی ضد تبلیغ             ← چسبیده به خطِ قبل
+#
+# هیچ بخشی Bold نیست؛ در عکس همهٔ خط‌ها یک وزن دارند و تنها عنوان داخلِ
+# نقل‌قول است (هم‌سبکِ قالب‌های ``modules/manage_features/texts.py``).
+WARN_REASON_DEFAULT = "تبلیغات گروهی"
+WARN_HEADER = "⚠️ کاربر  {user}"
+WARN_BODY = "پیام شما پاک شد | دلیل : {reason}"
+WARN_COUNT_LINE = "تعداد اخطار : {count}"
+WARN_ACTOR_LINE = "انجام دهنده : هوش مصنوعی ضد تبلیغ"
+
 WARN_TEMPLATE = (
-    "⚠️ کاربر  {user}\n"
+    WARN_HEADER + "\n"
+    + WARN_BODY + "\n"
     "\n"
-    "پیام شما پاک شد | دلیل : تبلیغات گروهی\n"
-    "\n"
-    "تعداد اخطار : {count}\n"
-    "\n"
-    "انجام دهنده : هوش مصنوعی ضد تبلیغ"
+    + WARN_COUNT_LINE + "\n"
+    + WARN_ACTOR_LINE
 )
 
 # ---------------------------------------------------------------------------
@@ -104,10 +121,22 @@ CONFIRM_WORDS = frozenset({
 CANCEL_WORDS = frozenset({"لغو", "❌ لغو", "▫️ لغو", "▫️لغو"})
 
 
-def render_warn(user: str, count: int) -> str:
-    """قالب هشدار را با مقدارهای واقعی می‌سازد."""
+def render_warn(user: str, count: int,
+                reason: str = WARN_REASON_DEFAULT) -> str:
+    """متنِ پیامِ هشدار را با مقدارهای واقعی می‌سازد."""
     try:
-        return WARN_TEMPLATE.format(user=user, count=count)
+        return WARN_TEMPLATE.format(user=user, count=count, reason=reason)
     except Exception:
         # قالبِ خراب نباید کل قابلیت را از کار بیندازد.
         return WARN_TEMPLATE
+
+
+def warn_payload(user: str, count: int,
+                 reason: str = WARN_REASON_DEFAULT):
+    """``(متن, entityها)`` پیامِ هشدار — فقط عنوان داخلِ نقل‌قول است."""
+    text = render_warn(user, count, reason)
+    header = WARN_HEADER.format(user=user)
+    entities = []
+    if text.startswith(header):
+        entities.append(MessageEntityBlockquote(offset=0, length=u16(header)))
+    return text, entities

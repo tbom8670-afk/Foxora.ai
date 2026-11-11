@@ -270,7 +270,8 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
     # پیامِ هشدار به‌صورتِ مستقل فرستاده می‌شود: پیامِ متخلف همین حالا حذف
     # شده و ریپلای روی آن یا خطا می‌دهد یا نقل‌قولِ شکسته می‌سازد.
     try:
-        await _send(bot, event, chat_id, texts.render_warn(_display(sender), count))
+        warn_text, warn_entities = texts.warn_payload(_display(sender), count)
+        await _send(bot, event, chat_id, warn_text, warn_entities)
     except Exception as exc:  # noqa: BLE001
         logger.warning("ad-spam warn send failed: %r", exc)
 
