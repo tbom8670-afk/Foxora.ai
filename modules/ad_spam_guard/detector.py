@@ -195,10 +195,12 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
         logger.warning("ad-spam warn counter failed: %r", exc)
         count = 0
 
+    # پیامِ هشدار به‌صورتِ مستقل فرستاده می‌شود: پیامِ متخلف همین حالا حذف
+    # شده و ریپلای روی آن یا خطا می‌دهد یا نقل‌قولِ شکسته می‌سازد.
     try:
-        await event.reply(texts.render_warn(_display(sender), count))
+        await _send(bot, event, chat_id, texts.render_warn(_display(sender), count))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("ad-spam warn reply failed: %r", exc)
+        logger.warning("ad-spam warn send failed: %r", exc)
 
     return True
 
@@ -225,7 +227,6 @@ async def _direct_delete(bot, chat_id, message_id) -> bool:
 # ---------------------------------------------------------------------------
 # دستورهای روشن/خاموش
 # ---------------------------------------------------------------------------
-
 def _is_admin(chat_id, user_id, sender) -> bool:
     try:
         from modules.admin_tools import has_admin_permission
@@ -247,11 +248,94 @@ async def _denied(bot, event) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# نرمال‌سازیِ کلمهٔ «تایید/لغو»
+# ---------------------------------------------------------------------------
+#: نشانه‌ها/قاب‌هایی که در قالبِ کارت می‌آیند یا کاربر ممکن است بنویسد.
+_WORD_NOISE = (
+    "▪▫◾◽◼◻■□●○◆◇◈★☆✅☑✔❌✖✗⚠💥🔹🔸•·«»‹›\"'`.,!:;،؛_*#-–—/+"
+)
+
+
+def _clean_word(text: str) -> str:
+    """کلمه را برای مقایسه یکدست می‌کند (نشانه/نیم‌فاصله/اعراب/تکرار).
+
+    «▪️تایید»، «تأیید»، «تایيد»، «✅ تایید» و «تــایید» همه به یک چیز
+    می‌رسند؛ وگرنه «تایید»ِ کاربر به مسیرِ دیگری (گزارش) می‌افتاد.
+    """
+    value = str(text or "")
+    for ch in ("\u200c", "\u200f", "\u200e", "\ufeff", "\u0640",
+               "\u064b", "\u064c", "\u064d", "\u064e", "\u064f",
+               "\u0650", "\u0651", "\u0652", "\u0653", "\u0654", "\u0655"):
+        value = value.replace(ch, "")
+    for src, dst in (("ي", "ی"), ("ك", "ک"), ("أ", "ا"), ("إ", "ا"),
+                     ("آ", "ا"), ("ٱ", "ا"), ("ة", "ه"), ("ۀ", "ه")):
+        value = value.replace(src, dst)
+    for ch in _WORD_NOISE:
+        value = value.replace(ch, " ")
+    value = value.replace("\ufe0f", "")
+    return " ".join(value.split())
+
+
+_CONFIRM_ROOTS = frozenset({"تایید", "تصویب", "قبول", "اوکی", "ok"})
+_CANCEL_ROOTS = frozenset({"لغو", "انصراف", "نه", "کنسل", "cancel"})
+
+
+def is_confirm_word(text: str) -> bool:
+    """آیا پیام یعنی «تایید» (با هر نشانه/اعراب/شکلِ نوشتاری)؟"""
+    return _clean_word(text) in _CONFIRM_ROOTS
+
+
+def is_cancel_word(text: str) -> bool:
+    """آیا پیام یعنی «لغو»؟"""
+    return _clean_word(text) in _CANCEL_ROOTS
+
+
+def has_pending_confirm(chat_id) -> bool:
+    """آیا کارتِ تأییدیه در این گروه منتظرِ تصمیم است؟ (بدون RPC)"""
+    try:
+        return bool(state.has_pending(chat_id))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------------------
+# ارسال
+# ---------------------------------------------------------------------------
+async def _send(bot, event, chat_id, text, entities=None):
+    """پیام را **مستقل** (بدونِ ریپلای روی دستور) می‌فرستد.
+
+    در اسکرین‌شاتِ درست، کارتِ تأییدیه هیچ نقل‌قولی از پیامِ «تبلیغ گر روشن»
+    ندارد؛ پس ``event.reply`` فقط «آخرین راهِ چاره» است.
+    """
+    payload = {"formatting_entities": entities} if entities else {}
+    target = None
+    try:
+        from modules.manage_features import peers
+
+        target = peers.group_peer(bot, chat_id)
+    except Exception:  # noqa: BLE001 — بدونِ helpers هم باید کار کند
+        target = None
+    for candidate in (target, chat_id):
+        if candidate is None:
+            continue
+        try:
+            return await bot.client.send_message(candidate, text, **payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam send via %r failed: %r", candidate, exc)
+    try:
+        return await event.reply(text, **payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam card reply failed: %r", exc)
+        return None
+
+
 async def handle_toggle(bot, event, chat_id, user_id, sender, mode: str) -> bool:
     """«تبلیغ گر روشن/خاموش» را اجرا می‌کند. خروجی: رسیدگی شد؟
 
-    «روشن» مستقیم فعال نمی‌کند: اول پیام تأییدیه را نشان می‌دهد و منتظرِ
-    «تایید/لغو» می‌ماند (مطابق اسکرین‌شاتِ کارفرما). «خاموش» مستقیم است.
+    «روشن» مستقیم فعال نمی‌کند: اول **کارتِ تأییدیه** (عیناً مطابق اسکرین‌شات)
+    به‌صورتِ پیامِ مستقل فرستاده می‌شود و منتظرِ «تایید/لغو» می‌ماند.
+    «خاموش» مستقیم است.
     """
     if not _is_admin(chat_id, user_id, sender):
         return await _denied(bot, event)
@@ -265,40 +349,65 @@ async def handle_toggle(bot, event, chat_id, user_id, sender, mode: str) -> bool
             )
         except Exception:
             pass
-        await event.reply(texts.CONFIRM_ENABLE_TEMPLATE)
+        text, entities = texts.confirm_enable()
+        sent = await _send(bot, event, chat_id, text, entities)
+        state.set_confirm_card(chat_id, getattr(sent, "id", None))
         return True
 
     storage.disable(chat_id)
+    state.clear_confirm(chat_id)
     try:
         bot.logger.log_info(
             "AD SPAM GUARD DISABLED chat_id=%s user_id=%s" % (chat_id, user_id)
         )
     except Exception:
         pass
-    await event.reply(texts.DISABLED_MESSAGE)
+    await _send(bot, event, chat_id, texts.DISABLED_MESSAGE)
     return True
 
 
-def is_confirm_word(text: str) -> bool:
-    return (text or "").strip() in texts.CONFIRM_WORDS
-
-
-def is_cancel_word(text: str) -> bool:
-    return (text or "").strip() in texts.CANCEL_WORDS
+def _reply_to_message_id(event):
+    """شناسهٔ پیامی که این پیام روی آن ریپلای شده (اگر باشد)."""
+    reply_to = getattr(getattr(event, "message", None), "reply_to", None)
+    if reply_to is None:
+        reply_to = getattr(event, "reply_to", None)
+    if reply_to is None:
+        return None
+    return (getattr(reply_to, "reply_to_msg_id", None)
+            or getattr(reply_to, "reply_to_id", None))
 
 
 async def handle_confirm(
     bot, event, chat_id, user_id, sender, *, accept: bool
 ) -> bool:
-    """پاسخ به «تایید/لغو» پیام تأییدیه را پردازش می‌کند."""
-    pending = state.pending_user(chat_id)
-    if pending is None:
-        return False
-    # فقط همان ادمینی که درخواست داده می‌تواند تأیید کند.
-    if str(pending) != str(user_id):
-        return False
+    """پاسخِ «تایید/لغو» کارت را پردازش می‌کند.
+
+    قواعدِ ثابتِ این مسیر (رفعِ باگِ کارفرما):
+
+    * تا وقتی کارتی در این گروه منتظرِ تصمیم است، کلمهٔ «تایید/لغو» **همیشه**
+      همین‌جا مصرف می‌شود و هرگز به مسیرِ «گزارش» نمی‌افتد
+      («گزارش‌دهنده نمی‌تواند تصمیم بگیرد»).
+    * هر ادمین/مالکِ همان گروه می‌تواند تأیید کند، نه فقط کسی که دستور را
+      زده؛ در عوض کاربرِ بی‌مجوز پیامِ روشنِ «دسترسی ندارید» می‌گیرد و کارت
+      باز می‌ماند.
+    * اگر وضعیت پس از ری‌استارت از دست رفته باشد، «تایید» با **ریپلای روی
+      خودِ کارت** هم پذیرفته می‌شود.
+    """
+    pending_user = state.pending_user(chat_id)
+    if pending_user is None:
+        # راهِ دوم: ریپلای روی همان کارتِ تأییدیه.
+        if state.is_pending_card(chat_id, _reply_to_message_id(event)):
+            pass
+        else:
+            return False
+
+    if not _is_admin(chat_id, user_id, sender):
+        # کلمه مصرف می‌شود تا به مسیرِ گزارش نرود، ولی کارت دست‌نخورده
+        # می‌ماند تا ادمینِ واقعی تصمیم بگیرد.
+        return await _denied(bot, event)
 
     state.clear_confirm(chat_id)
+
     if not accept:
         try:
             bot.logger.log_info(
@@ -307,11 +416,8 @@ async def handle_confirm(
             )
         except Exception:
             pass
-        await event.reply(texts.CANCELLED_MESSAGE)
+        await _send(bot, event, chat_id, texts.CANCELLED_MESSAGE)
         return True
-
-    if not _is_admin(chat_id, user_id, sender):
-        return await _denied(bot, event)
 
     storage.enable(chat_id)
     try:
@@ -320,5 +426,5 @@ async def handle_confirm(
         )
     except Exception:
         pass
-    await event.reply(texts.ENABLED_MESSAGE)
+    await _send(bot, event, chat_id, texts.ENABLED_MESSAGE)
     return True

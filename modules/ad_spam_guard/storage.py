@@ -76,11 +76,29 @@ def is_enabled(chat_id) -> bool:
     return bool(load().get(str(chat_id), False))
 
 
+def _normalize_command(text: str) -> str:
+    """دستور را یکدست می‌کند: نیم‌فاصله/ی‌و‌کِ عربی/فاصله‌های اضافه/نشانه."""
+    value = str(text or "")
+    value = value.replace("\u200c", " ")  # نیم‌فاصله = فاصله (نه حذف)
+    for ch in ("\u200f", "\u200e", "\ufeff", "\u0640"):
+        value = value.replace(ch, "")
+    for src, dst in (("ي", "ی"), ("ك", "ک"), ("أ", "ا"), ("إ", "ا"), ("آ", "ا")):
+        value = value.replace(src, dst)
+    for ch in "▪▫●○◆◇★☆✅❌.،!؛:«»":
+        value = value.replace(ch, " ")
+    return " ".join(value.split())
+
+
+def normalize_command(text: str) -> str:
+    """نسخهٔ عمومیِ نرمال‌سازِ دستور (برای تست/استفادهٔ بیرونی)."""
+    return _normalize_command(text)
+
+
 def is_toggle_command(text: str) -> str | None:
     """اگر متن یکی از دو دستورِ روشن/خاموش باشد، حالت را برمی‌گرداند."""
-    cleaned = (text or "").strip()
-    if cleaned == ON_COMMAND:
+    cleaned = _normalize_command(text)
+    if cleaned == _normalize_command(ON_COMMAND):
         return "on"
-    if cleaned == OFF_COMMAND:
+    if cleaned == _normalize_command(OFF_COMMAND):
         return "off"
     return None

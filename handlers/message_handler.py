@@ -4113,6 +4113,12 @@ async def handle_new_message(bot, event):
         # ایموجی) به‌همراه محتوای پیام تصمیم می‌گیرد و با صفِ حذفِ اختصاصی
         # کار می‌کند. ادمین/مالک معاف‌اند مگر اینکه هویتشان با مارکر مطابقت
         # داشته باشد (این ربات‌ها گاهی نشان ادمین هم دارند).
+        #
+        # ⚠️ ترتیب این‌جا **قرارداد** است: «تبلیغ گر روشن/خاموش» و سپس
+        # «تایید/لغو»ی همان کارت، پیش از هر قابلیتِ دیگری (از جمله «گزارش»)
+        # مصرف می‌شوند. قبلاً نام‌های عمومیِ این بسته در ``__init__`` صادر
+        # نشده بودند؛ در نتیجه همین بلوک با ``AttributeError`` می‌شکست، خطا
+        # بلعیده می‌شد و «تایید» به مسیرِ گزارش می‌افتاد.
         if not event.is_private and chat_id and user_id:
             try:
                 _ad_text = str(message_text or "").strip()
@@ -4146,6 +4152,22 @@ async def handle_new_message(bot, event):
                         f"chat_id={chat_id} user_id={user_id} "
                         f"error={_ad_spam_error!r}"
                     )
+                except Exception:
+                    pass
+                # ⛔️ مسیرِ جایگزینِ ایمن: اگر خطایی رخ داد ولی کارتِ
+                # «تبلیغ گر روشن» منتظرِ تصمیم است، «تایید/لغو» نباید به
+                # مسیرِ «گزارش» بیفتد (باگِ «گزارش‌دهنده نمی‌تواند تصمیم
+                # بگیرد»). پیام مصرف می‌شود و خطا در لاگ می‌ماند.
+                try:
+                    _ad_safe_text = str(message_text or "").strip()
+                    if (
+                        _ad_spam_guard.has_pending_confirm(chat_id)
+                        and (
+                            _ad_spam_guard.is_confirm_word(_ad_safe_text)
+                            or _ad_spam_guard.is_cancel_word(_ad_safe_text)
+                        )
+                    ):
+                        return
                 except Exception:
                     pass
 

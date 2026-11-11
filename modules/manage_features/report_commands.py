@@ -34,6 +34,20 @@ def normalize(text) -> str:
     return " ".join(value.split())
 
 
+def ad_spam_pending(chat_id) -> bool:
+    """آیا کارتِ تأییدیهٔ «تبلیغ گر» در این گروه منتظرِ «تایید/لغو» است؟
+
+    ارزان و بدونِ RPC؛ فقط برای اینکه کلمهٔ «تایید/لغو» به مسیرِ اشتباه
+    (پروندهٔ گزارش) نرود. خطای ایمپورت = «منتظر نیست».
+    """
+    try:
+        from modules import ad_spam_guard
+
+        return bool(ad_spam_guard.has_pending_confirm(chat_id))
+    except Exception:                                # noqa: BLE001
+        return False
+
+
 def is_command(text, chat_id=None, user_id=None) -> bool:
     """آیا این پیام به «گزارش» مربوط است؟ (ارزان: بدون RPC)
 
@@ -47,9 +61,13 @@ def is_command(text, chat_id=None, user_id=None) -> bool:
         return False
     if user_id is not None and reports.pending_reason(chat_id, user_id):
         return bool(cleaned)
-    if (cleaned in CONFIRM_WORDS or cleaned in CANCEL_WORDS) and \
-            _awaiting_case(chat_id):
-        return True
+    if cleaned in CONFIRM_WORDS or cleaned in CANCEL_WORDS:
+        # ⚠️ اگر کارتِ «تبلیغ گر روشن» منتظرِ تصمیم است، «تایید/لغو» مالِ همان
+        # قابلیت است و نباید واردِ پروندهٔ گزارش شود (باگِ کارفرما:
+        # «گزارش‌دهنده نمی‌تواند تصمیم بگیرد»).
+        if ad_spam_pending(chat_id):
+            return False
+        return bool(_awaiting_case(chat_id))
     return False
 
 
@@ -147,6 +165,9 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
 
     # ---- ۳) تأیید/لغو مالک ----
     if cleaned in CONFIRM_WORDS or cleaned in CANCEL_WORDS:
+        if ad_spam_pending(chat_id):
+            # مرزِ مالکیتِ کلمه: «تایید/لغو» متعلق به کارتِ «تبلیغ گر» است.
+            return False
         case_id = _awaiting_case(chat_id)
         if not case_id:
             return False
