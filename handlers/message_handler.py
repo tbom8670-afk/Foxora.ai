@@ -100,6 +100,15 @@ from modules.flag_guess import (
     is_exhausted as flag_guess_exhausted,
     start as start_flag_guess,
 )
+from modules.word_puzzle import (
+    texts as WORD_PUZZLE_TEXTS,
+    TIME_LIMIT as WORD_PUZZLE_SECONDS,
+    TOTAL as WORD_PUZZLE_TOTAL,
+    active as word_puzzle_active,
+    answer as answer_word_puzzle,
+    start as start_word_puzzle,
+    timeout as word_puzzle_timeout,
+)
 from modules.jadvalestan import (
     texts as JADVALESTAN_TEXTS,
     TIME_LIMIT as JADVALESTAN_SECONDS,
@@ -1020,6 +1029,7 @@ def is_game_answer_active(chat_id, user_id):
         or _speed_bomb.is_active(chat_id)
         or name_chain_active(chat_id)
         or jadvalestan_active(chat_id, user_id)
+        or word_puzzle_active(chat_id, user_id)
     )
 
 
@@ -1058,8 +1068,14 @@ JADVALESTAN_COMMANDS = frozenset({
 })
 
 
-def _jadvalestan_is_command(clean_text):
-    """آیا این متن یک دستورِ ربات است (پس جوابِ جدول نیست)؟
+# 🧩 پازل کلمه — تک‌نفره، ۲۰۰ مرحله، ۴۵ ثانیه برای هر مرحله.
+WORD_PUZZLE_COMMANDS = frozenset({
+    "پازل کلمه", "پازل کلمات", "پازل",
+})
+
+
+def _game_text_is_command(clean_text):
+    """آیا این متن یک دستورِ ربات است (پس جوابِ بازی نیست)؟
 
     بدونِ این بررسی، بازیکنِ وسطِ جدول با نوشتنِ «لیست بازی» یا «موجودی»
     پیامِ «جواب درست نیست» می‌گرفت و دستورش هم اجرا نمی‌شد.
@@ -1070,6 +1086,10 @@ def _jadvalestan_is_command(clean_text):
     if text in _INTERNAL_EXACT_COMMANDS:
         return True
     return text.startswith(("!", "/", "."))
+
+
+# نامِ قدیمی برای سازگاری (همان تابع).
+_jadvalestan_is_command = _game_text_is_command
 
 
 EMOJI_GUESS_TOTAL = _emoji_total_stages()
@@ -1147,6 +1167,58 @@ def _jadvalestan_schedule_timer(bot, event, chat_id, user_id, token):
     _JADVALESTAN_TIMERS[_jadvalestan_timer_key(chat_id, user_id)] = task
     _track_group_timer(bot, chat_id, task)
     return task
+
+
+# 🧩 پازل کلمه: تایمرِ ۴۵ ثانیه‌ای برای هر (گروه، کاربر). جوابِ درست
+# تایمر را لغو می‌کند و تایمرِ کهنه با «توکنِ ناهم‌خوان» خودش را کنار می‌کشد.
+_WORD_PUZZLE_TIMERS = {}
+
+
+def _word_puzzle_timer_key(chat_id, user_id):
+    return (normalize_group_id(chat_id), str(user_id))
+
+
+def _word_puzzle_cancel_timer(chat_id, user_id):
+    task = _WORD_PUZZLE_TIMERS.pop(_word_puzzle_timer_key(chat_id, user_id), None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _word_puzzle_schedule_timer(bot, event, chat_id, user_id, token):
+    """مهلتِ این مرحله؛ در پایانِ مهلت، کلمهٔ درست اعلام می‌شود."""
+    _word_puzzle_cancel_timer(chat_id, user_id)
+
+    async def word_puzzle_deadline():
+        await _asyncio.sleep(WORD_PUZZLE_SECONDS)
+        result = word_puzzle_timeout(chat_id, user_id, token)
+        if not result:
+            return
+        _WORD_PUZZLE_TIMERS.pop(_word_puzzle_timer_key(chat_id, user_id), None)
+        try:
+            await event.reply(result["message"])
+        except Exception as error:  # noqa: BLE001
+            bot.logger.log_error(
+                "WORD PUZZLE TIMEOUT REPLY FAILED "
+                f"chat_id={chat_id} user_id={user_id} error={error!r}"
+            )
+            return
+        bot.logger.log_info(
+            "WORD PUZZLE TIMEOUT "
+            f"chat_id={chat_id} user_id={user_id} stage={result['stage']}"
+        )
+
+    task = _asyncio.create_task(word_puzzle_deadline())
+    _WORD_PUZZLE_TIMERS[_word_puzzle_timer_key(chat_id, user_id)] = task
+    _track_group_timer(bot, chat_id, task)
+    return task
+
+
+def _word_puzzle_entities(payload):
+    """حروفِ جدول باید Bold باشند (بازه‌ها از خودِ ماژول می‌آید)."""
+    return [
+        MessageEntityBold(offset=int(offset), length=int(length))
+        for offset, length in (payload.get("spans") or ())
+    ]
 
 
 def _spam_runtime_key(chat_id, user_id):
@@ -3844,6 +3916,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "بیوگرافی",
     "یاد آوری", "ترجمه", "قفل", "باز", "جک", "تصحیح کلمات",
     "اسم فامیل", "اسم چین", "اسم‌چین", "جدولستان", "بازی جدولستان",
+    "پازل کلمه", "پازل کلمات", "پازل",
     "حدس ایموجی", "حدس پرچم", "چهار گزینه ای", "جای خالی", "چیستان",
     "کی بیشتر بلده", "دروغ یا حقیقت",
     "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
@@ -5932,7 +6005,7 @@ async def handle_new_message(bot, event):
             and (
                 clean_text in SIMPLE_REPLIES
                 or clean_text in INSULTS
-                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "اسم چین", "جدولستان", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
+                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "اسم چین", "جدولستان", "پازل کلمه", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
                 or clean_text.startswith(("سکوت نام", "اخراج نام"))
                 or (
                     clean_text.startswith(("!", "/", "."))
@@ -6885,6 +6958,55 @@ async def handle_new_message(bot, event):
                 )
                 return
 
+        # 🧩 پازل کلمه — ۲۰۰ مرحله، تک‌نفره، ۴۵ ثانیه برای هر مرحله.
+        # وضعیت به تفکیکِ (chat_id, user_id) است؛ پیامِ بقیه هیچ اثری روی
+        # جدولِ صاحبِ بازی ندارد و پیشرفت در دیسک برای همیشه می‌ماند.
+        if clean_text.strip() in WORD_PUZZLE_COMMANDS:
+            puzzle_round = start_word_puzzle(chat_id, user_id)
+            if puzzle_round is None:
+                await event.reply(WORD_PUZZLE_TEXTS.NOT_AVAILABLE_TEXT)
+                return
+            await event.reply(
+                puzzle_round.get("text") or puzzle_round.get("message"),
+                formatting_entities=_word_puzzle_entities(puzzle_round),
+            )
+            if puzzle_round["kind"] == "started":
+                _word_puzzle_schedule_timer(
+                    bot, event, chat_id, user_id, puzzle_round["token"])
+            else:
+                _word_puzzle_cancel_timer(chat_id, user_id)
+            bot.logger.log_info(
+                "WORD PUZZLE START "
+                f"chat_id={chat_id} user_id={user_id} "
+                f"stage={puzzle_round.get('stage')} "
+                f"total={WORD_PUZZLE_TOTAL} kind={puzzle_round['kind']}"
+            )
+            return
+
+        if (
+            word_puzzle_active(chat_id, user_id)
+            and not _game_text_is_command(clean_text)
+        ):
+            puzzle_result = answer_word_puzzle(chat_id, user_id, message_text)
+            if puzzle_result is not None:
+                await event.reply(
+                    puzzle_result["text"],
+                    formatting_entities=_word_puzzle_entities(puzzle_result),
+                )
+                if puzzle_result["kind"] == "correct":
+                    _word_puzzle_schedule_timer(
+                        bot, event, chat_id, user_id,
+                        puzzle_result["next_token"])
+                elif puzzle_result["kind"] == "finished":
+                    _word_puzzle_cancel_timer(chat_id, user_id)
+                bot.logger.log_info(
+                    "WORD PUZZLE ANSWER "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"stage={puzzle_result['stage']} "
+                    f"kind={puzzle_result['kind']}"
+                )
+                return
+
         # 🫆 اسم چین — زنجیرهٔ نام‌های ایرانی با ربات.
         # قاعدهٔ سختِ این بازی: فقط پیام‌هایی که روی پیامِ خودِ ربات ریپلای
         # شده‌اند پردازش می‌شوند؛ پیامِ آزادِ گروه هیچ‌وقت بلعیده نمی‌شود.
@@ -7729,6 +7851,8 @@ async def handle_new_message(bot, event):
                 "رقابت با ربات با آخر اسم یک اسم بگید\n\n"
                 "🧩 جدولستان\n"
                 "جدول روزنامه‌ای؛ ۳۲۰ مرحله، هر مرحله ۶۰ ثانیه و ۳ سکه نقره.\n\n"
+                "🧩 پازل کلمه\n"
+                "کلمه‌ی مخفی رو از بینِ حروفِ جدول پیدا کن؛ ۲۰۰ مرحله، هر مرحله ۴۵ ثانیه.\n\n"
                 "✍️ تصحیح کلمات\n"
                 "پیدا کردن شکل صحیح کلمات.\n\n"
                 "❓ چهار گزینه‌ای\n"
@@ -7790,6 +7914,7 @@ async def handle_new_message(bot, event):
                 "📝 اسم فامیل",
                 "🫆اسم چین",
                 "🧩 جدولستان",
+                "🧩 پازل کلمه",
                 "✍️ تصحیح کلمات",
                 "❓ چهار گزینه‌ای",
                 "📝 جای خالی",
