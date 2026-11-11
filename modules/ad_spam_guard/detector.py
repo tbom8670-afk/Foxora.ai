@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 
+from . import behavior as B
 from . import patterns as P
 from . import state
 from . import storage
@@ -47,8 +48,13 @@ def _has_repeated_run(text: str) -> bool:
     return bool(re.search(r"(.)\1{2,}", text, re.UNICODE))
 
 
-def evaluate(sender, message_text: str) -> dict:
-    """همهٔ سیگنال‌ها را می‌سنجد و نتیجه را با جزئیات برمی‌گرداند."""
+def evaluate(sender, message_text: str, behavior_signals: dict | None = None) -> dict:
+    """همهٔ سیگنال‌ها را می‌سنجد و نتیجه را با جزئیات برمی‌گرداند.
+
+    ``behavior_signals`` خروجیِ ``behavior.observe`` است. با آن، ربات‌های
+    «کاربرنما» که هیچ مارکرِ هویتی ندارند هم گرفته می‌شوند (تبلیغِ
+    چندپیامی: گپِ الکی + ریپلای به چند نفر + خطِ خدمات).
+    """
     name_raw = P.sender_name(sender)
     username_raw = P.sender_username(sender)
 
@@ -101,6 +107,12 @@ def evaluate(sender, message_text: str) -> dict:
     else:
         is_spam = score >= P.CONTENT_ONLY_THRESHOLD
 
+    # --- سیگنالِ رفتار (رباتِ کاربرنما) ---
+    behavior_reasons = B.decide(behavior_signals or {})
+    if behavior_reasons:
+        # رفتارِ رباتی کافی است، حتی با نام/یوزرنیمِ کاملاً عادی.
+        is_spam = True
+
     return {
         "is_spam": bool(is_spam),
         "score": score,
@@ -109,12 +121,40 @@ def evaluate(sender, message_text: str) -> dict:
         "content_hit": content_hit,
         "identity_strong": identity_strong,
         "content_strong": content_strong,
+        "behavior": behavior_signals or {},
+        "behavior_reasons": behavior_reasons,
+        "behavior_spam": bool(behavior_reasons),
     }
 
 
 # ---------------------------------------------------------------------------
 # ورود اصلی
 # ---------------------------------------------------------------------------
+
+def _reply_target_user_id(event):
+    """کاربری که این پیام ریپلای روی اوست (اگر کاربرِ واقعی باشد).
+
+    برای تشخیصِ «رباتِ ریپلای‌زن» لازم است: ربات به چند کاربرِ **مختلف**
+    جواب می‌دهد تا طبیعی دیده شود. اگر شناسه پیدا نشود ``None`` است و
+    سیگنالِ many_targets فقط بر پایهٔ بقیهٔ شواهد کار می‌کند.
+    """
+    reply_to = (getattr(getattr(event, "message", None), "reply_to", None)
+                or getattr(event, "reply_to", None))
+    if reply_to is None:
+        return None
+    for attr in ("from_id", "reply_to_sender_id", "user_id"):
+        value = getattr(reply_to, attr, None)
+        if value is None:
+            continue
+        candidate = getattr(value, "user_id", value)
+        try:
+            number = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
 
 async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> bool:
     """پیام را بررسی و در صورت اسپم حذف می‌کند.
@@ -145,7 +185,17 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
         # پیام بدون متنِ قابلِ بررسی؛ فقط رسانه را دست نمی‌زنیم.
         return False
 
-    result = evaluate(sender, message_text)
+    # --- ردیابِ رفتار: همین پیام را ثبت می‌کند و سیگنال‌های پنجره را می‌دهد ---
+    try:
+        behavior_signals = B.observe(
+            chat_id, user_id, message_id, message_text,
+            _reply_target_user_id(event),
+        )
+    except Exception as exc:  # noqa: BLE001 — ردیاب نباید مسیر را بشکند
+        logger.warning("ad-spam behavior tracker failed: %r", exc)
+        behavior_signals = {}
+
+    result = evaluate(sender, message_text, behavior_signals)
 
     # ادمین/مالک معاف‌اند، **مگر** اینکه هویتِ فرستنده با مارکر مطابقت
     # داشته باشد. این عمدی است: این ربات‌ها گاهی نشانِ ادمین هم دارند و
@@ -172,16 +222,38 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
     else:
         queued = await _direct_delete(bot, chat_id, message_id)
 
+    # --- حذفِ «ردِ» همان کمپین ---
+    # رباتِ کاربرنما تبلیغش را در چند پیام پخش می‌کند (گپِ الکی + خطِ خدمات).
+    # اگر فقط پیامِ آخر پاک شود، گپ‌ها می‌مانند و ربات با همان‌ها ادامه
+    # می‌دهد. پس پیام‌های قبلیِ همان کاربر در پنجرهٔ کوتاه هم پاک می‌شوند.
+    trail_deleted = 0
+    if P.TRAIL_ENABLED and result.get("behavior_spam"):
+        trail = [
+            mid for mid in (result.get("behavior") or {}).get("trail") or []
+            if str(mid) != str(message_id)
+        ][-P.TRAIL_MAX:]
+        for mid in trail:
+            try:
+                if _delete_queue is not None:
+                    _delete_queue.submit(chat_id, mid)
+                else:
+                    await _direct_delete(bot, chat_id, mid)
+                trail_deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("ad-spam trail delete failed: %r", exc)
+
     try:
         bot.logger.log_info(
             "AD SPAM GUARD HIT chat_id=%s user_id=%s message_id=%s score=%s "
-            "signals=%s queued=%s"
+            "signals=%s behavior=%s trail=%s queued=%s"
             % (
                 chat_id,
                 user_id,
                 message_id,
                 result["score"],
                 ",".join(k for k, v in result["signals"].items() if v),
+                ",".join(result.get("behavior_reasons") or []) or "-",
+                trail_deleted,
                 queued,
             )
         )

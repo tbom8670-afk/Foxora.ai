@@ -16,7 +16,7 @@
 می‌افتاد ⇒ پیامِ «گزارش‌دهنده نمی‌تواند تصمیم بگیرد».
 """
 
-from . import patterns, queue, state, storage, texts  # noqa: F401
+from . import behavior, patterns, queue, state, storage, texts  # noqa: F401
 from .detector import (  # noqa: F401
     bind_queue,
     evaluate,
@@ -39,6 +39,7 @@ __all__ = [
     "has_pending_confirm",
     "is_cancel_word",
     "is_confirm_word",
+    "behavior",
     "patterns",
     "queue",
     "state",
