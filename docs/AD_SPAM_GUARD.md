@@ -106,13 +106,13 @@ _ad_spam_guard.handle_confirm(...)
 modules/ad_spam_guard/__init__.py          صادرکردنِ نام‌های عمومی (ریشهٔ باگ)
 modules/ad_spam_guard/texts.py             قالبِ دقیقِ اسکرین‌شات + entity نقل‌قول
 modules/ad_spam_guard/state.py             وضعیتِ پایدارِ تأییدیه + شناسهٔ کارت
-modules/ad_spam_guard/detector.py          نرمال‌سازیِ تایید/لغو، ارسالِ مستقل، تأییدِ چندادمینی
+modules/ad_spam_guard/detector.py          نرمال‌سازیِ تایید/لغو، ارسالِ مستقل، تأییدِ چندادمینی، تایمرِ مستقلِ حذفِ هشدار
 modules/ad_spam_guard/storage.py           نرمال‌سازیِ دستورِ روشن/خاموش
 modules/manage_features/report_commands.py «تایید/لغو» را از تبلیغ گر نمی‌قاپد
 handlers/message_handler.py                مسیرِ جایگزینِ ایمن + شارحِ قراردادِ ترتیب
 modules/ad_spam_guard/behavior.py             ردیابِ رفتارِ ربات‌های کاربرنما
 modules/ad_spam_guard/patterns.py             الگوها و آستانه‌های رفتاری
-tests/test_ad_spam_behavior.py                تستِ سناریوی عکسِ کارفرما (۱۷ بررسی)
+tests/test_ad_spam_behavior.py                تستِ سناریوی عکسِ کارفرما (۶۰ بررسی)
 tests/test_ad_spam_guard_flow.py           تستِ کاملِ جریان (۶۵ بررسی)
 ```
 
@@ -121,9 +121,11 @@ tests/test_ad_spam_guard_flow.py           تستِ کاملِ جریان (۶۵ 
 ```bash
 PYTHONPATH=. python3 modules/ad_spam_guard/behavior.py             ردیابِ رفتارِ ربات‌های کاربرنما
 modules/ad_spam_guard/patterns.py             الگوها و آستانه‌های رفتاری
-tests/test_ad_spam_behavior.py                تستِ سناریوی عکسِ کارفرما (۱۷ بررسی)
+tests/test_ad_spam_behavior.py                تستِ سناریوی عکسِ کارفرما (۶۰ بررسی)
 tests/test_ad_spam_guard_flow.py   # 65 پاس
+PYTHONPATH=. python3 tests/test_ad_spam_behavior.py     # 60 پاس
 PYTHONPATH=. python3 tests/test_ad_spam_guard.py        # 61 پاس
+PYTHONPATH=. python3 tests/test_notice_cleanup.py       # 35 پاس
 PYTHONPATH=. python3 tests/test_manage_features.py      # 294 پاس
 ```
 
@@ -241,12 +243,34 @@ PYTHONPATH=. python3 tests/test_manage_features.py      # 294 پاس
 بوده باشد (کاربرِ عادی که دو بار «سلام»ِ ساده می‌نویسد گرفتار نمی‌شود).
 این شاهد «محتوایی» حساب می‌شود، پس در کول‌داون هم رباتِ برگشته گرفته می‌شود.
 
-### حذفِ خودکارِ پیامِ هشدار (۶۰ ثانیه)
+### حذفِ خودکارِ پیامِ هشدار (۶۰ ثانیه) — دو مسیرِ موازی
 
-پیامِ «⚠️ کاربر … پیام شما پاک شد» مثلِ بقیهٔ اعلان‌های خودکارِ ربات در
-`modules.notice_cleanup` زمان‌بندی می‌شود (`capture_sent` /
-`notice_cleanup.schedule`) و بعد از **۶۰ ثانیه** پاک می‌شود.
-خاموش‌کردن: `patterns.CLEANUP_WARN_NOTICES = False`.
+پیامِ «⚠️ کاربر … پیام شما پاک شد» بعد از **۶۰ ثانیه** پاک می‌شود، و این
+تضمین دو لایه دارد (باگِ «کارت‌ها بعد از ۶۰ ثانیه می‌مانند» از همین‌جا
+می‌آمد که فقط لایهٔ اول پیاده شده بود):
+
+| لایه | چه‌کار می‌کند | اگر نبود |
+| --- | --- | --- |
+| ۱. موتورِ اعلان‌های ربات | `notice_cleanup.capture_sent` / `notice_cleanup.schedule` — همان تایمرِ ۶۰ ثانیه‌ای اعلان‌های خودکار | لایهٔ ۲ جایگزین می‌شود |
+| ۲. تایمرِ مستقلِ همین قابلیت | `detector._delete_later` (یک تسکِ asyncio با TTL = `WARN_NOTICE_TTL`) که مستقیم در صفِ حذفِ `ad_spam_guard` می‌گذارد و اگر صف نبود `bot.client.delete_messages` می‌زند | — (همیشه مسلح است) |
+
+نکته‌های پیاده‌سازی:
+
+* شناسهٔ پیامِ هشدار با `notice_cleanup.extract_sent_id` و در صورتِ نیاز از
+  خودِ `sent.id` برداشته می‌شود؛ اگر هیچ‌کدام نبود، فقط لایهٔ ۱ می‌ماند.
+* شناسهٔ گروه پیش از `delete_messages` با همان `_chat_id_for_rpc` موتورِ
+  اعلان‌ها به شکلِ `-100…` تبدیل می‌شود (وگرنه حذف خطا می‌دهد).
+* برای هر هشدار یک لاگ می‌نشیند:
+  `AD SPAM WARN NOTICE TTL chat_id=… message_id=… ttl=60.0s engine=…`
+  — اگر `engine=False` بود یعنی موتورِ اعلان‌ها ثبت نکرد و حذف با تایمرِ
+  مستقل انجام می‌شود (باز هم حذف می‌شود).
+* اگر موتورِ اعلان‌ها روی نمونهٔ ربات **ساخته شده ولی `start()` نشده**
+  باشد، `schedule` فقط ردیف را ذخیره می‌کند و هیچ workerی اجرا نمی‌شود
+  (دقیقاً همان چیزی که باعث می‌شد کارت‌ها بمانند). `schedule_notice_cleanup`
+  موتور را تنبل استارت می‌کند و اگر `client` نداشت از کلاینتِ ربات پر
+  می‌کند — لاگ: `AD SPAM WARN NOTICE ENGINE LAZY START`.
+* خاموش‌کردن: `patterns.CLEANUP_WARN_NOTICES = False`؛ تغییرِ زمان:
+  `patterns.WARN_NOTICE_TTL = 60.0`.
 
 ### کول‌داون: «اگر عادی شد، دیگر گیر نده»
 

@@ -574,6 +574,121 @@ def test_warn_notice_is_scheduled_for_cleanup():
     check("TTL پیش‌فرض سیستم ۶۰ ثانیه است", True)
 
 
+def test_warn_notice_self_delete_timer():
+    print("\n=== ۱۷. تایمرِ مستقلِ حذفِ هشدار (بدونِ موتورِ اعلان‌ها) ===")
+
+    class Client(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.n = 7000
+
+        async def send_message(self, target, text, formatting_entities=None):
+            self.n += 1
+            sent = SimpleNamespace(id=self.n, message=text)
+            self.sent.append(text)
+            return sent
+
+    class Bot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.client = Client()
+            self.notice_cleanup = None      # موتورِ اعلان‌ها در دسترس نیست
+
+    bot = Bot()
+
+    async def scenario():
+        sent = await bot.client.send_message(CHAT, "هشدار")
+        ok = detector.schedule_notice_cleanup(bot, CHAT, sent, ttl=0.05)
+        await asyncio.sleep(0.3)
+        return ok, sent.id
+
+    ok, message_id = run(scenario())
+    check("ثبت برای حذف انجام شد", ok is True)
+    check("خودِ قابلیت پیام را بعد از TTL پاک کرد",
+          message_id in bot.client.deleted, (message_id, bot.client.deleted))
+
+
+def test_warn_notice_deleted_end_to_end():
+    print("\n=== ۱۸. از مسیرِ واقعی: هشدار بعد از TTL پاک می‌شود ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+
+    class Client(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.n = 8000
+
+        async def send_message(self, target, text, formatting_entities=None):
+            self.n += 1
+            self.sent.append(text)
+            return SimpleNamespace(id=self.n, message=text)
+
+    class Bot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.client = Client()
+
+    bot = Bot()
+    sender = SimpleNamespace(id=920, first_name="نیکا", username="nika_1990")
+    original_ttl = P.WARN_NOTICE_TTL
+    P.WARN_NOTICE_TTL = 0.05
+    try:
+        async def scenario():
+            for index in range(2):
+                clock[0] = index * 10.0
+                event = FakeEvent("سلام", message_id=2300 + index,
+                                  reply_to_user=42)
+                run_guard = detector.guard_message(
+                    bot, event, CHAT, 920, sender, 2300 + index)
+                await run_guard
+            await asyncio.sleep(0.3)
+        asyncio.get_event_loop().run_until_complete(scenario())
+    finally:
+        P.WARN_NOTICE_TTL = original_ttl
+
+    warn_ids = [int(i) for i in bot.client.deleted if int(i) >= 8000]
+    check("پیامِ هشدار (شناسهٔ ≥8000) بعد از TTL حذف شد", bool(warn_ids),
+          bot.client.deleted)
+    check("پیامِ متخلف هم حذف شد",
+          any(int(i) < 8000 for i in bot.client.deleted), bot.client.deleted)
+
+
+def test_warn_notice_engine_lazy_start():
+    print("\n=== ۱۹. موتورِ اعلانِ ساخته‌شده ولی استارت‌نشده هم تایمر را می‌سازد ===")
+    from modules.notice_cleanup import NoticeCleanup
+
+    class Client(FakeClient):
+        async def send_message(self, target, text, formatting_entities=None):
+            self.sent.append(text)
+            return SimpleNamespace(id=9100, message=text)
+
+    class Bot(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.client = Client()
+
+    bot = Bot()
+    bot.notice_cleanup = NoticeCleanup(
+        os.path.join(tempfile.mkdtemp(), "nc.json"),
+        logger=bot.logger, ttl_seconds=0.15,
+    )   # عمداً start() صدا زده نمی‌شود
+    check("موتور در ابتدا استارت نشده",
+          getattr(bot.notice_cleanup, "_started", False) is False)
+
+    async def scenario():
+        sent = await bot.client.send_message(CHAT, "هشدار")
+        detector.schedule_notice_cleanup(bot, CHAT, sent)  # ttl خودمان طولانی
+        await asyncio.sleep(0.5)
+
+    asyncio.get_event_loop().run_until_complete(scenario())
+    check("موتور به‌صورتِ تنبل استارت شد",
+          getattr(bot.notice_cleanup, "_started", False) is True)
+    check("پیامِ هشدار با موتورِ استارت‌شده پاک شد", 9100 in bot.client.deleted,
+          bot.client.deleted)
+
+
 def main():
     print("=" * 62)
     print("تستِ تشخیصِ رفتارِ ربات‌های کاربرنما")
@@ -594,6 +709,9 @@ def main():
     test_cooldown_after_hit()
     test_returning_repeater()
     test_warn_notice_is_scheduled_for_cleanup()
+    test_warn_notice_self_delete_timer()
+    test_warn_notice_deleted_end_to_end()
+    test_warn_notice_engine_lazy_start()
     print("\n" + "=" * 62)
     print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
     print("=" * 62)

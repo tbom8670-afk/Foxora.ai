@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from . import behavior as B
@@ -218,29 +219,133 @@ def _bump_warnings(bot, chat_id, user_id, sender=None):
     return int(count or 0), int(threshold)
 
 
-def schedule_notice_cleanup(bot, chat_id, sent) -> bool:
-    """پیامِ اعلان را در تایمرِ ۶۰ ثانیه‌ایِ خودِ ربات ثبت می‌کند.
+#: ارجاعِ زنده به تسک‌های حذفِ تأخیری (تا GC نگیردشان).
+_CLEANUP_TASKS: set = set()
 
-    «پیام‌های هشدارِ تبلیغات گروهی» هم مثلِ بقیهٔ اعلان‌های خودکارِ ربات باید
-    بعد از ۶۰ ثانیه پاک شوند (``modules.notice_cleanup``). بدونِ این کار
-    هشدارها در گروه می‌مانند.
+
+async def _delete_later(bot, chat_id, message_id, delay) -> None:
+    """تایمرِ اضطراریِ خودِ قابلیت: بعد از ``delay`` همان پیام را پاک می‌کند.
+
+    این مسیر **مستقل** از ``notice_cleanup`` است تا حتی اگر آن موتور در آن
+    نمونهٔ ربات استارت نخورده باشد (یا شناسهٔ پیام قابلِ استخراج نبود)،
+    هشدارها ۶۰ ثانیه‌ای پاک شوند.
+    """
+    try:
+        await asyncio.sleep(max(0.0, float(delay)))
+    except asyncio.CancelledError:  # pragma: no cover
+        return
+    try:
+        if _delete_queue is not None:
+            if _delete_queue.submit(chat_id, message_id):
+                return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam notice self-delete queue failed: %r", exc)
+    rpc_chat = chat_id
+    try:
+        # همان تبدیلِ notice_cleanup: شناسهٔ نرمال‌شدهٔ مثبتِ گروه به شکلِ
+        # -100… که SPlusthon برای حذف لازم دارد.
+        from modules.notice_cleanup import _chat_id_for_rpc
+
+        rpc_chat = _chat_id_for_rpc(chat_id)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        await _direct_delete(bot, rpc_chat, message_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam notice self-delete failed: %r", exc)
+
+
+def schedule_notice_cleanup(bot, chat_id, sent, ttl=None) -> bool:
+    """پیامِ هشدار را برای حذفِ خودکار (پیش‌فرض ۶۰ ثانیه) ثبت می‌کند.
+
+    دو مسیر با هم:
+
+    1. **موتورِ خودِ ربات** — ``modules.notice_cleanup`` (همان تایمرِ ۶۰
+       ثانیه‌ای که اعلان‌های خودکارِ ربات را پاک می‌کند): ``capture_sent``.
+    2. **تایمرِ مستقلِ همین قابلیت** — اگر موتور بالا در دسترس/استارت نبود،
+       یک تسکِ asyncio بعد از همان TTL پیام را از صفِ حذفِ اختصاصیِ همین
+       قابلیت (یا مستقیم) پاک می‌کند.
+
+    خروجی: آیا برای حذف ثبت شد؟
     """
     if not P.CLEANUP_WARN_NOTICES or sent is None:
         return False
-    try:
-        from modules.notice_cleanup import capture_sent
 
-        if capture_sent(bot, chat_id, sent):
-            return True
+    delay = P.WARN_NOTICE_TTL if ttl is None else float(ttl)
+    message_id = None
+    try:
+        from modules.notice_cleanup import capture_sent, extract_sent_id
+
+        message_id = extract_sent_id(sent)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("ad-spam notice cleanup import failed: %r", exc)
-    cleanup = getattr(bot, "notice_cleanup", None)
-    if cleanup is not None:
+        logger.warning("ad-spam notice id extract failed: %r", exc)
+        capture_sent = None
+    if message_id is None:
+        raw_id = getattr(sent, "id", None)
+        if isinstance(raw_id, int) and raw_id > 0:
+            message_id = raw_id
+
+    # موتورِ اعلان‌ها اگر روی همین نمونه ساخته شده ولی هنوز استارت نشده
+    # باشد، ``schedule`` بی‌صدا ردیف را ذخیره می‌کند و هیچ workerی اجرا
+    # نمی‌شود ⇒ پیام تا ابد می‌ماند. پس همین‌جا (به‌صورتِ تنبل) استارتش
+    # می‌کنیم.
+    cleanup_engine = getattr(bot, "notice_cleanup", None)
+    if cleanup_engine is not None and not getattr(
+        cleanup_engine, "_started", True
+    ):
         try:
-            return bool(cleanup.schedule(chat_id, sent))
+            if getattr(cleanup_engine, "client", None) is None:
+                cleanup_engine.client = getattr(bot, "client", None)
+            cleanup_engine.start()
+            try:
+                bot.logger.log_info(
+                    "AD SPAM WARN NOTICE ENGINE LAZY START chat_id=%s" % (
+                        chat_id,
+                    )
+                )
+            except Exception:
+                pass
         except Exception as exc:  # noqa: BLE001
-            logger.warning("ad-spam notice cleanup schedule failed: %r", exc)
-    return False
+            logger.warning("ad-spam notice engine start failed: %r", exc)
+
+    registered = False
+    if capture_sent is not None:
+        try:
+            registered = bool(capture_sent(bot, chat_id, sent))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam notice cleanup capture failed: %r", exc)
+    if not registered:
+        if cleanup_engine is not None:
+            try:
+                registered = bool(
+                    cleanup_engine.schedule(chat_id, message_id or sent)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ad-spam notice cleanup schedule failed: %r", exc
+                )
+
+    # تایمرِ مستقل (همیشه) — تضمینِ حذف حتی بدونِ موتورِ اعلان‌ها.
+    if message_id:
+        try:
+            task = asyncio.ensure_future(
+                _delete_later(bot, chat_id, message_id, delay)
+            )
+            _CLEANUP_TASKS.add(task)
+            task.add_done_callback(_CLEANUP_TASKS.discard)
+            registered = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam notice timer arm failed: %r", exc)
+
+    try:
+        bot.logger.log_info(
+            "AD SPAM WARN NOTICE TTL chat_id=%s message_id=%s ttl=%ss "
+            "engine=%s"
+            % (chat_id, message_id, delay, registered)
+        )
+    except Exception:
+        pass
+    return bool(registered)
 
 
 def _reply_target_user_id(event):
