@@ -100,6 +100,15 @@ from modules.flag_guess import (
     is_exhausted as flag_guess_exhausted,
     start as start_flag_guess,
 )
+from modules.name_chain import (
+    texts as NAME_CHAIN_TEXTS,
+    answer as answer_name_chain,
+    is_active as name_chain_active,
+    record_prompt as record_name_chain_prompt,
+    reply_message_id as name_chain_reply_id,
+    reply_sender_id as name_chain_reply_user,
+    start as start_name_chain,
+)
 from economy import name_filter
 from modules.group_memory import extract_name, friendly_reply, get_name as get_memory_name, remove_name as remove_memory_name, set_name as set_memory_name
 from modules.group_rules import begin as begin_rules, cancel as cancel_rules, format_rules, remove as remove_rules, save as save_rules, waiting as waiting_rules
@@ -1000,6 +1009,7 @@ def is_game_answer_active(chat_id, user_id):
         or _who_knows.is_active(chat_id)
         or _truth_lie.is_active(chat_id)
         or _speed_bomb.is_active(chat_id)
+        or name_chain_active(chat_id)
     )
 
 
@@ -1019,10 +1029,17 @@ def _chat_game_busy(chat_id):
         or _who_knows.is_active(chat_id)
         or _truth_lie.is_active(chat_id)
         or _speed_bomb.is_active(chat_id)
+        or name_chain_active(chat_id)
     )
 
 
 GAME_BUSY_MESSAGE = "⏳ یک بازی دیگر در این گروه در جریان است؛ لطفاً تا پایان آن صبر کنید."
+
+# 🫆 اسم چین — نام‌ها پس از normalize_command یکدست شده‌اند (نیم‌فاصله → فاصله،
+# ي/ك عربی → فارسی)، پس یک شکل کافی است و بقیه فقط برای اطمینان‌اند.
+NAME_CHAIN_COMMANDS = frozenset({
+    "اسم چین", "اسمچین", "اسم‌چین", "بازی اسم چین",
+})
 
 
 EMOJI_GUESS_TOTAL = _emoji_total_stages()
@@ -3750,7 +3767,8 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "سرگرمی خاموش", "سرگرمی فعال",
     "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "بیوگرافی",
     "یاد آوری", "ترجمه", "قفل", "باز", "جک", "تصحیح کلمات",
-    "اسم فامیل", "حدس ایموجی", "حدس پرچم", "چهار گزینه ای", "جای خالی", "چیستان",
+    "اسم فامیل", "اسم چین", "اسم‌چین",
+    "حدس ایموجی", "حدس پرچم", "چهار گزینه ای", "جای خالی", "چیستان",
     "کی بیشتر بلده", "دروغ یا حقیقت",
     "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
     "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "حذف حافظه", "قوانین",
@@ -3802,6 +3820,7 @@ def _is_known_internal_command(clean_text, chat_id, user_id):
         or _who_knows.is_active(chat_id)
         or _truth_lie.is_active(chat_id)
         or _speed_bomb.is_active(chat_id)
+        or name_chain_active(chat_id)
     )
 
 
@@ -4691,7 +4710,7 @@ async def handle_new_message(bot, event):
                 "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
                 "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
                 "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
-                "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+                "اسم چین", "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
                 "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "زامبی", "گروه آخرالزمان",
                 "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه",
                 "فعال", "غیر فعال", "فعال سازی",
@@ -5804,7 +5823,7 @@ async def handle_new_message(bot, event):
             and (
                 clean_text in SIMPLE_REPLIES
                 or clean_text in INSULTS
-                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
+                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "اسم چین", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
                 or clean_text.startswith(("سکوت نام", "اخراج نام"))
                 or (
                     clean_text.startswith(("!", "/", "."))
@@ -6712,6 +6731,49 @@ async def handle_new_message(bot, event):
         ):
             return
 
+        # 🫆 اسم چین — زنجیرهٔ نام‌های ایرانی با ربات.
+        # قاعدهٔ سختِ این بازی: فقط پیام‌هایی که روی پیامِ خودِ ربات ریپلای
+        # شده‌اند پردازش می‌شوند؛ پیامِ آزادِ گروه هیچ‌وقت بلعیده نمی‌شود.
+        if clean_text.strip() in NAME_CHAIN_COMMANDS:
+            if _chat_game_busy(chat_id) and not name_chain_active(chat_id):
+                await event.reply(GAME_BUSY_MESSAGE)
+                return
+            chain_round = start_name_chain(chat_id)
+            if chain_round is None:
+                await event.reply(NAME_CHAIN_TEXTS.UNAVAILABLE)
+                return
+            chain_sent = await event.reply(chain_round["text"])
+            # شناسهٔ همین پیام، تنها پیامی است که جواب‌ها باید رویش ریپلای شوند.
+            record_name_chain_prompt(chat_id, getattr(chain_sent, "id", None))
+            bot.logger.log_info(
+                "NAME CHAIN START "
+                f"chat_id={chat_id} user_id={user_id} letter={chain_round['letter']}"
+            )
+            return
+
+        if name_chain_active(chat_id):
+            chain_result = answer_name_chain(
+                chat_id,
+                message_text,
+                reply_id=name_chain_reply_id(event),
+                bot_user_id=getattr(bot, "bot_account_id", None),
+                reply_user_id=name_chain_reply_user(event),
+            )
+            if chain_result is not None:
+                chain_sent = await event.reply(chain_result["message"])
+                # در نوبتِ «قبول»، پیامِ تازهٔ ربات همان چیزی است که نوبتِ بعد
+                # باید رویش ریپلای شود؛ پس شناسه‌اش جایگزین می‌شود.
+                if chain_result["kind"] == "accepted":
+                    record_name_chain_prompt(
+                        chat_id, getattr(chain_sent, "id", None)
+                    )
+                bot.logger.log_info(
+                    "NAME CHAIN TURN "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"kind={chain_result['kind']}"
+                )
+                return
+
         # بازی اسم فامیل
         if clean_text == "اسم فامیل":
             if _chat_game_busy(chat_id):
@@ -7492,6 +7554,8 @@ async def handle_new_message(bot, event):
                 "تشخیص کشورها از روی پرچم‌های ایموجی.\n\n"
                 "📝 اسم فامیل\n"
                 "رقابت گروهی با امتیازدهی خودکار.\n\n"
+                "🫆اسم چین\n"
+                "رقابت با ربات با آخر اسم یک اسم بگید\n\n"
                 "✍️ تصحیح کلمات\n"
                 "پیدا کردن شکل صحیح کلمات.\n\n"
                 "❓ چهار گزینه‌ای\n"
@@ -7551,6 +7615,7 @@ async def handle_new_message(bot, event):
                 "😀 حدس ایموجی",
                 "🌍 حدس پرچم",
                 "📝 اسم فامیل",
+                "🫆اسم چین",
                 "✍️ تصحیح کلمات",
                 "❓ چهار گزینه‌ای",
                 "📝 جای خالی",
