@@ -272,6 +272,7 @@ def start(chat_id, letter=None):
         "letter": letter,
         "used": set(),
         "prompt_id": None,
+        "last_incoming_id": None,
         "last_bot": None,
         "turns": 0,
         "started_at": time.time(),
@@ -279,16 +280,49 @@ def start(chat_id, letter=None):
     return {"letter": letter, "text": T.start_text(letter)}
 
 
-def record_prompt(chat_id, message_id) -> bool:
-    """شناسهٔ پیامِ ربات را ثبت می‌کند (همان پیامی که باید رویش ریپلای شود)."""
+def extract_message_id(sent):
+    """شناسهٔ پیام از نتیجهٔ ``send_message``/``reply`` بیرون کشیده می‌شود.
+
+    کلاینت‌ها بسته به مسیرِ ارسال، ``Message``، ``Updates``، لیست یا حتی
+    ``None`` برمی‌گردانند. اینجا همان منطقِ آزمودهٔ
+    ``modules.notice_cleanup.extract_sent_id`` استفاده می‌شود (با پشتیبانِ
+    سادهٔ ``.id``) تا شناسهٔ پیام هیچ‌وقت بی‌دلیل از دست نرود.
+    """
+    if sent is None:
+        return None
+    if isinstance(sent, bool):
+        return None
+    try:
+        from modules.notice_cleanup import extract_sent_id
+
+        found = extract_sent_id(sent)
+        if isinstance(found, int) and found > 0:
+            return found
+    except Exception:  # noqa: BLE001
+        pass
+    for attr in ("id", "message_id"):
+        value = getattr(sent, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    try:
+        value = int(sent)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def record_prompt(chat_id, sent) -> bool:
+    """شناسهٔ پیامِ ربات را ثبت می‌کند (پیامی که باید رویش ریپلای شود).
+
+    ``sent`` می‌تواند خودِ نتیجهٔ ``event.reply``/``send_message`` باشد یا
+    یک شناسهٔ عددی. اگر شناسه در نیاید، بازی **نمی‌شکند**: قاعدهٔ جایگزینِ
+    «ریپلای روی هر پیامِ ربات» نوبت را ادامه می‌دهد.
+    """
     entry = state(chat_id)
     if entry is None:
         return False
-    try:
-        value = int(message_id)
-    except (TypeError, ValueError):
-        return False
-    if value <= 0:
+    value = extract_message_id(sent)
+    if not value:
         return False
     entry["prompt_id"] = value
     return True
@@ -315,7 +349,8 @@ def _pick_bot_name(letter, used):
     return random.choice(sorted(continuable or candidates))
 
 
-def answer(chat_id, text, *, reply_id=None, bot_user_id=None, reply_user_id=None):
+def answer(chat_id, text, *, reply_id=None, bot_user_id=None, reply_user_id=None,
+           incoming_id=None):
     """پاسخِ یک پیامِ ریپلای‌شده را پردازش می‌کند.
 
     خروجی ``None`` یعنی «این پیام به بازی مربوط نیست» (بدونِ ریپلای، ریپلای
@@ -334,7 +369,22 @@ def answer(chat_id, text, *, reply_id=None, bot_user_id=None, reply_user_id=None
     if not raw:
         return None
 
+    # ۰) تحویلِ دوبارهٔ همان پیام (کلاینت گاهی یک آپدیت را چند بار می‌دهد)
+    # نباید نوبتِ بازی را دو بار جلو ببرد یا دو پیامِ یکسان بفرستد.
+    if incoming_id is not None:
+        try:
+            incoming_id = int(incoming_id)
+        except (TypeError, ValueError):
+            incoming_id = None
+    if incoming_id is not None and entry.get("last_incoming_id") == incoming_id:
+        return None
+
     # ۱) فقط ریپلای روی پیامِ ربات.
+    #
+    # دو راه پذیرش، تا بازی بعد از نوبتِ اول گیر نکند:
+    #   الف) ریپلای روی همان پیامی که آخر ثبت شده (شناسه یکی است)،
+    #   ب) ریپلای روی **هر** پیامِ خودِ ربات — کاربر طبیعی روی همان پیامی
+    #      ریپلای می‌زند که می‌بیند، نه لزوماً آخرین پیامِ ما.
     if reply_id is None:
         return None
     try:
@@ -342,16 +392,17 @@ def answer(chat_id, text, *, reply_id=None, bot_user_id=None, reply_user_id=None
     except (TypeError, ValueError):
         return None
     prompt_id = entry.get("prompt_id")
-    if prompt_id is not None:
-        if reply_id != int(prompt_id):
-            return None
-    elif bot_user_id is not None and reply_user_id is not None:
-        # شناسهٔ پیام را نداریم؛ حداقل مطمئن می‌شویم ریپلای روی خودِ ربات است.
+    id_match = prompt_id is not None and reply_id == int(prompt_id)
+    reply_on_bot = False
+    if bot_user_id is not None and reply_user_id is not None:
         try:
-            if int(reply_user_id) != int(bot_user_id):
-                return None
+            reply_on_bot = int(reply_user_id) == int(bot_user_id)
         except (TypeError, ValueError):
-            return None
+            reply_on_bot = False
+    if not id_match and not reply_on_bot:
+        return None
+    if incoming_id is not None:
+        entry["last_incoming_id"] = incoming_id
 
     # ۲) «نمی‌دونم» = پایانِ بازی و باختِ کاربر.
     if is_unknown_phrase(raw):

@@ -3824,6 +3824,39 @@ def _is_known_internal_command(clean_text, chat_id, user_id):
     )
 
 
+async def _name_chain_reply_sender(bot, chat_id, message_id):
+    """شناسهٔ فرستندهٔ پیامی که این پیام روی آن ریپلای شده است.
+
+    بعضی نسخه‌های کلاینت ``reply_to.from_id`` را پر نمی‌کنند؛ آن‌وقت همان
+    پیام از سرور خوانده می‌شود تا مطمئن شویم ریپلای روی خودِ ربات است و
+    بازی بعد از نوبتِ اول قطع نمی‌شود.
+    """
+    if message_id is None:
+        return None
+    try:
+        fetched = await bot.client.get_messages(chat_id, ids=message_id)
+    except Exception as error:  # noqa: BLE001
+        _debug_log(
+            bot,
+            f"NAME CHAIN REPLY LOOKUP FAILED message_id={message_id} error={error!r}",
+        )
+        return None
+    if isinstance(fetched, (list, tuple)):
+        fetched = fetched[0] if fetched else None
+    if fetched is None:
+        return None
+    for attr in ("sender_id", "from_id", "user_id"):
+        value = getattr(fetched, attr, None)
+        if value is None:
+            continue
+        inner = getattr(value, "user_id", value)
+        try:
+            return int(inner)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _search_reply_message_id(event):
     message = getattr(event, "message", None)
     message_reply = getattr(message, "reply_to", None)
@@ -6743,8 +6776,9 @@ async def handle_new_message(bot, event):
                 await event.reply(NAME_CHAIN_TEXTS.UNAVAILABLE)
                 return
             chain_sent = await event.reply(chain_round["text"])
-            # شناسهٔ همین پیام، تنها پیامی است که جواب‌ها باید رویش ریپلای شوند.
-            record_name_chain_prompt(chat_id, getattr(chain_sent, "id", None))
+            # شناسهٔ همین پیام ثبت می‌شود (تابع خودش Message/Updates/None را
+            # هندل می‌کند) تا نوبتِ بعد بداند کدام پیام «پیامِ ربات» است.
+            record_name_chain_prompt(chat_id, chain_sent)
             bot.logger.log_info(
                 "NAME CHAIN START "
                 f"chat_id={chat_id} user_id={user_id} letter={chain_round['letter']}"
@@ -6752,27 +6786,43 @@ async def handle_new_message(bot, event):
             return
 
         if name_chain_active(chat_id):
+            chain_bot_id = getattr(bot, "bot_account_id", None)
+            chain_reply_id = name_chain_reply_id(event)
+            chain_reply_user = name_chain_reply_user(event)
+            # اگر کلاینت فرستندهٔ پیامِ ریپلای‌شده را نداد، خودمان می‌خوانیم:
+            # بدون این، هر ریپلای روی پیامی جز آخرین پیامِ ربات «نادیده»
+            # تلقی می‌شد و بازی بعد از نوبتِ اول می‌خوابید.
+            if chain_reply_user is None and chain_reply_id is not None:
+                chain_reply_user = await _name_chain_reply_sender(
+                    bot, chat_id, chain_reply_id
+                )
             chain_result = answer_name_chain(
                 chat_id,
                 message_text,
-                reply_id=name_chain_reply_id(event),
-                bot_user_id=getattr(bot, "bot_account_id", None),
-                reply_user_id=name_chain_reply_user(event),
+                reply_id=chain_reply_id,
+                bot_user_id=chain_bot_id,
+                reply_user_id=chain_reply_user,
+                incoming_id=getattr(getattr(event, "message", None), "id", None),
             )
             if chain_result is not None:
                 chain_sent = await event.reply(chain_result["message"])
                 # در نوبتِ «قبول»، پیامِ تازهٔ ربات همان چیزی است که نوبتِ بعد
                 # باید رویش ریپلای شود؛ پس شناسه‌اش جایگزین می‌شود.
                 if chain_result["kind"] == "accepted":
-                    record_name_chain_prompt(
-                        chat_id, getattr(chain_sent, "id", None)
-                    )
+                    record_name_chain_prompt(chat_id, chain_sent)
                 bot.logger.log_info(
                     "NAME CHAIN TURN "
                     f"chat_id={chat_id} user_id={user_id} "
                     f"kind={chain_result['kind']}"
                 )
                 return
+            _debug_log(
+                bot,
+                "NAME CHAIN IGNORE "
+                f"chat_id={chat_id} user_id={user_id} "
+                f"reply_id={chain_reply_id} reply_user={chain_reply_user} "
+                f"bot={chain_bot_id} reason=not_a_bot_reply",
+            )
 
         # بازی اسم فامیل
         if clean_text == "اسم فامیل":

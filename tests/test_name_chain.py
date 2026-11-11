@@ -290,7 +290,7 @@ def test_chat_isolation():
     # اینجا هم می‌کنیم تا «ریپلایِ کهنه» واقعاً کهنه باشد.
     NC.record_prompt("group-a", 1401)
     check("بازیِ گروه A همچنان فعال است", NC.is_active("group-a"))
-    check("ریپلایِ کهنه (پیامِ قبلیِ ربات) رد می‌شود",
+    check("بدونِ اطلاعاتِ فرستنده، ریپلایِ کهنه رد می‌شود",
           NC.answer("group-a", "هادی", reply_id=1400) is None)
     letter_a = NC.state("group-a")["letter"]
     fresh_name = next(
@@ -385,6 +385,10 @@ def _handler_e2e():
             self.reply_to_msg_id = getattr(reply_to, "reply_to_msg_id", None)
 
     class Event:
+        #: اگر True باشد، ``reply`` مقدار ``None`` برمی‌گرداند — مثلِ کلاینتی
+        #: که شناسهٔ پیامِ ارسال‌شده را به ما نمی‌دهد.
+        SILENT_REPLY = False
+
         def __init__(self, text, mid, reply_to=None, uid=770):
             self.message = Msg(text, mid, reply_to)
             self.chat_id = CHAT
@@ -405,6 +409,8 @@ def _handler_e2e():
 
         async def reply(self, text, **_kw):
             self.replies.append(text)
+            if Event.SILENT_REPLY:
+                return None
             return SimpleNamespace(id=next_id())
 
         async def respond(self, text, **_kw):
@@ -493,11 +499,23 @@ def _handler_e2e():
           refreshed_prompt != prompt_id and refreshed_prompt > prompt_id,
           (prompt_id, refreshed_prompt))
 
-    # ریپلای روی پیامِ قدیمی (نه آخرین پیام) نادیده گرفته می‌شود.
-    stale_event = Event("لاله", 7104, reply_to=ReplyTo(prompt_id, 555))  # پیامِ اولِ ربات
+    # ریپلای روی پیامِ **قدیمی‌ترِ** ربات هم باید بازی را جلو ببرد؛ کاربر
+    # طبیعی روی همان پیامی ریپلای می‌زند که جلوی چشمش است (باگِ گزارش‌شده:
+    # «بعد از اولین حرف انجام نمی‌ده»).
+    letter_now = NC.state(CHAT)["letter"]
+    name_now = next(
+        (NC.NAME_DISPLAY[key] for key in NC.NAMES_BY_LETTER.get(letter_now, ())), None
+    )
+    stale_event = Event(name_now, 7104, reply_to=ReplyTo(prompt_id, 555))
     asyncio.run(handler.handle_new_message(bot, stale_event))
-    check("ریپلای روی پیامِ قبلیِ ربات نادیده گرفته شد",
-          stale_event.replies == [], stale_event.replies)
+    check("ریپلای روی پیامِ قدیمی‌ترِ ربات هم پردازش شد (بازی خوابید نمی‌شود)",
+          len(stale_event.replies) == 1, stale_event.replies)
+
+    # ریپلای روی پیامِ یک **کاربر** (نه ربات) نباید بلعیده شود.
+    user_event = Event("هادی", 7106, reply_to=ReplyTo(prompt_id, 777))
+    asyncio.run(handler.handle_new_message(bot, user_event))
+    check("ریپلای روی پیامِ کاربرِ دیگر نادیده گرفته شد",
+          user_event.replies == [], user_event.replies)
 
     # «نمی‌دونم» با ریپلای ⇒ باختِ کاربر
     lose_event = Event(
@@ -507,6 +525,103 @@ def _handler_e2e():
     check("«نمی‌دونم» از مسیرِ هندلر هم باخت داد",
           lose_event.replies == ["بازنده شدی ⛄️"], lose_event.replies)
     check("بازی بسته شد", not NC.is_active(CHAT))
+
+    # ---- همان باگِ گزارش‌شده: کلاینت شناسهٔ پیامِ ارسال‌شده را نمی‌دهد ----
+    # (در عکس، بازی بعد از اولین حرف می‌خوابید چون شناسهٔ پیامِ تازهٔ ربات
+    #  ثبت نمی‌شد و هر ریپلایِ بعدی «نادیده» تلقی می‌شد.)
+    NC.reset()
+    Event.SILENT_REPLY = True
+    try:
+        silent_start = Event("اسم چین", 7201)
+        asyncio.run(handler.handle_new_message(bot, silent_start))
+        check("شروعِ بازی در کلاینتی که شناسه نمی‌دهد هم انجام شد",
+              len(silent_start.replies) == 1, silent_start.replies)
+        check("شناسهٔ پیامِ ربات نامعلوم است",
+              NC.state(CHAT)["prompt_id"] is None,
+              NC.state(CHAT)["prompt_id"])
+
+        silent_letter = NC.state(CHAT)["letter"]
+        silent_name = next(
+            (NC.NAME_DISPLAY[key]
+             for key in NC.NAMES_BY_LETTER.get(silent_letter, ())), None
+        )
+        # ریپلای روی پیامی که شناسه‌اش هرگز ثبت نشده بود.
+        silent_turn = Event(silent_name, 7202, reply_to=ReplyTo(123456, 555))
+        asyncio.run(handler.handle_new_message(bot, silent_turn))
+        check("نوبتِ بازی با ریپلای روی پیامِ ربات ادامه یافت (باگِ «بعد از اولین حرف»)",
+              len(silent_turn.replies) == 1 and "من می‌گم" in silent_turn.replies[0],
+              silent_turn.replies)
+
+        # و نوبتِ سوم هم: بازی نباید یک‌بار مصرف باشد.
+        NC.record_prompt(CHAT, None)
+        next_letter = NC.state(CHAT)["letter"]
+        third_name = next(
+            (NC.NAME_DISPLAY[key]
+             for key in NC.NAMES_BY_LETTER.get(next_letter, ())), None
+        )
+        silent_third = Event(third_name, 7203, reply_to=ReplyTo(123457, 555))
+        asyncio.run(handler.handle_new_message(bot, silent_third))
+        check("نوبتِ سوم هم ادامه یافت",
+              len(silent_third.replies) == 1 and "من می‌گم" in silent_third.replies[0],
+              silent_third.replies)
+    finally:
+        Event.SILENT_REPLY = False
+    NC.reset()
+
+
+
+# ---------------------------------------------------------------------------
+# ۱۲) مقاوم‌سازی: شناسهٔ نامعلوم، تحویلِ تکراری، استخراجِ شناسه
+# ---------------------------------------------------------------------------
+def test_robust_continuation():
+    section("۱۲. ادامهٔ بازی حتی وقتی شناسهٔ پیام گم شود")
+    from types import SimpleNamespace
+
+    # الف) شناسهٔ پیامِ ربات هیچ‌وقت استخراج نشود (مثل کلاینتی که None می‌دهد).
+    NC.reset()
+    NC.start("chat-robust", letter="ل")
+    check("ثبتِ شناسه با None ناموفق است ولی بازی را نمی‌شکند",
+          NC.record_prompt("chat-robust", None) is False)
+    out = NC.answer("chat-robust", "لاله", reply_id=4242,
+                    bot_user_id=555, reply_user_id=555)
+    check("با ریپلای روی پیامِ ربات (شناسهٔ نامعلوم) نوبت ادامه یافت",
+          out is not None and out["kind"] == "accepted", out)
+
+    # ب) استخراجِ شناسه از شکل‌های مختلفِ پاسخِ ارسال
+    check("شناسه از int", NC.extract_message_id(77) == 77)
+    check("شناسه از آبجکتِ ساده", NC.extract_message_id(SimpleNamespace(id=88)) == 88)
+    check("شناسه از Updates",
+          NC.extract_message_id(SimpleNamespace(
+              updates=[SimpleNamespace(message=SimpleNamespace(id=99))]
+          )) == 99, NC.extract_message_id(SimpleNamespace(
+              updates=[SimpleNamespace(message=SimpleNamespace(id=99))]
+          )))
+    check("شناسه از لیست",
+          NC.extract_message_id([SimpleNamespace(id=101)]) == 101)
+    check("None به‌جای شناسه", NC.extract_message_id(None) is None)
+    check("شناسهٔ نامعتبر رد می‌شود", NC.extract_message_id(0) is None)
+
+    # ج) تحویلِ تکراریِ همان پیام، نوبت را دو بار جلو نمی‌برد.
+    NC.reset()
+    NC.start("chat-dup", letter="ل")
+    NC.record_prompt("chat-dup", 900)
+    first = NC.answer("chat-dup", "لاله", reply_id=900, incoming_id=5555,
+                      bot_user_id=1, reply_user_id=1)
+    second = NC.answer("chat-dup", "لاله", reply_id=900, incoming_id=5555,
+                       bot_user_id=1, reply_user_id=1)
+    check("نوبتِ اول پذیرفته شد", first is not None and first["kind"] == "accepted")
+    check("تحویلِ دوبارهٔ همان پیام نادیده گرفته شد (پیامِ تکراری فرستاده نمی‌شود)",
+          second is None, second)
+    used = NC.state("chat-dup")["used"]
+    check("اسم‌ها فقط یک بار مصرف شدند", len(used) == 2, used)
+
+    # د) ریپلای روی پیامِ کاربر (نه ربات) و شناسهٔ نامعلوم ⇒ نادیده
+    NC.reset()
+    NC.start("chat-robust2", letter="ل")
+    check("ریپلای روی پیامِ کاربر با شناسهٔ نامعلوم نادیده گرفته می‌شود",
+          NC.answer("chat-robust2", "لاله", reply_id=4242,
+                    bot_user_id=555, reply_user_id=777) is None)
+    check("و بازی همچنان منتظرِ پاسخ است", NC.is_active("chat-robust2"))
     NC.reset()
 
 
@@ -525,6 +640,7 @@ def main():
     test_chat_isolation()
     test_handler_wiring()
     _handler_e2e()
+    test_robust_continuation()
     print("\n" + "=" * 62)
     print("نتیجه: %s پاس / %s شکست" % (PASS, FAIL))
     print("=" * 62)
