@@ -157,7 +157,9 @@ def test_bold_entities_content():
         if "\n" in sliced:
             # «تأیید دو مرحله‌ای دستورات خطرناک» و «متخلف» هم بلوکِ آمادهٔ
             # چندخطی‌اند (کلِ بلوک Bold، دستورها داخل یک نقل‌قول).
-            assert sliced.startswith(("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️")), sliced
+            assert sliced.startswith(
+                ("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️", "💥")
+            ), sliced
 
 
 def test_n2_and_n3_examples():

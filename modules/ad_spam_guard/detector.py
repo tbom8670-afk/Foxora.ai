@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 
 from . import patterns as P
+from . import state
 from . import storage
 from . import texts
 
@@ -187,15 +188,17 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
     except Exception:
         pass
 
-    # --- هشدار (فقط اگر کارفرما قالب داده باشد) ---
-    warn = texts.render_warn(
-        _display(sender), str(chat_id)
-    )
-    if warn:
-        try:
-            await event.reply(warn)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("ad-spam warn reply failed: %r", exc)
+    # --- شمارش اخطار + پیام هشدار ---
+    try:
+        count = state.add_warn(chat_id, user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam warn counter failed: %r", exc)
+        count = 0
+
+    try:
+        await event.reply(texts.render_warn(_display(sender), count))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam warn reply failed: %r", exc)
 
     return True
 
@@ -223,32 +226,99 @@ async def _direct_delete(bot, chat_id, message_id) -> bool:
 # دستورهای روشن/خاموش
 # ---------------------------------------------------------------------------
 
-async def handle_toggle(bot, event, chat_id, user_id, sender, mode: str) -> bool:
-    """«تبلیغ گر روشن/خاموش» را اجرا می‌کند. خروجی: رسیدگی شد؟"""
+def _is_admin(chat_id, user_id, sender) -> bool:
     try:
         from modules.admin_tools import has_admin_permission
-        from modules.admin_help_builder import ADMIN_PERMISSION_DENIED_TEXT
+
+        return bool(
+            has_admin_permission(chat_id, user_id, P.sender_username(sender))
+        )
     except Exception:
         return False
 
-    if not has_admin_permission(chat_id, user_id, P.sender_username(sender)):
+
+async def _denied(bot, event) -> bool:
+    try:
+        from modules.admin_help_builder import ADMIN_PERMISSION_DENIED_TEXT
+
         await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
-        return True
+    except Exception:
+        pass
+    return True
+
+
+async def handle_toggle(bot, event, chat_id, user_id, sender, mode: str) -> bool:
+    """«تبلیغ گر روشن/خاموش» را اجرا می‌کند. خروجی: رسیدگی شد؟
+
+    «روشن» مستقیم فعال نمی‌کند: اول پیام تأییدیه را نشان می‌دهد و منتظرِ
+    «تایید/لغو» می‌ماند (مطابق اسکرین‌شاتِ کارفرما). «خاموش» مستقیم است.
+    """
+    if not _is_admin(chat_id, user_id, sender):
+        return await _denied(bot, event)
 
     if mode == "on":
-        storage.enable(chat_id)
-        reply = "✅ ضد تبلیغ گر برای این گروه روشن شد."
-    else:
-        storage.disable(chat_id)
-        reply = "✅ ضد تبلیغ گر برای این گروه خاموش شد."
+        state.request_confirm(chat_id, user_id)
+        try:
+            bot.logger.log_info(
+                "AD SPAM GUARD CONFIRM REQUESTED chat_id=%s user_id=%s"
+                % (chat_id, user_id)
+            )
+        except Exception:
+            pass
+        await event.reply(texts.CONFIRM_ENABLE_TEMPLATE)
+        return True
 
+    storage.disable(chat_id)
     try:
         bot.logger.log_info(
-            "AD SPAM GUARD TOGGLE chat_id=%s user_id=%s mode=%s"
-            % (chat_id, user_id, mode)
+            "AD SPAM GUARD DISABLED chat_id=%s user_id=%s" % (chat_id, user_id)
         )
     except Exception:
         pass
+    await event.reply(texts.DISABLED_MESSAGE)
+    return True
 
-    await event.reply(reply)
+
+def is_confirm_word(text: str) -> bool:
+    return (text or "").strip() in texts.CONFIRM_WORDS
+
+
+def is_cancel_word(text: str) -> bool:
+    return (text or "").strip() in texts.CANCEL_WORDS
+
+
+async def handle_confirm(
+    bot, event, chat_id, user_id, sender, *, accept: bool
+) -> bool:
+    """پاسخ به «تایید/لغو» پیام تأییدیه را پردازش می‌کند."""
+    pending = state.pending_user(chat_id)
+    if pending is None:
+        return False
+    # فقط همان ادمینی که درخواست داده می‌تواند تأیید کند.
+    if str(pending) != str(user_id):
+        return False
+
+    state.clear_confirm(chat_id)
+    if not accept:
+        try:
+            bot.logger.log_info(
+                "AD SPAM GUARD CANCELLED chat_id=%s user_id=%s"
+                % (chat_id, user_id)
+            )
+        except Exception:
+            pass
+        await event.reply(texts.CANCELLED_MESSAGE)
+        return True
+
+    if not _is_admin(chat_id, user_id, sender):
+        return await _denied(bot, event)
+
+    storage.enable(chat_id)
+    try:
+        bot.logger.log_info(
+            "AD SPAM GUARD ENABLED chat_id=%s user_id=%s" % (chat_id, user_id)
+        )
+    except Exception:
+        pass
+    await event.reply(texts.ENABLED_MESSAGE)
     return True

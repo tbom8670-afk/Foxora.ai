@@ -4115,12 +4115,22 @@ async def handle_new_message(bot, event):
         # داشته باشد (این ربات‌ها گاهی نشان ادمین هم دارند).
         if not event.is_private and chat_id and user_id:
             try:
-                toggle_mode = _ad_spam_guard.storage.is_toggle_command(
-                    str(message_text or "")
-                )
+                _ad_text = str(message_text or "").strip()
+                toggle_mode = _ad_spam_guard.storage.is_toggle_command(_ad_text)
                 if toggle_mode is not None:
                     if await _ad_spam_guard.handle_toggle(
                         bot, event, chat_id, user_id, sender, toggle_mode
+                    ):
+                        return
+                elif _ad_spam_guard.is_confirm_word(_ad_text):
+                    # پاسخ به پیام تأییدیهٔ «تبلیغ گر روشن»
+                    if await _ad_spam_guard.handle_confirm(
+                        bot, event, chat_id, user_id, sender, accept=True
+                    ):
+                        return
+                elif _ad_spam_guard.is_cancel_word(_ad_text):
+                    if await _ad_spam_guard.handle_confirm(
+                        bot, event, chat_id, user_id, sender, accept=False
                     ):
                         return
                 elif _ad_spam_guard.storage.is_enabled(chat_id):

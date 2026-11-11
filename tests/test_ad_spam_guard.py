@@ -203,19 +203,55 @@ def main() -> int:
     check("گروه دیگر تأثیر نمی‌بیند", not storage.is_enabled("-999"))
 
     # ---------------------------------------------------------------- ۷
-    print("\n=== ۷. قالب هشدار (کارفرما می‌دهد) ===")
-    from modules.ad_spam_guard import texts  # noqa: E402
+    print("\n=== ۷. قالب‌های پیام (مطابق اسکرین‌شات) ===")
+    from modules.ad_spam_guard import texts, state  # noqa: E402
 
-    check("پیش‌فرض هیچ قالبی نیست", texts.WARN_TEMPLATE is None)
-    check("بدون قالب، پیامی ساخته نمی‌شود",
-          texts.render_warn("@x", "1") is None)
-    texts.WARN_TEMPLATE = "کاربر {user} از گروه {chat} اخراج شد"
-    check("با قالب، پیام ساخته می‌شود",
-          texts.render_warn("@ali", "-100") == "کاربر @ali از گروه -100 اخراج شد")
-    texts.WARN_TEMPLATE = "قالب خراب {ناموجود}"
-    check("قالب خراب ربات را نمی‌کند",
-          texts.render_warn("@ali", "1") is not None)
-    texts.WARN_TEMPLATE = None
+    check("قالب تأییدیه شامل فهرست قابلیت‌هاست",
+          "شناسایی پیام های تبلیغاتی ربات ها" in texts.CONFIRM_ENABLE_TEMPLATE)
+    check("قالب تأییدیه سؤالِ فعال‌سازی را دارد",
+          "آیا این قابلیت فعال شود ؟" in texts.CONFIRM_ENABLE_TEMPLATE)
+    check("قالب تأییدیه گزینهٔ تایید دارد", "▪️تایید" in texts.CONFIRM_ENABLE_TEMPLATE)
+    check("قالب تأییدیه گزینهٔ لغو دارد", "▫️ لغو" in texts.CONFIRM_ENABLE_TEMPLATE)
+
+    check("پیام فعال‌شدن درست است",
+          texts.ENABLED_MESSAGE
+          == "▫️ضد تبلیغ گر هوش مصنوعی روباه فعال شد")
+    check("پیام خاموش‌شدن درست است",
+          texts.DISABLED_MESSAGE
+          == "▪️ضد تبلیغ گر هوش مصنوعی روباه خاموش شد")
+
+    warn = texts.render_warn("@oskwma", 1)
+    check("قالب هشدار شامل نام کاربر است", "@oskwma" in warn)
+    check("قالب هشدار شامل دلیل است", "دلیل : تبلیغات گروهی" in warn)
+    check("قالب هشدار شامل تعداد اخطار است", "تعداد اخطار : 1" in warn)
+    check("قالب هشدار شامل انجام‌دهنده است",
+          "انجام دهنده : هوش مصنوعی ضد تبلیغ" in warn)
+
+    check("راهنمای ادمینی درست است",
+          texts.HELP_HEADER
+          == "💥برای فعال کردن ضد ربات های تبلیغ گر بنویسید")
+    check("دستور روشن درست است", texts.HELP_ON == "تبلیغ گر روشن")
+    check("دستور خاموش درست است", texts.HELP_OFF == "تبلیغ گر خاموش")
+
+    check("کلمهٔ تایید تشخیص داده می‌شود", detector.is_confirm_word("تایید"))
+    check("کلمهٔ لغو تشخیص داده می‌شود", detector.is_cancel_word("لغو"))
+    check("متن عادی تایید نیست", not detector.is_confirm_word("سلام"))
+
+    # ---------------------------------------------------------------- ۸
+    print("\n=== ۸. جریان تأییدیه ===")
+    state.clear_confirm("-777")
+    state.request_confirm("-777", "555")
+    check("کاربرِ منتظرِ تایید ثبت می‌شود", state.pending_user("-777") == "555")
+    state.clear_confirm("-777")
+    check("پس از لغو، کسی در انتظار نیست", state.pending_user("-777") is None)
+
+    # شمارندهٔ اخطار
+    before = state.warn_count("-888", "999")
+    c1 = state.add_warn("-888", "999")
+    c2 = state.add_warn("-888", "999")
+    check("شمارندهٔ اخطار افزایش می‌یابد", c2 == c1 + 1, (c1, c2))
+    state.reset_warns("-888", "999")
+    check("صفر کردن اخطار کار می‌کند", state.warn_count("-888", "999") == 0)
 
     print("\n" + "=" * 60)
     print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
