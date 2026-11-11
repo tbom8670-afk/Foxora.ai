@@ -218,6 +218,31 @@ def _bump_warnings(bot, chat_id, user_id, sender=None):
     return int(count or 0), int(threshold)
 
 
+def schedule_notice_cleanup(bot, chat_id, sent) -> bool:
+    """پیامِ اعلان را در تایمرِ ۶۰ ثانیه‌ایِ خودِ ربات ثبت می‌کند.
+
+    «پیام‌های هشدارِ تبلیغات گروهی» هم مثلِ بقیهٔ اعلان‌های خودکارِ ربات باید
+    بعد از ۶۰ ثانیه پاک شوند (``modules.notice_cleanup``). بدونِ این کار
+    هشدارها در گروه می‌مانند.
+    """
+    if not P.CLEANUP_WARN_NOTICES or sent is None:
+        return False
+    try:
+        from modules.notice_cleanup import capture_sent
+
+        if capture_sent(bot, chat_id, sent):
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam notice cleanup import failed: %r", exc)
+    cleanup = getattr(bot, "notice_cleanup", None)
+    if cleanup is not None:
+        try:
+            return bool(cleanup.schedule(chat_id, sent))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam notice cleanup schedule failed: %r", exc)
+    return False
+
+
 def _reply_target_user_id(event):
     """کاربری که این پیام ریپلای روی اوست (اگر کاربرِ واقعی باشد).
 
@@ -369,7 +394,9 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
         warn_text, warn_entities = texts.warn_payload(
             _display(sender), count, threshold=threshold
         )
-        await _send(bot, event, chat_id, warn_text, warn_entities)
+        warn_sent = await _send(bot, event, chat_id, warn_text, warn_entities)
+        # ⏱️ حذفِ خودکارِ همین هشدار بعد از ۶۰ ثانیه (تایمرِ اعلان‌های ربات)
+        schedule_notice_cleanup(bot, chat_id, warn_sent)
     except Exception as exc:  # noqa: BLE001
         logger.warning("ad-spam warn send failed: %r", exc)
 

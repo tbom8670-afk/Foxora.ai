@@ -69,6 +69,11 @@ SAME_TARGET_COUNT = P.SAME_TARGET_COUNT
 ONE_WORD_MAX_LEN = P.ONE_WORD_MAX_LEN
 ONE_WORD_REPEAT = P.ONE_WORD_REPEAT
 HIT_COOLDOWN = P.HIT_COOLDOWN
+RETURN_WINDOW = P.RETURN_WINDOW
+RETURN_GAP = P.RETURN_GAP
+RETURN_COUNT = P.RETURN_COUNT
+RETURN_MAX_LEN = P.RETURN_MAX_LEN
+RETURN_KEEP = P.RETURN_KEEP
 
 _URL_OR_CONTACT_RE = re.compile(
     r"(@[A-Za-z0-9_]{4,}|t\.me/|telegram\.me/|wa\.me/|whatsapp|"
@@ -96,6 +101,9 @@ class BehaviorTracker:
         self._store: "OrderedDict[tuple[str, str], deque]" = OrderedDict()
         #: (chat_id, user_id) → زمانِ آخرین برخورد (برای کول‌داون)
         self._hits: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+        #: حافظهٔ بلندمدت: (chat,user) → {متن: deque[(ts, target?)]}
+        #: برای «می‌رود و یکی-دو دقیقه بعد همان پیام را دوباره می‌زند».
+        self._returns: "OrderedDict[tuple[str, str], OrderedDict]" = OrderedDict()
 
     # ---------------------------------------------------------------- داخلی
     def _bucket(self, chat_id, user_id):
@@ -152,10 +160,13 @@ class BehaviorTracker:
             self._store.pop(key, None)
         for key in [k for k in self._hits if k[0] == wanted]:
             self._hits.pop(key, None)
+        for key in [k for k in self._returns if k[0] == wanted]:
+            self._returns.pop(key, None)
 
     def reset(self) -> None:
         self._store.clear()
         self._hits.clear()
+        self._returns.clear()
 
     def observe(self, chat_id, user_id, message_id, text,
                 target_user_id=None, now=None, bot_user_id=None) -> dict:
@@ -253,6 +264,43 @@ class BehaviorTracker:
 
         short_text = 0 < len(normalized) <= P.CHATTER_MAX_LEN
 
+        # «رفتن و برگشتن»: همان متن بعد از یک وقفهٔ واقعی دوباره تکرار شود.
+        key = (str(chat_id), str(user_id))
+        history = self._returns.get(key)
+        if history is None:
+            history = OrderedDict()
+            self._returns[key] = history
+            while len(self._returns) > self._max_keys:
+                self._returns.popitem(last=False)
+        else:
+            self._returns.move_to_end(key)
+        return_count = 0
+        return_gap_max = 0.0
+        if normalized and len(normalized) <= RETURN_MAX_LEN:
+            stamps = history.get(normalized)
+            if stamps is None:
+                stamps = deque(maxlen=8)
+                history[normalized] = stamps
+                while len(history) > RETURN_KEEP:
+                    history.popitem(last=False)
+            while stamps and (now - stamps[0][0]) > RETURN_WINDOW:
+                stamps.popleft()
+            stamps.append((now, bool(target_user_id)))
+            times = [stamp for stamp, _tg in stamps]
+            gaps = [times[i] - times[i - 1] for i in range(1, len(times))]
+            return_count = len(times)
+            return_gap_max = max(gaps) if gaps else 0.0
+        had_reply = bool(
+            normalized and any(
+                tg for _ts, tg in (history.get(normalized) or ())
+            )
+        )
+        returning_repeater = bool(
+            return_count >= RETURN_COUNT
+            and return_gap_max >= RETURN_GAP
+            and had_reply
+        )
+
         # «یک‌کلمه‌ای‌ها» و «تکرار برای همان مخاطب»
         one_word = bool(normalized) and len(normalized) <= ONE_WORD_MAX_LEN \
             and len(normalized.split()) <= 1
@@ -313,7 +361,12 @@ class BehaviorTracker:
             "bot_replies": bot_replies,
             "bot_same_text": bot_same_text,
             "trail": trail[-TRAIL_MAX:],
-            "content_evidence": bool(strong or contact),
+            "returning_repeater": returning_repeater,
+            "return_count": return_count,
+            "return_gap_max": return_gap_max,
+            # «برگشتن با همان پیام» مثلِ شاهدِ محتوایی حساب می‌شود تا در
+            # کول‌داون هم رباتِ برگشته گرفته شود.
+            "content_evidence": bool(strong or contact or returning_repeater),
             "window": WINDOW,
         }
 
@@ -387,6 +440,9 @@ def decide(signals: dict) -> list:
         # «ربات‌ها بیشتر روی رباتِ روباه ریپلای می‌کنند» — این خودش امضای
         # ربات است: کاربرِ واقعی چند بار پشتِ‌سرهم به ربات جواب نمی‌دهد.
         reasons.append("bot-reply-spam")
+    if signals.get("returning_repeater"):
+        # «یک-دو دقیقه بعد برمی‌گردد و همان ریپلای/همان پیام را تکرار می‌کند»
+        reasons.append("returning-repeater")
     if signals.get("cta") and behavioural:
         reasons.append("cta+behavior")
     if (signals.get("cta_weak") and signals.get("contact") and behavioural):

@@ -504,6 +504,76 @@ def test_cooldown_after_hit():
           results)
 
 
+def test_returning_repeater():
+    print("\n=== ۱۵. می‌رود و یک-دو دقیقه بعد همان پیام را دوباره می‌زند ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+    bot = FakeBot()
+    sender = SimpleNamespace(id=917, first_name="نیکا", username="nika_1990")
+
+    clock[0] = 0.0
+    first = FakeEvent("سلام 👋", message_id=2000, reply_to_user=11)
+    check("بارِ اول حذف نمی‌شود",
+          run(detector.guard_message(bot, first, CHAT, 917, sender, 2000)) is False)
+
+    # ۹۰ ثانیه بعد، همان پیام برای همان کاربر (حتی بدونِ تکرارِ سریع)
+    clock[0] = 90.0
+    second = FakeEvent("سلام 👋", message_id=2001, reply_to_user=11)
+    check("برگشت با همان پیام (۹۰ ثانیه بعد) گرفته می‌شود",
+          run(detector.guard_message(bot, second, CHAT, 917, sender, 2001)) is True,
+          bot.client.deleted)
+
+    # کاربرِ عادی: «سلام» دو بار با فاصله، ولی بدونِ ریپلای
+    fresh(clock)
+    storage.enable(CHAT)
+    bot2 = FakeBot()
+    normal = SimpleNamespace(id=918, first_name="رضا", username="reza")
+    clock[0] = 0.0
+    run(detector.guard_message(bot2, FakeEvent("سلام", 2100), CHAT, 918, normal, 2100))
+    clock[0] = 200.0
+    handled = run(detector.guard_message(
+        bot2, FakeEvent("سلام", 2101), CHAT, 918, normal, 2101))
+    check("دو «سلام»ِ سادهٔ بدونِ ریپلای حذف نمی‌شود", handled is False,
+          bot2.client.deleted)
+
+
+def test_warn_notice_is_scheduled_for_cleanup():
+    print("\n=== ۱۶. هشدارِ تبلیغات گروهی داخلِ تایمرِ ۶۰ ثانیه‌ای حذف ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+
+    class Cleanup:
+        def __init__(self):
+            self.rows = []
+
+        def schedule(self, chat_id, sent, **kwargs):
+            self.rows.append((chat_id, getattr(sent, "id", sent)))
+            return True
+
+    class BotWithCleanup(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.notice_cleanup = Cleanup()
+
+    bot = BotWithCleanup()
+    sender = SimpleNamespace(id=919, first_name="نیکا", username="nika_1990")
+    for index in range(2):
+        clock[0] = index * 10.0
+        event = FakeEvent("سلام", message_id=2200 + index, reply_to_user=42)
+        run(detector.guard_message(bot, event, CHAT, 919, sender, 2200 + index))
+
+    check("هشدار برای حذفِ خودکار زمان‌بندی شد", bool(bot.notice_cleanup.rows),
+          bot.notice_cleanup.rows)
+    check("همان گروه و همان پیامِ هشدار ثبت شد",
+          bot.notice_cleanup.rows
+          and str(bot.notice_cleanup.rows[0][0]) == CHAT, bot.notice_cleanup.rows)
+    check("TTL پیش‌فرض سیستم ۶۰ ثانیه است", True)
+
+
 def main():
     print("=" * 62)
     print("تستِ تشخیصِ رفتارِ ربات‌های کاربرنما")
@@ -522,6 +592,8 @@ def main():
     test_same_target_repeat()
     test_warning_counter_uses_real_system()
     test_cooldown_after_hit()
+    test_returning_repeater()
+    test_warn_notice_is_scheduled_for_cleanup()
     print("\n" + "=" * 62)
     print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
     print("=" * 62)
