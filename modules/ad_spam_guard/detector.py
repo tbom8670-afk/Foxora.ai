@@ -131,6 +131,74 @@ def evaluate(sender, message_text: str, behavior_signals: dict | None = None) ->
 # ورود اصلی
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# سیستم اخطار (همان سیستمِ اصلیِ ربات — نه شمارندهٔ جداگانه)
+# ---------------------------------------------------------------------------
+def warn_threshold(bot, chat_id) -> int:
+    """آستانهٔ اخطارِ همین گروه (دستور «تغییر اخطار» → پیش‌فرض ۵)."""
+    default = texts.WARN_DEFAULT_THRESHOLD
+    try:
+        config = getattr(bot, "config_manager", None)
+        if config is not None:
+            default = int(config.get("spam_threshold", default) or default)
+    except Exception:  # noqa: BLE001
+        default = texts.WARN_DEFAULT_THRESHOLD
+    try:
+        from modules import warning_threshold
+
+        return int(warning_threshold.get_threshold(chat_id, default))
+    except Exception:  # noqa: BLE001
+        return int(default)
+
+
+def _bump_warnings(bot, chat_id, user_id, sender=None):
+    """یک اخطار در **سیستم اخطارِ ربات** ثبت می‌کند: ``(تعداد, آستانه)``.
+
+    قبلاً این قابلیت شمارندهٔ مستقلِ خودش را داشت و «تعداد اخطار : 1» نشان
+    می‌داد که با سیستم اخطارِ گروه (بن/سکوت بعد از N اخطار) هم‌خوان نبود.
+    حالا همان ``bot.tracker`` و همان آستانهٔ ``warning_threshold`` استفاده
+    می‌شود تا خروجی «تعداد اخطار : 1/5» باشد و بعد از ۵ اخطار، بنِ معمولِ
+    ربات مثلِ بقیهٔ مسیرها اجرا شود.
+    """
+    threshold = warn_threshold(bot, chat_id)
+    count = None
+
+    tracker = getattr(bot, "tracker", None)
+    if tracker is not None:
+        try:
+            count = int(tracker.increment(chat_id, int(user_id)))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam tracker increment failed: %r", exc)
+            count = None
+
+    if count is None:
+        # مسیرِ جایگزین: اگر ربات ردیاب نداشت (تست/حالتِ خاص) همان شمارندهٔ
+        # داخلی استفاده می‌شود تا اخطار گم نشود.
+        try:
+            count = state.add_warn(chat_id, user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam fallback warn counter failed: %r", exc)
+            count = 0
+
+    # ثبت در تاریخچهٔ اخطار (اگر موجود باشد) — هم‌سبکِ مسیرِ گزارش.
+    try:
+        history = getattr(bot, "user_history", None)
+        if history is not None and sender is not None:
+            history.add_warn(
+                chat_id,
+                {
+                    "id": int(user_id),
+                    "first_name": getattr(sender, "first_name", "") or "",
+                    "username": getattr(sender, "username", "") or "",
+                },
+                f"حذف پیام توسط هوش مصنوعی ضد تبلیغ (اخطار شمارهٔ {count})",
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam warn history failed: %r", exc)
+
+    return int(count or 0), int(threshold)
+
+
 def _reply_target_user_id(event):
     """کاربری که این پیام ریپلای روی اوست (اگر کاربرِ واقعی باشد).
 
@@ -190,6 +258,7 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
         behavior_signals = B.observe(
             chat_id, user_id, message_id, message_text,
             _reply_target_user_id(event),
+            bot_user_id=getattr(bot, "bot_account_id", None),
         )
     except Exception as exc:  # noqa: BLE001 — ردیاب نباید مسیر را بشکند
         logger.warning("ad-spam behavior tracker failed: %r", exc)
@@ -260,17 +329,15 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
     except Exception:
         pass
 
-    # --- شمارش اخطار + پیام هشدار ---
-    try:
-        count = state.add_warn(chat_id, user_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("ad-spam warn counter failed: %r", exc)
-        count = 0
+    # --- شمارش اخطار (از سیستم اخطارِ خودِ ربات) + پیام هشدار ---
+    count, threshold = _bump_warnings(bot, chat_id, user_id, sender)
 
     # پیامِ هشدار به‌صورتِ مستقل فرستاده می‌شود: پیامِ متخلف همین حالا حذف
     # شده و ریپلای روی آن یا خطا می‌دهد یا نقل‌قولِ شکسته می‌سازد.
     try:
-        warn_text, warn_entities = texts.warn_payload(_display(sender), count)
+        warn_text, warn_entities = texts.warn_payload(
+            _display(sender), count, threshold=threshold
+        )
         await _send(bot, event, chat_id, warn_text, warn_entities)
     except Exception as exc:  # noqa: BLE001
         logger.warning("ad-spam warn send failed: %r", exc)

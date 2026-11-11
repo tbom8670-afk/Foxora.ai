@@ -63,6 +63,11 @@ LOW_VOCAB_MIN = P.LOW_VOCAB_MIN
 LOW_VOCAB_RATIO = P.LOW_VOCAB_RATIO
 BIO_BAIT_MAX_LEN = P.BIO_BAIT_MAX_LEN
 BIO_BAIT_COUNT = P.BIO_BAIT_COUNT
+BOT_REPLY_COUNT = P.BOT_REPLY_COUNT
+BOT_REPLY_ANY = P.BOT_REPLY_ANY
+SAME_TARGET_COUNT = P.SAME_TARGET_COUNT
+ONE_WORD_MAX_LEN = P.ONE_WORD_MAX_LEN
+ONE_WORD_REPEAT = P.ONE_WORD_REPEAT
 
 _URL_OR_CONTACT_RE = re.compile(
     r"(@[A-Za-z0-9_]{4,}|t\.me/|telegram\.me/|wa\.me/|whatsapp|"
@@ -119,7 +124,7 @@ class BehaviorTracker:
         self._store.clear()
 
     def observe(self, chat_id, user_id, message_id, text,
-                target_user_id=None, now=None) -> dict:
+                target_user_id=None, now=None, bot_user_id=None) -> dict:
         """پیام را ثبت و سیگنال‌های رفتاری را برمی‌گرداند."""
         now = self._clock() if now is None else now
         normalized = P.normalize(text)
@@ -147,6 +152,12 @@ class BehaviorTracker:
                 "سلام" in normalized or normalized in P.GREETING_PHRASES
             ),
             "target": None if target_user_id is None else str(target_user_id),
+            "to_bot": bool(
+                bot_user_id is not None and target_user_id is not None
+                and str(target_user_id) == str(bot_user_id)
+            ),
+            "one_word": bool(normalized) and len(normalized) <= ONE_WORD_MAX_LEN
+                        and len(normalized.split()) <= 1,
         }
         bucket.append(record)
 
@@ -208,6 +219,36 @@ class BehaviorTracker:
 
         short_text = 0 < len(normalized) <= P.CHATTER_MAX_LEN
 
+        # «یک‌کلمه‌ای‌ها» و «تکرار برای همان مخاطب»
+        one_word = bool(normalized) and len(normalized) <= ONE_WORD_MAX_LEN \
+            and len(normalized.split()) <= 1
+        one_word_count = sum(
+            1 for r in window_records
+            if r["one_word"] and now - r["ts"] <= WINDOW
+        )
+        same_text_one_word = sum(
+            1 for r in window_records
+            if r["one_word"] and r["text"] == normalized
+            and now - r["ts"] <= WINDOW
+        ) if one_word else 0
+
+        per_target: dict = {}
+        for r in window_records:
+            if r["target"]:
+                per_target[r["target"]] = per_target.get(r["target"], 0) + 1
+        same_target_max = max(per_target.values()) if per_target else 0
+
+        bot_records = [
+            r for r in bucket
+            if r["to_bot"] and now - r["ts"] <= BURST_WINDOW
+        ]
+        bot_replies = len(bot_records)
+        bot_same_text = max(
+            (sum(1 for r in bot_records if r["text"] == rr["text"])
+             for rr in bot_records),
+            default=0,
+        )
+
         return {
             "cta": bool(strong),
             "cta_phrase": strong,
@@ -231,6 +272,12 @@ class BehaviorTracker:
             "greeting_bait": greeting_count >= BIO_BAIT_COUNT,
             "greeting_count": greeting_count,
             "greeting_targets": len(greeting_targets),
+            "one_word": one_word,
+            "one_word_count": one_word_count,
+            "same_one_word_count": same_text_one_word,
+            "same_target_max": same_target_max,
+            "bot_replies": bot_replies,
+            "bot_same_text": bot_same_text,
             "trail": trail[-TRAIL_MAX:],
             "window": WINDOW,
         }
@@ -240,8 +287,10 @@ class BehaviorTracker:
 TRACKER = BehaviorTracker()
 
 
-def observe(chat_id, user_id, message_id, text, target_user_id=None) -> dict:
-    return TRACKER.observe(chat_id, user_id, message_id, text, target_user_id)
+def observe(chat_id, user_id, message_id, text, target_user_id=None,
+            bot_user_id=None) -> dict:
+    return TRACKER.observe(chat_id, user_id, message_id, text, target_user_id,
+                           bot_user_id=bot_user_id)
 
 
 def decide(signals: dict) -> list:
@@ -279,6 +328,20 @@ def decide(signals: dict) -> list:
             and signals.get("targets_count", 0) >= 1):
         # سریع‌سریع به بقیه جواب می‌دهد و حرفش هم الکی است.
         reasons.append("fast-replier")
+    # ── «به ربات روباه / به یک نفر زیاد ریپلای می‌کند و یک جمله را تکرار
+    #    می‌کند» — اکثراً جمله‌های یک‌کلمه‌ای ──
+    if signals.get("one_word") and signals.get("same_one_word_count", 0) >= ONE_WORD_REPEAT:
+        reasons.append("one-word-repeat")
+    if (signals.get("same_target_max", 0) >= SAME_TARGET_COUNT
+            and (signals.get("one_word") or signals.get("repeat")
+                 or signals.get("short_text"))):
+        # همان جمله را چند بار برای **یک** مخاطب (کاربر یا ربات) می‌فرستد.
+        reasons.append("same-target-spam")
+    if (signals.get("bot_same_text", 0) >= BOT_REPLY_COUNT
+            or signals.get("bot_replies", 0) >= BOT_REPLY_ANY):
+        # «ربات‌ها بیشتر روی رباتِ روباه ریپلای می‌کنند» — این خودش امضای
+        # ربات است: کاربرِ واقعی چند بار پشتِ‌سرهم به ربات جواب نمی‌دهد.
+        reasons.append("bot-reply-spam")
     if signals.get("cta") and behavioural:
         reasons.append("cta+behavior")
     if (signals.get("cta_weak") and signals.get("contact") and behavioural):

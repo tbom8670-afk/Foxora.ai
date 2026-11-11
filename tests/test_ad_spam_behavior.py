@@ -334,26 +334,105 @@ def test_warn_template():
     print("\n=== ۱۰. قالبِ پیام هشدار (مطابقِ اسکرین‌شات) ===")
     from modules.ad_spam_guard import texts
 
-    text, entities = texts.warn_payload("@Linx_cox", 1)
+    text, entities = texts.warn_payload("@Linx_cox", 1, threshold=5)
     expected = (
         "⚠️ کاربر  @Linx_cox\n"
         "پیام شما پاک شد | دلیل : تبلیغات گروهی\n"
         "\n"
-        "تعداد اخطار : 1\n"
+        "تعداد اخطار : 1/5\n"
         "انجام دهنده : هوش مصنوعی ضد تبلیغ"
     )
     check("متنِ هشدار دقیقاً همان عکس است", text == expected, repr(text))
-    check("فقط یک entity (نقل‌قول) دارد",
-          [type(e).__name__ for e in entities] == ["MessageEntityBlockquote"],
-          [type(e).__name__ for e in entities])
+    kinds = [type(e).__name__ for e in entities]
+    check("کلِ متن Bold است", "MessageEntityBold" in kinds, kinds)
+    bold = [e for e in entities if type(e).__name__ == "MessageEntityBold"]
+    check("Bold از ابتدا تا انتهای متن است",
+          bold and bold[0].offset == 0
+          and bold[0].length == len(text.encode("utf-16-le")) // 2, bold)
+    check("خطِ عنوان نقل‌قول هم دارد", "MessageEntityBlockquote" in kinds, kinds)
+    quote = [e for e in entities
+             if type(e).__name__ == "MessageEntityBlockquote"]
     check("نقل‌قول فقط خطِ عنوان را می‌گیرد",
-          entities and entities[0].offset == 0
-          and entities[0].length == len("⚠️ کاربر  @Linx_cox".encode("utf-16-le")) // 2,
-          entities)
-    check("هیچ بخشی Bold نیست",
-          not any(type(e).__name__ == "MessageEntityBold" for e in entities))
+          quote and quote[0].offset == 0
+          and quote[0].length == len("⚠️ کاربر  @Linx_cox".encode("utf-16-le")) // 2,
+          quote)
+    check("شمارنده به‌شکلِ count/threshold است",
+          "تعداد اخطار : 3/7" in texts.render_warn("@x", 3, threshold=7))
     check("دلیل قابلِ تغییر است",
           "دلیل : کلمه ممنوعه" in texts.render_warn("@x", 2, "کلمه ممنوعه"))
+
+
+def test_bot_reply_spam():
+    print("\n=== ۱۱. ریپلایِ تکراری به خودِ رباتِ روباه ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+    bot = FakeBot()                      # bot_account_id = 42
+    sender = SimpleNamespace(id=913, first_name="نیکا", username="nika_1990")
+
+    clock[0] = 0.0
+    first = FakeEvent("سلام", message_id=1300, reply_to_user=42)
+    check("یک ریپلای به ربات حذف نمی‌شود",
+          run(detector.guard_message(bot, first, CHAT, 913, sender, 1300)) is False)
+
+    clock[0] = 9.0
+    second = FakeEvent("سلام", message_id=1301, reply_to_user=42)
+    check("تکرارِ همان جمله برای ربات گرفته می‌شود",
+          run(detector.guard_message(bot, second, CHAT, 913, sender, 1301)) is True,
+          bot.client.deleted)
+
+
+def test_same_target_repeat():
+    print("\n=== ۱۲. تکرارِ یک جمله برای یک مخاطب ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+    bot = FakeBot()
+    sender = SimpleNamespace(id=914, first_name="n", username="n")
+    results = []
+    for index in range(3):
+        clock[0] = index * 25.0
+        event = FakeEvent("خاخ", message_id=1400 + index, reply_to_user=777)
+        results.append(run(detector.guard_message(
+            bot, event, CHAT, 914, sender, 1400 + index)))
+    check("سه بار «خاخ» برای یک نفر گرفته می‌شود", any(results), results)
+
+
+def test_warning_counter_uses_real_system():
+    print("\n=== ۱۳. تعداد اخطار از سیستم اخطارِ ربات ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+
+    class Tracker:
+        def __init__(self):
+            self.counts = {}
+
+        def increment(self, chat_id, user_id):
+            key = (str(chat_id), str(user_id))
+            self.counts[key] = self.counts.get(key, 0) + 1
+            return self.counts[key]
+
+    class BotWithTracker(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.tracker = Tracker()
+
+    bot = BotWithTracker()
+    sender = SimpleNamespace(id=915, first_name="n", username="n")
+    for index in range(2):
+        clock[0] = index * 10.0
+        event = FakeEvent("سلام", message_id=1500 + index, reply_to_user=42)
+        run(detector.guard_message(bot, event, CHAT, 915, sender, 1500 + index))
+
+    check("شمارنده در سیستم اخطارِ ربات بالا رفت",
+          bot.tracker.counts.get((CHAT, "915"), 0) >= 1, bot.tracker.counts)
+    check("پیامِ هشدار «1/5» نشان می‌دهد",
+          any("تعداد اخطار : 1/5" in text for text in bot.client.sent),
+          bot.client.sent)
 
 
 def main():
@@ -370,6 +449,9 @@ def main():
     test_endless_repetitive_chatter()
     test_fast_replier()
     test_warn_template()
+    test_bot_reply_spam()
+    test_same_target_repeat()
+    test_warning_counter_uses_real_system()
     print("\n" + "=" * 62)
     print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
     print("=" * 62)

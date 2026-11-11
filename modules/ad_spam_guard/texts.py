@@ -1,15 +1,11 @@
 """قالب پیام‌های قابلیت «ضد ربات تبلیغاتی» (تبلیغ گر).
 
-همهٔ قالب‌ها **عیناً** مطابق اسکرین‌شاتِ کارفرما هستند. تفاوت‌های مهم با
-نسخهٔ قبلی (که کارفرما آن را رد کرد):
+همهٔ قالب‌ها **عیناً** مطابق اسکرین‌شاتِ کارفرما هستند:
 
-* عنوانِ کارت («🦠ضد تبلیغ گر پیام های کاربران و ربات ها») داخلِ
-  **نقل‌قول** (``MessageEntityBlockquote``) می‌رود — در عکس، همین خط است که
-  با نوارِ سرخ/رنگی سمت راست نمایش داده می‌شود و بقیهٔ متن بیرونِ آن است.
-* بینِ خط‌های فهرست **هیچ خطِ خالی** نیست (در عکس پشتِ‌سرهم‌اند)؛ فقط بعد از
-  نقل‌قول و قبل از «آیا این قابلیت فعال شود ؟» یک خطِ خالی هست.
-* کارت **به‌صورت ریپلای روی دستورِ «تبلیغ گر روشن» فرستاده نمی‌شود**؛ یک
-  پیامِ مستقل است (در عکسِ درست هیچ نقل‌قولی از پیامِ دستور دیده نمی‌شود).
+* کارتِ تأییدیهٔ روشن‌کردن: عنوان داخلِ نقل‌قول، فهرستِ پنج‌خطیِ پشتِ‌سرهم،
+  «آیا این قابلیت فعال شود ؟» و دو خطِ «▪️تایید» / «▫️ لغو».
+* پیامِ هشدارِ حذف: عنوان داخلِ نقل‌قول، کلِ متن **Bold**، و شمارندهٔ اخطار
+  به‌شکلِ «تعداد اخطار : 1/5» از **سیستم اخطارِ خودِ ربات**.
 
 هیچ ``parse_mode``/مارک‌داونی در کار نیست؛ متن + entity صریح ساخته می‌شود
 (هم‌سبکِ ``modules/manage_features/texts.py``).
@@ -18,9 +14,14 @@
 from __future__ import annotations
 
 try:  # pragma: no cover — در تست‌ها/محیطِ بدونِ کتابخانه هم باید ایمپورت شود
-    from splusthon.tl.types import MessageEntityBlockquote
+    from splusthon.tl.types import MessageEntityBlockquote, MessageEntityBold
 except ImportError:  # pragma: no cover
     class MessageEntityBlockquote:  # type: ignore[no-redef]
+        def __init__(self, offset=0, length=0):
+            self.offset = offset
+            self.length = length
+
+    class MessageEntityBold:  # type: ignore[no-redef]
         def __init__(self, offset=0, length=0):
             self.offset = offset
             self.length = length
@@ -73,27 +74,27 @@ CANCELLED_MESSAGE = "▫️لغو شد."
 
 # ---------------------------------------------------------------------------
 # ۳) پیام هشدار هنگام حذف پیام تبلیغاتی
-#    {user}   — نمایش کاربر (مثل @username)
-#    {count}  — تعداد اخطارهای کاربر
-#    {reason} — دلیلِ حذف (پیش‌فرض: تبلیغات گروهی)
 # ---------------------------------------------------------------------------
 # قالب — عیناً مطابقِ اسکرین‌شاتِ کارفرما:
 #
 #   ┌ نقل‌قول ────────────────────────────────┐
-#   │ ⚠️ کاربر  @user                         │   ← فقط همین خط Blockquote است
+#   │ ⚠️ کاربر  @user                         │  ← این خط Blockquote است
 #   └─────────────────────────────────────────┘
-#   پیام شما پاک شد | دلیل : تبلیغات گروهی        ← بدونِ خطِ خالی، چسبیده به نقل‌قول
-#                                                  ← یک خطِ خالی
-#   تعداد اخطار : 1
-#   انجام دهنده : هوش مصنوعی ضد تبلیغ             ← چسبیده به خطِ قبل
+#   پیام شما پاک شد | دلیل : تبلیغات گروهی       ← چسبیده به نقل‌قول
+#                                                ← یک خطِ خالی
+#   تعداد اخطار : 1/5                            ← شمارندهٔ سیستم اخطار + آستانهٔ گروه
+#   انجام دهنده : هوش مصنوعی ضد تبلیغ            ← چسبیده به خطِ قبل
 #
-# هیچ بخشی Bold نیست؛ در عکس همهٔ خط‌ها یک وزن دارند و تنها عنوان داخلِ
-# نقل‌قول است (هم‌سبکِ قالب‌های ``modules/manage_features/texts.py``).
+# **کلِ متن Bold است** (خواستِ کارفرما) و فقط خطِ عنوان نقل‌قول دارد.
 WARN_REASON_DEFAULT = "تبلیغات گروهی"
 WARN_HEADER = "⚠️ کاربر  {user}"
 WARN_BODY = "پیام شما پاک شد | دلیل : {reason}"
-WARN_COUNT_LINE = "تعداد اخطار : {count}"
+#: شمارنده از ``bot.tracker`` (سیستمِ اخطارِ ربات) و آستانه از
+#: ``modules.warning_threshold`` — دقیقاً مثلِ «تعداد اخطار : 2/5» در گزارش.
+WARN_COUNT_LINE = "تعداد اخطار : {count}/{threshold}"
 WARN_ACTOR_LINE = "انجام دهنده : هوش مصنوعی ضد تبلیغ"
+#: آستانهٔ پیش‌فرض وقتی سیستم اخطار در دسترس نیست (همان پیش‌فرضِ ربات).
+WARN_DEFAULT_THRESHOLD = 5
 
 WARN_TEMPLATE = (
     WARN_HEADER + "\n"
@@ -122,21 +123,31 @@ CANCEL_WORDS = frozenset({"لغو", "❌ لغو", "▫️ لغو", "▫️لغو
 
 
 def render_warn(user: str, count: int,
-                reason: str = WARN_REASON_DEFAULT) -> str:
+                reason: str = WARN_REASON_DEFAULT,
+                threshold: int = WARN_DEFAULT_THRESHOLD) -> str:
     """متنِ پیامِ هشدار را با مقدارهای واقعی می‌سازد."""
     try:
-        return WARN_TEMPLATE.format(user=user, count=count, reason=reason)
+        return WARN_TEMPLATE.format(
+            user=user, count=int(count), reason=reason,
+            threshold=int(threshold) or WARN_DEFAULT_THRESHOLD,
+        )
     except Exception:
         # قالبِ خراب نباید کل قابلیت را از کار بیندازد.
         return WARN_TEMPLATE
 
 
 def warn_payload(user: str, count: int,
-                 reason: str = WARN_REASON_DEFAULT):
-    """``(متن, entityها)`` پیامِ هشدار — فقط عنوان داخلِ نقل‌قول است."""
-    text = render_warn(user, count, reason)
+                 reason: str = WARN_REASON_DEFAULT,
+                 threshold: int = WARN_DEFAULT_THRESHOLD):
+    """``(متن, entityها)`` پیامِ هشدار.
+
+    * **کلِ متن Bold است** (خواستِ کارفرما).
+    * خطِ اول («⚠️ کاربر @…») علاوه‌بر Bold، ``MessageEntityBlockquote`` هم
+      دارد تا مثلِ عکس با نوارِ رنگی نمایش داده شود.
+    """
+    text = render_warn(user, count, reason, threshold)
+    entities = [MessageEntityBold(offset=0, length=u16(text))]
     header = WARN_HEADER.format(user=user)
-    entities = []
     if text.startswith(header):
         entities.append(MessageEntityBlockquote(offset=0, length=u16(header)))
     return text, entities
