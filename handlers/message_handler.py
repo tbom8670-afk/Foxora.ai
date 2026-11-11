@@ -100,6 +100,15 @@ from modules.flag_guess import (
     is_exhausted as flag_guess_exhausted,
     start as start_flag_guess,
 )
+from modules.jadvalestan import (
+    texts as JADVALESTAN_TEXTS,
+    TIME_LIMIT as JADVALESTAN_SECONDS,
+    TOTAL as JADVALESTAN_TOTAL,
+    active as jadvalestan_active,
+    answer as answer_jadvalestan,
+    start as start_jadvalestan,
+    timeout as jadvalestan_timeout,
+)
 from modules.name_chain import (
     texts as NAME_CHAIN_TEXTS,
     answer as answer_name_chain,
@@ -1010,6 +1019,7 @@ def is_game_answer_active(chat_id, user_id):
         or _truth_lie.is_active(chat_id)
         or _speed_bomb.is_active(chat_id)
         or name_chain_active(chat_id)
+        or jadvalestan_active(chat_id, user_id)
     )
 
 
@@ -1041,6 +1051,26 @@ NAME_CHAIN_COMMANDS = frozenset({
     "اسم چین", "اسمچین", "اسم‌چین", "بازی اسم چین",
 })
 
+# 🧩 جدولستان — تک‌نفره و بدونِ کلیدِ گروه؛ نام‌ها بعد از normalize_command
+# یکدست شده‌اند، پس شکل‌های اضافی فقط برای اطمینان‌اند.
+JADVALESTAN_COMMANDS = frozenset({
+    "جدولستان", "بازی جدولستان", "جدول",
+})
+
+
+def _jadvalestan_is_command(clean_text):
+    """آیا این متن یک دستورِ ربات است (پس جوابِ جدول نیست)؟
+
+    بدونِ این بررسی، بازیکنِ وسطِ جدول با نوشتنِ «لیست بازی» یا «موجودی»
+    پیامِ «جواب درست نیست» می‌گرفت و دستورش هم اجرا نمی‌شد.
+    """
+    text = (clean_text or "").strip()
+    if not text:
+        return True
+    if text in _INTERNAL_EXACT_COMMANDS:
+        return True
+    return text.startswith(("!", "/", "."))
+
 
 EMOJI_GUESS_TOTAL = _emoji_total_stages()
 
@@ -1070,6 +1100,52 @@ def _track_group_timer(bot, chat_id, task):
             bot.group_timer_tasks.pop(chat_id, None)
 
     task.add_done_callback(discard_finished_task)
+    return task
+
+
+# 🧩 جدولستان: یک تایمرِ ۶۰ ثانیه‌ای برای هر (گروه، کاربر). جوابِ درست
+# تایمر را لغو می‌کند؛ تایمرِ باقی‌مانده هم با «توکنِ کهنه» خودش را کنار
+# می‌کشد، پس هیچ‌وقت روی مرحلهٔ تازه اثری ندارد.
+_JADVALESTAN_TIMERS = {}
+
+
+def _jadvalestan_timer_key(chat_id, user_id):
+    return (normalize_group_id(chat_id), str(user_id))
+
+
+def _jadvalestan_cancel_timer(chat_id, user_id):
+    task = _JADVALESTAN_TIMERS.pop(
+        _jadvalestan_timer_key(chat_id, user_id), None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _jadvalestan_schedule_timer(bot, event, chat_id, user_id, token):
+    """مهلتِ این مرحله را تنظیم می‌کند؛ در پایان، جوابِ درست اعلام می‌شود."""
+    _jadvalestan_cancel_timer(chat_id, user_id)
+
+    async def jadvalestan_deadline():
+        await _asyncio.sleep(JADVALESTAN_SECONDS)
+        result = jadvalestan_timeout(chat_id, user_id, token)
+        if not result:
+            return
+        _JADVALESTAN_TIMERS.pop(_jadvalestan_timer_key(chat_id, user_id), None)
+        try:
+            await event.reply(result["message"])
+        except Exception as error:  # noqa: BLE001
+            bot.logger.log_error(
+                "JADVALESTAN TIMEOUT REPLY FAILED "
+                f"chat_id={chat_id} user_id={user_id} error={error!r}"
+            )
+            return
+        bot.logger.log_info(
+            "JADVALESTAN TIMEOUT "
+            f"chat_id={chat_id} user_id={user_id} stage={result['stage']}"
+        )
+
+    task = _asyncio.create_task(jadvalestan_deadline())
+    _JADVALESTAN_TIMERS[_jadvalestan_timer_key(chat_id, user_id)] = task
+    _track_group_timer(bot, chat_id, task)
     return task
 
 
@@ -3767,7 +3843,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "سرگرمی خاموش", "سرگرمی فعال",
     "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "بیوگرافی",
     "یاد آوری", "ترجمه", "قفل", "باز", "جک", "تصحیح کلمات",
-    "اسم فامیل", "اسم چین", "اسم‌چین",
+    "اسم فامیل", "اسم چین", "اسم‌چین", "جدولستان", "بازی جدولستان",
     "حدس ایموجی", "حدس پرچم", "چهار گزینه ای", "جای خالی", "چیستان",
     "کی بیشتر بلده", "دروغ یا حقیقت",
     "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
@@ -5856,7 +5932,7 @@ async def handle_new_message(bot, event):
             and (
                 clean_text in SIMPLE_REPLIES
                 or clean_text in INSULTS
-                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "اسم چین", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
+                or clean_text in {"راهنما", "/help", "!help", "help", "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "راهنمای امتیاز", "امتیاز من", "رتبه ها", "بیوگرافی", "یاد آوری", "ترجمه", "قفل", "باز", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "جک", "تصحیح کلمات", "اسم فامیل", "اسم چین", "جدولستان", "حدس ایموجی", "حدس پرچم", "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "قوانین", "ثبت قوانین", "حذف قوانین", "حذف حافظه", "موجودی", "فروشگاه", "سکوت", "رفع سکوت", "آزاد", "اخطار", "اخراج", "بن", "ثبت ادمین", "برکناری ادمین", "لغو ادمین", "تغییر اخطار", "تغییر مجازات", "سنجاق", "قفل", "باز", "سابقه ها", "سابقه‌ها", "سطح گروه", "vip", "لغو vip", "لیست vip", "لیست سکوت", "پاک لیست سکوت", "لیست اخراج", "پاک لیست اخراج", "نمودار"} | EMOJI_RESET_COMMANDS | FOX_GAME_COMMANDS
                 or clean_text.startswith(("سکوت نام", "اخراج نام"))
                 or (
                     clean_text.startswith(("!", "/", "."))
@@ -6764,6 +6840,51 @@ async def handle_new_message(bot, event):
         ):
             return
 
+        # 🧩 جدولستان — جدولِ روزنامه‌ایِ تک‌نفره، ۳۲۰ مرحله.
+        # وضعیت به تفکیکِ (chat_id, user_id) است، پس چند نفر می‌توانند
+        # هم‌زمان بازی کنند و پیامِ بقیه هیچ اثری روی جدولِ صاحبِ بازی
+        # ندارد. پیشرفت در دیسک می‌ماند و هیچ‌وقت ریست نمی‌شود.
+        if clean_text.strip() in JADVALESTAN_COMMANDS:
+            jadval_round = start_jadvalestan(chat_id, user_id)
+            if jadval_round is None:
+                await event.reply(JADVALESTAN_TEXTS.NOT_AVAILABLE_TEXT)
+                return
+            await event.reply(
+                jadval_round.get("message") or jadval_round.get("text"))
+            if jadval_round["kind"] == "started":
+                _jadvalestan_schedule_timer(
+                    bot, event, chat_id, user_id, jadval_round["token"])
+            else:
+                _jadvalestan_cancel_timer(chat_id, user_id)
+            bot.logger.log_info(
+                "JADVALESTAN START "
+                f"chat_id={chat_id} user_id={user_id} "
+                f"stage={jadval_round.get('stage')} "
+                f"total={JADVALESTAN_TOTAL} kind={jadval_round['kind']}"
+            )
+            return
+
+        if (
+            jadvalestan_active(chat_id, user_id)
+            and not _jadvalestan_is_command(clean_text)
+        ):
+            jadval_result = answer_jadvalestan(chat_id, user_id, message_text)
+            if jadval_result is not None:
+                await event.reply(jadval_result["message"])
+                if jadval_result["kind"] == "correct":
+                    _jadvalestan_schedule_timer(
+                        bot, event, chat_id, user_id,
+                        jadval_result["next_token"])
+                elif jadval_result["kind"] == "finished":
+                    _jadvalestan_cancel_timer(chat_id, user_id)
+                bot.logger.log_info(
+                    "JADVALESTAN ANSWER "
+                    f"chat_id={chat_id} user_id={user_id} "
+                    f"stage={jadval_result['stage']} "
+                    f"kind={jadval_result['kind']}"
+                )
+                return
+
         # 🫆 اسم چین — زنجیرهٔ نام‌های ایرانی با ربات.
         # قاعدهٔ سختِ این بازی: فقط پیام‌هایی که روی پیامِ خودِ ربات ریپلای
         # شده‌اند پردازش می‌شوند؛ پیامِ آزادِ گروه هیچ‌وقت بلعیده نمی‌شود.
@@ -7606,6 +7727,8 @@ async def handle_new_message(bot, event):
                 "رقابت گروهی با امتیازدهی خودکار.\n\n"
                 "🫆اسم چین\n"
                 "رقابت با ربات با آخر اسم یک اسم بگید\n\n"
+                "🧩 جدولستان\n"
+                "جدول روزنامه‌ای؛ ۳۲۰ مرحله، هر مرحله ۶۰ ثانیه و ۳ سکه نقره.\n\n"
                 "✍️ تصحیح کلمات\n"
                 "پیدا کردن شکل صحیح کلمات.\n\n"
                 "❓ چهار گزینه‌ای\n"
@@ -7666,6 +7789,7 @@ async def handle_new_message(bot, event):
                 "🌍 حدس پرچم",
                 "📝 اسم فامیل",
                 "🫆اسم چین",
+                "🧩 جدولستان",
                 "✍️ تصحیح کلمات",
                 "❓ چهار گزینه‌ای",
                 "📝 جای خالی",

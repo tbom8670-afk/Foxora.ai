@@ -35,6 +35,8 @@ _REWARDS = {
     "battle":          (2, BRONZE, "نبرد"),
     "sentence_guess":  (3, BRONZE, "ساخت جمله"),
     "minesweeper":     (5, SILVER, "مین یاب"),
+    # 🧩 جدولستان: هر مرحله یک جدولِ کامل است ⇒ نقره (۳ سکه در هر مرحله).
+    "jadvalestan":     (3, SILVER, "جدولستان"),
     "who_knows":       (2, BRONZE, "کی بیشتر بلده"),
     "truth_lie":       (2, BRONZE, "دروغ یا حقیقت"),
     "speed_bomb":      (3, BRONZE, "بمب سرعت روباه"),
