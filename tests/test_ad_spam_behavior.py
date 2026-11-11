@@ -144,8 +144,9 @@ def test_sequence_from_screenshot():
 
     check("سه پیامِ اول (شروعِ گپ) چیزی را حذف نمی‌کنند",
           handled[:3] == [False, False, False], handled)
-    check("از چهارمی به بعد (الگویِ رباتی) گرفته می‌شود",
-          all(handled[3:]), handled)
+    check("از چهارمی (الگویِ رباتی) گرفته می‌شود", handled[3] is True, handled)
+    check("گپِ کوتاهِ بعدی در کول‌داون دست‌نخورده می‌ماند",
+          handled[4] is False, handled)
     check("پیامِ «خدمات میدم» گرفته شد", handled[-1] is True, handled)
     check("همان پیام حذف شد", 505 in bot.client.deleted, bot.client.deleted)
     check("ردِ کمپین (۵ پیامِ قبلی) هم پاک شد",
@@ -232,8 +233,9 @@ def test_reply_bot_without_cta():
                           reply_to_user=target)
         results.append(run(detector.guard_message(
             bot, event, CHAT, 902, sender, 900 + index)))
-    check("ریپلای به ۶ کاربرِ مختلف در یک دقیقه ⇒ گرفته می‌شود",
-          results[-1] is True, results)
+    check("ریپلای به چند کاربرِ مختلف گرفته می‌شود", any(results), results)
+    check("ادامهٔ گپِ بدونِ تبلیغ در کول‌داون حذف نمی‌شود",
+          not any(results[2:]), results)
 
 
 def test_admin_exempt():
@@ -435,6 +437,73 @@ def test_warning_counter_uses_real_system():
           bot.client.sent)
 
 
+def test_cooldown_after_hit():
+    print("\n=== ۱۴. بعد از برخورد، کاربرِ عادی دیگر اذیت نمی‌شود ===")
+    clock = [0.0]
+    fresh(clock)
+    no_admin(False)
+    storage.enable(CHAT)
+
+    class Tracker:
+        def __init__(self):
+            self.counts = {}
+
+        def increment(self, chat_id, user_id):
+            key = (str(chat_id), str(user_id))
+            self.counts[key] = self.counts.get(key, 0) + 1
+            return self.counts[key]
+
+    class BotWithTracker(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.tracker = Tracker()
+
+    bot = BotWithTracker()
+    sender = SimpleNamespace(id=916, first_name="نیکا", username="nika_1990")
+
+    # سه ریپلایِ تکراری ⇒ برخورد
+    for index in range(3):
+        clock[0] = index * 10.0
+        event = FakeEvent("سلام", message_id=1600 + index, reply_to_user=42)
+        run(detector.guard_message(bot, event, CHAT, 916, sender, 1600 + index))
+    check("اولین برخورد انجام شد (۲ اخطار یا بیشتر)",
+          bot.tracker.counts.get((CHAT, "916"), 0) >= 1, bot.tracker.counts)
+    warns_before = bot.tracker.counts.get((CHAT, "916"), 0)
+    deleted_before = len(bot.client.deleted)
+
+    # حالا کاربر عادی شده: گپ‌های کوتاهِ تکراری، بی‌آزار
+    for index, text in enumerate(["اوف", "اوف", "خاخ", "داغم", "سلام"]):
+        clock[0] = 40.0 + index * 5.0
+        event = FakeEvent(text, message_id=1700 + index, reply_to_user=777)
+        handled = run(detector.guard_message(
+            bot, event, CHAT, 916, sender, 1700 + index))
+        check("پیامِ %r در کول‌داون حذف نشد" % text, handled is False)
+    check("هیچ پیامِ تازه‌ای حذف نشد",
+          len(bot.client.deleted) == deleted_before, bot.client.deleted)
+    check("اخطارِ اضافه ثبت نشد",
+          bot.tracker.counts.get((CHAT, "916"), 0) == warns_before,
+          bot.tracker.counts)
+
+    # ولی تبلیغِ واقعیِ تازه در همان کول‌داون باید گرفته شود
+    clock[0] = 120.0
+    event = FakeEvent("خدمات میدم، پیام بدید @nika_support", message_id=1800,
+                      reply_to_user=778)
+    handled = run(detector.guard_message(bot, event, CHAT, 916, sender, 1800))
+    check("تبلیغِ واقعیِ تازه در کول‌داون گرفته می‌شود", handled is True,
+          bot.client.deleted)
+
+    # پس از پایانِ کول‌داون، تشخیصِ رفتاری دوباره کار می‌کند
+    clock[0] = 120.0 + 1000.0
+    results = []
+    for index in range(3):
+        clock[0] += 5.0
+        event = FakeEvent("سلام", message_id=1900 + index, reply_to_user=42)
+        results.append(run(detector.guard_message(
+            bot, event, CHAT, 916, sender, 1900 + index)))
+    check("بعد از پایانِ کول‌داون، تکرار دوباره گرفته می‌شود", any(results),
+          results)
+
+
 def main():
     print("=" * 62)
     print("تستِ تشخیصِ رفتارِ ربات‌های کاربرنما")
@@ -452,6 +521,7 @@ def main():
     test_bot_reply_spam()
     test_same_target_repeat()
     test_warning_counter_uses_real_system()
+    test_cooldown_after_hit()
     print("\n" + "=" * 62)
     print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
     print("=" * 62)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 
 from . import behavior as B
+from .behavior import in_cooldown as b_in_cooldown
 from . import patterns as P
 from . import state
 from . import storage
@@ -48,7 +49,8 @@ def _has_repeated_run(text: str) -> bool:
     return bool(re.search(r"(.)\1{2,}", text, re.UNICODE))
 
 
-def evaluate(sender, message_text: str, behavior_signals: dict | None = None) -> dict:
+def evaluate(sender, message_text: str, behavior_signals: dict | None = None,
+             cooling: bool = False) -> dict:
     """همهٔ سیگنال‌ها را می‌سنجد و نتیجه را با جزئیات برمی‌گرداند.
 
     ``behavior_signals`` خروجیِ ``behavior.observe`` است. با آن، ربات‌های
@@ -109,6 +111,21 @@ def evaluate(sender, message_text: str, behavior_signals: dict | None = None) ->
 
     # --- سیگنالِ رفتار (رباتِ کاربرنما) ---
     behavior_reasons = B.decide(behavior_signals or {})
+    # «اگر عادی شد، دیگر گیر نده»: بعد از یک برخورد، تا پایانِ کول‌داون فقط
+    # شاهدِ محتواییِ تازه (خطِ تبلیغ/آیدی/لینک) اجازهٔ اکشن دارد؛ الگوهای
+    # رفتاریِ کهنه نادیده گرفته می‌شوند.
+    content_evidence = bool(
+        (behavior_signals or {}).get("content_evidence")
+    )
+    if cooling and behavior_reasons and not content_evidence:
+        # «اگر عادی شد، دیگر گیر نده»: در کول‌داون هیچ الگوی رفتاری‌ای به
+        # تنهایی اکشن نمی‌سازد؛ فقط شاهدِ محتواییِ تازه (تبلیغ/آیدی/لینک).
+        if P.COOLDOWN_CONTENT_ONLY or \
+                len(behavior_reasons) < P.COOLDOWN_REASONS:
+            behavior_reasons = []
+    if cooling and not behavior_reasons and (behavior_signals or {}).get("cta"):
+        # تبلیغِ صریحِ تازه از کسی که همین تازگی جریمه شده ⇒ اکشن.
+        behavior_reasons = ["ad-after-warning"]
     if behavior_reasons:
         # رفتارِ رباتی کافی است، حتی با نام/یوزرنیمِ کاملاً عادی.
         is_spam = True
@@ -124,6 +141,8 @@ def evaluate(sender, message_text: str, behavior_signals: dict | None = None) ->
         "behavior": behavior_signals or {},
         "behavior_reasons": behavior_reasons,
         "behavior_spam": bool(behavior_reasons),
+        "cooling": bool(cooling),
+        "content_evidence": content_evidence,
     }
 
 
@@ -264,7 +283,8 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
         logger.warning("ad-spam behavior tracker failed: %r", exc)
         behavior_signals = {}
 
-    result = evaluate(sender, message_text, behavior_signals)
+    cooling = b_in_cooldown(chat_id, user_id)
+    result = evaluate(sender, message_text, behavior_signals, cooling=cooling)
 
     # ادمین/مالک معاف‌اند، **مگر** اینکه هویتِ فرستنده با مارکر مطابقت
     # داشته باشد. این عمدی است: این ربات‌ها گاهی نشانِ ادمین هم دارند و
@@ -329,8 +349,19 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
     except Exception:
         pass
 
+    # --- پس از برخورد: پنجرهٔ رفتاریِ این کاربر صفر و کول‌داون فعال می‌شود ---
+    try:
+        B.mark_hit(chat_id, user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam mark_hit failed: %r", exc)
+
     # --- شمارش اخطار (از سیستم اخطارِ خودِ ربات) + پیام هشدار ---
-    count, threshold = _bump_warnings(bot, chat_id, user_id, sender)
+    # در کول‌داون فقط وقتی اخطارِ تازه ثبت می‌شود که شاهدِ محتواییِ تازه
+    # (تبلیغِ واقعی) دیده شده باشد؛ وگرنه کاربر بی‌دلیل اخطار جمع نمی‌کند.
+    if cooling and not result.get("content_evidence"):
+        count, threshold = 0, warn_threshold(bot, chat_id)
+    else:
+        count, threshold = _bump_warnings(bot, chat_id, user_id, sender)
 
     # پیامِ هشدار به‌صورتِ مستقل فرستاده می‌شود: پیامِ متخلف همین حالا حذف
     # شده و ریپلای روی آن یا خطا می‌دهد یا نقل‌قولِ شکسته می‌سازد.

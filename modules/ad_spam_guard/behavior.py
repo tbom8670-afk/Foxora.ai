@@ -68,6 +68,7 @@ BOT_REPLY_ANY = P.BOT_REPLY_ANY
 SAME_TARGET_COUNT = P.SAME_TARGET_COUNT
 ONE_WORD_MAX_LEN = P.ONE_WORD_MAX_LEN
 ONE_WORD_REPEAT = P.ONE_WORD_REPEAT
+HIT_COOLDOWN = P.HIT_COOLDOWN
 
 _URL_OR_CONTACT_RE = re.compile(
     r"(@[A-Za-z0-9_]{4,}|t\.me/|telegram\.me/|wa\.me/|whatsapp|"
@@ -93,6 +94,8 @@ class BehaviorTracker:
         self._max_records = max(1, int(max_records))
         #: (chat_id, user_id) → deque[record]
         self._store: "OrderedDict[tuple[str, str], deque]" = OrderedDict()
+        #: (chat_id, user_id) → زمانِ آخرین برخورد (برای کول‌داون)
+        self._hits: "OrderedDict[tuple[str, str], float]" = OrderedDict()
 
     # ---------------------------------------------------------------- داخلی
     def _bucket(self, chat_id, user_id):
@@ -114,14 +117,45 @@ class BehaviorTracker:
             bucket.popleft()
 
     # ---------------------------------------------------------------- عمومی
+    # ---------------------------------------------------------------- کول‌داون
+    def mark_hit(self, chat_id, user_id, now=None) -> None:
+        """پس از یک برخورد: پنجرهٔ رفتاریِ این کاربر صفر می‌شود + کول‌داون.
+
+        بدونِ این کار، «گپ‌های تکراریِ» قبلی تا ۵ دقیقه در حافظه می‌ماندند و
+        کاربرِ عادی که همان لحظه دست از کار کشیده، بازهم پیامِ بعدی‌اش حذف
+        می‌شد. با پاک‌شدنِ پنجره، هر اکشنِ بعدی نیاز به شاهدِ تازه دارد.
+        """
+        now = self._clock() if now is None else now
+        key = (str(chat_id), str(user_id))
+        self._hits[key] = now
+        self._hits.move_to_end(key)
+        while len(self._hits) > self._max_keys:
+            self._hits.popitem(last=False)
+        self._store.pop(key, None)
+
+    def in_cooldown(self, chat_id, user_id, now=None) -> bool:
+        """آیا این کاربر تازه جریمه شده و باید فقط شواهدِ محتوایی اکشن بدهد؟"""
+        now = self._clock() if now is None else now
+        key = (str(chat_id), str(user_id))
+        stamp = self._hits.get(key)
+        if stamp is None:
+            return False
+        if now - stamp > HIT_COOLDOWN:
+            self._hits.pop(key, None)
+            return False
+        return True
+
     def forget_chat(self, chat_id) -> None:
         """پاک‌کردنِ وضعیتِ یک گروه (مثلاً وقتی قابلیت خاموش می‌شود)."""
         wanted = str(chat_id)
         for key in [k for k in self._store if k[0] == wanted]:
             self._store.pop(key, None)
+        for key in [k for k in self._hits if k[0] == wanted]:
+            self._hits.pop(key, None)
 
     def reset(self) -> None:
         self._store.clear()
+        self._hits.clear()
 
     def observe(self, chat_id, user_id, message_id, text,
                 target_user_id=None, now=None, bot_user_id=None) -> dict:
@@ -279,12 +313,23 @@ class BehaviorTracker:
             "bot_replies": bot_replies,
             "bot_same_text": bot_same_text,
             "trail": trail[-TRAIL_MAX:],
+            "content_evidence": bool(strong or contact),
             "window": WINDOW,
         }
 
 
 #: نمونهٔ مشترکِ ردیاب (برای مسیرِ گرم؛ بی‌حالت و thread-safe به‌اندازهٔ کافی).
 TRACKER = BehaviorTracker()
+
+
+def mark_hit(chat_id, user_id) -> None:
+    """ثبتِ برخورد (پنجره صفر + کول‌داون)."""
+    TRACKER.mark_hit(chat_id, user_id)
+
+
+def in_cooldown(chat_id, user_id) -> bool:
+    """آیا کاربر تازه جریمه شده است؟"""
+    return TRACKER.in_cooldown(chat_id, user_id)
 
 
 def observe(chat_id, user_id, message_id, text, target_user_id=None,
