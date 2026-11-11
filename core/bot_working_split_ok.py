@@ -1045,6 +1045,36 @@ class SoroushAntiSpamBot:
             inter_batch_delay=0,
             peer_cache=self.reply_input_peer_cache,
         )
+        # صف حذفِ اختصاصیِ «ضد ربات تبلیغاتی» — مستقل از صف‌های اصلی ربات تا
+        # این قابلیت هرگز صفِ حذفِ عادیِ گروه‌ها را اشغال نکند. هر خطا در
+        # این بخش نباید استارتاپ را مختل کند، بنابراین کامل در try است.
+        try:
+            from modules.ad_spam_guard import AdSpamDeleteQueue, bind_queue
+
+            async def _ad_spam_delete_one(group_id, message_id):
+                # از همان مسیرِ حذفِ ربات استفاده می‌کنیم تا peer-cache و
+                # سیاستِ RPC یکسان بماند؛ فقط scheduling جدا است.
+                # شناسه باید int باشد (MessageDeleteQueue فقط int می‌پذیرد)
+                # و priority=0 یعنی جلوتر از پاک‌سازیِ خودکارِ اسپم برود.
+                try:
+                    chat = int(group_id)
+                    mid = int(message_id)
+                except (TypeError, ValueError):
+                    return False
+                deleted, _remaining = await self.message_delete_queue.enqueue(
+                    chat, [mid], priority=0
+                )
+                return bool(deleted)
+
+            self.ad_spam_delete_queue = AdSpamDeleteQueue(_ad_spam_delete_one)
+            bind_queue(self.ad_spam_delete_queue)
+            self.ad_spam_delete_queue.start()
+            self.logger.log_info("AD SPAM GUARD QUEUE READY")
+        except Exception as _ad_spam_queue_error:  # noqa: BLE001
+            self.ad_spam_delete_queue = None
+            self.logger.log_error(
+                f"AD SPAM GUARD QUEUE FAILED {_ad_spam_queue_error!r}"
+            )
         # Outgoing sender for normal replies - separate from delete queue.
         # install() is the single constructor so there is never an unused
         # duplicate sender/queue object at startup.

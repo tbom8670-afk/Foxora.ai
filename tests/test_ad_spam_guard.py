@@ -1,0 +1,227 @@
+# -*- coding: utf-8 -*-
+"""🧪 تست قابلیت «ضد ربات تبلیغاتی» ( modules/ad_spam_guard ).
+
+اجرا:
+
+    PYTHONPATH=. python3 tests/test_ad_spam_guard.py
+
+پوشش:
+ ۱. نرمال‌سازی مقاوم (تکرار حروف، ی/ک عربی، کاراکتر نامرئی، تاتویل، جداکننده)
+ ۲. تشخیص ربات از روی هویت (نام/یوزرنیم) + محتوا
+ ۳. ایمنی: پیام کاربر عادی هرگز اسپم شمرده نمی‌شود
+ ۴. ربات با نشان ادمین هم گرفته می‌شود (اگر مارکر در نام باشد)
+ ۵. صف اختصاصی: سقف، تکراری‌نبودن، حذف موفق/ناموفق
+ ۶. دستورهای روشن/خاموش per-group
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# محیط آزمون: فایل‌های تنظیمات در پوشهٔ موقت بنشیند تا state واقعی دست نخورد.
+_TMP = tempfile.mkdtemp(prefix="adspam_test_")
+os.environ["BOT_HOME"] = _TMP
+
+from modules.ad_spam_guard import detector, patterns as P, storage  # noqa: E402
+from modules.ad_spam_guard.queue import AdSpamDeleteQueue  # noqa: E402
+
+PASS = 0
+FAIL = 0
+
+
+def check(label, condition, detail=""):
+    global PASS, FAIL
+    if condition:
+        PASS += 1
+        print("  ✅ %s" % label)
+    else:
+        FAIL += 1
+        print("  ❌ %s %s" % (label, detail))
+
+
+class _Sender:
+    def __init__(self, first=None, last=None, username=None):
+        self.first_name = first
+        self.last_name = last
+        self.username = username
+
+
+def ev(first, last, username, text):
+    return detector.evaluate(_Sender(first, last, username), text)
+
+
+deleted_log = []
+
+
+async def _fake_delete(group_id, message_id):
+    deleted_log.append((group_id, message_id))
+    return True
+
+
+async def queue_tests():
+    """آزمون‌های صف اختصاصی."""
+    q = AdSpamDeleteQueue(
+        _fake_delete, max_pending=5, max_pending_per_group=3
+    )
+    q.start()
+    try:
+        check("ثبت پیام موفق است", q.submit("-100", "10"))
+        check("پیام تکراری دوباره صف نمی‌شود", not q.submit("-100", "10"))
+        check("پیام دیگرِ همان گروه قبول می‌شود", q.submit("-100", "11"))
+        await asyncio.sleep(0.4)
+        check("پیام‌ها حذف شدند", len(deleted_log) == 2, deleted_log)
+        check("صف خالی شد", q.pending == 0)
+        check("آمار درست است",
+              q.stats["deleted"] == 2 and q.stats["failed"] == 0, q.stats)
+
+        # سقف per-group
+        for i in range(20, 40):
+            q.submit("-200", str(i))
+        check("سقف per-group رعایت می‌شود",
+              q.stats["dropped"] > 0 and q.pending <= 3, q.stats)
+        await asyncio.sleep(1.0)
+
+        # حذف ناموفق
+        async def _fail_delete(group_id, message_id):
+            return False
+
+        q2 = AdSpamDeleteQueue(_fail_delete, max_pending=5, max_attempts=2)
+        q2.start()
+        try:
+            q2.submit("-300", "50")
+            await asyncio.sleep(1.0)
+            check("حذف ناموفق شمرده می‌شود", q2.stats["failed"] == 1, q2.stats)
+        finally:
+            await q2.stop(drain=False)
+
+        # استثنا در delete ربات را نمی‌کند
+        async def _boom_delete(group_id, message_id):
+            raise RuntimeError("boom")
+
+        q3 = AdSpamDeleteQueue(_boom_delete, max_pending=5, max_attempts=1)
+        q3.start()
+        try:
+            q3.submit("-400", "60")
+            await asyncio.sleep(0.5)
+            check("استثنا گرفته و لاگ می‌شود",
+                  q3.stats["failed"] == 1, q3.stats)
+        finally:
+            await q3.stop(drain=False)
+    finally:
+        await q.stop(drain=False)
+
+
+def main() -> int:
+    global PASS, FAIL
+    PASS = 0
+    FAIL = 0
+
+    # ---------------------------------------------------------------- ۱
+    print("\n=== ۱. نرمال‌سازی مقاوم ===")
+    check("تکرار حروف جمع می‌شود",
+          P.normalize("عسل استررررررومو ببین") == "عسل استرومو ببین")
+    check("ی/ک عربی یکدست می‌شود",
+          P.normalize("عسل استررررررومو ببين") == "عسل استرومو ببین")
+    check("کاراکتر نامرئی حذف می‌شود",
+          P.normalize("عسل اس\u200bترررررررومو ببین") == "عسل استرومو ببین")
+    check("تاتویل حذف می‌شود",
+          P.normalize("عسل اســـــــترررررررومو ببین") == "عسل استرومو ببین")
+    check("جداکننده به فاصله تبدیل می‌شود",
+          P.normalize("عسل_استررررررومو_ببین") == "عسل استرومو ببین")
+    check("فاصلهٔ اضافه فشرده می‌شود",
+          P.normalize("عسل    استررررررومو   ببین") == "عسل استرومو ببین")
+    check("امضای ایموجی درست است",
+          P.emoji_signature("سلام 😍🥵😍 سلام") == "😍🥵😍")
+
+    # ---------------------------------------------------------------- ۲
+    print("\n=== ۲. تشخیص ربات ===")
+    r = ev("عسل", "استررررررومو ببین 😍🥵😍", None, "عسل استررررررومو ببین")
+    check("ربات اسکرین‌شات گرفته می‌شود", r["is_spam"], r)
+    r = ev("عسسسسل", "اسسسستتتترررررررومو ببییییین 🤗👋", None, "ببین")
+    check("ربات با نام تحریف‌شده گرفته می‌شود", r["is_spam"], r)
+    r = ev("asalam", None, "عسل_استرررررررومو_ببین", "سلام")
+    check("ربات با یوزرنیمِ نشانه‌دار گرفته می‌شود", r["is_spam"], r)
+    r = ev("ربات", None, "x", "عسل استررررررومو ببین 🥰😍🔥")
+    check("ربات با متنِ نشانه‌دار گرفته می‌شود", r["is_spam"], r)
+    r = ev("A", None, None,
+           "عسسسسل اسسسستتتتتتتتتتتتتتررررررررررررررومو ببییییین")
+    check("ربات با بیشینه تکرار گرفته می‌شود", r["is_spam"], r)
+
+    # ---------------------------------------------------------------- ۳
+    print("\n=== ۳. ایمنی کاربر عادی ===")
+    normals = [
+        ("رضا", "محمدی", "reza_m", "سلام دوستان، امشب بازی فوتبال تماشا می‌کنیم"),
+        ("مهدی", None, "mehii", "سلام"),
+        ("عسل", None, "asal", "سلام خوبی؟"),
+        ("استر", None, "star_fan", "استر والیبال امشب played خوب بود"),
+        ("Ali", None, "ali_dev", "ببین این کد رو می‌شه اصلاح کنی؟"),
+        ("سارا", None, "sara", "🥰😍 عالی بود ممنون"),
+        ("زهرا", None, "zahra", "کد تخفیف دارم برای همه 🎁"),
+        ("محمد", None, "mohsen", "بیوگرافی ات رو خوندم، خیلی قشنگ بود"),
+        ("نگار", None, "negar", "عسل مو خوبه، ببین چقوه شیرینه"),
+        ("رضا", None, "reza2", "قیمت دلار امروز چنده؟"),
+        ("Mehi", None, "mehi", "سلام 🤗👋"),
+    ]
+    for first, last, uname, text in normals:
+        r = ev(first, last, uname, text)
+        check("عادی: %s / %r" % (first, text[:20]), not r["is_spam"], r)
+
+    # ---------------------------------------------------------------- ۴
+    print("\n=== ۴. ربات با نشان ادمین ===")
+    r = ev("عسل", "استررررررومو ببین 😍🥵😍", None, "عسل استررررررومو ببین")
+    check("هویت قوی تشخیص داده می‌شود", r["identity_strong"], r)
+    r = ev("Mehi", None, "mehi", "سلام 🤗👋")
+    check("ادمینِ واقعی هویت قوی ندارد", not r["identity_strong"], r)
+
+    # ---------------------------------------------------------------- ۵
+    print("\n=== ۵. صف اختصاصی ===")
+    asyncio.run(queue_tests())
+
+    # ---------------------------------------------------------------- ۶
+    print("\n=== ۶. دستورهای روشن/خاموش ===")
+    check("دستور روشن تشخیص داده می‌شود",
+          storage.is_toggle_command("تبلیغ گر روشن") == "on")
+    check("دستور خاموش تشخیص داده می‌شود",
+          storage.is_toggle_command("تبلیغ گر خاموش") == "off")
+    check("متن عادی دستور نیست", storage.is_toggle_command("سلام") is None)
+    check("فاصلهٔ اضافی نادیده گرفته می‌شود",
+          storage.is_toggle_command(" تبلیغ گر روشن ") == "on")
+
+    storage.enable("-555")
+    check("روشن شدن ذخیره می‌شود", storage.is_enabled("-555"))
+    storage.disable("-555")
+    check("خاموش شدن ذخیره می‌شود", not storage.is_enabled("-555"))
+    storage.enable("-555")
+    check("گروه دیگر تأثیر نمی‌بیند", not storage.is_enabled("-999"))
+
+    # ---------------------------------------------------------------- ۷
+    print("\n=== ۷. قالب هشدار (کارفرما می‌دهد) ===")
+    from modules.ad_spam_guard import texts  # noqa: E402
+
+    check("پیش‌فرض هیچ قالبی نیست", texts.WARN_TEMPLATE is None)
+    check("بدون قالب، پیامی ساخته نمی‌شود",
+          texts.render_warn("@x", "1") is None)
+    texts.WARN_TEMPLATE = "کاربر {user} از گروه {chat} اخراج شد"
+    check("با قالب، پیام ساخته می‌شود",
+          texts.render_warn("@ali", "-100") == "کاربر @ali از گروه -100 اخراج شد")
+    texts.WARN_TEMPLATE = "قالب خراب {ناموجود}"
+    check("قالب خراب ربات را نمی‌کند",
+          texts.render_warn("@ali", "1") is not None)
+    texts.WARN_TEMPLATE = None
+
+    print("\n" + "=" * 60)
+    print("نتیجه: %d پاس / %d شکست" % (PASS, FAIL))
+    print("=" * 60)
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

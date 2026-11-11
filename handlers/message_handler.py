@@ -175,6 +175,7 @@ from modules import user_message_purge
 from modules import message_tracker
 from modules import big_spam
 from modules import search_access
+from modules import ad_spam_guard as _ad_spam_guard
 from modules import web_search, wiki_search_service
 from modules.notice_cleanup import capture_sent
 try:
@@ -4106,6 +4107,37 @@ async def handle_new_message(bot, event):
                         f"chat_id={chat_id} user_id={user_id} "
                         f"error={_violator_gate_error!r}"
                     )
+
+        # ===== 🛡️ گیت «ضد ربات تبلیغاتی» =====
+        # مستقل از ضد-اسپم عادی: بر پایهٔ هویتِ فرستنده (نام/یوزرنیم/سری
+        # ایموجی) به‌همراه محتوای پیام تصمیم می‌گیرد و با صفِ حذفِ اختصاصی
+        # کار می‌کند. ادمین/مالک معاف‌اند مگر اینکه هویتشان با مارکر مطابقت
+        # داشته باشد (این ربات‌ها گاهی نشان ادمین هم دارند).
+        if not event.is_private and chat_id and user_id:
+            try:
+                toggle_mode = _ad_spam_guard.storage.is_toggle_command(
+                    str(message_text or "")
+                )
+                if toggle_mode is not None:
+                    if await _ad_spam_guard.handle_toggle(
+                        bot, event, chat_id, user_id, sender, toggle_mode
+                    ):
+                        return
+                elif _ad_spam_guard.storage.is_enabled(chat_id):
+                    if await _ad_spam_guard.guard_message(
+                        bot, event, chat_id, user_id, sender,
+                        getattr(event.message, "id", None),
+                    ):
+                        return
+            except Exception as _ad_spam_error:
+                try:
+                    bot.logger.log_error(
+                        "AD SPAM GUARD FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_ad_spam_error!r}"
+                    )
+                except Exception:
+                    pass
 
         # Big-spam incidents are the sole opt-in per-message ID registry.
         # Capture before any later return/lock branch can race this event.

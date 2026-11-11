@@ -50,8 +50,9 @@ def test_blocks_count_and_contact():
     # (۴ بلوک «لینک/آیدی بیو» حذف شد — قابلیت خودکار است — و ۱ بلوک
     # «پاک کامل» و ۱ بلوک «اضافه کردن کانال من برای عضویت اجباری» اضافه شد.
     # + ۲ بلوک «اختصاصی» و «پیام زماندار» + ۱ بلوک «تأیید دو مرحله‌ای» = ۵۱
-    # + ۱ بلوک «متخلف/لغو متخلف» (پایینِ لیست) = ۵۲)
-    assert len(bquote_entities) == 52
+    # + ۱ بلوک «متخلف/لغو متخلف» (پایینِ لیست) = ۵۲
+    # + ۱ بلوک «ضد ربات تبلیغاتی» (تبلیغ گر روشن/خاموش) = ۵۳)
+    assert len(bquote_entities) == 53
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -126,8 +127,9 @@ def test_blockquotes_span_exact_lines():
     bquote_entities = [e for e in ADMIN_HELP_ENTITIES if isinstance(e, MessageEntityBlockquote)]
     # ۵۲ = ۴۸ ردیفِ قبلی + ۲ نقل‌قولِ «اختصاصی»/«پیام زماندار»
     # + ۱ نقل‌قولِ «تأیید دو مرحله‌ای دستورات خطرناک»
-    # + ۱ نقل‌قولِ «متخلف/لغو متخلف».
-    assert len(bquote_entities) == 52
+    # + ۱ نقل‌قولِ «متخلف/لغو متخلف»
+    # + ۱ نقل‌قولِ «ضد ربات تبلیغاتی».
+    assert len(bquote_entities) == 53
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -143,7 +145,8 @@ def test_bold_entities_content():
     # + 2 بلوکِ «اختصاصی»/«پیام زماندار» که کلِ متن‌شان Bold است
     # + 1 بلوکِ «تأیید دو مرحله‌ای دستورات خطرناک» = 54
     # + 1 بلوکِ «متخلف/لغو متخلف» (کلِ متن Bold) = 55
-    assert len(bold_entities) == 55
+    # + 1 بلوکِ «ضد ربات تبلیغاتی» (کلِ متن Bold) = 56
+    assert len(bold_entities) == 56
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
