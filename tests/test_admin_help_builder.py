@@ -23,6 +23,8 @@ from modules.admin_help_builder import (
     build_admin_help,
     ADMIN_HELP_TEXT,
     ADMIN_HELP_ENTITIES,
+    ADMIN_HELP_MESSAGES,
+    MAX_QUOTES_PER_MESSAGE,
 )
 from splusthon.tl.types import MessageEntityBold, MessageEntityBlockquote
 from handlers.message_handler import ADMIN_HELP_TEXT as H_TEXT, ADMIN_HELP_ENTITIES as H_ENTITIES
@@ -178,3 +180,56 @@ def test_handler_admin_help_integration():
     """بررسی استفاده از ADMIN_HELP_TEXT و ADMIN_HELP_ENTITIES در message_handler."""
     assert H_TEXT == ADMIN_HELP_TEXT
     assert H_ENTITIES == ADMIN_HELP_ENTITIES
+
+
+# ---------------------------------------------------------------------------
+#  تکه‌تکه ارسال (محدودیت نقل‌قول سروش‌پلاس)
+# ---------------------------------------------------------------------------
+def test_messages_are_chunked_to_avoid_lost_quotes():
+    """سروش‌پلاس نقل‌قول‌های اضافیِ یک پیام بلند را بی‌صدا حذف می‌کند.
+
+    برای همین «لیست ادمینی» تکه‌تکه فرستاده می‌شود؛ هر تکه باید:
+    * حداکثر MAX_QUOTES_PER_MESSAGE نقل‌قول داشته باشد،
+    * هیچ ردیفی بین دو تکه نصف نشود باشد (هر تکه با «\\n\\n» کامل جدا شود).
+    """
+    chunks = ADMIN_HELP_MESSAGES
+    assert len(chunks) >= 2, "لیست باید حداقل دو تکه شود"
+
+    total_quotes = 0
+    for text, entities in chunks:
+        quotes = [e for e in entities
+                  if type(e).__name__ == "MessageEntityBlockquote"]
+        total_quotes += len(quotes)
+        assert len(quotes) <= MAX_QUOTES_PER_MESSAGE
+        # هیچ تکه‌ای نباید با جداکنندهٔ ردیف تمام شود (یعنی ردیف نصف شده)
+        assert not text.endswith("\n")
+
+    # هیچ نقتیول از دست نرفته باشد
+    full_quotes = [e for e in ADMIN_HELP_ENTITIES
+                   if type(e).__name__ == "MessageEntityBlockquote"]
+    assert total_quotes == len(full_quotes)
+
+    # چسباندن تکه‌ها باید همهٔ ردیف‌ها را بدهد (فقط جداکنندهٔ بین‌تکه‌ای کم است)
+    joined = "\n\n".join(chunk[0] for chunk in chunks)
+    assert joined == ADMIN_HELP_TEXT
+
+    # آخرین تکه باید خط «تماس با سازنده» را داشته باشد
+    assert "تماس با سازنده" in chunks[-1][0]
+    # اولین تکه باید عنوان لیست را داشته باشد
+    assert chunks[0][0].startswith("👑 دستورات ادمین‌ها:")
+
+
+def test_every_row_keeps_its_quote_in_chunks():
+    """هر ردیفی که در پیام تک‌تکه نقل‌قول داشت، در تکه‌ها هم دارد."""
+    def quotes_of(text, entities):
+        raw = text.encode("utf-16-le")
+        return [raw[e.offset * 2:(e.offset + e.length) * 2]
+                .decode("utf-16-le", "replace")
+                for e in entities
+                if type(e).__name__ == "MessageEntityBlockquote"]
+
+    wanted = set(quotes_of(ADMIN_HELP_TEXT, ADMIN_HELP_ENTITIES))
+    got = set()
+    for text, entities in ADMIN_HELP_MESSAGES:
+        got.update(quotes_of(text, entities))
+    assert wanted == got, "بعضی نقل‌قول‌ها در تکه‌بندی گم شده‌اند"

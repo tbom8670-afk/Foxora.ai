@@ -672,16 +672,40 @@ HELP_LABELS = (
 )
 
 
+def _merge_chunks(pieces):
+    """تکه‌های پیام‌های پشت‌سرهم را به یک (متن، entity) تبدیل می‌کند.
+
+    «لیست ادمینی» برای اینکه هیچ نقتیول به‌خاطر ازدحام حذف نشود،
+    تکه‌تکه فرستاده می‌شود؛ برای آزمونِ محتوا باید همهٔ تکه‌ها یکی شوند.
+    """
+    parts = []
+    entities = []
+    for text, chunk_entities in pieces:
+        start = len("".join(parts).encode("utf-16-le")) // 2
+        parts.append(text)
+        for entity in (chunk_entities or []):
+            entities.append(type(entity)(offset=start + entity.offset,
+                                         length=entity.length))
+        parts.append("\n\n")
+    return "".join(parts).rstrip("\n"), entities
+
+
 def _help_output(command):
-    """متن و entityهای واقعیِ پاسخ «لیست ادمینی» / «لیست کاربران»."""
+    """متن و entityهای واقعیِ پاسخ «لیست ادمینی» / «لیست کاربران».
+
+    «لیست ادمینی» برای اینکه هیچ نقتیول به‌خاطر ازدحام حذف نشود،
+    تکه‌تکه فرستاده می‌شود؛ اینجا همهٔ تکه‌ها یکی می‌شوند تا محتوا و
+    entityها مثل یک پیامِ واحد آزموده شوند.
+    """
     from modules.owner_check import get_owner
     event, _bot = _drive(command, get_owner()["user_id"])
-    for text, kwargs in event.sent:
-        if isinstance(text, str) and command == "لیست ادمینی" and "دستورات ادمین" in text:
-            return text, kwargs.get("formatting_entities") or []
-        if isinstance(text, str) and command == "لیست کاربران" and "کاربران:" in text:
-            return text, kwargs.get("formatting_entities") or []
-    raise AssertionError(f"no {command!r} reply in {event.replies!r}")
+    pieces = [(text, kwargs.get("formatting_entities") or [])
+              for text, kwargs in event.sent if isinstance(text, str)]
+    if not pieces:
+        raise AssertionError(f"no {command!r} reply in {event.replies!r}")
+    if command == "لیست ادمینی":
+        return _merge_chunks(pieces)
+    return pieces[0]
 
 
 def _spans(text, entities, kind):

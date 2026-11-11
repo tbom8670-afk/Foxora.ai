@@ -7692,10 +7692,16 @@ async def handle_new_message(bot, event):
             admin_marker = "👑 دستورات ادمین‌ها:\n\n"
             games_marker = "🎮 لیست بازی‌ها:\n\n"
             if clean_text.strip() == "لیست ادمینی":
-                await event.reply(
-                    ADMIN_HELP_TEXT,
-                    formatting_entities=list(ADMIN_HELP_ENTITIES)
-                )
+                # ⚠️ سروش‌پلاس تعداد نقل‌قول‌های یک پیام را محدود می‌کند؛
+                # اگر همهٔ ردیف‌ها در یک پیام برود، چند نقل‌قولِ آخر
+                # بی‌صدا حذف می‌شود. برای همین لیست تکه‌تکه فرستاده می‌شود
+                # (هر تکه حداکثر ۳۰ نقل‌قول) تا هیچ ردیفی بی‌نقل‌قول نماند.
+                from modules.admin_help_builder import ADMIN_HELP_MESSAGES
+                for _chunk_text, _chunk_entities in ADMIN_HELP_MESSAGES:
+                    await event.reply(
+                        _chunk_text,
+                        formatting_entities=list(_chunk_entities)
+                    )
                 return
             elif clean_text.strip() == "لیست کاربران":
                 bot.logger.log_info("HANDLER CALLED handler=user_list")

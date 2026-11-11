@@ -418,7 +418,7 @@ def test_01_mark_success():
     check("پیام ریپلای‌شده هم حذف شد", 4321 in bot.chat.deleted,
           bot.chat.deleted)
     check("پاسخ ربات قالب «ثبت شد» است",
-          any("در لیست متخلف گروه" in text
+          any("در لیست متخلف قرار گرفت" in text
               for text, _entities in event.replies), event.replies)
     check("پاسخ، عنوانِ نقل‌قول‌دار دارد",
           any(any(type(e).__name__ == "MessageEntityBlockquote"
@@ -781,19 +781,19 @@ def test_14_templates():
     check("عنوان داخل نقل‌قول است",
           len(quotes) == 1 and
           slice16(text, quotes[0].offset, quotes[0].length) ==
-          "⛔️ کاربر : @target_user", quotes)
+          "⛔️ کـاربـر : @target_user", quotes)
     check("متن «ثبت شد» عیناً مطابق تصویر",
-          "در لیست متخلف گروه از این پس پیام های کاربری پاک خواهد شد" in text,
-          text)
+          "در لیست متخلف قرار گرفت\n"
+          "از این پس پیام های کاربر پاک خواهد شد" in text, text)
     text2, _e2 = texts.violator_message(username="@target_user",
                                         kind="unmarked")
     check("متن «لغو شد» عیناً مطابق تصویر",
-          "از لیست متخلف گروه از این پس کاربر میتواند پیام ارسال کند"
-          in text2, text2)
+          "از لیست متخلف معاف شد\n"
+          "از این پس کاربر میتواند پیام ارسال کند" in text2, text2)
     text3, entities3 = texts.violator_message(username="@u", kind="protected")
     check("قالب خطا هم header+نقل‌قول دارد",
           any(isinstance(e, MessageEntityBlockquote) for e in entities3) and
-          "⛔️ کاربر : @u" in text3, text3)
+          "⛔️ کـاربـر : @u" in text3, text3)
 
 
 # ---------------------------------------------------------------------------
@@ -1158,7 +1158,7 @@ def test_24_unmark_by_username():
     event, deleted_before = run(scenario())
     check("رکورد حذف شد", violators.get_record(CHAT_ID, TARGET_ID) is None)
     check("پاسخ «لغو شد» داده شد",
-          any("از لیست متخلف گروه" in text for text, _ in event.replies),
+          any("از لیست متخلف معاف شد" in text for text, _ in event.replies),
           event.replies)
     check("پاسخ عنوان نقل‌قول‌دار دارد",
           any(any(type(e).__name__ == "MessageEntityBlockquote"

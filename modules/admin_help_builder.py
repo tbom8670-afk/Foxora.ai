@@ -33,57 +33,117 @@ GROWTH_HELP_TEXT = (
 #: نشانهٔ «این ردیف یک بلوکِ آمادهٔ Bold/نقل‌قول است، نه عنوان + دستور».
 READY_BLOCK = object()
 
+#: ⚠️ سروش‌پلاس تعداد نقل‌قول‌های یک پیام را محدود می‌کند: در پیام‌های
+#: خیلی بلند (این لیست ۵۲ نقل‌قول دارد) چند نقل‌قولِ **آخر** بی‌صدا
+#: نادیده گرفته می‌شوند و فقط متنشان می‌ماند. برای همین «لیست ادمینی»
+#: تکه‌تکه ارسال می‌شود تا هر پیام کمترین نقل‌قول را داشته باشد و هیچ
+#: ردیفی بی‌نقل‌قول نماند.
+MAX_QUOTES_PER_MESSAGE = 30
+MAX_UNITS_PER_MESSAGE = 1800
 
-def build_admin_help():
-    """تولید متن کامل راهنمای ادمین به همراه آرایه دقیق موجودیت‌های نقل‌قول و ضخیم."""
+
+def _row(title, cmds, bold_cmds=False, quote=True):
+    """یک ردیف را با آفست‌های **نسبی** (از صفر) می‌سازد.
+
+    خروجی ``(text, entities)`` است و در ``_join_rows`` به هم چسبانده
+    می‌شود؛ آفست‌ها فقط یک بار در همان جا جابه‌جا می‌شوند.
+    """
     parts = []
     entities = []
+    start_t = 0
+    parts.append(title)
+    entities.append(MessageEntityBold(offset=start_t, length=_u16(title)))
+    parts.append("\n")
+    cmd_text = "\n".join(cmds)
+    start_c = _u16("".join(parts))
+    parts.append(cmd_text)
+    if quote:
+        entities.append(MessageEntityBlockquote(offset=start_c,
+                                                length=_u16(cmd_text)))
+    if bold_cmds:
+        # هر دستور جداگانه Bold می‌شود (نقل‌قول یکی است، دستورها جدا).
+        cursor = start_c
+        for line in cmds:
+            if line:
+                entities.append(MessageEntityBold(offset=cursor,
+                                                  length=_u16(line)))
+            cursor += _u16(line) + 1
+    return "".join(parts), entities
 
-    header = "👑 دستورات ادمین‌ها:"
-    parts.append(header)
-    entities.append(MessageEntityBold(offset=0, length=_u16(header)))
-    parts.append("\n\n")
+
+def _rich_row(chunk, quote_texts=()):
+    """بلوکِ آماده: کلِ متن Bold، و فقط بخش‌های خواسته‌شده داخل نقل‌قول."""
+    entities = [MessageEntityBold(offset=0, length=_u16(chunk))]
+    for needle in quote_texts:
+        index = chunk.find(needle)
+        if index < 0:
+            continue
+        # اگر نیدل با «\n» شروع شود یعنی «این خط، از ابتدای خط»؛ خودِ
+        # خط‌شکن داخل نقل‌قول نمی‌رود. لازم است چون عنوانِ بلوک هم می‌تواند
+        # همان عبارت را داشته باشد و نقل‌قول نباید داخل عنوان بیفتد.
+        lead = 1 if needle.startswith("\n") else 0
+        text_part = needle[lead:]
+        entities.append(MessageEntityBlockquote(
+            offset=_u16(chunk[:index + lead]), length=_u16(text_part)))
+    return chunk, entities
+
+
+def _join_rows(rows):
+    """ردیف‌ها را با «\\n\\n» به هم می‌چسباند و آفست‌ها را جابه‌جا می‌کند.
+
+    جداکننده فقط **بین** ردیف‌ها می‌آید (بعد از آخرین ردیف چیزی اضافه
+    نمی‌شود) تا خروجیِ تک‌پیامی عیناً مثل قبل بماند.
+    """
+    parts = []
+    entities = []
+    for position, (text, row_entities) in enumerate(rows):
+        if position:
+            parts.append("\n\n")
+        start = _u16("".join(parts))
+        parts.append(text)
+        for entity in row_entities:
+            entities.append(type(entity)(offset=start + entity.offset,
+                                         length=entity.length))
+    return "".join(parts), entities
+
+
+def _split_rows(rows, max_quotes=MAX_QUOTES_PER_MESSAGE,
+                max_units=MAX_UNITS_PER_MESSAGE):
+    """ردیف‌ها را به تکه‌های امن تقسیم می‌کند (هیچ ردیفی نصف نمی‌شود)."""
+    chunks = []
+    current = []
+    current_quotes = 0
+    current_units = 0
+    for text, row_entities in rows:
+        quotes = sum(1 for entity in row_entities
+                     if type(entity).__name__ == "MessageEntityBlockquote")
+        units = _u16(text)
+        if current and (current_quotes + quotes > max_quotes
+                        or current_units + units > max_units):
+            chunks.append(current)
+            current = []
+            current_quotes = 0
+            current_units = 0
+        current.append((text, row_entities))
+        current_quotes += quotes
+        current_units += units
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _admin_rows():
+    """همهٔ ردیف‌های «دستورات ادمین» — هر ردیف ``(text, entities)`` نسبی."""
+    rows = []
 
     def add_item(title, cmds, bold_cmds=False, quote=True):
-        start_t = _u16("".join(parts))
-        parts.append(title)
-        entities.append(MessageEntityBold(offset=start_t, length=_u16(title)))
-        parts.append("\n")
+        rows.append(_row(title, cmds, bold_cmds=bold_cmds, quote=quote))
 
-        cmd_text = "\n".join(cmds)
-        start_c = _u16("".join(parts))
-        parts.append(cmd_text)
-        if quote:
-            entities.append(MessageEntityBlockquote(
-                offset=start_c, length=_u16(cmd_text)))
-        if bold_cmds:
-            # هر دستور جداگانه Bold می‌شود (نقل‌قول یکی است، دستورها جدا).
-            cursor = start_c
-            for line in cmds:
-                if line:
-                    entities.append(MessageEntityBold(
-                        offset=cursor, length=_u16(line)))
-                cursor += _u16(line) + 1
-        parts.append("\n\n")
+    def add_rich_item(chunk, quote_texts=()):
+        rows.append(_rich_row(chunk, quote_texts=quote_texts))
 
-    def add_rich_item(chunk, quote_texts=(), trailing="\n\n"):
-        """بلوکِ آماده: کلِ متن Bold، و فقط بخش‌های خواسته‌شده داخل نقل‌قول."""
-        start = _u16("".join(parts))
-        parts.append(chunk)
-        entities.append(MessageEntityBold(offset=start, length=_u16(chunk)))
-        for needle in quote_texts:
-            index = chunk.find(needle)
-            if index < 0:
-                continue
-            # اگر نیدل با «\n» شروع شود یعنی «این خط، از ابتدای خط»؛ خودِ
-            # خط‌شکن داخل نقل‌قول نمی‌رود. لازم است چون عنوانِ بلوک هم می‌تواند
-            # همان عبارت را داشته باشد و نقل‌قول نباید داخل عنوان بیفتد.
-            lead = 1 if needle.startswith("\n") else 0
-            text_part = needle[lead:]
-            entities.append(MessageEntityBlockquote(
-                offset=start + _u16(chunk[:index + lead]),
-                length=_u16(text_part)))
-        parts.append(trailing)
+    header = "👑 دستورات ادمین‌ها:"
+    rows.append((header, [MessageEntityBold(offset=0, length=_u16(header))]))
 
     blocks_before_vip = [
         # 🔒 عضویت اجباری کانال — عنوان Bold و هر دو دستور Bold داخل **یک**
@@ -235,15 +295,31 @@ def build_admin_help():
         add_item(title, cmds)
 
     contact = "تماس با سازنده : @OSINE2"
-    start_ct = _u16("".join(parts))
-    parts.append(contact)
-    entities.append(MessageEntityBold(offset=start_ct, length=_u16(contact)))
-    entities.append(MessageEntityBlockquote(offset=start_ct, length=_u16(contact)))
+    rows.append((contact, [
+        MessageEntityBold(offset=0, length=_u16(contact)),
+        MessageEntityBlockquote(offset=0, length=_u16(contact)),
+    ]))
+    return rows
 
-    return "".join(parts), entities
+
+def build_admin_help():
+    """تولید متن کامل راهنمای ادمین به همراه آرایه دقیق موجودیت‌های نقل‌قول و ضخیم."""
+    return _join_rows(_admin_rows())
+
+
+def build_admin_help_messages(max_quotes=MAX_QUOTES_PER_MESSAGE,
+                              max_units=MAX_UNITS_PER_MESSAGE):
+    """همان لیست، تکه‌تکه — تا هیچ نقلیول به‌خاطر ازدحام حذف نشود.
+
+    هر تکه تعداد محدودی نقل‌قول دارد و هیچ ردیفی بین دو پیام نصف نمی‌شود.
+    """
+    return [_join_rows(chunk) for chunk in _split_rows(
+        _admin_rows(), max_quotes=max_quotes, max_units=max_units)]
 
 
 ADMIN_HELP_TEXT, ADMIN_HELP_ENTITIES = build_admin_help()
+#: تکه‌های آمادهٔ ارسال (اولی همان ADMIN_HELP_TEXT است، فقط جابه‌جاشده).
+ADMIN_HELP_MESSAGES = build_admin_help_messages()
 
 
 # ---------------------------------------------------------------------------
