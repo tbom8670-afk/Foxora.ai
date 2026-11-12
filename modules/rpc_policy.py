@@ -35,6 +35,10 @@ RPC_REQUEST_ID = contextvars.ContextVar("rpc_request_id", default=None)
 RPC_ATTEMPT = contextvars.ContextVar("rpc_attempt", default=0)
 
 
+#: درخواست‌هایی که مهلتِ کوتاهِ اختصاصی دارند (خواندن‌های تک‌کاربره).
+SHORT_TIMEOUT_REQUESTS = frozenset({"GetParticipantRequest"})
+
+
 def _env_float(name, default, minimum=0.0, maximum=None):
     try:
         value = max(minimum, float(os.getenv(name, str(default))))
@@ -213,6 +217,18 @@ class RpcPolicy:
         reusing it means a newly-added request type cannot silently fall back
         to the 60s net.
         """
+        # ⏱️ GetParticipantRequest یک «خواندن» است، نه عملیاتِ مدیریتی؛ اگر
+        # روی سرور پشتیبانی نشود یا کند باشد نباید مثل یک بن/سکوت ۲۰ ثانیه
+        # صبر کند. مقدارِ ۰ = همان رفتارِ قبلی (مهلتِ باکت).
+        try:
+            if type(request).__name__ in SHORT_TIMEOUT_REQUESTS:
+                override = _env_float(
+                    "BOT_RPC_GET_PARTICIPANT_TIMEOUT_S", 5.0, 0.0, 60.0
+                )
+                if override > 0:
+                    return override
+        except Exception:
+            pass
         try:
             from modules.rpc_governor import classify_request
             bucket = classify_request(request).bucket

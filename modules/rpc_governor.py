@@ -304,6 +304,22 @@ def note_flood_wait(request_name=None, bucket=None, seconds=0.0):
         return False
 
 
+#: 🧪 پیشنهاد (پیش‌فرض = رفتارِ فعلی): GetParticipantRequest یک خواندنِ
+#: تک‌کاربره است و اگر در باکتِ ``poll`` برود، دو اسلاتِ ``critical`` را
+#: نمی‌تواند ۸ تا ۲۰ ثانیه اشغال کند. با ``BOT_RPC_GET_PARTICIPANT_BUCKET=poll``
+#: فعال می‌شود؛ پیش‌فرض ``critical`` یعنی رفتارِ قبلی دست‌نخورده.
+_POLL_BUCKET_CACHE = [None, False]
+
+
+def _get_participant_in_poll() -> bool:
+    """آیا GetParticipantRequest در باکتِ poll برود؟ (خواندنِ تنبلِ env)"""
+    raw = os.getenv("BOT_RPC_GET_PARTICIPANT_BUCKET", "critical").strip().lower()
+    if _POLL_BUCKET_CACHE[0] != raw:
+        _POLL_BUCKET_CACHE[0] = raw
+        _POLL_BUCKET_CACHE[1] = (raw == "poll")
+    return _POLL_BUCKET_CACHE[1]
+
+
 def classify_request(request, *, urgent_send=False, critical_context=False,
                      channel="main"):
     """Classify a SPlusthon TL request using names stable across versions.
@@ -317,6 +333,14 @@ def classify_request(request, *, urgent_send=False, critical_context=False,
         names = [type(request).__name__]
 
     name_set = set(names)
+    if _get_participant_in_poll() and "GetParticipantRequest" in name_set:
+        # خواندنِ تک‌کاربره در لِینِ poll (سقفِ جدا، پایین‌ترین اولویت).
+        return RpcAdmission(
+            priority=P3_HEAVY,
+            bucket="poll",
+            request_name="+".join(names[:3]),
+            chat_key=_stable_chat_key(_request_chat(request)),
+        )
     if name_set.intersection(_CRITICAL_REQUESTS):
         priority, bucket = P0_CRITICAL, "critical"
     elif name_set.intersection(_DELETE_REQUESTS):

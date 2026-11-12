@@ -21,6 +21,7 @@ import inspect
 import os
 import time
 
+from modules import rpc_unsupported_cache, update_loop_compat
 from modules.rpc_governor import RpcGovernor, classify_request, is_keepalive_request
 from modules.rpc_resilience import install_rpc_resilience
 
@@ -694,6 +695,29 @@ def _wrap_call_with_gate(client, logger, governor=None):
                 return value
         return "global"
 
+    def _translate_update_loop_error(name, error, request, logger):
+        """برای GetDifference/GetChannelDifference خطا را تحمل‌پذیر کن."""
+        try:
+            return update_loop_compat.note_and_translate(
+                name, error, request=request, logger=logger
+            )
+        except Exception:
+            return error
+
+    def _translate_update_loop_cancel(name, logger):
+        """کنسلِ watchdog روی همین دو درخواست → تایم‌اوتِ تحمل‌پذیر.
+
+        کنسلِ واقعی (خاموشی/قطعِ عمدی) دست نمی‌خورد.
+        """
+        try:
+            if not update_loop_compat.applies_to(name):
+                return None
+            if update_loop_compat.current_task_is_cancelling():
+                return None
+            return update_loop_compat.translate(name, TimeoutError("cancelled"), None)
+        except Exception:
+            return None
+
     @functools.wraps(orig)
     async def wrapped(sender, request, ordered=False, flood_sleep_threshold=None):
         name = _req_name(request)
@@ -738,6 +762,21 @@ def _wrap_call_with_gate(client, logger, governor=None):
                 phase_token, _ = begin_rpc_phases(name)
         except Exception:
             phase_token = None
+
+        # 🚫 اگر سرور قبلاً برای همین کانال گفته «چنین متدی ندارم»، درخواست
+        # حتی ساخته نمی‌شود: نه گیت، نه مجوزِ governor، نه سوکت. خطای محلی همان
+        # نوع/متنِ خطای واقعیِ سرور را دارد تا رفتارِ callerها یکی بماند.
+        if rpc_unsupported_cache.is_cached(name, chat_for_gate):
+            error = rpc_unsupported_cache.error_for(name, chat_for_gate)
+            if logger:
+                try:
+                    logger.log_info(
+                        "OUTGOING RPC NOT_SUPPORTED CACHED "
+                        f"request={name} chat={chat_for_gate}"
+                    )
+                except Exception:
+                    pass
+            raise error
 
         try:
             if is_low:
@@ -787,9 +826,30 @@ def _wrap_call_with_gate(client, logger, governor=None):
                     ordered=ordered,
                     flood_sleep_threshold=flood_sleep_threshold,
                 )
-            except Exception:
-                call_error = True
+            except asyncio.CancelledError:
+                # کنسلی که watchdogِ ما روی تسکِ درونی گذاشته برای
+                # GetDifference «تایم‌اوت» است، نه خاموشی؛ حلقهٔ updateِ
+                # کتابخانه CancelledError را می‌بلعد و بی‌صدا می‌میرد.
+                translated = _translate_update_loop_cancel(name, logger)
+                if translated is not None:
+                    call_error = True
+                    raise translated from None
                 raise
+            except Exception as error:
+                call_error = True
+                # 📝 دانشِ «پشتیبانی نمی‌شود» را سراسری نگه دار.
+                try:
+                    if rpc_unsupported_cache.note_if_unsupported(
+                            name, chat_for_gate, error) and logger:
+                        logger.log_info(
+                            "OUTGOING RPC NOT_SUPPORTED CACHED_NOW "
+                            f"request={name} chat={chat_for_gate} "
+                            f"cooldown_s={rpc_unsupported_cache.cooldown_seconds():g}"
+                        )
+                except Exception:
+                    pass
+                raise _translate_update_loop_error(
+                    name, error, request, logger) from None
         finally:
             call_elapsed_ms = (time.perf_counter() - t_call_start) * 1000
             try:

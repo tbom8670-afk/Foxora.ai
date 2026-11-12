@@ -92,6 +92,20 @@ def _entity_resolution_error(error):
     )
 
 
+def _transient_rpc_timeout(error):
+    """آیا این خطا «مهلت تمام شد» است و یک تلاشِ دوباره ارزش دارد؟
+
+    ``asyncio.TimeoutError`` تنها نوعِ ممکن نیست: با نصبِ
+    ``connection_guard``/``outgoing_sender``، تمام‌شدنِ مهلت به‌صورت
+    ``RpcTimeout`` (که ``TimeoutError`` نیست) بالا می‌آید. قبلاً همین باعث
+    می‌شد تلاشِ دوم انجام نشود و پیامِ اسپم باقی بماند.
+    """
+    if isinstance(error, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
+        return True
+    name = _error_name(error)
+    return "timeout" in name or "timedout" in name
+
+
 def _id_specific_error(error):
     """A batch may contain one bad ID; only these errors justify isolation."""
     name = _error_name(error)
@@ -327,7 +341,8 @@ class MessageDeleteQueue:
                             await asyncio.sleep(flood_wait)
                             continue
                         break
-                    if isinstance(error, (TimeoutError, asyncio.TimeoutError, ConnectionError)) and attempt == 1:
+                    if _transient_rpc_timeout(error) and attempt == 1:
+                        # تلاشِ دوم با backoffِ کوتاه: پیامِ اسپم نباید بماند.
                         await asyncio.sleep(0.05)
                         continue
                     break

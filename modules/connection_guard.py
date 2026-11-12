@@ -950,8 +950,37 @@ def install_rpc_timeout(client, timeout=None, on_timeout=None, logger=None,
                 f"{name} did not answer within {deadline}s"
             ) from None
         except asyncio.CancelledError:
+            # باگِ قبلی: ``request`` جا افتاده بود و همین شاخه به‌جای
+            # CancelledError یک TypeError می‌داد (کنسلِ watchdog را می‌پوشاند
+            # و حلقهٔ update را با خطای بی‌ربط می‌کشت).
             drop_request_pending(sender, request)
             drop_completed_pending(sender)
+            # 🔎 کنسلی که از watchdogِ خودمان روی تسکِ درونی آمده «تایم‌اوت» است،
+            # نه خاموشیِ کلِ ربات. اگر آن را CancelledError بالا بفرستیم،
+            # حلقهٔ updateِ کتابخانه آن را می‌بلعد و بی‌صدا می‌میرد؛ برای همین
+            # همان RpcTimeout را می‌دهیم (لایهٔ بالاتر آن را برای
+            # GetDifference/GetChannelDifference تحمل‌پذیر می‌کند).
+            try:
+                from modules.update_loop_compat import current_task_is_cancelling
+                inner_cancelled = task.cancelled()
+                ours_cancelling = current_task_is_cancelling()
+            except Exception:
+                inner_cancelled = False
+                ours_cancelling = False
+            if inner_cancelled and not ours_cancelling:
+                name = request.__class__.__name__
+                if logger is not None:
+                    try:
+                        logger.log_info(
+                            "CONNECTION GUARD rpc cancelled by watchdog "
+                            f"request={name} request_id={request_id or '-'} "
+                            f"deadline_s={deadline}"
+                        )
+                    except Exception:
+                        pass
+                raise RpcTimeout(
+                    f"{name} was cancelled by the watchdog before {deadline}s"
+                ) from None
             raise
         finally:
             # Success, exception, timeout or cancel: this request's await
