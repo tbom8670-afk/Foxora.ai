@@ -51,8 +51,9 @@ def test_blocks_count_and_contact():
     # «پاک کامل» و ۱ بلوک «اضافه کردن کانال من برای عضویت اجباری» اضافه شد.
     # + ۲ بلوک «اختصاصی» و «پیام زماندار» + ۱ بلوک «تأیید دو مرحله‌ای» = ۵۱
     # + ۱ بلوک «متخلف/لغو متخلف» (پایینِ لیست) = ۵۲
-    # + ۱ بلوک «ضد ربات تبلیغاتی» (تبلیغ گر روشن/خاموش) = ۵۳)
-    assert len(bquote_entities) == 53
+    # + ۱ بلوک «ضد ربات تبلیغاتی» (تبلیغ گر روشن/خاموش) = ۵۳
+    # + ۱ بلوک «محدودیت پیام» = ۵۴)
+    assert len(bquote_entities) == 54
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -128,8 +129,9 @@ def test_blockquotes_span_exact_lines():
     # ۵۲ = ۴۸ ردیفِ قبلی + ۲ نقل‌قولِ «اختصاصی»/«پیام زماندار»
     # + ۱ نقل‌قولِ «تأیید دو مرحله‌ای دستورات خطرناک»
     # + ۱ نقل‌قولِ «متخلف/لغو متخلف»
-    # + ۱ نقل‌قولِ «ضد ربات تبلیغاتی».
-    assert len(bquote_entities) == 53
+    # + ۱ نقل‌قولِ «ضد ربات تبلیغاتی»
+    # + ۱ نقل‌قولِ سه‌خطیِ «محدودیت پیام».
+    assert len(bquote_entities) == 54
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -146,7 +148,8 @@ def test_bold_entities_content():
     # + 1 بلوکِ «تأیید دو مرحله‌ای دستورات خطرناک» = 54
     # + 1 بلوکِ «متخلف/لغو متخلف» (کلِ متن Bold) = 55
     # + 1 بلوکِ «ضد ربات تبلیغاتی» (کلِ متن Bold) = 56
-    assert len(bold_entities) == 56
+    # + 1 بلوکِ «محدودیت پیام» (کلِ متن Bold) = 57
+    assert len(bold_entities) == 57
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
@@ -155,11 +158,39 @@ def test_bold_entities_content():
         # تمام خطوط بولد تک‌خطی‌اند، جز بلوک‌های «آماده» مثل «نمودار»،
         # «پاکسازی کامل»، «اختصاصی» و «پیام زماندار».
         if "\n" in sliced:
-            # «تأیید دو مرحله‌ای دستورات خطرناک» و «متخلف» هم بلوکِ آمادهٔ
+            # «تأیید دو مرحله‌ای دستورات خطرناک»، «متخلف» و «محدودیت پیام» هم بلوکِ آمادهٔ
             # چندخطی‌اند (کلِ بلوک Bold، دستورها داخل یک نقل‌قول).
             assert sliced.startswith(
-                ("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️", "💥")
+                ("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️", "💥", "🛎")
             ), sliced
+
+
+def test_message_limit_admin_help_block():
+    """بررسی دقیق بلوک «محدودیت پیام» در لیست ادمینی (بولد کامل + یک نقل‌قول سه‌خطی واحد)."""
+    expected_full = (
+        "🛎 برای ایجاد محدودیت ارسال پیام برای یک کاربر ریپلای کنید بنویسید\n"
+        "محدودیت پیام › بعد عدد مثال\n"
+        "محدودیت پیام 4\n"
+        "لغو محدودیت"
+    )
+    expected_quote = (
+        "محدودیت پیام › بعد عدد مثال\n"
+        "محدودیت پیام 4\n"
+        "لغو محدودیت"
+    )
+    assert expected_full in ADMIN_HELP_TEXT
+    bold_slices = [
+        _slice_u16(ADMIN_HELP_TEXT, e.offset, e.length)
+        for e in ADMIN_HELP_ENTITIES
+        if isinstance(e, MessageEntityBold)
+    ]
+    quote_slices = [
+        _slice_u16(ADMIN_HELP_TEXT, e.offset, e.length)
+        for e in ADMIN_HELP_ENTITIES
+        if isinstance(e, MessageEntityBlockquote)
+    ]
+    assert expected_full in bold_slices
+    assert expected_quote in quote_slices
 
 
 def test_n2_and_n3_examples():

@@ -1130,6 +1130,7 @@ class SoroushAntiSpamBot:
         # مسیر راه‌اندازی نمی‌زنند (کارها در صف اختصاصی خودشان می‌نشینند).
         try:
             from modules.manage_features import (exclusive_commands,
+                                                 message_limit as _message_limit_engine,
                                                  report_commands,
                                                  timed_commands,
                                                  violators as _violators_engine)
@@ -1137,11 +1138,13 @@ class SoroushAntiSpamBot:
             _reports_restored = report_commands.recover(self, self.logger)
             _exclusive_pending = exclusive_commands.recover(self, self.logger)
             _violators_state = _violators_engine.recover(self, self.logger)
+            _msg_limit_state = _message_limit_engine.recover(self, self.logger)
             self.logger.log_info(
                 "MANAGE FEATURES RECOVERY "
                 f"timed={len(_timed_restored)} reports={_reports_restored} "
                 f"exclusive={len(_exclusive_pending)} "
-                f"violators={_violators_state.get('users', 0)}"
+                f"violators={_violators_state.get('users', 0)} "
+                f"message_limits={_msg_limit_state.get('counting', 0) + _msg_limit_state.get('muted', 0)}"
             )
             # ⏰ «تأیید دو مرحله‌ای»: مسیرِ اجرای تأییدشدهٔ ۹ دستورِ خطرناک
             # همین‌جا به روتر وصل می‌شود تا پس از رمزِ درست، همان دستور با

@@ -570,3 +570,87 @@ def violator_rights_lost():
     for body_line in VIOLATOR_RIGHTS_LOST_BODY.split("\n"):
         builder.line(body_line)
     return builder.build()
+
+
+# ---------------------------------------------------------------------------
+#  ۱۰) «محدودیت تعداد پیام» — عیناً مطابق اسکرین‌شات کارفرما
+# ---------------------------------------------------------------------------
+MESSAGE_LIMIT_SET_TITLE = "محدودیت تعداد پیام تنظیم شد"
+MESSAGE_LIMIT_USER_LINE = "🔐 کاربر : {user}"
+MESSAGE_LIMIT_COUNT_LINE = "🔐 محدودیت ارسال : {limit} پیام"
+
+MESSAGE_LIMIT_REACHED_HEADER = "🔐 کاربر : {user}"
+MESSAGE_LIMIT_REACHED_BODY = (
+    "شما به محدویت ارسال\n"
+    "« {limit} » پیام رسیدید دستررسی ارسال پیام برای شما\n"
+    "بسته میشود"
+)
+
+MESSAGE_LIMIT_LOCKED_BODY = (
+    "این کاربر قفل محدودیت پیام دارد\n"
+    "روی پیامش ریپلای کنید بنویسید"
+)
+MESSAGE_LIMIT_LOCKED_QUOTE = "🔐 »» لغو محدودیت پیام"
+
+MESSAGE_LIMIT_CANCELLED_TEXT = "« 🔐 » محدودیت لغو شد"
+
+#: محلِ اتصالِ صریح برای هر قالبِ تکمیلیِ آینده (فعلاً هیچ پیامِ خطا/هشدارِ
+#: طراحی‌شده از سمت ربات ارسال نمی‌شود؛ فقط چهار قالبِ اسکرین‌شات فعال‌اند).
+MESSAGE_LIMIT_EXTRA_TEMPLATES: dict = {}
+
+
+def message_limit_set(*, username, limit):
+    """قالب ۱: ثبت/به‌روزرسانی محدودیت پیام (کل متن Bold، خط اول داخل نقل‌قول)."""
+    builder = _Builder()
+    builder.line(MESSAGE_LIMIT_SET_TITLE, quote=True)
+    builder.line()
+    builder.line(MESSAGE_LIMIT_USER_LINE.format(user=username))
+    builder.line(MESSAGE_LIMIT_COUNT_LINE.format(limit=int(limit)))
+    return builder.build()
+
+
+def message_limit_reached(*, username, limit):
+    """قالب ۲: رسیدن به سقف مجاز و اعمال میوت.
+
+    مطابق اسکرین‌شات: خطِ «🔐 کاربر : @...» داخل نقل‌قول (بدون Bold) و بدنهٔ
+    سه‌خطی زیرِ آن کامل Bold است.
+    """
+    header = MESSAGE_LIMIT_REACHED_HEADER.format(user=username)
+    body = MESSAGE_LIMIT_REACHED_BODY.format(limit=int(limit))
+    prefix = header + "\n"
+    text = prefix + body
+    entities = [
+        MessageEntityBlockquote(offset=0, length=u16(header)),
+        MessageEntityBold(offset=u16(prefix), length=u16(body)),
+    ]
+    return text, entities
+
+
+def message_limit_locked_notice():
+    """قالب ۳: جلوگیری از باز شدن با «آزاد» یا «رفع سکوت»."""
+    prefix = MESSAGE_LIMIT_LOCKED_BODY + "\n"
+    text = prefix + MESSAGE_LIMIT_LOCKED_QUOTE
+    entities = [
+        MessageEntityBold(offset=0, length=u16(text)),
+        MessageEntityBlockquote(
+            offset=u16(prefix),
+            length=u16(MESSAGE_LIMIT_LOCKED_QUOTE),
+        ),
+    ]
+    return text, entities
+
+
+def message_limit_cancelled():
+    """قالب ۴: لغو محدودیت پیام (کلِ خط Bold، بدون نقل‌قول)."""
+    text = MESSAGE_LIMIT_CANCELLED_TEXT
+    entities = [MessageEntityBold(offset=0, length=u16(text))]
+    return text, entities
+
+
+def message_limit_optional_template(kind: str, **context):
+    """نقطهٔ اتصالِ قالب‌های اختیاری آینده؛ اگر قالبی تعریف نشده ``None``."""
+    factory = MESSAGE_LIMIT_EXTRA_TEMPLATES.get(kind)
+    if callable(factory):
+        return factory(**context)
+    return None
+

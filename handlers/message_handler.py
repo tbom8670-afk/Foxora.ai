@@ -695,6 +695,7 @@ def _manage_features():
         return _MANAGE_FEATURES or None
     try:
         from modules.manage_features import (exclusive_commands,
+                                             message_limit_commands,
                                              report_commands, timed_commands,
                                              two_factor_commands,
                                              violator_commands)
@@ -704,6 +705,7 @@ def _manage_features():
         return None
     _MANAGE_FEATURES = {
         "exclusive": exclusive_commands,
+        "message_limit": message_limit_commands,
         "timed": timed_commands,
         "report": report_commands,
         "two_factor": two_factor_commands,
@@ -713,6 +715,36 @@ def _manage_features():
 
 
 _VIOLATORS_MODULE = None
+_MESSAGE_LIMIT_MODULE = None
+
+
+def _message_limit_module():
+    """ایمپورتِ تنبلِ موتور «محدودیت پیام» برای مسیر گرم شمارش و قفل رفع سکوت."""
+    global _MESSAGE_LIMIT_MODULE
+    if _MESSAGE_LIMIT_MODULE is None:
+        try:
+            from modules.manage_features import message_limit as _ml_engine
+            _MESSAGE_LIMIT_MODULE = _ml_engine
+        except Exception as error:                   # noqa: BLE001
+            print(f"MESSAGE LIMIT IMPORT FAILED error={error!r}")
+            _MESSAGE_LIMIT_MODULE = False
+    return _MESSAGE_LIMIT_MODULE or None
+
+
+def _is_muted_by_message_limit(chat_id, user_id) -> bool:
+    ml = _message_limit_module()
+    if ml is None:
+        return False
+    try:
+        return bool(ml.is_muted_by_limit(chat_id, user_id))
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+async def _reply_message_limit_locked(event):
+    from modules.manage_features import texts as _mf_texts
+    text, entities = _mf_texts.message_limit_locked_notice()
+    return await event.reply(text, formatting_entities=entities)
 
 
 def _violators_module():
@@ -3309,6 +3341,26 @@ async def handle_fast_moderation_command(
     ):
         return False
 
+    _ml_fast = _message_limit_module()
+    if _ml_fast is not None and user_id != getattr(bot, "bot_account_id", None):
+        try:
+            if await _ml_fast.observe_message(
+                bot,
+                event,
+                chat_id,
+                user_id,
+                sender=sender,
+                chat=getattr(event, "chat", None),
+                is_edit=False,
+                logger=getattr(bot, "logger", None),
+            ):
+                return True
+        except Exception as _ml_fast_err:
+            try:
+                bot.logger.log_error(f"FAST MSG LIMIT OBSERVE FAILED: {_ml_fast_err!r}")
+            except Exception:
+                pass
+
     if clean_text in {"قفل", "باز"}:
         action = "lock" if clean_text == "قفل" else "unlock"
         async def group_action_succeeded(_result):
@@ -3379,6 +3431,7 @@ async def handle_fast_moderation_command(
         target_key = f"{chat_id}:{target_user.id}"
         if (
             manual_mute_storage.is_manual_muted(chat_id, target_user.id)
+            or _is_muted_by_message_limit(chat_id, target_user.id)
             or target_key in getattr(getattr(bot, "tracker", None), "muted_users", {})
             or target_key in getattr(bot, "punished_users", set())
         ):
@@ -4448,6 +4501,44 @@ async def handle_new_message(bot, event):
                 f"SELF COMMAND ALLOWED chat_id={chat_id} command={own_text!r}"
             )
 
+        # ===== 🔐 شمارش پیام برای کاربران دارای «محدودیت پیام» =====
+        # مسیر گرم O(1) بدون I/O برای کاربران عادی؛ تمام انواع پیام جدید
+        # (متن، عکس، ویدیو، فایل، ویس، استیکر، گیف، فوروارد و ...) شمرده می‌شود
+        # و پیام‌های ویرایش‌شده و مالکین معاف نادیده گرفته می‌شوند.
+        if (
+            not event.is_private
+            and not is_edited_message
+            and not two_factor_confirmed_active()
+            and user_id
+            and user_id != getattr(bot, "bot_account_id", None)
+        ):
+            _ml_engine = _message_limit_module()
+            if _ml_engine is not None:
+                try:
+                    _skip_for_cancel_cmd = False
+                    if message_text and _ml_engine.is_cancel_command(message_text):
+                        from modules.manage_features import access as _mf_access
+                        if _mf_access.is_registered_admin(chat_id, user_id):
+                            _skip_for_cancel_cmd = True
+                    if not _skip_for_cancel_cmd:
+                        if await _ml_engine.observe_message(
+                            bot,
+                            event,
+                            chat_id,
+                            user_id,
+                            sender=sender,
+                            chat=event_chat,
+                            is_edit=is_edited_message,
+                            logger=bot.logger,
+                        ):
+                            return
+                except Exception as _ml_obs_err:
+                    bot.logger.log_error(
+                        "MESSAGE LIMIT OBSERVE FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_ml_obs_err!r}"
+                    )
+
         # A captionless ordinary media message has no text to inspect.  Return
         # before the tracker and every text-only route (commands, word filters,
         # repeat/flood text checks and SpamDetector).  GIFs and forwards keep
@@ -4530,6 +4621,12 @@ async def handle_new_message(bot, event):
             _manage = _manage_features()
             if _manage is not None:
                 try:
+                    if not is_edited_message and _manage["message_limit"].is_command(message_text):
+                        if await _manage["message_limit"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger, chat=event_chat,
+                        ):
+                            return
                     if _manage["violators"].is_command(message_text):
                         if await _manage["violators"].handle(
                             bot, event, chat_id, user_id, sender, message_text,
@@ -9628,6 +9725,11 @@ async def handle_new_message(bot, event):
                     except Exception:
                         pass
 
+                # قفل «محدودیت پیام» با «آزاد» باز نمی‌شود؛ فقط با «لغو محدودیت پیام».
+                if _is_muted_by_message_limit(_c, _u.id):
+                    await _reply_message_limit_locked(_ev)
+                    return
+
                 # سکوت دستی با «آزاد» رفع نمی‌شود؛ فقط «رفع سکوت» می‌تواند
                 # آن را بردارد.
                 try:
@@ -9949,6 +10051,7 @@ async def handle_new_message(bot, event):
                 target_key = f"{chat_id}:{target_user.id}"
                 if (
                     manual_mute_storage.is_manual_muted(chat_id, target_user.id)
+                    or _is_muted_by_message_limit(chat_id, target_user.id)
                     or target_key in getattr(bot.tracker, "muted_users", {})
                     or target_key in getattr(bot, "punished_users", set())
                 ):
@@ -10081,6 +10184,11 @@ async def handle_new_message(bot, event):
                     await event.reply("❌ کاربر پیدا نشد")
                     return
 
+                # قفل «محدودیت پیام» با «رفع سکوت» باز نمی‌شود؛ فقط با «لغو محدودیت پیام».
+                if _is_muted_by_message_limit(chat_id, target_user.id):
+                    await _reply_message_limit_locked(event)
+                    return
+
                 async def unmute_succeeded(_result):
                     target_id = getattr(target_user, "id", None)
                     target_key = f"{chat_id}:{target_id}"
@@ -10193,6 +10301,8 @@ async def handle_new_message(bot, event):
                     try:
                         target_id = int(uid)
                     except (TypeError, ValueError):
+                        continue
+                    if _is_muted_by_message_limit(chat_id, target_id):
                         continue
                     try:
                         await bot.admin_actions.unmute_user(
