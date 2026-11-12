@@ -38,6 +38,19 @@ RPC_ATTEMPT = contextvars.ContextVar("rpc_attempt", default=0)
 #: درخواست‌هایی که مهلتِ کوتاهِ اختصاصی دارند (خواندن‌های تک‌کاربره).
 SHORT_TIMEOUT_REQUESTS = frozenset({"GetParticipantRequest"})
 
+#: درخواست‌های «سبکِ خواندنی» که در باکتِ critical می‌نشینند ولی هرگز نباید
+#: یکی از اسلات‌های آن را ۲۰ ثانیه اشغال کنند (حالتِ اتصالِ مرده).
+#: ⚠️ عمداً GetDifferenceRequest/GetChannelDifferenceRequest اینجا نیستند:
+#: کنسل‌کردنِ زودهنگامِ آن‌ها وسطِ catch-up یعنی هیچ‌وقت تمام نمی‌شود
+#: (زنده‌قفل)؛ و Export/ImportAuthorization هم چون وسطِ آپلودِ فایل اجرا
+#: می‌شوند دست‌نخورده می‌مانند. ``BOT_RPC_FAST_READ_TIMEOUT_S=0`` خاموشش
+#: می‌کند و مهلتِ باکت (۲۰s) برمی‌گردد.
+FAST_READ_TIMEOUT_REQUESTS = frozenset({
+    "GetStateRequest",
+    "GetConfigRequest",
+    "PingRequest",
+})
+
 
 def _env_float(name, default, minimum=0.0, maximum=None):
     try:
@@ -224,6 +237,17 @@ class RpcPolicy:
             if type(request).__name__ in SHORT_TIMEOUT_REQUESTS:
                 override = _env_float(
                     "BOT_RPC_GET_PARTICIPANT_TIMEOUT_S", 5.0, 0.0, 60.0
+                )
+                if override > 0:
+                    return override
+        except Exception:
+            pass
+        # ⏱️ سبک‌های خواندنی (GetState/GetConfig/Ping): اگر سرور جواب ندهد
+        # اسلاتِ critical را ۲۰ ثانیه نگیرند. مقدارِ ۰ = مهلتِ باکت.
+        try:
+            if type(request).__name__ in FAST_READ_TIMEOUT_REQUESTS:
+                override = _env_float(
+                    "BOT_RPC_FAST_READ_TIMEOUT_S", 5.0, 0.0, 60.0
                 )
                 if override > 0:
                     return override
