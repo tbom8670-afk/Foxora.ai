@@ -11,10 +11,19 @@ from modules import fox_game_tokens, group_storage
 from handlers.message_handler import handle_new_message
 
 
+_NEXT_MESSAGE_ID = [2000]
+
+
 class MockEvent:
-    def __init__(self, text, chat_id=5001, user_id=9001, first_name="علی"):
+    def __init__(self, text, chat_id=5001, user_id=9001, first_name="علی",
+                 message_id=None):
         self.raw_text = text
-        self.message = SimpleNamespace(message=text, id=1, entities=None)
+        # شناسهٔ یکتا: هر پیامِ تازه شناسهٔ تازه دارد (مثل سرور واقعی).
+        if message_id is None:
+            _NEXT_MESSAGE_ID[0] += 1
+            message_id = _NEXT_MESSAGE_ID[0]
+        self.message = SimpleNamespace(message=text, id=message_id,
+                                       entities=None)
         self.chat_id = chat_id
         self.sender_id = user_id
         self.is_private = False

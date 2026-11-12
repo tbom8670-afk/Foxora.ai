@@ -109,6 +109,7 @@ from modules.word_puzzle import (
     start as start_word_puzzle,
     timeout as word_puzzle_timeout,
 )
+from modules import message_dedup
 from modules.jadvalestan import (
     texts as JADVALESTAN_TEXTS,
     TIME_LIMIT as JADVALESTAN_SECONDS,
@@ -4206,6 +4207,42 @@ async def handle_new_message(bot, event):
                 _debug_log(bot, f"SPAM DEBUG EARLY RETURN reason=no_message_attr chat_id={_er_chat} message_id={_er_mid}")
             except: pass
             return
+
+        # ♻️ dedup: همان (chat_id, message_id) فقط یک‌بار پردازش شود.
+        # بعد از reconnect یک update تکراری می‌آمد و بازی دوبار اجرا می‌شد
+        # (دو SendMessageRequest). پیامِ واقعیِ تازه شناسهٔ تازه دارد، پس
+        # هیچ پیامِ تازه‌ای گم نمی‌شود. مسیرِ «دستورِ تأییدشدهٔ دو مرحله‌ای»
+        # عمداً مستثناست (همان متن را با شناسهٔ پیامِ اصلی دوباره اجرا می‌کند).
+        try:
+            if not two_factor_confirmed_active():
+                _dedup_mid = getattr(getattr(event, "message", None), "id", None)
+                _dedup_text = (
+                    getattr(getattr(event, "message", None), "message", None)
+                    or getattr(getattr(event, "message", None), "caption", None)
+                    or ""
+                )
+                if message_dedup.is_duplicate(chat_id, _dedup_mid, _dedup_text):
+                    try:
+                        bot.logger.log_info(
+                            "MESSAGE DEDUP SKIP "
+                            f"chat_id={chat_id} message_id={_dedup_mid}"
+                        )
+                    except Exception:
+                        pass
+                    _debug_log(
+                        bot,
+                        f"SPAM DEBUG EARLY RETURN reason=duplicate_message "
+                        f"chat_id={chat_id} message_id={_dedup_mid}",
+                    )
+                    return
+        except Exception as _dedup_error:
+            try:
+                bot.logger.log_error(
+                    "MESSAGE DEDUP FAILED "
+                    f"chat_id={chat_id} error={_dedup_error!r}"
+                )
+            except Exception:
+                pass
 
         # اطلاعات پیام
         message_text = getattr(event.message, "message", "") or ""

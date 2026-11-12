@@ -119,6 +119,42 @@ def max_concurrency() -> int:
     return _env_int("FORCE_JOIN_MAX_CONCURRENCY", 2, 1, 16)
 
 
+# --- کشِ سریعِ عضویت (همه با فلگ خاموش‌شدنی؛ خاموش = رفتار دقیقاً مثل قبل) ---
+
+def cache_enabled() -> bool:
+    """آیا لایهٔ کشِ سریعِ عضویت فعال است؟ (خاموش = کدِ قبلی)"""
+    return _env_flag("FORCE_JOIN_CACHE_ENABLED", True)
+
+
+def fast_member_ttl() -> int:
+    """TTL «عضو است» در حالتِ مسیرِ ارزان (پیش‌فرض ۶۰ ثانیه)."""
+    return _env_int("FORCE_JOIN_FAST_MEMBER_TTL", 60, 10, 7 * 24 * 3600)
+
+
+def fast_not_member_ttl() -> int:
+    """TTL «عضو نیست» در حالتِ مسیرِ ارزان (پیش‌فرض ۴ ثانیه: ۳ تا ۵)."""
+    return _env_int("FORCE_JOIN_FAST_NOT_MEMBER_TTL", 4, 1, 300)
+
+
+def fast_ttl_always() -> bool:
+    """TTLهای کوتاه حتی وقتی فقط «اسکنِ کامل» در دسترس است (پیش‌فرض: نه).
+
+    چرا پیش‌فرض خاموش: روی سروری که مسیرِ تک‌کاربره ندارد، TTL کوتاه یعنی
+    اسکنِ کاملِ بیشتر — خلافِ هدفِ کم‌کردنِ درخواست‌ها.
+    """
+    return _env_flag("FORCE_JOIN_FAST_TTL_ALWAYS", False)
+
+
+def cheap_route_enabled() -> bool:
+    """آیا مسیرِ تک‌کاربره (GetParticipant) اول امتحان شود؟"""
+    return _env_flag("FORCE_JOIN_CHEAP_ROUTE", True)
+
+
+def cheap_route_retry_seconds() -> int:
+    """اگر سرور مسیرِ تک‌کاربره را نداشت، چند ثانیه دوباره امتحان نشود."""
+    return _env_int("FORCE_JOIN_CHEAP_ROUTE_RETRY", 3600, 60, 7 * 24 * 3600)
+
+
 def gate_await_timeout() -> float:
     """سقف انتظار تصمیم‌گیری در مسیر پیام؛ بیشتر از این = fail-open."""
     return _env_float("FORCE_JOIN_GATE_TIMEOUT", 3.0, 0.5, 30.0)
@@ -541,6 +577,8 @@ STATS = {
     "scans": 0,
     "snapshot_decisions": 0,
     "deferred": 0,
+    # چند بررسیِ هم‌زمان به همان پیمایشِ در جریان چسبیدند (RPCِ کمتر)
+    "scan_coalesced": 0,
 }
 
 
@@ -840,7 +878,28 @@ async def _group_input_peer(bot, chat_id):
 # بررسی عضویت یک کاربر
 # ---------------------------------------------------------------------------
 
-def _ttl_for(status: str) -> int:
+def _fast_ttl_active(record=None) -> bool:
+    """TTL کوتاه فقط وقتی معنی دارد که بررسی ارزان باشد.
+
+    اگر فقط «اسکنِ کامل» در دسترس است، TTL کوتاه تعدادِ اسکن را چند برابر
+    می‌کند، پس همان TTLهای فعلی می‌مانند (هدف: کم‌کردنِ درخواست‌ها).
+    """
+    if not cache_enabled():
+        return False
+    if fast_ttl_always():
+        return True
+    if record is None:
+        return False
+    try:
+        return bool(channel_routes(record).get(ROUTE_PARTICIPANT))
+    except Exception:
+        return False
+
+
+def _ttl_for(status: str, record=None) -> int:
+    if _fast_ttl_active(record):
+        return (fast_member_ttl() if status == storage.STATUS_MEMBER
+                else fast_not_member_ttl())
     return member_ttl() if status == storage.STATUS_MEMBER else not_member_ttl()
 
 
@@ -863,7 +922,7 @@ def _completed_scan_status(record, user_id, now=None):
     if _safe_int(user_id) in member_ids:
         return storage.STATUS_MEMBER
     # The shared snapshot lives 30–60s, but absence still has a shorter TTL.
-    if age > not_member_ttl():
+    if age > _ttl_for(storage.STATUS_NOT_MEMBER, record):
         return None
     return storage.STATUS_NOT_MEMBER
 
@@ -1164,6 +1223,54 @@ def _schedule_snapshot_refresh(bot, record) -> bool:
     return True
 
 
+#: (channel_key, user_id) → Task پیمایشِ در جریان (single-flightِ مسیرِ اسکن)
+_scan_inflight: dict = {}
+#: channel_id → تا این زمان مسیرِ تک‌کاربره دوباره امتحان نمی‌شود
+_cheap_probe_until: dict = {}
+
+
+def _cheap_probe_allowed(channel_id) -> bool:
+    """آیا امتحان‌کردنِ مسیرِ تک‌کاربره الان به‌صرفه است؟ (cooldown بعد از NOT_SUPPORTED)"""
+    if not cache_enabled() or not cheap_route_enabled():
+        return False
+    try:
+        return time.time() >= _cheap_probe_until.get(channel_id, 0.0)
+    except Exception:
+        return False
+
+
+async def _scan_single_flight(bot, record, user_id):
+    """همان پیمایش برای همان کاربر فقط یک‌بار اجرا شود؛ بقیه منتظرِ همان نتیجه.
+
+    چرا امن: همهٔ منتظران **همان حکمِ** اجرای اصلی را می‌گیرند (نه حکمِ
+    دیگری)، پس تصمیمِ gate دقیقاً عوض نمی‌شود؛ فقط RPCِ تکراری حذف می‌شود.
+    """
+    if not cache_enabled():
+        return await _scan_route(bot, record, user_id, inline=True)
+    key = (channel_key(record["channel_id"]), _safe_int(user_id))
+    running = _scan_inflight.get(key)
+    if running is not None:
+        STATS["scan_coalesced"] += 1
+        _log(bot, f"MEMBER CHECK scan coalesced chat={record['group_id']} "
+                  f"user={user_id}")
+        try:
+            return await asyncio.shield(running)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return storage.STATUS_UNKNOWN, "inflight_error", None
+
+    task = asyncio.ensure_future(
+        _scan_route(bot, record, user_id, inline=True)
+    )
+    _scan_inflight[key] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if _scan_inflight.get(key) is task:
+            _scan_inflight.pop(key, None)
+
+
 async def _routed_check(bot, record, user_id, user_entity=None):
     """زنجیرهٔ مسیرها: اولین پاسخ قطعی برنده است؛ هر شکست دیده می‌شود.
 
@@ -1184,6 +1291,15 @@ async def _routed_check(bot, record, user_id, user_entity=None):
         "error": None,
     }
     key = (channel_key(channel_id), _safe_int(user_id))
+
+    # مسیرِ تک‌کاربره (GetParticipant) اول امتحان شود، حتی اگر probe قدیمی
+    # آن را خاموش کرده باشد؛ نتیجه‌اش همان زنجیرهٔ فعلی را طی می‌کند و اگر
+    # سرور پشتیبانی نکند، با cooldownِ بلند کنار گذاشته می‌شود.
+    # فقط وقتی حداقل یک مسیرِ سالم ثبت شده است: اگر مالک همه را خاموش کرده
+    # («no_route»)، دستِ خودش را عوض نمی‌کنیم.
+    if order and ROUTE_PARTICIPANT not in order and _cheap_probe_allowed(channel_id):
+        order.insert(0, ROUTE_PARTICIPANT)
+        _log(bot, f"CHEAP ROUTE probe user_id={user_id} channel_id={channel_id}")
 
     if not order:
         diag.update(state="no_route", error="no_route")
@@ -1213,6 +1329,12 @@ async def _routed_check(bot, record, user_id, user_entity=None):
                 if api.is_not_supported(error) or \
                         raw_state == api.RESULT_NOT_SUPPORTED:
                     disable_route(bot, record, route, "NOT_SUPPORTED")
+                    if route == ROUTE_PARTICIPANT:
+                        # همین مسیر ارزان پشتیبانی نمی‌شود: تا یک ساعت
+                        # دوباره امتحان نشود (هیچ RPCِ بی‌نتیجه‌ای).
+                        _cheap_probe_until[channel_id] = (
+                            time.time() + cheap_route_retry_seconds()
+                        )
                     record = storage.get_group(record["group_id"]) or record
                 continue
 
@@ -1256,8 +1378,8 @@ async def _routed_check(bot, record, user_id, user_entity=None):
                 continue
 
             if route == ROUTE_SCAN:
-                status, outcome, payload = await _scan_route(
-                    bot, record, user_id, inline=True
+                status, outcome, payload = await _scan_single_flight(
+                    bot, record, user_id
                 )
                 diag["trace"].append({route: outcome})
                 if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
@@ -1398,7 +1520,7 @@ async def resolve_status(bot, record, user_id, user_entity=None, *,
     entry = None if force else _member_cache.get((channel_id, user_id))
     if entry is not None:
         status, verified_at = entry
-        if now - verified_at <= _ttl_for(status):
+        if now - verified_at <= _ttl_for(status, record):
             STATS["cache_hits"] += 1
             _log(bot, f"MEMBER CHECK cache hit chat={record['group_id']} "
                       f"user={user_id} result={str(status == storage.STATUS_MEMBER).lower()}")
@@ -1422,7 +1544,7 @@ async def resolve_status(bot, record, user_id, user_entity=None, *,
     stored = storage.get_member(channel_id, user_id)
     if stored and stored.get("last_verified_at") and not force:
         age = now - float(stored["last_verified_at"])
-        if age <= _ttl_for(stored["membership_status"]):
+        if age <= _ttl_for(stored["membership_status"], record):
             STATS["db_hits"] += 1
             _log(bot, f"MEMBER CHECK cache hit chat={record['group_id']} "
                       f"user={user_id} result={str(stored['membership_status'] == storage.STATUS_MEMBER).lower()}")
@@ -3221,6 +3343,8 @@ def reset_runtime_state() -> None:
     _last_error.clear()
     _last_diag.clear()
     _scan_until.clear()
+    _scan_inflight.clear()
+    _cheap_probe_until.clear()
     _refresh_tasks.clear()
     _awaiting_confirm.clear()
     _confirm_inflight.clear()

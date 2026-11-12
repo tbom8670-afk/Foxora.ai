@@ -51,6 +51,9 @@ def isolated_storage(tmp_path, monkeypatch):
         game.reset_all()
 
 
+_NEXT_MESSAGE_ID = [1000]
+
+
 class RecordingEvent:
     """event قلابی که متن و entityها را با هم ثبت می‌کند."""
 
@@ -60,7 +63,10 @@ class RecordingEvent:
         self.user_id = user_id
         self.is_private = is_private
         self.sent = []          # [(text, kwargs), ...]
-        self.message = SimpleNamespace(message=text, id=77, entities=None, file=None)
+        # شناسهٔ یکتا: هر پیامِ تازه شناسهٔ تازه دارد (مثل سرور واقعی).
+        _NEXT_MESSAGE_ID[0] += 1
+        self.message = SimpleNamespace(message=text, id=_NEXT_MESSAGE_ID[0],
+                                       entities=None, file=None)
         self.sender = SimpleNamespace(id=user_id, username="ali", first_name="علی")
         self.sender_id = user_id
 

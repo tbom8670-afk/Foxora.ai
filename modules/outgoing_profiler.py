@@ -14,6 +14,7 @@ import os
 import sys
 import time
 
+from modules import rpc_window_stats
 from modules.rpc_policy import (
     RPC_ATTEMPT,
     RPC_REQUEST_ID,
@@ -1492,6 +1493,9 @@ def _wrap_call(client, logger):
                 "result": result,
                 "request": _request_name(request),
             }
+            # 📈 پنجرهٔ ۶۰ ثانیه‌ای: فقط دو جمع و یک مقایسه (بدونِ I/O، بدونِ
+            # تسک). خطِ لاگ هر ۶۰ ثانیه یک‌بار و تنبل نوشته می‌شود.
+            rpc_window_stats.record(request_name, rpc_wait_ms, logger)
             if op_state is not None:
                 op_state.setdefault("calls", []).append(record)
                 op_state["last_return"] = time.perf_counter()
