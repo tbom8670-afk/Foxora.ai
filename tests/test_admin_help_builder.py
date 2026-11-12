@@ -52,8 +52,9 @@ def test_blocks_count_and_contact():
     # + ۲ بلوک «اختصاصی» و «پیام زماندار» + ۱ بلوک «تأیید دو مرحله‌ای» = ۵۱
     # + ۱ بلوک «متخلف/لغو متخلف» (پایینِ لیست) = ۵۲
     # + ۱ بلوک «ضد ربات تبلیغاتی» (تبلیغ گر روشن/خاموش) = ۵۳
-    # + ۱ بلوک «محدودیت پیام» = ۵۴)
-    assert len(bquote_entities) == 54
+    # + ۱ بلوک «محدودیت پیام» = ۵۴
+    # + ۱ بلوک «خاموشی گروه» = ۵۵)
+    assert len(bquote_entities) == 55
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -130,8 +131,9 @@ def test_blockquotes_span_exact_lines():
     # + ۱ نقل‌قولِ «تأیید دو مرحله‌ای دستورات خطرناک»
     # + ۱ نقل‌قولِ «متخلف/لغو متخلف»
     # + ۱ نقل‌قولِ «ضد ربات تبلیغاتی»
-    # + ۱ نقل‌قولِ سه‌خطیِ «محدودیت پیام».
-    assert len(bquote_entities) == 54
+    # + ۱ نقل‌قولِ سه‌خطیِ «محدودیت پیام»
+    # + ۱ نقل‌قولِ «خاموشی گروه».
+    assert len(bquote_entities) == 55
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -149,7 +151,8 @@ def test_bold_entities_content():
     # + 1 بلوکِ «متخلف/لغو متخلف» (کلِ متن Bold) = 55
     # + 1 بلوکِ «ضد ربات تبلیغاتی» (کلِ متن Bold) = 56
     # + 1 بلوکِ «محدودیت پیام» (کلِ متن Bold) = 57
-    assert len(bold_entities) == 57
+    # + 1 بلوکِ «خاموشی گروه» (کلِ متن Bold) = 58
+    assert len(bold_entities) == 58
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
@@ -158,10 +161,10 @@ def test_bold_entities_content():
         # تمام خطوط بولد تک‌خطی‌اند، جز بلوک‌های «آماده» مثل «نمودار»،
         # «پاکسازی کامل»، «اختصاصی» و «پیام زماندار».
         if "\n" in sliced:
-            # «تأیید دو مرحله‌ای دستورات خطرناک»، «متخلف» و «محدودیت پیام» هم بلوکِ آمادهٔ
+            # «تأیید دو مرحله‌ای دستورات خطرناک»، «متخلف»، «محدودیت پیام» و «خاموشی گروه» هم بلوکِ آمادهٔ
             # چندخطی‌اند (کلِ بلوک Bold، دستورها داخل یک نقل‌قول).
             assert sliced.startswith(
-                ("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️", "💥", "🛎")
+                ("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️", "💥", "🛎", "🌖")
             ), sliced
 
 
@@ -201,6 +204,35 @@ def test_message_limit_admin_help_block():
     assert "تماس با سازنده : @OSINE2" in last_chunk_text
     assert (
         last_chunk_text.index("⛔️ : برای اینکه یک کاربر")
+        < last_chunk_text.index(expected_full)
+        < last_chunk_text.index("تماس با سازنده : @OSINE2")
+    )
+
+
+def test_group_shutdown_admin_help_block():
+    """بررسی دقیق بلوک «خاموشی گروه» در لیست ادمینی (بولد کامل + نقل‌قول سروش‌پلاس داخل همان لیست)."""
+    expected_full = (
+        "🌖 برای خاموشی و قفل خودکار گروه بنویسید\n"
+        "خاموشی گروه"
+    )
+    expected_quote = "خاموشی گروه"
+    assert expected_full in ADMIN_HELP_TEXT
+    bold_slices = [
+        _slice_u16(ADMIN_HELP_TEXT, e.offset, e.length)
+        for e in ADMIN_HELP_ENTITIES
+        if isinstance(e, MessageEntityBold)
+    ]
+    quote_slices = [
+        _slice_u16(ADMIN_HELP_TEXT, e.offset, e.length)
+        for e in ADMIN_HELP_ENTITIES
+        if isinstance(e, MessageEntityBlockquote)
+    ]
+    assert expected_full in bold_slices
+    assert expected_quote in quote_slices
+    assert len(ADMIN_HELP_MESSAGES) == 2
+    last_chunk_text = ADMIN_HELP_MESSAGES[-1][0]
+    assert (
+        last_chunk_text.index("🛎 برای ایجاد محدودیت ارسال پیام")
         < last_chunk_text.index(expected_full)
         < last_chunk_text.index("تماس با سازنده : @OSINE2")
     )

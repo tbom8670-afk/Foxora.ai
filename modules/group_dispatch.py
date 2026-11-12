@@ -137,6 +137,8 @@ _ADMIN_EXACT = frozenset({
     "راهنمای کانال", "راهنمای اجرا",
     # محدودیت تعداد پیام — دستور مدیریتی
     "محدودیت پیام", "لغو محدودیت پیام", "لغو محدودیت",
+    # خاموشی خودکار گروه — دستور ویژهٔ مالک ثبت‌شدهٔ ربات
+    "خاموشی گروه", "لغو خاموشی گروه", "لغو خاموشی",
 })
 
 #: پیشوندهای خطِ دستور برای «اختصاصی @user».
@@ -147,6 +149,7 @@ _ADMIN_PREFIXES = (
     "تست عضویت ", "تشخیص عضویت ",
     "لغو عضویت اجباری ", "حذف کانال من ",
     "محدودیت پیام ",
+    "خاموشی گروه ",
     "پاک ", "بن ", "اخراج ", "سکوت ",
     "سکوت نام", "اخراج نام",
     "فیلتر اسم", "لغو اسم", "فیلتر نام", "لغو نام",
@@ -226,6 +229,8 @@ def classify_priority(text, event=None):
         return PRIORITY_COMMAND, LANE_COMMAND
     if raw.startswith(_COMMAND_PREFIXES_MANAGE):
         return PRIORITY_ADMIN, LANE_ADMIN
+    if _is_active_group_shutdown_input(event):
+        return PRIORITY_ADMIN, LANE_ADMIN
     if raw.startswith(_COMMAND_PREFIXES):
         return PRIORITY_COMMAND, LANE_COMMAND
     # پاسخ/ثبت‌نام داخل یک بازیِ در جریان (دادگاه روباه، بقا، زامبی، …) هم
@@ -243,6 +248,22 @@ def _event_user_id(event):
         sender = getattr(event, "sender", None)
         user_id = getattr(sender, "id", None)
     return user_id
+
+
+def _is_active_group_shutdown_input(event):
+    """آیا مالک ثبت‌شدهٔ ربات در حال وارد کردن مدت زمان برای «خاموشی گروه» است؟ (O(1) بدون I/O)"""
+    if event is None or getattr(event, "is_private", False):
+        return False
+    chat_id = getattr(event, "chat_id", None)
+    user_id = _event_user_id(event)
+    if chat_id is None or user_id is None:
+        return False
+    try:
+        from modules.manage_features import group_shutdown_commands
+
+        return group_shutdown_commands.is_awaiting(chat_id, user_id)
+    except Exception:
+        return False
 
 
 def _is_active_game_answer(event):

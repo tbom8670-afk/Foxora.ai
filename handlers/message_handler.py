@@ -695,6 +695,7 @@ def _manage_features():
         return _MANAGE_FEATURES or None
     try:
         from modules.manage_features import (exclusive_commands,
+                                             group_shutdown_commands,
                                              message_limit_commands,
                                              report_commands, timed_commands,
                                              two_factor_commands,
@@ -705,6 +706,7 @@ def _manage_features():
         return None
     _MANAGE_FEATURES = {
         "exclusive": exclusive_commands,
+        "group_shutdown": group_shutdown_commands,
         "message_limit": message_limit_commands,
         "timed": timed_commands,
         "report": report_commands,
@@ -4621,6 +4623,14 @@ async def handle_new_message(bot, event):
             _manage = _manage_features()
             if _manage is not None:
                 try:
+                    if not is_edited_message and _manage["group_shutdown"].is_command(
+                        message_text, chat_id, user_id
+                    ):
+                        if await _manage["group_shutdown"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger, chat=event_chat,
+                        ):
+                            return
                     if not is_edited_message and _manage["message_limit"].is_command(message_text):
                         if await _manage["message_limit"].handle(
                             bot, event, chat_id, user_id, sender, message_text,

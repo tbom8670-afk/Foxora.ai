@@ -654,3 +654,80 @@ def message_limit_optional_template(kind: str, **context):
         return factory(**context)
     return None
 
+
+# ---------------------------------------------------------------------------
+#  ۱۱) خاموشی گروه (قفل خودکار زمان‌بندی‌شده) — عیناً مطابق اسکرین‌شات کارفرما
+# ---------------------------------------------------------------------------
+GROUP_SHUTDOWN_PROMPT_HEADER = "⚙️ : قفل خودکار گروه و خاموشی فعالیت"
+GROUP_SHUTDOWN_PROMPT_BODY = (
+    "لطفا ساعت قفل خودکار رو به صورت زیر بنویسید\n"
+    "دستورات قابل قبول ✓\n"
+    "مثال »» 3:10:10\n"
+    "مثال »» 20 دقیقه\n"
+    "مثال »» 3 ساعت\n"
+    "گروه در همان ساعت / دقیقه / ثانیه قفل خواهد شد"
+)
+
+GROUP_SHUTDOWN_SCHEDULED_TEXT = "🕓 : قفل خودکار فعالیت در گروه تنظیم شد"
+
+GROUP_SHUTDOWN_EXECUTED_HEADER = "🔐 قفل خودکار انجام شد ✓"
+GROUP_SHUTDOWN_EXECUTED_BODY = "زمان فعالیت در این گروه به پایان رسید"
+
+#: جایگاه‌های آماده برای قالب‌های اختیاری (بدون تولید متن اضافی خارج از اسکرین‌شات).
+GROUP_SHUTDOWN_EXTRA_TEMPLATES: dict = {
+    "unauthorized": None,
+    "invalid_input": None,
+    "duration_too_long": None,
+    "already_locked": None,
+    "api_error": None,
+    "cancelled": None,
+}
+
+
+def group_shutdown_prompt():
+    """قالب ۱: درخواست زمان خاموشی پس از دستور «خاموشی گروه».
+
+    مطابق اسکرین‌شات: کل متن Bold است و خط عنوانِ اول داخل نقل‌قول سروش‌پلاس.
+    """
+    text = GROUP_SHUTDOWN_PROMPT_HEADER + "\n" + GROUP_SHUTDOWN_PROMPT_BODY
+    entities = [
+        MessageEntityBold(offset=0, length=u16(text)),
+        MessageEntityBlockquote(
+            offset=0,
+            length=u16(GROUP_SHUTDOWN_PROMPT_HEADER),
+        ),
+    ]
+    return text, entities
+
+
+def group_shutdown_scheduled():
+    """قالب ۲: تأیید ثبت زمان‌بندی خاموشی گروه (کل خط Bold، بدون نقل‌قول)."""
+    text = GROUP_SHUTDOWN_SCHEDULED_TEXT
+    entities = [MessageEntityBold(offset=0, length=u16(text))]
+    return text, entities
+
+
+def group_shutdown_executed():
+    """قالب ۳: اعلان انجام قفل خودکار در لحظهٔ رسیدن زمان خاموشی.
+
+    مطابق اسکرین‌شات: خط اول («🔐 قفل خودکار انجام شد ✓») هم Bold و هم داخل
+    نقل‌قول است؛ خط دوم («زمان فعالیت در این گروه به پایان رسید») عادی است.
+    """
+    prefix = GROUP_SHUTDOWN_EXECUTED_HEADER + "\n"
+    text = prefix + GROUP_SHUTDOWN_EXECUTED_BODY
+    header_len = u16(GROUP_SHUTDOWN_EXECUTED_HEADER)
+    entities = [
+        MessageEntityBold(offset=0, length=header_len),
+        MessageEntityBlockquote(offset=0, length=header_len),
+    ]
+    return text, entities
+
+
+def group_shutdown_optional_template(kind: str, **context):
+    """نقطهٔ اتصالِ قالب‌های اختیاری آینده؛ اگر قالبی تعریف نشده ``None``."""
+    factory = GROUP_SHUTDOWN_EXTRA_TEMPLATES.get(kind)
+    if callable(factory):
+        return factory(**context)
+    return None
+
+
