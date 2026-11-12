@@ -39,7 +39,7 @@ READY_BLOCK = object()
 #: تکه‌تکه ارسال می‌شود تا هر پیام کمترین نقل‌قول را داشته باشد و هیچ
 #: ردیفی بی‌نقل‌قول نماند.
 MAX_QUOTES_PER_MESSAGE = 30
-MAX_UNITS_PER_MESSAGE = 1800
+MAX_UNITS_PER_MESSAGE = 3500
 
 
 def _row(title, cmds, bold_cmds=False, quote=True):
@@ -118,15 +118,17 @@ def _split_rows(rows, max_quotes=MAX_QUOTES_PER_MESSAGE,
         quotes = sum(1 for entity in row_entities
                      if type(entity).__name__ == "MessageEntityBlockquote")
         units = _u16(text)
+        sep_units = 2 if current else 0
         if current and (current_quotes + quotes > max_quotes
-                        or current_units + units > max_units):
+                        or current_units + sep_units + units > max_units):
             chunks.append(current)
             current = []
             current_quotes = 0
             current_units = 0
+            sep_units = 0
         current.append((text, row_entities))
         current_quotes += quotes
-        current_units += units
+        current_units += sep_units + units
     if current:
         chunks.append(current)
     return chunks

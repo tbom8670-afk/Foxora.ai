@@ -192,6 +192,19 @@ def test_message_limit_admin_help_block():
     assert expected_full in bold_slices
     assert expected_quote in quote_slices
 
+    # بلوک «محدودیت پیام» نباید به یک پیام سوم جداگانه سرریز شود؛ باید دقیقاً
+    # داخل همان پیامِ لیستِ بالایی (زیر «متخلف» و بالای «تماس با سازنده») باشد.
+    assert len(ADMIN_HELP_MESSAGES) == 2
+    last_chunk_text = ADMIN_HELP_MESSAGES[-1][0]
+    assert "⛔️ : برای اینکه یک کاربر" in last_chunk_text
+    assert expected_full in last_chunk_text
+    assert "تماس با سازنده : @OSINE2" in last_chunk_text
+    assert (
+        last_chunk_text.index("⛔️ : برای اینکه یک کاربر")
+        < last_chunk_text.index(expected_full)
+        < last_chunk_text.index("تماس با سازنده : @OSINE2")
+    )
+
 
 def test_n2_and_n3_examples():
     """بررسی نمونه‌های n2 و n3 در متن خروجی."""
