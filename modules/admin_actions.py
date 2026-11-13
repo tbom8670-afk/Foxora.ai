@@ -10,6 +10,11 @@ from modules.cache_manager import (
     TtlCache,
     is_chat_admin_required_error,
 )
+from modules.self_admin_shield import (
+    SelfAdminProtectedError,
+    is_self_target,
+    save_persisted_bot_id,
+)
 from datetime import timedelta
 
 try:
@@ -95,6 +100,35 @@ class AdminActions:
             self.peer_cache = peer_cache
         if bot_account_id is not None:
             self.bot_account_id = bot_account_id
+
+    async def _is_self_target_blocked(
+        self, chat_id, user_id, user=None, *, action_name: str = "moderation"
+    ) -> bool:
+        """جلوگیری قطعی از اعمال سکوت/رفع سکوت/بن/رفع بن روی خودِ اکانت ربات."""
+        if self.bot_account_id is None:
+            self.bot_account_id = getattr(self.client, "_self_id", None)
+        if self.bot_account_id is None and callable(getattr(self.client, "get_me", None)):
+            try:
+                me = await self.client.get_me()
+                me_id = getattr(me, "id", None)
+                if me_id is not None:
+                    self.bot_account_id = me_id
+                    save_persisted_bot_id(me_id)
+            except Exception:
+                pass
+        if (
+            is_self_target(user_id, client=self.client, bot_account_id=self.bot_account_id)
+            or is_self_target(user, client=self.client, bot_account_id=self.bot_account_id)
+        ):
+            self.logger.log_error(
+                "LEAVE REQUEST DEBUG\n"
+                f"chat_id={chat_id}\n"
+                f"reason=blocked self-targeted {action_name}\n"
+                "trigger_file=modules/admin_actions.py\n"
+                f"trigger_function=AdminActions.{action_name}"
+            )
+            return True
+        return False
 
     def _cached_chat_peer(self, chat_id):
         cache = self.peer_cache
@@ -224,6 +258,10 @@ class AdminActions:
 
     async def _mute_user_rpc(self, chat_id, user_id, duration_seconds=None, *,
                              user=None, chat=None):
+        if await self._is_self_target_blocked(
+            chat_id, user_id, user=user, action_name="mute_user"
+        ):
+            return False
         if not self.circuit_breaker.can_execute(chat_id, "mute"):
             return False
         try:
@@ -232,6 +270,10 @@ class AdminActions:
             user_peer = await self._input_entity(
                 user if user is not None else user_id
             )
+            if await self._is_self_target_blocked(
+                chat_id, user_id, user=user_peer, action_name="mute_user"
+            ):
+                return False
             cached_chat = self._cached_chat_peer(chat_id)
             chat_peer = await self._input_entity(
                 chat if chat is not None else (
@@ -325,12 +367,20 @@ class AdminActions:
 
     async def _unmute_user_rpc(self, chat_id, user_id, *, user=None,
                                chat=None) -> bool:
+        if await self._is_self_target_blocked(
+            chat_id, user_id, user=user, action_name="unmute_user"
+        ):
+            return False
         if not self.circuit_breaker.can_execute(chat_id, "unmute"):
             return False
         try:
             user_peer = await self._input_entity(
                 user if user is not None else user_id
             )
+            if await self._is_self_target_blocked(
+                chat_id, user_id, user=user_peer, action_name="unmute_user"
+            ):
+                return False
             cached_chat = self._cached_chat_peer(chat_id)
             chat_peer = await self._input_entity(
                 chat if chat is not None else (
@@ -405,6 +455,10 @@ class AdminActions:
     async def ban_user(self, chat_id, user_id,
                        reason="حذف دائمی به دلیل اسپم", *, user=None,
                        chat=None) -> bool:
+        if await self._is_self_target_blocked(
+            chat_id, user_id, user=user, action_name="ban_user"
+        ):
+            return False
         # 🔇 حالت مجازات گروه: اگر مالک «تغییر مجازات» را روی سکوت گذاشته
         # باشد، همین‌جا به جای بن، سکوت دائمی اعمال می‌شود. مقدار برگشتی و
         # مسیر موفقیت/شکست عیناً مثل بن است تا callback ها و سیستم پاکسازی
@@ -618,6 +672,10 @@ class AdminActions:
         *, user=None, chat=None,
     ):
         """اعمال مجازات بر اساس تنظیمات"""
+        if await self._is_self_target_blocked(
+            chat_id, user_id, user=user, action_name="punish_user"
+        ):
+            return False
         action = self.config.get("action_on_threshold", "mute")
         duration = self.config.get("action_duration_seconds", 3600)
 
@@ -693,6 +751,10 @@ class AdminActions:
         )
 
     async def _unban_user_rpc(self, chat_id, user_id, username=None):
+        if await self._is_self_target_blocked(
+            chat_id, user_id, action_name="unban_user"
+        ):
+            return False
         if not self.circuit_breaker.can_execute(chat_id, "unban"):
             return False
         try:
@@ -703,8 +765,16 @@ class AdminActions:
             from splusthon.tl import functions, types
 
             user = await self.client.get_entity(user_id)
+            if await self._is_self_target_blocked(
+                chat_id, user_id, user=user, action_name="unban_user"
+            ):
+                return False
             entity = await self.client.get_input_entity(chat_id)
             user_entity = await self.client.get_input_entity(user)
+            if await self._is_self_target_blocked(
+                chat_id, user_id, user=user_entity, action_name="unban_user"
+            ):
+                return False
 
             await self.client(
                 functions.channels.EditBannedRequest(

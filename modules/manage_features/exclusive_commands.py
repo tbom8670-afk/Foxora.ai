@@ -24,6 +24,7 @@ import asyncio
 from modules.manage_features import (access, exclusive, peers, storage,
                                      timed as timed_engine, texts)
 from modules.manage_features.queue import PerGroupQueue
+from modules.self_admin_shield import is_self_target
 
 #: صف مستقلِ اختصاصی — هیچ حذف پیام/زمان‌داری داخلش اجرا نمی‌شود.
 QUEUE = PerGroupQueue("exclusive_access", max_pending_per_key=16,
@@ -201,13 +202,16 @@ async def watch(chat_id, context, *, logger=None):
         return
     if lock_state_cached(chat_id) is not None:
         return
-    bot = getattr(context, "bot", context)
+    bot = (
+        context.get("bot")
+        if isinstance(context, dict)
+        else getattr(context, "bot", context)
+    )
     try:
-        # ``submit`` همیشه یک Future برمی‌گرداند ⇒ خودش با await (یا صف) اجرا
-        # می‌شود و مستقیماً یک تسک ساخته می‌شود؛ نباید دوباره wrap شود.
-        QUEUE.submit(
+        await QUEUE.submit(
             key=storage.group_key(chat_id),
             job=lambda: refresh_lock_state(bot, chat_id, logger),
+            dedupe_key="refresh_lock_state",
             serialize=True, logger=logger)
     except Exception:                                # noqa: BLE001
         pass
@@ -263,6 +267,14 @@ async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
         # شناسایی نشده، پس پیام «کاربر پیدا نشد» داده می‌شود.
         await _reply(bot, event, _error_payload("no_target_entity", ""),
                      logger)
+        return True
+    if is_self_target(target_id, bot=bot) or is_self_target(entity, bot=bot):
+        await _reply(
+            bot,
+            event,
+            _plain_bold("⚠️ این پیام متعلق به خود ربات است؛ روی پیام کاربر موردنظر ریپلای کنید"),
+            logger,
+        )
         return True
     label = _label(target_name, target_username, target_id)
 

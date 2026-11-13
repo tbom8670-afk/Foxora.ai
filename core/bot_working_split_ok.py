@@ -56,6 +56,12 @@ from modules.outgoing_sender import install as install_outgoing_sender, install_
 from modules.group_dispatch import GroupDispatcher, classify_priority, looks_like_link
 from modules.light_spam_ingest import ingest_event
 from modules import connection_guard
+from modules.self_admin_shield import (
+    install_self_admin_shield,
+    load_persisted_bot_id,
+    sanitize_self_records,
+    save_persisted_bot_id,
+)
 # 🖇 تشخیص لینک در بیوگرافی (سرویس مستقل، پایش دوره‌ای اعضا).
 from modules import bio_link_service
 from modules import force_join_service
@@ -733,6 +739,12 @@ class SoroushAntiSpamBot:
             raise RuntimeError("SPlusthon نصب نیست")
 
         self.client = self._make_client()
+        if not getattr(self, "bot_account_id", None):
+            self.bot_account_id = (
+                getattr(self.client, "_self_id", None)
+                or load_persisted_bot_id()
+            )
+        install_self_admin_shield(self.client, bot=self, logger=self.logger)
 
         # وصلهٔ آپلودِ فایل (media DC) را روی کلاسِ کلاینت نصب می‌کند.
         # چون روی کلاس است، کلاینت‌هایِ بازسازی‌شده هم خودکار وصله‌خورده‌اند.
@@ -798,6 +810,7 @@ class SoroushAntiSpamBot:
                 f"reason={reason!r}"
             )
             new_client = self._make_client()
+            install_self_admin_shield(new_client, bot=self, logger=self.logger)
 
             # انتقال هندلرها از کلاینت کهنه به کلاینت جدید
             old_builders = getattr(old_client, "_event_builders", None)
@@ -816,8 +829,18 @@ class SoroushAntiSpamBot:
             )
 
             await new_client.connect()
-            me = await new_client.get_me()
-            self.bot_account_id = getattr(me, "id", self.bot_account_id)
+            try:
+                me = await new_client.get_me()
+                resolved_me_id = getattr(me, "id", None)
+                if resolved_me_id:
+                    self.bot_account_id = resolved_me_id
+                    save_persisted_bot_id(resolved_me_id)
+            except Exception as me_error:
+                if is_permanent_auth_error(me_error):
+                    raise
+                self.logger.log_error(
+                    f"CLIENT REBUILD get_me transient failure (keeping bot_account_id={self.bot_account_id}): {me_error!r}"
+                )
 
             # سوئیچ مرجع‌های ربات به کلاینت جدید
             self.client = new_client
@@ -1018,17 +1041,59 @@ class SoroushAntiSpamBot:
         await self.initialize_client()
 
         await self.client.connect()
-        try:
-            self.bot_account_id = getattr(await self.client.get_me(), "id", None)
-        except Exception as error:
-            # نشست منقضی/نامعتبر (مثل AuthKeyUnregisteredError) خطای دائمی
-            # است: نه rebuild نه retry کمکی می‌کند. فوراً با راهنما خارج شو.
-            if is_permanent_auth_error(error):
-                raise FatalAuthError(
-                    f"نشست سروش نامعتبر/منقضی است ({error!r})"
-                ) from error
-            self.bot_account_id = None
-            self.logger.log_error(f"خطا در دریافت شناسه حساب ربات: {error}")
+        _resolved_startup_me = False
+        for _me_attempt, _me_backoff in enumerate((0.0, 0.5, 1.5), start=1):
+            if _me_backoff > 0:
+                await asyncio.sleep(_me_backoff)
+            try:
+                _me_obj = await self.client.get_me()
+                _me_id = getattr(_me_obj, "id", None)
+                if _me_id:
+                    self.bot_account_id = _me_id
+                    save_persisted_bot_id(_me_id)
+                    _resolved_startup_me = True
+                break
+            except Exception as error:
+                # نشست منقضی/نامعتبر (مثل AuthKeyUnregisteredError) خطای دائمی
+                # است: نه rebuild نه retry کمکی می‌کند. فوراً با راهنما خارج شو.
+                if is_permanent_auth_error(error):
+                    raise FatalAuthError(
+                        f"نشست سروش نامعتبر/منقضی است ({error!r})"
+                    ) from error
+                if _me_attempt == 3:
+                    self.bot_account_id = (
+                        getattr(self, "bot_account_id", None)
+                        or getattr(self.client, "_self_id", None)
+                        or load_persisted_bot_id()
+                    )
+                    self.logger.log_error(
+                        f"خطا در دریافت شناسه حساب ربات در استارتاپ (fallback={self.bot_account_id}): {error}"
+                    )
+        if not _resolved_startup_me:
+            async def _deferred_resolve_bot_id():
+                for _delay in (3.0, 10.0, 30.0):
+                    await asyncio.sleep(_delay)
+                    try:
+                        _me_late = await self.client.get_me()
+                        _late_id = getattr(_me_late, "id", None)
+                        if _late_id:
+                            self.bot_account_id = _late_id
+                            save_persisted_bot_id(_late_id)
+                            if getattr(self, "admin_actions", None) is not None:
+                                self.admin_actions.bind_runtime_context(
+                                    bot_account_id=_late_id
+                                )
+                            sanitize_self_records(_late_id, logger=self.logger)
+                            self.logger.log_info(
+                                f"BOT ACCOUNT ID RESOLVED IN BACKGROUND id={_late_id}"
+                            )
+                            return
+                    except Exception:
+                        continue
+            asyncio.create_task(_deferred_resolve_bot_id())
+        if self.bot_account_id:
+            sanitize_self_records(self.bot_account_id, logger=self.logger)
+        install_self_admin_shield(self.client, bot=self, logger=self.logger)
         if getattr(self, "admin_actions", None) is not None:
             self.admin_actions.bind_runtime_context(
                 peer_cache=self.reply_input_peer_cache,

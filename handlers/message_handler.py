@@ -182,6 +182,7 @@ from modules.outgoing_profiler import (
 )
 from handlers.admin_handler import handle_admin_commands
 from modules import admin_tools
+from modules.self_admin_shield import is_self_target
 # 🎮 روشن/خاموش کردن بازی‌های داخلی به تفکیک گروه (storage و گارد خالص).
 from modules import entertainment_control
 from modules.group_dispatch import PRIORITY_ADMIN, classify_priority
@@ -3413,6 +3414,13 @@ async def handle_fast_moderation_command(
         if not target_user:
             return {"error": "user_not_found"}
 
+        if is_self_target(target_user, bot=bot):
+            return {
+                "protected_admin": True,
+                "muted": False,
+                "target_user": target_user,
+            }
+
         target_username = getattr(target_user, "username", None)
         if _has_group_management_permission(
             bot, chat_id, target_user.id, target_username
@@ -4372,6 +4380,11 @@ async def handle_new_message(bot, event):
             except Exception:
                 pass
 
+        _is_own_bot_message = bool(
+            (user_id and is_self_target(user_id, bot=bot))
+            or is_self_target(sender, bot=bot)
+        )
+
         # ===== ⛔️ گیت «متخلف» — اولین نقطهٔ خط لولهٔ پیام =====
         # پیش از ضد اسپم، بازی‌ها، آمار، فیلترها و روتر دستورها: اگر
         # فرستنده در این گروه «متخلف» باشد، پیام بلافاصله حذف و پردازش
@@ -4384,7 +4397,7 @@ async def handle_new_message(bot, event):
         # برای همین رویداد وجود ندارد؛ ``events.StopPropagation`` عمداً
         # raise نمی‌شود چون دیسپچرِ core آن را در ``except Exception``
         # به‌عنوان «MESSAGE HANDLER CRASHED» لاگ می‌کرد.
-        if not event.is_private and chat_id and user_id:
+        if not event.is_private and chat_id and user_id and not _is_own_bot_message:
             _violators_engine = _violators_module()
             if _violators_engine is not None:
                 try:
@@ -4432,7 +4445,7 @@ async def handle_new_message(bot, event):
                         bot, event, chat_id, user_id, sender, accept=False
                     ):
                         return
-                elif _ad_spam_guard.storage.is_enabled(chat_id):
+                elif _ad_spam_guard.storage.is_enabled(chat_id) and not _is_own_bot_message:
                     if await _ad_spam_guard.guard_message(
                         bot, event, chat_id, user_id, sender,
                         getattr(event.message, "id", None),
@@ -4466,35 +4479,37 @@ async def handle_new_message(bot, event):
 
         # Big-spam incidents are the sole opt-in per-message ID registry.
         # Capture before any later return/lock branch can race this event.
-        _capture_big_spam_message(
-            bot, chat_id, user_id, getattr(event.message, "id", None)
-        )
+        if not _is_own_bot_message:
+            _capture_big_spam_message(
+                bot, chat_id, user_id, getattr(event.message, "id", None)
+            )
         # ⚖️ مجازات دادگاه روباه: اگر پنجرهٔ ۶۰ ثانیه‌ایِ متهمِ محکوم باز
         # باشد، همین پیام (و فقط همین پیامِ همین کاربر در همین گروه) به
         # صف حذف موجود ربات سپرده می‌شود. تابع sync و بدون RPC است، پس
         # مسیر پیام کند نمی‌شود؛ هیچ پیامی از کاربران دیگر لمس نمی‌شود.
-        try:
-            from modules.court_game import punishment as _court_punishment
-            _court_punishment.observe_message(
-                bot, event, chat_id, user_id,
-                getattr(getattr(event, "message", None), "id", None),
-            )
-        except Exception as _court_punish_error:
+        if not _is_own_bot_message:
             try:
-                bot.logger.log_error(
-                    "COURT PUNISHMENT OBSERVE FAILED "
-                    f"chat_id={chat_id} user_id={user_id} "
-                    f"error={_court_punish_error!r}"
+                from modules.court_game import punishment as _court_punishment
+                _court_punishment.observe_message(
+                    bot, event, chat_id, user_id,
+                    getattr(getattr(event, "message", None), "id", None),
                 )
-            except Exception:
-                pass
+            except Exception as _court_punish_error:
+                try:
+                    bot.logger.log_error(
+                        "COURT PUNISHMENT OBSERVE FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_court_punish_error!r}"
+                    )
+                except Exception:
+                    pass
         # پیام‌های معمولیِ اکانت سشن نباید وارد moderation شوند، اما همین
         # اکانت در سروش نقش رابط ربات را هم دارد و مالک با آن «راهنما» و
         # «روباه» را می‌فرستد. بازگرداندنِ همهٔ event.out ها باعث می‌شد فقط
         # مسیرهای مدیریتیِ زودهنگام کار کنند و فرمان‌های عمومی بی‌صدا شوند.
         # فقط فرمان‌های شناخته‌شدهٔ خود اکانت اجازهٔ عبور دارند؛ پاسخ‌های
         # تولیدشدهٔ ربات و چت عادی همچنان برای جلوگیری از حلقه رد می‌شوند.
-        if user_id and user_id == getattr(bot, "bot_account_id", None):
+        if _is_own_bot_message:
             own_text = normalize_command(message_text)
             _own_priority, own_kind = classify_priority(own_text, event)
             if own_kind not in {"admin", "command"}:
@@ -4712,8 +4727,11 @@ async def handle_new_message(bot, event):
         # storage, tracker and lock path. Historical spam state cannot outrank
         # a current owner/admin role.
         registered_admin_bypass = bool(
-            not event.is_private and admin_tools.has_admin_permission(
-                chat_id, user_id, sender_username
+            not event.is_private and (
+                _is_own_bot_message
+                or admin_tools.has_admin_permission(
+                    chat_id, user_id, sender_username
+                )
             )
         )
         # Native Soroush role is only needed to authorize management
@@ -9354,6 +9372,10 @@ async def handle_new_message(bot, event):
                     await event.reply("❌ کاربر پیدا نشد")
                     return
 
+                if is_self_target(target_user, bot=bot):
+                    await event.reply("⚠️ این پیام متعلق به خود ربات است و قابل اخراج نیست")
+                    return
+
                 from modules import vip_storage
                 if vip_storage.is_vip(chat_id, target_user.id):
                     await event.reply("⚠️ این کاربر vip است و نمی‌تواند اخراج شود")
@@ -9564,6 +9586,10 @@ async def handle_new_message(bot, event):
                         await event.reply("❌ کاربر پیدا نشد")
                         return
                     username_for_unban = getattr(user, "username", None)
+
+                if is_self_target(user, bot=bot):
+                    await event.reply("⚠️ این پیام متعلق به خود ربات است؛ روی پیام کاربر موردنظر ریپلای کنید")
+                    return
 
                 # Use independent moderation worker (per-chat, limited concurrency)
                 _u = user
@@ -9934,6 +9960,10 @@ async def handle_new_message(bot, event):
                     await event.reply("❌ کاربر پیدا نشد")
                     return
 
+                if is_self_target(user, bot=bot):
+                    await event.reply("⚠️ این پیام متعلق به خود ربات است و قابل اخطار نیست")
+                    return
+
                 from modules import vip_storage
                 if vip_storage.is_vip(chat_id, user.id):
                     await event.reply("⚠️ این کاربر vip است و نمی‌تواند اخطار بگیرد")
@@ -10039,6 +10069,10 @@ async def handle_new_message(bot, event):
 
                 if not target_user:
                     await event.reply("❌ کاربر پیدا نشد")
+                    return
+
+                if is_self_target(target_user, bot=bot):
+                    await event.reply("⚠️ این پیام متعلق به خود ربات است و سکوت نشد")
                     return
 
                 from modules import vip_storage
@@ -10194,6 +10228,10 @@ async def handle_new_message(bot, event):
                     await event.reply("❌ کاربر پیدا نشد")
                     return
 
+                if is_self_target(target_user, bot=bot):
+                    await event.reply("⚠️ این پیام متعلق به خود ربات است؛ روی پیام کاربر موردنظر ریپلای کنید")
+                    return
+
                 # قفل «محدودیت پیام» با «رفع سکوت» باز نمی‌شود؛ فقط با «لغو محدودیت پیام».
                 if _is_muted_by_message_limit(chat_id, target_user.id):
                     await _reply_message_limit_locked(event)
@@ -10311,6 +10349,9 @@ async def handle_new_message(bot, event):
                     try:
                         target_id = int(uid)
                     except (TypeError, ValueError):
+                        continue
+                    if is_self_target(target_id, bot=bot):
+                        manual_mute_storage.remove_manual_mute(chat_id, target_id)
                         continue
                     if _is_muted_by_message_limit(chat_id, target_id):
                         continue
@@ -10585,7 +10626,11 @@ async def handle_new_message(bot, event):
                     await event.reply("❌ دریافت لیست اعضای گروه با خطا مواجه شد یا گروه خالی است.")
                     return
 
-                me_id = getattr(bot, "account_id", None) or getattr(bot.admin_actions, "bot_account_id", None)
+                me_id = (
+                    getattr(bot, "bot_account_id", None)
+                    or getattr(bot, "account_id", None)
+                    or getattr(bot.admin_actions, "bot_account_id", None)
+                )
                 if me_id is None:
                     try:
                         me = await bot.client.get_me()
@@ -10600,7 +10645,7 @@ async def handle_new_message(bot, event):
                     m_id = getattr(member, "id", None)
                     if not m_id:
                         continue
-                    if m_id == me_id or m_id == user_id:
+                    if m_id == me_id or m_id == user_id or is_self_target(member, bot=bot):
                         continue
                     if is_global_owner(m_id):
                         continue

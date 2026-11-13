@@ -54,6 +54,7 @@ from modules.group_actions import (
 from modules.manage_features import peers, storage
 from modules.manage_features.rpc import (call, flood_seconds, is_transient,
                                          log_info)
+from modules.self_admin_shield import is_self_target
 
 try:
     from splusthon.tl import functions, types
@@ -692,8 +693,12 @@ async def grant_participant_rights(bot, chat_id, user_id, *, entity=None):
     ``none`` که روی سیم = عزل است) امتحان نمی‌شود؛ اگر سرور رد کند
     ``GrantRejected`` بالا می‌رود و رکورد برای بازیابی می‌ماند.
     """
+    if is_self_target(user_id, bot=bot) or is_self_target(entity, bot=bot):
+        raise GrantRejected("cannot modify bot's own admin rights via exclusive")
     _peer, channel = await _require_channel(bot, chat_id)
     participant = await user_peer(bot, chat_id, user_id, entity=entity)
+    if is_self_target(participant, bot=bot):
+        raise GrantRejected("cannot modify bot's own admin rights via exclusive")
 
     attempt = 0
     last_error = None
@@ -737,8 +742,12 @@ async def revoke_participant_rights(bot, chat_id, user_id, *, entity=None):
       پاک می‌شود (BACK TO NORMAL).
     * اگر محدودیتِ شخصی ندارد ⇒ هیچ ``EditBanned`` زده نمی‌شود.
     """
+    if is_self_target(user_id, bot=bot) or is_self_target(entity, bot=bot):
+        raise NotExclusive("cannot demote bot's own account")
     _peer, channel = await _require_channel(bot, chat_id)
     participant = await user_peer(bot, chat_id, user_id, entity=entity)
+    if is_self_target(participant, bot=bot):
+        raise NotExclusive("cannot demote bot's own account")
 
     await call(
         (lambda: bot.client(functions.channels.EditAdminRequest(
@@ -874,6 +883,8 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username="",
     ``verify=False`` پیش‌فرض است: لایهٔ دستور خودش تأیید را در پس‌زمینه اجرا
     می‌کند. اگر ``True`` باشد همین‌جا (بعد از رکورد) تأیید هم انجام می‌شود.
     """
+    if is_self_target(user_id, bot=bot) or is_self_target(entity, bot=bot):
+        raise GrantRejected("cannot modify bot's own admin rights via exclusive")
     if not await is_group_locked(bot, chat_id):
         raise NotLocked(f"group {chat_id} is not locked")
 
@@ -881,6 +892,8 @@ async def grant(bot, chat_id, user_id, *, actor_id=None, name="", username="",
         else peers.user_identifier(user_id)
     if identifier is None:
         raise TargetChanged(f"invalid user identity: {user_id!r}")
+    if is_self_target(identifier, bot=bot):
+        raise GrantRejected("cannot modify bot's own admin rights via exclusive")
 
     existing = get_entry(chat_id, identifier)
     if existing and existing.get("state") == "active":
@@ -1036,6 +1049,8 @@ async def revoke(bot, chat_id, user_id, *, reason="manual", entity=None):
         else peers.user_identifier(user_id)
     if identifier is None:
         raise TargetChanged(f"invalid user identity: {user_id!r}")
+    if is_self_target(identifier, bot=bot) or is_self_target(entity, bot=bot):
+        raise NotExclusive("cannot demote bot's own account")
 
     entry = get_entry(chat_id, identifier)
     if not entry:
