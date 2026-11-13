@@ -133,8 +133,9 @@ def test_blockquotes_span_exact_lines():
     # + ۱ نقل‌قولِ «متخلف/لغو متخلف»
     # + ۱ نقل‌قولِ «ضد ربات تبلیغاتی»
     # + ۱ نقل‌قولِ سه‌خطیِ «محدودیت پیام»
-    # + ۱ نقل‌قولِ «خاموشی گروه».
-    assert len(bquote_entities) == 55
+    # + ۱ نقل‌قولِ «خاموشی گروه»
+    # + ۱ نقل‌قولِ «ضد کانال» (profile guard).
+    assert len(bquote_entities) == 56
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -153,7 +154,9 @@ def test_bold_entities_content():
     # + 1 بلوکِ «ضد ربات تبلیغاتی» (کلِ متن Bold) = 56
     # + 1 بلوکِ «محدودیت پیام» (کلِ متن Bold) = 57
     # + 1 بلوکِ «خاموشی گروه» (کلِ متن Bold) = 58
-    assert len(bold_entities) == 58
+    # + 1 هدرِ «🧯 ضد بیوگرافی/کانال» + 2 دستورِ Boldِ «ضد کانال روشن/خاموش»
+    #   (profile guard) = 61
+    assert len(bold_entities) == 61
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:

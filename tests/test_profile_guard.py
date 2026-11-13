@@ -107,11 +107,11 @@ check("خط دوم: دلیلِ کانال",
       expected_lines[1] == "پیام شما پاک شد | دلیل : کانال فیلتر شده",
       repr(expected_lines[1]))
 check("خط خالی بعد از دلیل", expected_lines[2] == "", repr(expected_lines))
-check("نام کانال", expected_lines[3].startswith("➖ نام کانال بیوگرافی : فیلم و سریال"),
+check("نام کانال", expected_lines[3].startswith("↻- نام کانال بیوگرافی : فیلم و سریال"),
       repr(expected_lines[3]))
-check("تعداد اعضا", expected_lines[4] == "➖ تعداد اعضا : 1245",
+check("تعداد اعضا", expected_lines[4] == "↻- تعداد اعضا : 1245",
       repr(expected_lines[4]))
-check("مجازات دائمی", expected_lines[5] == "➖ مجازات : سکوت دائمی",
+check("مجازات دائمی", expected_lines[5] == "↻- مجازات : سکوت دائمی",
       repr(expected_lines[5]))
 check("entity نقل‌قول روی خط اول",
       any(isinstance(e, texts.MessageEntityBlockquote) and e.offset == 0
@@ -121,6 +121,20 @@ check("bolt روی مقدار کانال",
       any(isinstance(e, texts.MessageEntityBold) and e.length > 0
           for e in entities))
 
+# --- اسپویلر: نامِ کانال و تعداد اعضا پنهان، مجازات عادی -------------------
+def _spoiler_texts(t, ents):
+    out = []
+    for e in ents:
+        if isinstance(e, texts.MessageEntitySpoiler):
+            u16 = t.encode("utf-16-le")
+            out.append(u16[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le"))
+    return out
+
+_sp = _spoiler_texts(text, entities)
+check("اسپویلر: نام کانال پنهان است", "فیلم و سریال" in _sp, repr(_sp))
+check("اسپویلر: تعداد اعضا پنهان است", "1245" in _sp, repr(_sp))
+check("اسپویلر: مجازات پنهان نیست", "سکوت دائمی" not in _sp, repr(_sp))
+
 text_bio, _ = texts.notice_bio("@foxora", "بیا تو کانال ما فیلم هست",
                                duration_seconds=4 * 3600)
 bio_lines = text_bio.split("\n")
@@ -128,10 +142,15 @@ check("دلیلِ بیوگرافی",
       bio_lines[1] == "پیام شما پاک شد | دلیل : فیلتر بیوگرافی",
       repr(bio_lines[1]))
 check("برچسب کلمهٔ فیلتر",
-      bio_lines[3].startswith("➖ کلمه فیلتر بیوگرافی : بیا تو کانال"),
+      bio_lines[3].startswith("↻- کلمه فیلتر بیوگرافی : بیا تو کانال"),
       repr(bio_lines[3]))
-check("مجازات ۴ ساعته", bio_lines[4] == "➖ مجازات : 4 ساعت سکوت",
+check("مجازات ۴ ساعته", bio_lines[4] == "↻- مجازات : 4 ساعت سکوت",
       repr(bio_lines[4]))
+_bio_sp = _spoiler_texts(text_bio, _)
+check("اسپویلر بیو: جملهٔ فیلتر پنهان است",
+      "بیا تو کانال ما فیلم هست" in _bio_sp, repr(_bio_sp))
+check("اسپویلر بیو: مجازات پنهان نیست", "4 ساعت سکوت" not in _bio_sp,
+      repr(_bio_sp))
 check("برچسب یک‌ساعته", texts.punish_label(3600) == "1 ساعت سکوت")
 check("برچسب نامعلوم‌بودن اعضا", texts.format_members(None) == "نامشخص")
 
@@ -361,12 +380,33 @@ check("پیام کاربر حذف شد", client.deleted and client.deleted[-1][1
       repr(client.deleted))
 notice = client.sent[-1]["text"] if client.sent else ""
 check("قالب کانال: دلیل درست", "دلیل : کانال فیلتر شده" in notice, repr(notice))
-check("قالب کانال: نام کانال", "➖ نام کانال بیوگرافی : فیـلم و سريال" in notice,
+check("قالب کانال: نام کانال", "↻- نام کانال بیوگرافی : فیـلم و سريال" in notice,
       repr(notice))
-check("قالب کانال: تعداد اعضا", "➖ تعداد اعضا : 1245" in notice, repr(notice))
-check("قالب کانال: مجازات", "➖ مجازات : سکوت دائمی" in notice, repr(notice))
+check("قالب کانال: تعداد اعضا", "↻- تعداد اعضا : 1245" in notice, repr(notice))
+check("قالب کانال: مجازات", "↻- مجازات : سکوت دائمی" in notice, repr(notice))
 check("قالب کانال: نقل‌قول کاربر", notice.startswith("⛔ کاربر : @osieka"),
       repr(notice.split("\n")[0]))
+
+
+def _hidden(entities, text):
+    """متنِ زیرِ entityهای اسپویلر (مستقل از کلاسِ کتابخانه)."""
+    if not entities:
+        return []
+    u16 = text.encode("utf-16-le")
+    return [
+        u16[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le")
+        for e in entities
+        if type(e).__name__ == "MessageEntitySpoiler"
+    ]
+
+
+_hidden_channel = _hidden(client.sent[-1]["entities"] if client.sent else [], notice)
+check("ارسال: نام کانال اسپویلر است",
+      "فیـلم و سريال" in _hidden_channel, repr(_hidden_channel))
+check("ارسال: تعداد اعضا اسپویلر است",
+      "1245" in _hidden_channel, repr(_hidden_channel))
+check("ارسال: مجازات اسپویلر نیست",
+      "سکوت دائمی" not in _hidden_channel, repr(_hidden_channel))
 check("یک RPC برای پروفایل (کش بعدی رایگان است)", client.rpc == 1,
       str(client.rpc))
 
@@ -389,9 +429,14 @@ check("کد مجازات: ۴ ساعت",
 notice2 = client2.sent[-1]["text"] if client2.sent else ""
 check("قالب بیو: دلیل", "دلیل : فیلتر بیوگرافی" in notice2, repr(notice2))
 check("قالب بیو: جملهٔ تطبیق‌یافته",
-      "➖ کلمه فیلتر بیوگرافی : بیا تو کانال ما فیلم هست" in notice2,
+      "↻- کلمه فیلتر بیوگرافی : بیا تو کانال ما فیلم هست" in notice2,
       repr(notice2))
-check("قالب بیو: مجازات", "➖ مجازات : 4 ساعت سکوت" in notice2, repr(notice2))
+check("قالب بیو: مجازات", "↻- مجازات : 4 ساعت سکوت" in notice2, repr(notice2))
+_hidden_bio = _hidden(client2.sent[-1]["entities"] if client2.sent else [], notice2)
+check("ارسال: جملهٔ فیلتر اسپویلر است",
+      "بیا تو کانال ما فیلم هست" in _hidden_bio, repr(_hidden_bio))
+check("ارسال: مجازات بیو اسپویلر نیست",
+      "4 ساعت سکوت" not in _hidden_bio, repr(_hidden_bio))
 
 # --- کاربر سالم: هیچ کاری نباید بشود ------------------------------------
 service.clear()

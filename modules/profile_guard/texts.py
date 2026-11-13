@@ -7,17 +7,17 @@
     ⛔ کاربر : @username            ← این خط Blockquote + Bold است
     پیام شما پاک شد | دلیل : کانال فیلتر شده
                                     ← یک خط خالی
-    ➖ نام کانال بیوگرافی : Foxora Films
-    ➖ تعداد اعضا : 1245
-    ➖ مجازات : سکوت دائمی
+    ↻- نام کانال بیوگرافی : Foxora Films   ← مقدار اسپویلر است
+    ↻- تعداد اعضا : 1245                    ← مقدار اسپویلر است
+    ↻- مجازات : سکوت دائمی                  ← مقدار عادی
 
 2) پیام حذف به‌خاطر جملهٔ بیوگرافی::
 
     ⛔ کاربر : @username
     پیام شما پاک شد | دلیل : فیلتر بیوگرافی
 
-    ➖ کلمه فیلتر بیوگرافی : بیا تو کانال ما فیلم هست
-    ➖ مجازات : 4 ساعت سکوت
+    ↻- کلمه فیلتر بیوگرافی : بیا تو کانال ما فیلم هست   ← اسپویلر
+    ↻- مجازات : 4 ساعت سکوت                             ← عادی
 
 3) پیام روشن‌شدن::
 
@@ -38,7 +38,11 @@ from __future__ import annotations
 from typing import List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover — در محیط بدونِ کتابخانه هم باید ایمپورت شود
-    from splusthon.tl.types import MessageEntityBlockquote, MessageEntityBold
+    from splusthon.tl.types import (
+        MessageEntityBlockquote,
+        MessageEntityBold,
+        MessageEntitySpoiler,
+    )
 except ImportError:  # pragma: no cover
     class MessageEntityBlockquote:  # type: ignore[no-redef]
         def __init__(self, offset=0, length=0):
@@ -46,6 +50,11 @@ except ImportError:  # pragma: no cover
             self.length = length
 
     class MessageEntityBold:  # type: ignore[no-redef]
+        def __init__(self, offset=0, length=0):
+            self.offset = offset
+            self.length = length
+
+    class MessageEntitySpoiler:  # type: ignore[no-redef]
         def __init__(self, offset=0, length=0):
             self.offset = offset
             self.length = length
@@ -61,7 +70,8 @@ def u16(text) -> int:
 # ---------------------------------------------------------------------------
 BOLD_HEADER = True       # خط «⛔ کاربر : @…»
 BOLD_REASON = True       # «کانال فیلتر شده» / «فیلتر بیوگرافی»
-BOLD_VALUES = True       # مقدارِ جلوی هر ➖
+BOLD_VALUES = True       # مقدارِ جلوی هر ↻-
+SPOILER_VALUES = True    # پنهان‌بودنِ نامِ کانال / جملهٔ فیلتر / تعداد اعضا (اسپویلر)
 BOLD_ENABLE_TITLE = True  # خط اولِ پیام روشن‌شدن
 
 # ---------------------------------------------------------------------------
@@ -74,7 +84,7 @@ REASON_BIO = "فیلتر بیوگرافی"
 
 BODY = "پیام شما پاک شد | دلیل : {reason}"
 
-BULLET = "➖ {label} : {value}"
+BULLET = "↻- {label} : {value}"
 LABEL_CHANNEL_NAME = "نام کانال بیوگرافی"
 LABEL_MEMBERS = "تعداد اعضا"
 LABEL_PUNISH = "مجازات"
@@ -100,8 +110,8 @@ class _Builder:
         self._text = ""
         self._entities: List[object] = []
 
-    def add(self, text: str, *, bold: bool = False,
-            quote: bool = False) -> "_Builder":
+    def add(self, text: str, *, bold: bool = False, quote: bool = False,
+            spoiler: bool = False) -> "_Builder":
         if not text:
             return self
         offset = u16(self._text)
@@ -114,6 +124,10 @@ class _Builder:
         if bold:
             self._entities.append(
                 MessageEntityBold(offset=offset, length=length)
+            )
+        if spoiler:
+            self._entities.append(
+                MessageEntitySpoiler(offset=offset, length=length)
             )
         return self
 
@@ -149,11 +163,15 @@ def format_members(value) -> str:
         return UNKNOWN_VALUE
 
 
-def _bullets(builder: _Builder, rows: Sequence[Tuple[str, str]]) -> None:
-    for index, (label, value) in enumerate(rows):
+def _bullets(builder: _Builder, rows: Sequence[tuple]) -> None:
+    """هر ردیف: ``(label, value)`` یا ``(label, value, spoiler)``."""
+    for index, row in enumerate(rows):
+        label, value = row[0], row[1]
+        hidden = bool(row[2]) if len(row) > 2 else False
         line = BULLET.format(label=label, value="")
         builder.add(("" if index == 0 else "\n") + line)
-        builder.add(str(value), bold=BOLD_VALUES)
+        builder.add(str(value), bold=BOLD_VALUES,
+                    spoiler=hidden and SPOILER_VALUES)
 
 
 def notice_channel(user: str, channel_title: Optional[str],
@@ -166,9 +184,9 @@ def notice_channel(user: str, channel_title: Optional[str],
     builder.add(REASON_CHANNEL, bold=BOLD_REASON)
     builder.add("\n\n")
     _bullets(builder, [
-        (LABEL_CHANNEL_NAME, channel_title or UNKNOWN_VALUE),
-        (LABEL_MEMBERS, format_members(members)),
-        (LABEL_PUNISH, punish_label(duration_seconds)),
+        (LABEL_CHANNEL_NAME, channel_title or UNKNOWN_VALUE, True),
+        (LABEL_MEMBERS, format_members(members), True),
+        (LABEL_PUNISH, punish_label(duration_seconds), False),
     ])
     return builder.build()
 
@@ -183,8 +201,8 @@ def notice_bio(user: str, matched: Optional[str], *,
     builder.add(REASON_BIO, bold=BOLD_REASON)
     builder.add("\n\n")
     _bullets(builder, [
-        (LABEL_BIO_WORD, matched or UNKNOWN_VALUE),
-        (LABEL_PUNISH, punish_label(duration_seconds)),
+        (LABEL_BIO_WORD, matched or UNKNOWN_VALUE, True),
+        (LABEL_PUNISH, punish_label(duration_seconds), False),
     ])
     return builder.build()
 
@@ -212,7 +230,8 @@ def notice_for(kind: str, user: str, *, value: Optional[str] = None,
 
 
 __all__ = [
-    "u16", "HEADER", "REASON_CHANNEL", "REASON_BIO", "BODY", "BULLET",
+    "u16", "MessageEntityBlockquote", "MessageEntityBold",
+    "MessageEntitySpoiler", "HEADER", "REASON_CHANNEL", "REASON_BIO", "BODY", "BULLET",
     "LABEL_CHANNEL_NAME", "LABEL_MEMBERS", "LABEL_PUNISH", "LABEL_BIO_WORD",
     "PUNISH_PERMANENT", "PUNISH_TEMPORARY", "UNKNOWN_VALUE",
     "ENABLE_TITLE", "ENABLE_COUNT", "DISABLED_MESSAGE",
