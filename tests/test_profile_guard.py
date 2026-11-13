@@ -70,8 +70,12 @@ single = matcher.build(["فیلم"])
 check("«فیلم» روی متن ساده", matcher.matches_any("کانال فیلم من", single))
 check("«فیلم» روی «فیلمبرداری» اثر نکند",
       not matcher.matches_any("کار فیلمبرداری حرفه‌ای", single))
-check("«فیلم» روی «فیلم‌ها» اثر نکند",
-      not matcher.matches_any("فیلمها و سریالها", single))
+check("«فیلم‌ها» با پسوندِ جمع گرفته شود",
+      matcher.matches_any("فیلمها و سریالها", single))
+check("«فیلمی» با پسوندِ نکره گرفته شود",
+      matcher.matches_any("یه فیلمی دارم", single))
+check("«فیلمبرداری» باز هم گرفته نشود (پسوندِ ناشناس)",
+      not matcher.matches_any("کار فیلمبرداری حرفه‌ای", single))
 check("«فیلم» روی «فیلم-بازار» (کلمهٔ مستقل) بگیرد",
       matcher.matches_any("فیلم-بازار", single))
 check("متن بی‌ربط تطبیق نشود",
@@ -81,6 +85,28 @@ check("فهرست خالی هیچ‌چیز را نگیرد",
       not matcher.matches_any("هرچیزی", matcher.build([])))
 check("عبارت یک‌حرفی نادیده گرفته شود",
       matcher.build(["ا"]) == [])
+
+print("\n=== ۲ب) پسوندهای چسبیده (مثل «استوریمو») ===")
+_estori = matcher.build(["استوری", "استور", "استوریمو ببینین"])
+for sample in (
+    "استوریمو",
+    "استوریمو ببینین",
+    "⭕️استوریمو⭕️",
+    "استوريمو",
+    "استوریـمو",
+    "استوری هامو ببین",
+    "استورییییی",
+    "استوریموببینین",
+):
+    check(f"«{sample}» گرفته شود", matcher.matches_any(sample, _estori))
+check("«کسی» با عبارتِ ۲ حرفی «کس» گرفته نشود (پسوند ممنوع)",
+      not matcher.matches_any("کسی نیومد", matcher.build(["کس"])))
+check("«سکسی» با «سکس» گرفته شود",
+      matcher.matches_any("بیو سکسی", matcher.build(["سکس"])))
+check("«بی‌سکس» گرفته نشود (مرزِ چپ)", 
+      not matcher.matches_any("بیسکس", matcher.build(["سکس"])))
+check("«بیوگرافیم» با «بیوگرافی» گرفته شود",
+      matcher.matches_any("بیوگرافیم رو ببین", matcher.build(["بیوگرافی"])))
 
 print("\n=== ۳) تطبیق جملهٔ بیوگرافی ===")
 bio_phrases = matcher.build(["بیا تو کانال ما فیلم هست"])
