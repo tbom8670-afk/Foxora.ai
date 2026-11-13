@@ -115,8 +115,27 @@ def _is_exempt(chat_id, user_id, sender) -> bool:
     return _is_admin(chat_id, user_id, sender)
 
 
-async def _send(bot, event, chat_id, payload) -> None:
-    """ارسال پیام مستقل (مثل بقیهٔ قابلیت‌های همین ربات)."""
+def _schedule_cleanup(bot, chat_id, sent) -> None:
+    """ثبتِ پیامِ خودکار در صفِ «حذف پس از ۶۰ ثانیه»ی خودِ ربات.
+
+    همان سرویسِ ``modules/notice_cleanup`` که بقیهٔ هشدارهای خودکار ربات
+    استفاده می‌کنند؛ تنها پیام‌های هشدار اینجا می‌آیند (پاسخِ دستورها نه).
+    """
+    try:
+        from modules.notice_cleanup import capture_sent
+        if capture_sent(bot, chat_id, sent):
+            _log(bot, f"notice scheduled for cleanup chat_id={chat_id}")
+    except Exception as error:
+        _log(bot, f"notice cleanup schedule failed "
+                  f"error={type(error).__name__}", error=True)
+
+
+async def _send(bot, event, chat_id, payload, *, notice: bool = False) -> None:
+    """ارسال پیام مستقل (مثل بقیهٔ قابلیت‌های همین ربات).
+
+    ``notice=True`` ⇒ پیامِ هشدار است و پس از TTLِ سرویسِ
+    ``notice_cleanup`` (پیش‌فرض ۶۰ ثانیه) از گروه پاک می‌شود.
+    """
     text, entities = payload if isinstance(payload, tuple) else (payload, None)
     kwargs = {"formatting_entities": entities} if entities else {}
     target = None
@@ -129,15 +148,21 @@ async def _send(bot, event, chat_id, payload) -> None:
         if candidate is None:
             continue
         try:
-            await bot.client.send_message(candidate, text, **kwargs)
-            return
+            sent = await bot.client.send_message(candidate, text, **kwargs)
         except Exception as error:
             _log(bot, f"send failed target={type(candidate).__name__} "
                       f"error={type(error).__name__}", error=True)
+            continue
+        if notice:
+            _schedule_cleanup(bot, chat_id, sent)
+        return
     try:
-        await event.reply(text, **kwargs)
+        sent = await event.reply(text, **kwargs)
     except Exception as error:
         _log(bot, f"reply failed error={type(error).__name__}", error=True)
+        return
+    if notice:
+        _schedule_cleanup(bot, chat_id, sent)
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +366,7 @@ async def _punish(bot, event, chat_id, user_id, sender, message_id,
                                                  or matched),
             members=members, duration_seconds=duration,
         )
-        await _send(bot, event, chat_id, payload)
+        await _send(bot, event, chat_id, payload, notice=True)
         _notified[key] = now
 
     _log(bot, f"punished kind={kind} chat_id={chat_id} user_id={user_id} "

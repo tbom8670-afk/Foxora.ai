@@ -345,11 +345,23 @@ class _Client:
         return _pytypes.SimpleNamespace(id=1)
 
 
+class _NoticeCleanup:
+    """جانشینِ سرویسِ حذفِ خودکار (۶۰ ثانیه) در رباتِ واقعی."""
+
+    def __init__(self):
+        self.scheduled = []
+
+    def schedule(self, chat_id, sent):
+        self.scheduled.append((chat_id, getattr(sent, "id", None)))
+        return True
+
+
 class _Bot:
     def __init__(self, client):
         self.client = client
         self.logger = _Logger()
         self.admin_actions = _AdminActions()
+        self.notice_cleanup = _NoticeCleanup()
         self.bot_account_id = 999
 
 
@@ -433,6 +445,9 @@ check("ارسال: تعداد اعضا اسپویلر است",
       "1245" in _hidden_channel, repr(_hidden_channel))
 check("ارسال: مجازات اسپویلر نیست",
       "سکوت دائمی" not in _hidden_channel, repr(_hidden_channel))
+check("هشدار در صفِ حذفِ خودکار (۶۰ ثانیه) ثبت شد",
+      len(bot.notice_cleanup.scheduled) == 1,
+      repr(bot.notice_cleanup.scheduled))
 check("یک RPC برای پروفایل (کش بعدی رایگان است)", client.rpc == 1,
       str(client.rpc))
 
@@ -628,6 +643,23 @@ check("بیو ۱: پایانِ ثبت‌شده ≈ ۴ ساعت",
       and abs(float(_penalty["until"]) - (time.time() + 14400)) < 300,
       repr(_penalty))
 _notice_count = len(client.sent)
+check("کارتِ هشدار در صفِ حذفِ خودکار رفت",
+      len(bot.notice_cleanup.scheduled) == 1,
+      repr(bot.notice_cleanup.scheduled))
+
+# --- پاسخِ دستورها هرگز در صفِ حذف نمی‌رود ------------------------------
+_toggle_client = _Client(_UsersUserFull(_FullUser(), []))
+_toggle_bot = _Bot(_toggle_client)
+_original_is_admin = guard._is_admin
+guard._is_admin = lambda *a, **k: True          # نقشِ ادمین را شبیه‌سازی می‌کنیم
+try:
+    _run(guard.handle_toggle(_toggle_bot, _Event(), CHAT, 555, _Sender(555), "on"))
+finally:
+    guard._is_admin = _original_is_admin
+check("کارتِ «فعال شد» در صفِ حذف نمی‌رود",
+      _toggle_bot.notice_cleanup.scheduled == [],
+      repr(_toggle_bot.notice_cleanup.scheduled))
+check("کارتِ «فعال شد» ارسال شد", len(_toggle_client.sent) == 1)
 
 # --- ۲) بیو عوض می‌شود؛ کش تازه است ولی کاربر «زیرِ نظر» ⇒ باید دیده شود --
 client.response = _UsersUserFull(_FullUser(about="استوری من", channel_id=None), [])
