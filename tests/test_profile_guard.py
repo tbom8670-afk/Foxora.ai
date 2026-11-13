@@ -509,6 +509,16 @@ check("مسیر با فاصله حفظ می‌شود",
       _guard.parse_file_command("ضد کانال فایل /sdcard/my files/f.txt")
       == {"section": None, "path": "/sdcard/my files/f.txt"})
 
+# --- خطوط فقط‌ایموجی هرگز نوشته نمی‌شوند -----------------------------
+unusable_file = work / "unusable.txt"
+unusable_file.write_text("CHANNEL\n😍\n🔥\nفیلم خوب\n", encoding="utf-8")
+rep = importer.import_file(str(unusable_file))
+check("فقط‌ایموجی‌ها نوشته نشدند",
+      rep["skipped_unusable"][importer.SECTION_CHANNEL] == 2, str(rep))
+check("عبارت سالمِ همان فایل نوشته شد",
+      rep["added"][importer.SECTION_CHANNEL] == 1, str(rep["added"]))
+check("گزارش، تعداد بی‌حرف را می‌گوید", "ایموجی" in importer.summary(rep))
+
 print("\n----------------------------------------")
 print(f"PASS={PASS}  FAIL={FAIL}")
 sys.exit(0 if FAIL == 0 else 1)

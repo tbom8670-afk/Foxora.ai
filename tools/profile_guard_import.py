@@ -74,6 +74,7 @@ def main(argv=None) -> int:
 
     added = report.get("added") or {}
     dup = report.get("skipped_duplicates") or {}
+    bad = report.get("skipped_unusable") or {}
     totals = report.get("totals") or {}
     prefix = "🔎 (dry-run) " if args.dry_run else "✅ "
     print(prefix + "نتیجهٔ ورودِ فایل:", report.get("source"))
@@ -83,6 +84,10 @@ def main(argv=None) -> int:
                   + int(dup.get(importer.SECTION_BIO, 0) or 0))
     if duplicates:
         print("   تکراری (نادیده)     :", duplicates)
+    unusable = (int(bad.get(importer.SECTION_CHANNEL, 0) or 0)
+                + int(bad.get(importer.SECTION_BIO, 0) or 0))
+    if unusable:
+        print("   بی‌حرف/فقط‌ایموجی    :", unusable)
     for section_name, path in (report.get("files") or {}).items():
         print(f"   فایل مقصد ({section_name}) : {path}")
     if totals:

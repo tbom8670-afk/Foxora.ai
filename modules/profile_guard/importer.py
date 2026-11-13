@@ -138,6 +138,7 @@ def import_text(text: str, *, source: str = "input",
         "ok": False,
         "added": {SECTION_CHANNEL: 0, SECTION_BIO: 0},
         "skipped_duplicates": {SECTION_CHANNEL: 0, SECTION_BIO: 0},
+        "skipped_unusable": {SECTION_CHANNEL: 0, SECTION_BIO: 0},
         "errors": [],
         "files": {},
         "source": source,
@@ -177,7 +178,12 @@ def import_text(text: str, *, source: str = "input",
         fresh: List[str] = []
         for phrase in items:
             key = _key(phrase)
-            if not key or key in seen:
+            # خطِ فقط‌ایموجی/تک‌حرفی هرگز با متن کاربر تطبیق نمی‌خورد
+            # (موتور تطبیق دست‌کم ۲ حرف لازم دارد)، پس نوشته نمی‌شود.
+            if len(key) < 2:
+                report["skipped_unusable"][section] += 1  # type: ignore[index]
+                continue
+            if key in seen:
                 report["skipped_duplicates"][section] += 1  # type: ignore[index]
                 continue
             seen.add(key)
@@ -244,6 +250,7 @@ def summary(report: Dict[str, object]) -> str:
     errors: Iterable[str] = report.get("errors") or []
     added = report.get("added") or {}
     dup = report.get("skipped_duplicates") or {}
+    bad = report.get("skipped_unusable") or {}
     totals = report.get("totals") or {}
     if errors:
         return "\n".join(["❌ ورود فایل انجام نشد:"] + [f"• {e}" for e in errors])
@@ -256,6 +263,10 @@ def summary(report: Dict[str, object]) -> str:
     dup_bio = int(dup.get(SECTION_BIO, 0) or 0)
     if dup_channels or dup_bio:
         lines.append(f"➖ تکراری (نادیده) : {dup_channels + dup_bio}")
+    bad_total = (int(bad.get(SECTION_CHANNEL, 0) or 0)
+                 + int(bad.get(SECTION_BIO, 0) or 0))
+    if bad_total:
+        lines.append(f"➖ بی‌حرف/فقط‌ایموجی (نادیده) : {bad_total}")
     if totals:
         lines.append(
             "➖ مجموع فهرست‌ها : "
