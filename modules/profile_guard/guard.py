@@ -115,7 +115,7 @@ def _is_exempt(chat_id, user_id, sender) -> bool:
     return _is_admin(chat_id, user_id, sender)
 
 
-def _schedule_cleanup(bot, chat_id, sent) -> None:
+def _schedule_cleanup(bot, chat_id, sent, text: str = "") -> None:
     """ثبتِ پیامِ هشدار برای حذف پس از ۶۰ ثانیه.
 
     مسیرِ اصلی، تایمرِ اختصاصیِ همین قابلیت است
@@ -124,7 +124,7 @@ def _schedule_cleanup(bot, chat_id, sent) -> None:
     می‌شود. سرویسِ عمومیِ ربات هم به‌عنوانِ پشتیبان ثبت می‌شود.
     """
     try:
-        cleanup.schedule(bot, chat_id, sent)
+        cleanup.schedule(bot, chat_id, sent, text=text)
     except Exception as error:
         _log(bot, f"own cleanup schedule failed "
                   f"error={type(error).__name__}", error=True)
@@ -160,7 +160,7 @@ async def _send(bot, event, chat_id, payload, *, notice: bool = False) -> None:
                       f"error={type(error).__name__}", error=True)
             continue
         if notice:
-            _schedule_cleanup(bot, chat_id, sent)
+            _schedule_cleanup(bot, chat_id, sent, text)
         return
     try:
         sent = await event.reply(text, **kwargs)
@@ -168,7 +168,7 @@ async def _send(bot, event, chat_id, payload, *, notice: bool = False) -> None:
         _log(bot, f"reply failed error={type(error).__name__}", error=True)
         return
     if notice:
-        _schedule_cleanup(bot, chat_id, sent)
+        _schedule_cleanup(bot, chat_id, sent, text)
 
 
 # ---------------------------------------------------------------------------

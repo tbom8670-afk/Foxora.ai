@@ -796,6 +796,19 @@ check("شناسهٔ نامعتبر پذیرفته نمی‌شود",
       _cleanup.message_id_of(None) is None)
 
 
+class _ClientWithHistory(_Client):
+    """کلاینتی که ``get_messages`` هم دارد (برای مسیرِ «پیدا کردن با متن»)."""
+
+    def __init__(self, response, history):
+        super().__init__(response)
+        self.history = history
+        self.history_calls = 0
+
+    async def get_messages(self, target, limit=20):
+        self.history_calls += 1
+        return self.history
+
+
 async def _cleanup_case():
     _bot = _Bot(_Client(_UsersUserFull(_FullUser(), [])))
     _sent = _pytypes.SimpleNamespace(id=9001)
@@ -809,6 +822,31 @@ _deleted_ids, _rows_after = asyncio.run(_cleanup_case())
 check("تایمرِ اختصاصی پیام را پاک کرد",
       _deleted_ids == [(CHAT, [9001])], repr(_deleted_ids))
 check("بعد از حذف، ردیف از فایل پاک شد", _rows_after == [], repr(_rows_after))
+
+# --- اگر نتیجهٔ ارسال شناسه نداشت: پیدا کردن با متن ----------------------
+_CARD = "⛔ کاربر : @test\nپیام شما پاک شد | دلیل : فیلتر بیوگرافی"
+
+
+async def _text_fallback_case():
+    _client = _ClientWithHistory(_UsersUserFull(_FullUser(), []), [
+        _pytypes.SimpleNamespace(id=555, message="سلام"),
+        _pytypes.SimpleNamespace(id=777, message=_CARD),
+    ])
+    _bot = _Bot(_client)
+    _task = _cleanup.schedule(_bot, CHAT, None, ttl=0, text=_CARD)
+    if _task is not None:
+        await _task
+    return _client.deleted, _client.history_calls
+
+
+_fb_deleted, _fb_history = asyncio.run(_text_fallback_case())
+check("بدونِ شناسه: پیام با متن پیدا و پاک شد",
+      _fb_deleted == [(CHAT, [777])], repr(_fb_deleted))
+check("بدونِ شناسه: تاریخچه فقط یک‌بار خوانده شد", _fb_history == 1,
+      str(_fb_history))
+check("نه شناسه نه متن ⇒ زمان‌بندی نمی‌شود",
+      _cleanup.schedule(_Bot(_Client(_UsersUserFull(_FullUser(), []))),
+                        CHAT, None) is None)
 
 # --- بازیابی پس از ری‌استارت: ردیفِ سررسیدشده فوراً پاک می‌شود -----------
 _cleanup._save([{"chat_id": CHAT, "message_id": 9010,
@@ -857,6 +895,8 @@ _run(guard.guard_message(_c_bot, _Event(), CHAT, 990, _Sender(990), 95))
 _rows = _cleanup._load()
 check("کارتِ هشدار در مسیرِ اختصاصی ثبت شد",
       len(_rows) == 1 and _rows[0]["message_id"] == 1, repr(_rows))
+check("متنِ کارت هم برای بازیابی ذخیره شد",
+      "پیام شما پاک شد" in str(_rows[0].get("text")), repr(_rows[0]))
 check("سرویسِ عمومیِ ربات هم ثبت شد (پشتیبان)",
       len(_c_bot.notice_cleanup.scheduled) == 1,
       repr(_c_bot.notice_cleanup.scheduled))
