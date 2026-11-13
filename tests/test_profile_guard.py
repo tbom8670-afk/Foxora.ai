@@ -180,6 +180,37 @@ check("اسپویلر بیو: مجازات پنهان نیست", "4 ساعت س�
 check("برچسب یک‌ساعته", texts.punish_label(3600) == "1 ساعت سکوت")
 check("برچسب نامعلوم‌بودن اعضا", texts.format_members(None) == "نامشخص")
 
+# --- حالت‌های پنهان‌سازیِ مقدار (PROFILE_GUARD_HIDE) ---------------------
+import os as _os  # noqa: E402
+
+_os.environ.pop("PROFILE_GUARD_HIDE", None)
+_t_spoiler, _e_spoiler = texts.notice_bio("x", "استوری", duration_seconds=14400)
+_os.environ["PROFILE_GUARD_HIDE"] = "mask"
+_t_mask, _e_mask = texts.notice_bio("x", "استوری", duration_seconds=14400)
+_os.environ["PROFILE_GUARD_HIDE"] = "both"
+_t_both, _e_both = texts.notice_bio("x", "استوری", duration_seconds=14400)
+_os.environ.pop("PROFILE_GUARD_HIDE", None)
+
+check("حالتِ پیش‌فرض = اسپویلر (متن اصلی موجود، entity اسپویلر)",
+      "استوری" in _t_spoiler
+      and any(isinstance(e, texts.MessageEntitySpoiler) for e in _e_spoiler))
+check("حالتِ پیش‌فرض: روی محدودهٔ اسپویلر Bold نیست",
+      not any(isinstance(e, texts.MessageEntityBold) and e.offset ==
+              [x for x in _e_spoiler
+               if isinstance(x, texts.MessageEntitySpoiler)][0].offset
+              for e in _e_spoiler), repr(_e_spoiler))
+check("حالتِ mask: متنِ اصلی هرگز فرستاده نمی‌شود",
+      "استوری" not in _t_mask and texts.HIDE_MASK in _t_mask)
+check("حالتِ mask: بدونِ entity اسپویلر",
+      not any(isinstance(e, texts.MessageEntitySpoiler) for e in _e_mask))
+check("حالتِ both: ماسک + اسپویلر",
+      texts.HIDE_MASK in _t_both
+      and any(isinstance(e, texts.MessageEntitySpoiler) for e in _e_both))
+check("مجازات در همهٔ حالت‌ها دیده می‌شود",
+      all("4 ساعت سکوت" in t for t in (_t_spoiler, _t_mask, _t_both)))
+check("مقدارِ نامشخص هم پنهان می‌شود",
+      texts.UNKNOWN_VALUE in texts.notice_channel("u", None)[0])
+
 enable_text, enable_entities = texts.enabled(67)
 check("پیام فعال‌شدن، خط اول",
       enable_text.split("\n")[0] == "⚠️ ضد کانال و بیوگرافی کاربران فعال شد",

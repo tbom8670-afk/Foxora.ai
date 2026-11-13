@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover — در محیط بدونِ کتابخانه هم باید ایمپورت شود
@@ -72,6 +73,14 @@ BOLD_HEADER = True       # خط «⛔ کاربر : @…»
 BOLD_REASON = True       # «کانال فیلتر شده» / «فیلتر بیوگرافی»
 BOLD_VALUES = True       # مقدارِ جلوی هر ↻-
 SPOILER_VALUES = True    # پنهان‌بودنِ نامِ کانال / جملهٔ فیلتر / تعداد اعضا (اسپویلر)
+
+#: حالتِ پنهان‌سازیِ مقدارها:
+#:   ``spoiler`` (پیش‌فرض) — فقط entity اسپویلر (با یک ضربه در کلاینت باز می‌شود)
+#:   ``mask``                — خودِ متن با «••••••» جایگزین می‌شود (در همهٔ
+#:                             کلاینت‌ها پنهان است، حتی اگر اسپویلر پشتیبانی نشود)
+#:   ``both``                — هم ماسک، هم اسپویلر
+#: با ``PROFILE_GUARD_HIDE=mask`` در ``.env`` عوض می‌شود (بدون تغییرِ کد).
+HIDE_MASK = "••••••"
 BOLD_ENABLE_TITLE = True  # خط اولِ پیام روشن‌شدن
 
 # ---------------------------------------------------------------------------
@@ -163,15 +172,28 @@ def format_members(value) -> str:
         return UNKNOWN_VALUE
 
 
+def hide_mode() -> str:
+    """حالتِ پنهان‌سازی (``spoiler`` / ``mask`` / ``both``)."""
+    value = str(os.getenv("PROFILE_GUARD_HIDE", "spoiler") or "spoiler").strip().lower()
+    return value if value in ("spoiler", "mask", "both") else "spoiler"
+
+
 def _bullets(builder: _Builder, rows: Sequence[tuple]) -> None:
     """هر ردیف: ``(label, value)`` یا ``(label, value, spoiler)``."""
+    mode = hide_mode()
     for index, row in enumerate(rows):
         label, value = row[0], row[1]
         hidden = bool(row[2]) if len(row) > 2 else False
+        if hidden and mode in ("mask", "both"):
+            shown = HIDE_MASK
+        else:
+            shown = str(value)
         line = BULLET.format(label=label, value="")
         builder.add(("" if index == 0 else "\n") + line)
-        builder.add(str(value), bold=BOLD_VALUES,
-                    spoiler=hidden and SPOILER_VALUES)
+        # ⚠️ روی محدودهٔ اسپویلر، Bold نمی‌گذاریم: بعضی کلاینت‌ها ترکیبِ
+        # Bold+Spoiler را نادیده می‌گیرند و متن را ساده نشان می‌دهند.
+        builder.add(shown, bold=BOLD_VALUES and not (hidden and mode in ("spoiler", "both")),
+                    spoiler=hidden and SPOILER_VALUES and mode in ("spoiler", "both"))
 
 
 def notice_channel(user: str, channel_title: Optional[str],
@@ -235,6 +257,6 @@ __all__ = [
     "LABEL_CHANNEL_NAME", "LABEL_MEMBERS", "LABEL_PUNISH", "LABEL_BIO_WORD",
     "PUNISH_PERMANENT", "PUNISH_TEMPORARY", "UNKNOWN_VALUE",
     "ENABLE_TITLE", "ENABLE_COUNT", "DISABLED_MESSAGE",
-    "punish_label", "format_members", "notice_channel", "notice_bio",
+    "hide_mode", "HIDE_MASK", "punish_label", "format_members", "notice_channel", "notice_bio",
     "enabled", "disabled", "notice_for",
 ]
