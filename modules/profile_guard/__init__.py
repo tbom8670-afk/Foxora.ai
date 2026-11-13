@@ -15,9 +15,10 @@
 ``__all__`` باشند (درسِ باگِ ``ad_spam_guard``).
 """
 
-from . import filters, guard, importer, matcher, service, storage, texts  # noqa: F401
+from . import (filters, guard, importer, matcher, penalties, service,  # noqa: F401
+               storage, texts)
 from .guard import (guard_message, handle_file_command,  # noqa: F401
-                    handle_toggle, parse_file_command)
+                    handle_toggle, parse_file_command, recover)
 from .storage import toggle_mode  # noqa: F401
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "guard",
     "importer",
     "matcher",
+    "penalties",
     "service",
     "storage",
     "texts",
@@ -32,5 +34,6 @@ __all__ = [
     "handle_file_command",
     "handle_toggle",
     "parse_file_command",
+    "recover",
     "toggle_mode",
 ]

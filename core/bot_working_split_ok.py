@@ -1206,13 +1206,24 @@ class SoroushAntiSpamBot:
             _violators_state = _violators_engine.recover(self, self.logger)
             _msg_limit_state = _message_limit_engine.recover(self, self.logger)
             _shutdown_state = group_shutdown_commands.recover(self, self.logger)
+            # 🛡️ «ضد کانال و بیوگرافی»: سکوت‌های دائمیِ ثبت‌شده پس از
+            # ری‌استارت دوباره اعمال می‌شوند (در تسکِ پس‌زمینه، بدون بلاک).
+            try:
+                from modules import profile_guard as _profile_guard
+                _pg_reapplied = _profile_guard.recover(self, self.logger)
+            except Exception as _pg_error:            # noqa: BLE001
+                _pg_reapplied = 0
+                self.logger.log_error(
+                    "PROFILE GUARD RECOVERY FAILED "
+                    f"error={_pg_error!r}")
             self.logger.log_info(
                 "MANAGE FEATURES RECOVERY "
                 f"timed={len(_timed_restored)} reports={_reports_restored} "
                 f"exclusive={len(_exclusive_pending)} "
                 f"violators={_violators_state.get('users', 0)} "
                 f"message_limits={_msg_limit_state.get('counting', 0) + _msg_limit_state.get('muted', 0)} "
-                f"group_shutdown={_shutdown_state.get('active', 0)}"
+                f"group_shutdown={_shutdown_state.get('active', 0)} "
+                f"profile_guard_permanent={_pg_reapplied}"
             )
             # ⏰ «تأیید دو مرحله‌ای»: مسیرِ اجرای تأییدشدهٔ ۹ دستورِ خطرناک
             # همین‌جا به روتر وصل می‌شود تا پس از رمزِ درست، همان دستور با

@@ -23,17 +23,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Optional
 
-from modules.profile_guard import (filters, importer, matcher, service,
-                                  storage, texts)
+from modules.profile_guard import (filters, importer, matcher, penalties,
+                                  service, storage, texts)
 
 #: مدت سکوت برای تخلفِ «جملهٔ بیوگرافی» (پیش‌فرض ۴ ساعت — طبق اسکرین‌شات).
 BIO_MUTE_SECONDS = 4 * 3600
 
 _notified: dict = {}
+
+#: زمانِ آخرین تلاش برای «اعمالِ دوبارهٔ سکوتِ دائمی» (ضدِ اسپمِ RPC).
+_healed: dict = {}
 
 
 def _env_int(name: str, default: int, minimum: int = 0,
@@ -55,8 +59,13 @@ def freshness_seconds() -> int:
 
 
 def notice_cooldown() -> int:
-    """فاصلهٔ حداقلی بین دو پیامِ اخطارِ همین کاربر در همین گروه."""
+    """فاصلهٔ حداقلی بین دو پیامِ اخطارِ **همان تخلفِ** همین کاربر."""
     return _env_int("PROFILE_GUARD_NOTICE_COOLDOWN", 3600, 0, 86400)
+
+
+def reheal_interval() -> int:
+    """فاصلهٔ حداقلی بین دو تلاشِ «سکوتِ دوباره» برای یک کاربرِ دائم‌ساکت."""
+    return _env_int("PROFILE_GUARD_REHEAL_INTERVAL", 60, 5, 3600)
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +302,25 @@ async def _punish(bot, event, chat_id, user_id, sender, message_id,
         _log(bot, f"mute failed chat_id={chat_id} user_id={user_id} "
                   f"error={type(error).__name__}", error=True)
 
-    # پیامِ اخطار: با cooldown تا در صورت شکستِ سکوت، اسپم نشود.
-    key = f"{chat_id}:{user_id}"
+    # 🗂 ثبتِ پایدار: سکوتِ دائمی باید از ری‌استارت جان سالم بردارد و کاربرِ
+    # متخلف «زیرِ نظر» بماند تا بیوگرافی‌اش هر بار تازه چک شود.
+    try:
+        penalties.record(
+            chat_id, user_id, kind,
+            None if duration is None else time.time() + int(duration),
+        )
+    except Exception as error:
+        _log(bot, f"penalty record failed error={type(error).__name__}",
+             error=True)
+    # کشِ پروفایل دور ریخته می‌شود تا پیامِ بعدی حتماً تازه خوانده شود.
+    try:
+        service.invalidate(user_id)
+    except Exception:
+        pass
+
+    # پیامِ اخطار: کلیدِ cooldown شاملِ نوع و مقدارِ تخلف است تا تخلفِ
+    # **جدید** همیشه هشدار بگیرد و فقط تکرارِ عینِ همان تخلف ساکت بماند.
+    key = f"{chat_id}:{user_id}:{kind}:{matched}"
     now = time.time()
     if now - _notified.get(key, 0) >= notice_cooldown():
         members = snapshot.get("participants")
@@ -324,6 +350,87 @@ async def _punish(bot, event, chat_id, user_id, sender, message_id,
     return deleted or storage_ok
 
 
+async def _enforce_permanent(bot, event, chat_id, user_id, sender,
+                             message_id) -> bool:
+    """کاربرِ «دائم‌ساکت» دوباره پیام داده ⇒ سکوتش برداشته شده؛ فوراً برگردان.
+
+    بدونِ RPCِ پروفایل و بدونِ پیامِ اخطار (هشدار قبلاً داده شده) — فقط
+    حذفِ پیام + سکوتِ دوباره، با فاصلهٔ حداقلی تا RPC تکرار نشود.
+    """
+    try:
+        await bot.client.delete_messages(int(chat_id), [int(message_id)])
+    except Exception as error:
+        _log(bot, f"reheal delete failed chat_id={chat_id} "
+                  f"error={type(error).__name__}", error=True)
+
+    key = f"{chat_id}:{user_id}"
+    now = time.time()
+    if now - _healed.get(key, 0) < reheal_interval():
+        return True
+    _healed[key] = now
+
+    ok = False
+    try:
+        if getattr(bot, "admin_actions", None) is not None:
+            ok = bool(await bot.admin_actions.mute_user(
+                chat_id, user_id, None, user=sender, chat=None,
+            ))
+    except Exception as error:
+        _log(bot, f"reheal mute failed chat_id={chat_id} user_id={user_id} "
+                  f"error={type(error).__name__}", error=True)
+    _log(bot, f"rehealed permanent chat_id={chat_id} user_id={user_id} "
+              f"muted={ok}")
+    return True
+
+
+async def _reapply_permanent(bot, logger=None) -> int:
+    """پس از ری‌استارت، سکوتِ دائمیِ ثبت‌شده را دوباره اعمال می‌کند."""
+    rows = [row for row in penalties.permanent_entries()
+            if storage.is_enabled(row.get("chat_id"))]
+    applied = 0
+    for row in rows:
+        try:
+            chat_id = int(row.get("chat_id"))
+            user_id = int(row.get("user_id"))
+        except (TypeError, ValueError):
+            continue
+        if getattr(bot, "admin_actions", None) is None:
+            break
+        try:
+            ok = bool(await bot.admin_actions.mute_user(chat_id, user_id, None,
+                                                       user=None, chat=None))
+        except Exception as error:
+            _log(bot, f"reapply failed chat_id={chat_id} user_id={user_id} "
+                      f"error={type(error).__name__}", error=True)
+            continue
+        applied += 1 if ok else 0
+        if reheal_interval():
+            await asyncio.sleep(min(reheal_interval(), 5))
+    _log(bot, f"permanent mutes reapplied count={applied} total={len(rows)}")
+    return applied
+
+
+def recover(bot, logger=None) -> int:
+    """قلابِ استارتاپ: تعدادِ سکوت‌های دائمیِ ثبت‌شده را (بدون بلاک‌کردن) برمی‌گرداند."""
+    try:
+        total = len([row for row in penalties.permanent_entries()
+                     if storage.is_enabled(row.get("chat_id"))])
+        penalties.prune()
+    except Exception:
+        return 0
+    if not total:
+        return 0
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return total
+    try:
+        loop.create_task(_reapply_permanent(bot, logger))
+    except Exception:
+        pass
+    return total
+
+
 async def guard_message(bot, event, chat_id, user_id, sender,
                         message_id) -> bool:
     """پیامِ گروهی را بررسی می‌کند؛ ``True`` یعنی رسیدگی شد (پاک شد)."""
@@ -345,10 +452,27 @@ async def guard_message(bot, event, chat_id, user_id, sender,
     if _is_exempt(chat_id, user_id, sender):
         return False
 
+    # 🩹 خودترمیمی: این کاربر قبلاً «سکوت دائمی» گرفته ولی دارد پیام می‌دهد
+    # ⇒ سکوتش برداشته شده (ری‌استارت/باگ سرویس)؛ بدون معطلی برمی‌گردانیم.
+    try:
+        if penalties.is_permanent(chat_id, user_id):
+            return await _enforce_permanent(bot, event, chat_id, user_id,
+                                            sender, message_id)
+    except Exception as error:
+        _log(bot, f"reheal check failed error={type(error).__name__}",
+             error=True)
+
     channel_phrases = matcher.build(filters.channel_names())
     bio_phrases = matcher.build(filters.bio_sentences())
 
-    snapshot = await service.snapshot(bot, sender)
+    # 🎯 کاربرِ سابقه‌دار (سکوتِ دائمی/موقتِ فعال یا تازه‌تمام‌شده) همیشه با
+    # پروفایلِ تازه بررسی می‌شود تا تغییرِ بیوگرافی از دست نرود.
+    try:
+        watch = penalties.is_watched(chat_id, user_id)
+    except Exception:
+        watch = False
+
+    snapshot = await service.snapshot(bot, sender, force=watch)
     if not snapshot:
         return False
 

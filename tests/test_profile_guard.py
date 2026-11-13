@@ -564,6 +564,131 @@ check("عبارت سالمِ همان فایل نوشته شد",
       rep["added"][importer.SECTION_CHANNEL] == 1, str(rep["added"]))
 check("گزارش، تعداد بی‌حرف را می‌گوید", "ایموجی" in importer.summary(rep))
 
+print("\n=== ۹) بررسیِ همیشگیِ بیوگرافی + دوامِ سکوت پس از ری‌استارت ===")
+import time  # noqa: E402
+from modules.profile_guard import penalties  # noqa: E402
+from modules.profile_guard import storage as _storage  # noqa: E402
+
+CHAT2 = -1009999999999
+_storage.enable(CHAT)
+_storage.disable(CHAT2)
+
+# فهرست‌های مستقلِ این بخش (بعد از بازنویسی‌های بخش ۸)
+_CHANNEL_LIST = ["فیلم و سریال"]
+_BIO_LIST = ["سکس", "استوری"]
+filters.channel_names = lambda: list(_CHANNEL_LIST)
+filters.bio_sentences = lambda: list(_BIO_LIST)
+filters.is_empty = lambda: not (_CHANNEL_LIST or _BIO_LIST)
+filters.filter_count = lambda: len(_CHANNEL_LIST) + len(_BIO_LIST)
+
+service.clear()
+penalties.clear()
+guard._notified.clear()
+guard._healed.clear()
+
+# --- ۱) تخلفِ بیو ⇒ سکوت ۴ ساعته + ثبتِ پایدار --------------------------
+client = _Client(_UsersUserFull(_FullUser(about="سکس", channel_id=None), []))
+bot = _Bot(client)
+_run(guard.guard_message(bot, _Event(), CHAT, 660, _Sender(660), 71))
+check("بیو ۱: پیام پاک شد", client.deleted == [(CHAT, [71])],
+      repr(client.deleted))
+check("بیو ۱: سکوت ۴ ساعته",
+      bot.admin_actions.calls and bot.admin_actions.calls[-1][2] == 14400,
+      repr(bot.admin_actions.calls))
+_penalty = penalties.get(CHAT, 660)
+check("بیو ۱: مجازات در دفترچه ثبت شد", bool(_penalty), repr(_penalty))
+check("بیو ۱: پایانِ ثبت‌شده ≈ ۴ ساعت",
+      _penalty and _penalty.get("until") is not None
+      and abs(float(_penalty["until"]) - (time.time() + 14400)) < 300,
+      repr(_penalty))
+_notice_count = len(client.sent)
+
+# --- ۲) بیو عوض می‌شود؛ کش تازه است ولی کاربر «زیرِ نظر» ⇒ باید دیده شود --
+client.response = _UsersUserFull(_FullUser(about="استوری من", channel_id=None), [])
+_run(guard.guard_message(bot, _Event(), CHAT, 660, _Sender(660), 72))
+check("تغییرِ بیو ⇒ تخلفِ تازه گرفته شد",
+      client.deleted[-1] == (CHAT, [72]), repr(client.deleted))
+check("تغییرِ بیو ⇒ هشدارِ دوباره فرستاده شد",
+      len(client.sent) == _notice_count + 1, str(len(client.sent)))
+check("کارتِ دوم مقدارِ تازه را دارد",
+      "استوری" in (client.sent[-1]["text"] if client.sent else ""),
+      repr(client.sent[-1]["text"] if client.sent else ""))
+check("برای بیوی تازه RPC زده شد (نه کش)", client.rpc >= 2, str(client.rpc))
+
+# --- ۳) تکرارِ عینِ همان تخلف: کارتِ سوم نه ------------------------------
+_run(guard.guard_message(bot, _Event(), CHAT, 660, _Sender(660), 73))
+check("تکرارِ همان مقدار: کارتِ اضافه نمی‌آید",
+      len(client.sent) == _notice_count + 1, str(len(client.sent)))
+
+# --- ۴) سکوتِ دائمیِ کانال + شبیه‌سازیِ ری‌استارت -------------------------
+service.clear()
+guard._notified.clear()
+guard._healed.clear()
+client2 = _Client(_UsersUserFull(
+    _FullUser(about="سالم", channel_id=4321),
+    [_Channel(4321, "فیلم و سریال", participants=99)],
+))
+bot2 = _Bot(client2)
+_run(guard.guard_message(bot2, _Event(), CHAT, 815, _Sender(815), 81))
+check("کانال: سکوت دائمی اعمال شد",
+      bot2.admin_actions.calls and bot2.admin_actions.calls[-1][2] is None,
+      repr(bot2.admin_actions.calls))
+check("کانال: در دفترچه دائمی ثبت شد", penalties.is_permanent(CHAT, 815))
+
+# ری‌استارت: همهٔ کش‌های حافظه‌ای خالی، فقط دفترچهٔ روی دیسک می‌ماند
+service.clear()
+guard._notified.clear()
+guard._healed.clear()
+client3 = _Client(_UsersUserFull(_FullUser(about="سالمِ سالم", channel_id=None), []))
+bot3 = _Bot(client3)
+_handled = _run(guard.guard_message(bot3, _Event(), CHAT, 815, _Sender(815), 82))
+check("پس از ری‌استارت: پیامِ کاربرِ دائم‌ساکت پاک می‌شود",
+      _handled is True and client3.deleted == [(CHAT, [82])],
+      repr(client3.deleted))
+check("پس از ری‌استارت: سکوت دوباره اعمال شد",
+      bot3.admin_actions.calls and bot3.admin_actions.calls[-1][2] is None,
+      repr(bot3.admin_actions.calls))
+check("پس از ری‌استارت: کارتِ تکراری فرستاده نمی‌شود",
+      client3.sent == [], repr(client3.sent))
+check("پس از ری‌استارت: برای سکوتِ دوباره RPCِ پروفایل لازم نیست",
+      client3.rpc == 0, str(client3.rpc))
+
+# --- ۵) قلابِ استارتاپ: اعمالِ دوبارهٔ سکوت‌های دائمی ---------------------
+service.clear()
+penalties.clear()
+penalties.record(CHAT, 815, "channel", None)
+penalties.record(CHAT2, 816, "channel", None)
+
+
+async def _recover_case():
+    bot4 = _Bot(_Client(_UsersUserFull(_FullUser(), [])))
+    total = guard.recover(bot4, None)
+    await asyncio.sleep(0.8)
+    return total, bot4.admin_actions.calls
+
+
+_total, _calls = asyncio.run(_recover_case())
+check("recover: فقط گروهِ روشن شمرده می‌شود", _total == 1, str(_total))
+check("recover: سکوتِ دائمیِ همان کاربر دوباره اعمال شد",
+      _calls == [(CHAT, 815, None)], repr(_calls))
+
+# --- ۶) محرمانگی و هرسِ دفترچه ------------------------------------------
+_raw = ""
+try:
+    _raw = Path(str(penalties.FILE)).read_text(encoding="utf-8")
+except Exception:
+    _raw = ""
+check("دفترچه هیچ متنِ بیو/کانال را ذخیره نمی‌کند",
+      "سکس" not in _raw and "استوری" not in _raw, _raw[:200])
+
+penalties.clear()
+penalties.record(CHAT, 900, "bio", time.time() - 7200)
+check("رکوردِ موقتِ کهنه هرس می‌شود",
+      penalties.prune() == 1 and penalties.get(CHAT, 900) is None)
+penalties.record(CHAT, 901, "channel", None)
+check("رکوردِ دائمی هرس نمی‌شود", penalties.prune() == 0)
+penalties.clear()
+
 print("\n----------------------------------------")
 print(f"PASS={PASS}  FAIL={FAIL}")
 sys.exit(0 if FAIL == 0 else 1)
