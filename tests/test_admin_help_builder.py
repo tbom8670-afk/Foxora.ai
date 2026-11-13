@@ -53,8 +53,9 @@ def test_blocks_count_and_contact():
     # + ۱ بلوک «متخلف/لغو متخلف» (پایینِ لیست) = ۵۲
     # + ۱ بلوک «ضد ربات تبلیغاتی» (تبلیغ گر روشن/خاموش) = ۵۳
     # + ۱ بلوک «محدودیت پیام» = ۵۴
-    # + ۱ بلوک «خاموشی گروه» = ۵۵)
-    assert len(bquote_entities) == 55
+    # + ۱ بلوک «خاموشی گروه» = ۵۵
+    # + ۱ بلوک «ضد کانال و بیوگرافی» (ضد کانال روشن/خاموش) = ۵۶)
+    assert len(bquote_entities) == 56
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 

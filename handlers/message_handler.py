@@ -205,6 +205,8 @@ from modules import message_tracker
 from modules import big_spam
 from modules import search_access
 from modules import ad_spam_guard as _ad_spam_guard
+# 🦊 ضد کانال و بیوگرافی — شناسایی کانالِ متصل به پروفایل + جمله‌های بیو.
+from modules import profile_guard as _profile_guard
 from modules import web_search, wiki_search_service
 from modules.notice_cleanup import capture_sent
 try:
@@ -4474,6 +4476,44 @@ async def handle_new_message(bot, event):
                         )
                     ):
                         return
+                except Exception:
+                    pass
+
+        # ===== 🦊 گیت «ضد کانال و بیوگرافی» =====
+        # مستقل از ضد-اسپم و ضد-تبلیغ: کانالِ متصل به پروفایل (از طریق
+        # GetFullUserRequest → personal_channel_id) و جمله‌های بیوگرافی را
+        # بررسی می‌کند. تصمیم‌ها در خودِ بسته گرفته می‌شود و این‌جا فقط
+        # «مصرف/عدمِ مصرف» پیام است؛ هر خطا در لاگ می‌ماند و مسیر پیام
+        # را نمی‌شکند.
+        if (not event.is_private and chat_id and user_id
+                and not _is_own_bot_message):
+            try:
+                _pg_text = str(message_text or "").strip()
+                # «ضد کانال فایل [کانال|بیو] <مسیر>» — ورودِ جمله‌ها از فایلِ
+                # Termux (فقط مالکِ ربات).
+                if await _profile_guard.handle_file_command(
+                    bot, event, chat_id, user_id, sender, _pg_text
+                ):
+                    return
+                _pg_mode = _profile_guard.toggle_mode(_pg_text)
+                if _pg_mode is not None:
+                    if await _profile_guard.handle_toggle(
+                        bot, event, chat_id, user_id, sender, _pg_mode
+                    ):
+                        return
+                elif _profile_guard.storage.is_enabled(chat_id):
+                    if await _profile_guard.guard_message(
+                        bot, event, chat_id, user_id, sender,
+                        getattr(event.message, "id", None),
+                    ):
+                        return
+            except Exception as _profile_guard_error:
+                try:
+                    bot.logger.log_error(
+                        "PROFILE GUARD FAILED "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"error={_profile_guard_error!r}"
+                    )
                 except Exception:
                     pass
 
