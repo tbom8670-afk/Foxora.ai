@@ -15,13 +15,14 @@
 ``__all__`` باشند (درسِ باگِ ``ad_spam_guard``).
 """
 
-from . import (filters, guard, importer, matcher, penalties, service,  # noqa: F401
-               storage, texts)
+from . import (cleanup, filters, guard, importer, matcher,  # noqa: F401
+               penalties, service, storage, texts)
 from .guard import (guard_message, handle_file_command,  # noqa: F401
                     handle_toggle, parse_file_command, recover)
 from .storage import toggle_mode  # noqa: F401
 
 __all__ = [
+    "cleanup",
     "filters",
     "guard",
     "importer",

@@ -28,8 +28,8 @@ import os
 import time
 from typing import Optional
 
-from modules.profile_guard import (filters, importer, matcher, penalties,
-                                  service, storage, texts)
+from modules.profile_guard import (cleanup, filters, importer, matcher,
+                                  penalties, service, storage, texts)
 
 #: مدت سکوت برای تخلفِ «جملهٔ بیوگرافی» (پیش‌فرض ۴ ساعت — طبق اسکرین‌شات).
 BIO_MUTE_SECONDS = 4 * 3600
@@ -116,15 +116,21 @@ def _is_exempt(chat_id, user_id, sender) -> bool:
 
 
 def _schedule_cleanup(bot, chat_id, sent) -> None:
-    """ثبتِ پیامِ خودکار در صفِ «حذف پس از ۶۰ ثانیه»ی خودِ ربات.
+    """ثبتِ پیامِ هشدار برای حذف پس از ۶۰ ثانیه.
 
-    همان سرویسِ ``modules/notice_cleanup`` که بقیهٔ هشدارهای خودکار ربات
-    استفاده می‌کنند؛ تنها پیام‌های هشدار اینجا می‌آیند (پاسخِ دستورها نه).
+    مسیرِ اصلی، تایمرِ اختصاصیِ همین قابلیت است
+    (``modules/profile_guard/cleanup.py``) که با
+    ``client.delete_messages`` پاک می‌کند — همان روشی که پیامِ متخلف حذف
+    می‌شود. سرویسِ عمومیِ ربات هم به‌عنوانِ پشتیبان ثبت می‌شود.
     """
     try:
+        cleanup.schedule(bot, chat_id, sent)
+    except Exception as error:
+        _log(bot, f"own cleanup schedule failed "
+                  f"error={type(error).__name__}", error=True)
+    try:
         from modules.notice_cleanup import capture_sent
-        if capture_sent(bot, chat_id, sent):
-            _log(bot, f"notice scheduled for cleanup chat_id={chat_id}")
+        capture_sent(bot, chat_id, sent)
     except Exception as error:
         _log(bot, f"notice cleanup schedule failed "
                   f"error={type(error).__name__}", error=True)
@@ -443,14 +449,16 @@ def recover(bot, logger=None) -> int:
         penalties.prune()
     except Exception:
         return 0
-    if not total:
-        return 0
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return total
     try:
         loop.create_task(_reapply_permanent(bot, logger))
+    except Exception:
+        pass
+    try:
+        cleanup.recover(bot, logger)
     except Exception:
         pass
     return total

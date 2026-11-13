@@ -778,6 +778,93 @@ penalties.record(CHAT, 901, "channel", None)
 check("رکوردِ دائمی هرس نمی‌شود", penalties.prune() == 0)
 penalties.clear()
 
+print("\n=== ۱۰) مسیرِ اختصاصیِ حذفِ هشدار پس از ۶۰ ثانیه ===")
+from modules.profile_guard import cleanup as _cleanup  # noqa: E402
+
+_cleanup.FILE = Path(_TMP) / "cleanup_case.json"
+try:
+    _cleanup.FILE.unlink()
+except OSError:
+    pass
+
+check("مهلتِ پیش‌فرض ۶۰ ثانیه است", _cleanup.ttl_seconds() == 60,
+      str(_cleanup.ttl_seconds()))
+check("شناسهٔ پیام از نتیجهٔ ارسال خوانده می‌شود",
+      _cleanup.message_id_of(_pytypes.SimpleNamespace(id=4321,
+                                                      peer_id=None)) == 4321)
+check("شناسهٔ نامعتبر پذیرفته نمی‌شود",
+      _cleanup.message_id_of(None) is None)
+
+
+async def _cleanup_case():
+    _bot = _Bot(_Client(_UsersUserFull(_FullUser(), [])))
+    _sent = _pytypes.SimpleNamespace(id=9001)
+    _task = _cleanup.schedule(_bot, CHAT, _sent, ttl=0)
+    if _task is not None:
+        await _task
+    return _bot.client.deleted, list(_cleanup._load())
+
+
+_deleted_ids, _rows_after = asyncio.run(_cleanup_case())
+check("تایمرِ اختصاصی پیام را پاک کرد",
+      _deleted_ids == [(CHAT, [9001])], repr(_deleted_ids))
+check("بعد از حذف، ردیف از فایل پاک شد", _rows_after == [], repr(_rows_after))
+
+# --- بازیابی پس از ری‌استارت: ردیفِ سررسیدشده فوراً پاک می‌شود -----------
+_cleanup._save([{"chat_id": CHAT, "message_id": 9010,
+                 "due": time.time() - 5}])
+
+
+async def _recover_cleanup_case():
+    _bot = _Bot(_Client(_UsersUserFull(_FullUser(), [])))
+    _count = _cleanup.recover(_bot, None)
+    await asyncio.sleep(0.2)
+    return _count, _bot.client.deleted, list(_cleanup._load())
+
+
+_count, _deleted2, _rows2 = asyncio.run(_recover_cleanup_case())
+check("recover: ردیفِ سررسیدشده دوباره زمان‌بندی شد", _count == 1, str(_count))
+check("recover: پیامِ کهنه پاک شد",
+      _deleted2 == [(CHAT, [9010])], repr(_deleted2))
+check("recover: فایل خالی شد", _rows2 == [], repr(_rows2))
+
+# --- ردیفِ خیلی کهنه (بیش از ۶ ساعت) دنبال نمی‌شود -----------------------
+_cleanup._save([{"chat_id": CHAT, "message_id": 9020,
+                 "due": time.time() - _cleanup.STALE_SECONDS - 10}])
+
+
+async def _stale_case():
+    _bot = _Bot(_Client(_UsersUserFull(_FullUser(), [])))
+    _count = _cleanup.recover(_bot, None)
+    await asyncio.sleep(0.1)
+    return _count, _bot.client.deleted
+
+
+_stale_count, _stale_deleted = asyncio.run(_stale_case())
+check("ردیفِ خیلی کهنه دوباره اجرا نمی‌شود",
+      _stale_count == 0 and _stale_deleted == [],
+      f"{_stale_count} / {_stale_deleted}")
+
+# --- هشدارِ واقعی هم در همین مسیر ثبت می‌شود ---------------------------
+_cleanup.FILE = Path(_TMP) / "cleanup_case2.json"
+try:
+    _cleanup.FILE.unlink()
+except OSError:
+    pass
+_c_client = _Client(_UsersUserFull(_FullUser(about="سکس", channel_id=None), []))
+_c_bot = _Bot(_c_client)
+_run(guard.guard_message(_c_bot, _Event(), CHAT, 990, _Sender(990), 95))
+_rows = _cleanup._load()
+check("کارتِ هشدار در مسیرِ اختصاصی ثبت شد",
+      len(_rows) == 1 and _rows[0]["message_id"] == 1, repr(_rows))
+check("سرویسِ عمومیِ ربات هم ثبت شد (پشتیبان)",
+      len(_c_bot.notice_cleanup.scheduled) == 1,
+      repr(_c_bot.notice_cleanup.scheduled))
+try:
+    _cleanup.FILE.unlink()
+except OSError:
+    pass
+
 print("\n----------------------------------------")
 print(f"PASS={PASS}  FAIL={FAIL}")
 sys.exit(0 if FAIL == 0 else 1)
