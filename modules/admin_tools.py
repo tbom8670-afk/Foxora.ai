@@ -29,7 +29,6 @@ from modules.time_utils import TEHRAN, now_local
 # نامِ داخلیِ هم‌نامِ قبلی برای سازگاری با ارجاع‌های موجود و تست‌ها.
 _TEHRAN = TEHRAN
 
-from modules.owner_check import is_global_owner
 from modules.admin_storage import is_admin
 from modules.group_storage import get_group_owner
 from modules.owner_check import get_owner

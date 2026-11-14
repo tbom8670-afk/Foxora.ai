@@ -362,7 +362,7 @@ _FA_EN_HINTS = {
     "پل": "bridge", "جاده": "road", "تپه": "hill", "آبشار": "waterfall",
     "پلنگ": "leopard", "پلنگ صورتی": "pink panther", "پلنگ برفی": "snow leopard",
     "یوزپلنگ": "cheetah", "ببر": "tiger", "شیر": "lion",
-    "رودخانه": "river", "اقیانوس": "ocean", "لاکپشت": "turtle", "کوسه": "shark",
+    "رودخانه": "river", "اقیانوس": "ocean", "کوسه": "shark",
     "دلفین": "dolphin", "نهنگ": "whale", "خرچنگ": "crab", "پروانه": "butterfly",
     "زنبور": "bee", "مورچه": "ant", "عنکبوت": "spider", "مار": "snake",
     "سوسمار": "lizard", "تمساح": "crocodile", "گوزن": "deer", "گورخر": "zebra",
@@ -372,7 +372,7 @@ _FA_EN_HINTS = {
     "ماهی قرمز": "goldfish", "اختاپوس": "octopus", "ستاره دریایی": "starfish",
     "لاکپشت دریایی": "sea turtle", "شاهین": "falcon", "فلامینگو": "flamingo",
     "آسمان": "sky", "دریا": "sea", "جنگل": "forest", "پرنده": "bird",
-    "ماهی": "fish", "اسب": "horse", "ببر": "tiger", "شیر": "lion",
+    "ماهی": "fish", "اسب": "horse",
     "خرس": "bear", "گرگ": "wolf", "روباه": "fox", "پاندا": "panda",
     "سنجاب": "squirrel", "خرگوش": "rabbit", "فیل": "elephant",
     "زرافه": "giraffe", "کانگورو": "kangaroo", "پنگوئن": "penguin",
@@ -384,7 +384,7 @@ _FA_EN_HINTS = {
 # این‌ها «حساس» هستند: باید عبارتِ انگلیسیِ کاملِ شخص را به‌عنوانِ anchor
 # بیاورند تا تصاویرِ واقعیِ همان شخص (نه فیلم/مکان/شباهت) انتخاب شوند.
 _FA_PEOPLE_HINTS = {
-    "بروسلی": "bruce lee", "بروس لی": "bruce lee", "بروسلی": "bruce lee",
+    "بروسلی": "bruce lee", "بروس لی": "bruce lee",
     "رونالدو": "cristiano ronaldo", "کریستیانو رونالدو": "cristiano ronaldo",
     "تتلو": "amir tataloo", "امیر تتلو": "amir tataloo",
     "امیر تاتالو": "amir tataloo", "تاتالو": "amir tataloo",
@@ -513,7 +513,6 @@ def _strongly_relevant(title, tags, url, keywords, english_hint):
 
 def _search_openverse(query, limit):
     """جستجو در Openverse؛ برمی‌گرداند لیستِ (url, title, tags)."""
-    from urllib.parse import quote
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -548,7 +547,6 @@ def _search_wikimedia(query, limit):
     برایِ عبارت‌هایِ فارسی که Openverse نتیجه نمی‌دهد، منبعِ دوم است.
     برمی‌گرداند لیستِ (url, title, []).
     """
-    from urllib.parse import quote
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -585,7 +583,6 @@ def _search_wikipedia_topic(query, limit=None):
     نشد (یا ویکی در دسترس نبود/rate-limit شد)، لیستِ خالی برمی‌گردد تا
     fallback به منابعِ دیگر انجام شود.
     """
-    from urllib.parse import quote
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
