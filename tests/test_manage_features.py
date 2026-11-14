@@ -1671,6 +1671,83 @@ def test_07f_timed_single_status_message():
     check("بعد از ری‌استارت پیام وضعیت تازه ساخته نشد", sent2 == [], sent2)
 
 
+def test_07g_timed_status_when_send_returns_no_id():
+    """اگر ``send_message`` شناسه برنگرداند، باز هم فقط **یک** پیام وضعیت ساخته شود.
+
+    باگِ واقعیِ کارفرما: پیام «🧹 شروع پاکسازی پیام های زماندار» سه بار
+    می‌آمد، چون شناسهٔ پیامِ وضعیت درنمی‌آمد و هر انتشار یک پیام تازه
+    می‌ساخت.
+    """
+    print("\n### ۷ز) پیام وضعیت وقتی ارسال شناسه ندارد")
+
+    def _make_bot(chat_id, with_history):
+        chat = FakeChat(chat_id, locked=False)
+        bot = FakeBot(chat)
+        client = bot.client
+        original_send = client.send_message
+
+        async def send_without_id(chat_id_arg, text, formatting_entities=None,
+                                  **kwargs):
+            await original_send(chat_id_arg, text,
+                                formatting_entities=formatting_entities,
+                                **kwargs)
+            return None
+
+        client.send_message = send_without_id
+        if with_history:
+            async def get_messages(peer, limit=20):
+                rows = [type("Message", (),
+                             {"id": item[3], "message": item[1]})()
+                        for item in client.sent[-limit:]]
+                return list(reversed(rows))
+
+            client.get_messages = get_messages
+        return bot
+
+    # ---- الف) شناسه از تاریخچهٔ گروه پیدا می‌شود -------------------------
+    fresh()
+    chat_id = -(10 ** 12) - 983
+    bot = _make_bot(chat_id, with_history=True)
+    timed.start(chat_id, 30, actor_id=4242)
+    for message_id in range(9200, 9205):
+        timed.track_message(chat_id, message_id)
+
+    async def scenario_a():
+        for _ in range(3):
+            await timed_commands.ensure_status_message(bot, chat_id,
+                                                       logger=bot.logger)
+        await timed_commands.publish_status(bot, chat_id, deleted=2, failed=0,
+                                            elapsed=4, state="deleting",
+                                            logger=bot.logger)
+        await timed_commands.publish_status(bot, chat_id, deleted=5, failed=0,
+                                            elapsed=7, state="done",
+                                            logger=bot.logger)
+        return list(bot.client.sent), list(bot.client.edits)
+
+    sent, edits = run(scenario_a())
+    check("بدونِ شناسه: فقط یک پیام وضعیت ساخته شد", len(sent) == 1, len(sent))
+    check("بدونِ شناسه: همان پیام ویرایش شد", len(edits) >= 1, len(edits))
+    check("بدونِ شناسه: شناسه از تاریخچه روی رکورد ثبت شد",
+          (timed.get_record(chat_id) or {}).get("status_message_id") == sent[0][3],
+          (timed.get_record(chat_id) or {}).get("status_message_id"))
+
+    # ---- ب) حتی تاریخچه هم جواب ندهد ⇒ پیام تازه‌تری ساخته نمی‌شود -------
+    fresh()
+    chat_id2 = -(10 ** 12) - 984
+    bot2 = _make_bot(chat_id2, with_history=False)
+    timed.start(chat_id2, 30, actor_id=4242)
+
+    async def scenario_b():
+        for _ in range(4):
+            await timed_commands.ensure_status_message(bot2, chat_id2,
+                                                       logger=bot2.logger)
+        return list(bot2.client.sent)
+
+    sent_b = run(scenario_b())
+    check("شناسهٔ نامعلوم: بیشتر از یک پیام ساخته نمی‌شود", len(sent_b) == 1,
+          len(sent_b))
+
+
 def test_08_report_flow():
     print("\n### ۸) گزارش: معتبر، بدون ریپلای، خود، تکراری، ۷ ثانیه")
     fresh()

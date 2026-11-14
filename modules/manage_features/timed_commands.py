@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Optional
 
 from modules.group_id import normalize_group_id
 from modules.manage_features import access, storage, texts, timed
@@ -145,6 +146,67 @@ def status_id(chat_id):
 #: قفلِ ساختِ پیام وضعیت به‌ازای هر گروه — جلوگیری از پیام‌های تکراری.
 _ENSURE_LOCKS: dict = {}
 
+#: گروه‌هایی که یک‌بار پیام وضعیت فرستادند ولی شناسه‌اش به دست نیامد.
+#: دیگر پیام تازه‌ای نمی‌سازیم (کاربر به‌جای یک کارت، سه کارت نبیند).
+_STATUS_FAILED: set = set()
+
+
+def _sent_id(sent) -> Optional[int]:
+    """شناسهٔ پیام از نتیجهٔ ارسال — با همان استخراج‌کنندهٔ سرویسِ ربات."""
+    try:
+        from modules.notice_cleanup import extract_sent_id
+        found = extract_sent_id(sent)
+        if found:
+            return int(found)
+    except Exception:                                # noqa: BLE001
+        pass
+    value = getattr(sent, "id", None)
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+async def _locate_status(bot, chat_id, text, record=None, logger=None):
+    """اگر ارسال شناسه برنگرداند، همان پیام را از تاریخچهٔ کوتاه پیدا می‌کند.
+
+    بعضی لفافه‌های ارسال در سروش ``Message`` برنمی‌گردانند؛ در آن حالت
+    شناسهٔ پیامِ وضعیت را از ۲۰ پیامِ آخرِ همان گروه می‌گیریم تا پیام
+    **ویرایش** شود و کارتِ تازه ساخته نشود.
+    """
+    if not text:
+        return None
+    try:
+        peer = timed.resolve_peer(bot, chat_id, record)
+    except Exception:                                # noqa: BLE001
+        peer = None
+    try:
+        history = await asyncio.wait_for(
+            bot.client.get_messages(peer if peer is not None else chat_id,
+                                    limit=20),
+            timeout=timed.RPC_TIMEOUT)
+    except Exception as error:                       # noqa: BLE001
+        if logger is not None:
+            try:
+                logger.log_error(
+                    f"TIMED STATUS LOCATE FAILED chat_id={chat_id} "
+                    f"error={error!r}")
+            except Exception:                        # noqa: BLE001
+                pass
+        return None
+    if history is None:
+        return None
+    if not isinstance(history, (list, tuple)):
+        history = [history]
+    wanted = str(text).strip()
+    for message in history:
+        body = getattr(message, "message", None) or getattr(message, "text", None)
+        if body is None or str(body).strip() != wanted:
+            continue
+        found = getattr(message, "id", None)
+        if isinstance(found, int) and found > 0:
+            return found
+    return None
+
 
 def _message_key(chat_id):
     return storage.group_key(chat_id)
@@ -164,6 +226,8 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
       بخورد، پیام دوم ساخته نشود.
     """
     key = _message_key(chat_id)
+    if key in _STATUS_FAILED:
+        return None
     in_memory = _STATUS.get(key)
     if in_memory:
         return in_memory
@@ -208,9 +272,22 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
                 except Exception:                    # noqa: BLE001
                     pass
             return None
-        message_id = getattr(sent, "id", None)
+        message_id = _sent_id(sent)
         if message_id is None:
+            # 🔁 راهِ دوم: پیدا کردنِ همان پیام در تاریخچهٔ گروه
+            message_id = await _locate_status(bot, chat_id, payload[0],
+                                              fresh, logger)
+        if message_id is None:
+            _STATUS_FAILED.add(key)
+            if logger is not None:
+                try:
+                    logger.log_error(
+                        f"TIMED STATUS ID UNKNOWN chat_id={chat_id} "
+                        "action=no_more_status_messages")
+                except Exception:                    # noqa: BLE001
+                    pass
             return None
+        _STATUS_FAILED.discard(key)
         return register_status(chat_id, message_id)
 
 
@@ -446,6 +523,8 @@ def reset_all(chat_id=None):
         _CHOICES.clear()
         _STATUS.clear()
         _ENSURE_LOCKS.clear()
+        _STATUS_FAILED.clear()
     else:
         clear_choice(chat_id)
         _STATUS.pop(_key(chat_id), None)
+        _STATUS_FAILED.discard(_key(chat_id))
