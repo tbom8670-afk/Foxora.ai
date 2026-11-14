@@ -72,7 +72,7 @@ def _import_json_once():
     if not _USE_SQLITE:
         return
     marker = "banned_users_json_import_v1"
-    if runtime_db.meta_get(marker):
+    if runtime_db.meta_flag(marker):
         return
     existing = runtime_db.query_one("SELECT COUNT(*) FROM banned_users")[0]
     if existing:

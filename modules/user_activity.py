@@ -36,7 +36,7 @@ def _import_json_once():
     if not _USE_SQLITE:
         return
     marker = "user_activity_json_import_v1"
-    if runtime_db.meta_get(marker):
+    if runtime_db.meta_flag(marker):
         return
     if runtime_db.query_one("SELECT COUNT(*) FROM user_activity")[0]:
         runtime_db.meta_set(marker, "existing-db")

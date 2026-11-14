@@ -187,7 +187,7 @@ def _ensure_admin_log_sqlite():
     if not _USE_SQLITE_LOG:
         return
     marker = "admin_log_json_import_v1"
-    if runtime_db.meta_get(marker):
+    if runtime_db.meta_flag(marker):
         return
     existing = runtime_db.query_one("SELECT COUNT(*) FROM admin_events")[0]
     if existing:

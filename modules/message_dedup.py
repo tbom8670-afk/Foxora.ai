@@ -31,6 +31,9 @@ _lock = threading.RLock()
 #: key → (زمانِ پردازش، اثرانگشتِ متن)
 _seen: "OrderedDict[tuple, tuple]" = OrderedDict()
 
+_SWEEP_INTERVAL = 5.0
+_last_sweep = 0.0
+
 #: شمارنده‌ها (فقط برای تست/گزارش؛ رفتار را عوض نمی‌کنند)
 COUNTERS = {"checked": 0, "duplicates": 0, "skipped_flag": 0}
 
@@ -115,8 +118,12 @@ def is_duplicate(chat_id, message_id, text=None) -> bool:
         _seen.move_to_end(key)
         while len(_seen) > limit:
             _seen.popitem(last=False)
-        # پاک‌سازیِ تنبلِ کلیدهای کهنه تا حافظه بی‌دلیل بزرگ نماند.
-        if len(_seen) > 16:
+        # پاک‌سازیِ تنبلِ کلیدهای کهنه تا حافظه بی‌دلیل بزرگ نماند. پیمایشِ
+        # کلِ جدول برای «هر» پیام گران بود؛ چند ثانیه یک‌بار کافی است، چون
+        # تازگیِ هر کلید همان بالا هنگامِ خواندن بررسی می‌شود.
+        global _last_sweep
+        if len(_seen) > 16 and now - _last_sweep >= _SWEEP_INTERVAL:
+            _last_sweep = now
             stale = [item for item, at in _seen.items() if now - at[0] > ttl]
             for item in stale:
                 _seen.pop(item, None)
@@ -125,8 +132,10 @@ def is_duplicate(chat_id, message_id, text=None) -> bool:
 
 def reset() -> None:
     """پاک‌کردنِ کاملِ حالت (فقط تست)."""
+    global _last_sweep
     with _lock:
         _seen.clear()
+        _last_sweep = 0.0
         for key in COUNTERS:
             COUNTERS[key] = 0
 

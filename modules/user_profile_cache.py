@@ -102,6 +102,11 @@ def prune_to(limit):
 
 
 def clear():
+    try:
+        from modules import full_user_shared
+        full_user_shared.clear()
+    except Exception:
+        pass
     _CACHE.clear()
     _INFLIGHT.clear()
     _LAST_CALL.clear()

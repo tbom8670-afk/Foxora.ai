@@ -61,11 +61,25 @@ def _read_owner_file(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+_SAME_PATH_CACHE: dict = {}
+
+
 def _same_path(first: Path, second: Path) -> bool:
+    # get_owner() runs several times per incoming message.  Resolving both
+    # paths costs a chain of lstat() calls each time, while the answer for a
+    # given pair of paths does not change during the process lifetime.
+    key = (str(first), str(second))
+    cached = _SAME_PATH_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
-        return first.resolve() == second.resolve()
+        result = first.resolve() == second.resolve()
     except OSError:
-        return str(first) == str(second)
+        result = str(first) == str(second)
+    if len(_SAME_PATH_CACHE) > 64:
+        _SAME_PATH_CACHE.clear()
+    _SAME_PATH_CACHE[key] = result
+    return result
 
 
 def _sync_runtime_owner(owner: Dict[str, Any], runtime_file: Path) -> bool:

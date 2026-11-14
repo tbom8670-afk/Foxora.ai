@@ -238,7 +238,7 @@ async def _resolve_channel(bot, channel_id, access_hash=None):
     return None
 
 
-async def _fetch(bot, user) -> Optional[dict]:
+async def _fetch(bot, user, *, fresh: bool = False) -> Optional[dict]:
     """یک‌بار خواندنِ کامل پروفایل و کانالِ متصل به آن."""
     client = getattr(bot, "client", None)
     if client is None:
@@ -268,8 +268,11 @@ async def _fetch(bot, user) -> Optional[dict]:
 
     await _throttle()
     try:
-        full = await asyncio.wait_for(
-            client(GetFullUserRequest(request_input)), timeout=fetch_timeout()
+        # همان RPC با «لینک بیو» مشترک است (یک رفت‌وبرگشت برای هر دو).
+        from modules import full_user_shared
+        full = await full_user_shared.get_full_user(
+            client, lambda: GetFullUserRequest(request_input),
+            getattr(user, "id", None), timeout=fetch_timeout(), fresh=fresh,
         )
     except asyncio.TimeoutError:
         _log(bot, "getFullUser timeout", error=True)
@@ -346,7 +349,7 @@ async def snapshot(bot, user, *, force: bool = False,
         if entry and not force and (time.time() - entry.get("ts", 0)) < age_limit:
             return entry
         async with _loop_semaphore():
-            fresh = await _fetch(bot, user)
+            fresh = await _fetch(bot, user, fresh=force)
         if fresh is None:
             _retry_after[key] = time.time() + error_retry_seconds()
             return entry
@@ -398,6 +401,11 @@ async def channel_details(bot, channel_id, access_hash=None) -> dict:
 def invalidate(user_id) -> None:
     """پاک‌کردن کشِ یک کاربر (برای بررسی اجباری در پیام بعدی)."""
     _cache.pop(str(user_id), None)
+    try:
+        from modules import full_user_shared
+        full_user_shared.invalidate(user_id)
+    except Exception:
+        pass
 
 
 def clear() -> None:

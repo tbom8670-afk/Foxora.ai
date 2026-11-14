@@ -275,6 +275,26 @@ def is_contentful(text):
     return False
 
 
+_COOKED_MARKERS = None
+
+
+def _cooked_markers():
+    """``(marker, normalized, normalized-without-spaces)`` — built once.
+
+    The marker list is a constant; normalising all of it again for every
+    incoming message was the single largest CPU cost of the spam check.
+    """
+    global _COOKED_MARKERS
+    if _COOKED_MARKERS is None:
+        rows = []
+        for marker in _AD_MARKERS:
+            cooked = normalize_text(marker)
+            if cooked:
+                rows.append((marker, cooked, cooked.replace(" ", "")))
+        _COOKED_MARKERS = tuple(rows)
+    return _COOKED_MARKERS
+
+
 def looks_promotional(text):
     raw = str(text or "")
     if "🔞" in raw:
@@ -283,9 +303,8 @@ def looks_promotional(text):
     if not normalized:
         return False
     compact = compact_text(normalized)
-    for marker in _AD_MARKERS:
-        cooked = normalize_text(marker)
-        if cooked and (cooked in normalized or cooked.replace(" ", "") in compact):
+    for _marker, cooked, squeezed in _cooked_markers():
+        if cooked in normalized or squeezed in compact:
             return True
     if _PROMO_RE.search(normalized):
         return True
@@ -296,9 +315,8 @@ def markers_in(text):
     normalized = normalize_text(text)
     compact = compact_text(normalized)
     found = []
-    for marker in _AD_MARKERS:
-        cooked = normalize_text(marker)
-        if cooked and (cooked in normalized or cooked.replace(" ", "") in compact):
+    for marker, cooked, squeezed in _cooked_markers():
+        if cooked in normalized or squeezed in compact:
             found.append(marker)
     return found
 

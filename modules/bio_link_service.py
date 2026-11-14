@@ -233,8 +233,12 @@ async def fetch_about(bot, user, *,
 
     async def _fetch_full_user():
         try:
-            full = await asyncio.wait_for(
-                client(GetFullUserRequest(request_input)), timeout=fetch_timeout()
+            # همان RPC با «پروفایل گارد» مشترک است (یک رفت‌وبرگشت برای هر دو).
+            from modules import full_user_shared
+            full = await full_user_shared.get_full_user(
+                client, lambda: GetFullUserRequest(request_input),
+                getattr(user, "id", None), timeout=fetch_timeout(),
+                fresh=not use_cache,
             )
         except asyncio.TimeoutError:
             return STATUS_ERROR, None

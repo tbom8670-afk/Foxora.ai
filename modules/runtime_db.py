@@ -178,6 +178,32 @@ def meta_get(key, default=None):
     return row[0] if row else default
 
 
+_FLAG_CONN = None
+_FLAG_SEEN = set()
+
+
+def meta_flag(key) -> bool:
+    """Truthy ``meta_get`` for one-time markers, remembered per connection.
+
+    Import markers such as ``*_json_import_v1`` only ever go from unset to
+    set.  Callers on the message path asked SQLite for them on every single
+    message; once a marker has been seen set on the current connection the
+    answer is served from memory.  A reopened/replaced database starts clean.
+    """
+    global _FLAG_CONN
+    conn = connection()
+    if conn is not _FLAG_CONN:
+        _FLAG_CONN = conn
+        _FLAG_SEEN.clear()
+    key = str(key)
+    if key in _FLAG_SEEN:
+        return True
+    if meta_get(key):
+        _FLAG_SEEN.add(key)
+        return True
+    return False
+
+
 def meta_set(key, value):
     execute(
         "INSERT INTO storage_meta(key,value) VALUES(?,?) "

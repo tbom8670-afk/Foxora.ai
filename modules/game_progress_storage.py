@@ -28,7 +28,7 @@ class SeenProgressStore:
 
     def _import_once(self):
         marker = f"{self.namespace}_json_import_v1"
-        if runtime_db.meta_get(marker):
+        if runtime_db.meta_flag(marker):
             return
         existing = runtime_db.query_one(
             "SELECT COUNT(*) FROM runtime_kv WHERE namespace=?",
