@@ -227,8 +227,8 @@ def main() -> int:
     check("قالب هشدار شامل انجام‌دهنده است",
           "■ انجام دهنده : هوش مصنوعی" in warn)
     check("قالب هشدار شامل درصد تشخیص است", "■ درصد تشخیص : 85/11" in warn)
-    check("قالب هشدار یادآوریِ حذف دارد",
-          "■ این هشدار ۶۰ ثانیهٔ دیگر خودکار پاک می‌شود" in warn)
+    check("کارت هیچ خطِ اضافه‌ای ندارد",
+          len([ln for ln in warn.split("\n") if ln]) == 5, repr(warn))
 
     # ساختارِ entityها: نقل‌قول فقط روی سرصفحه، Bold فقط روی ارقام
     warn_text, warn_entities = texts.warn_payload("@oskwma", 1, threshold=5,
@@ -254,7 +254,8 @@ def main() -> int:
           any(_slice(b) == "85/11" for b in bolds))
     check("انجام‌دهنده Bold نیست",
           all(_slice(b) not in ("هوش مصنوعی", lines[4]) for b in bolds))
-    check("یادآوری Bold نیست", all(_slice(b) != lines[-1] for b in bolds))
+    check("خطِ آخر (درصد تشخیص) همان خطِ عکس است",
+          lines[-1] == "■ درصد تشخیص : 85/11")
 
     # درصدِ تشخیص از امتیاز خام
     check("درصد تشخیص از امتیاز ۱۳ برابر ۱۰۰ می‌شود",

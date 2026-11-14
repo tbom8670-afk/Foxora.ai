@@ -152,7 +152,6 @@ PYTHONPATH=. python3 tests/test_manage_features.py      # 294 پاس
 ■ تعداد اخطار : 1/5                            ← ■ + متنِ ساده + ارقام Bold
 ■ انجام دهنده : هوش مصنوعی                    ← ■ + متنِ ساده
 ■ درصد تشخیص : 85/11                          ← ■ + متنِ ساده + ارقام Bold
-■ این هشدار ۶۰ ثانیهٔ دیگر خودکار پاک می‌شود    ← یادآوری برای متخلف
 ```
 
 * **نقل‌قول:** فقط خطِ اول. سرصفحه دیگر Bold نیست.
@@ -169,8 +168,9 @@ PYTHONPATH=. python3 tests/test_manage_features.py      # 294 پاس
   امتیاز خام در `detector.evaluate()["score"]` است و همان‌جا به
   `texts.warn_payload(..., score=score)` داده می‌شود. عددِ دوم بعد از «/»
   همان **امتیازِ خام** است (مثلِ «85/11» = ۸۵٪ تشخیص، امتیاز ۱۱).
-* **یادآوری:** خطِ آخر با `texts.WARN_REMINDER`؛ برای حذفِ آن
-  `warn_payload(..., reminder=None)` یا خالی‌کردنِ `WARN_REMINDER`.
+* **بدونِ خطِ اضافه:** کارفرما گفت هیچ خطِ اضافه‌ای داخلِ متن نباشد؛
+  `texts.WARN_REMINDER` پیش‌فرض **خالی** است. اگر روزی خواست، همان
+  متغیر را پر کن (یا `warn_payload(..., reminder="…")`).
 * API: `texts.warn_payload(user, count, reason, threshold, *, percent=None,
   score=None, reminder=...)` → `(متن, entityها)`.
 

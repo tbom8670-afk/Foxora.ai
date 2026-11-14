@@ -343,8 +343,7 @@ def test_warn_template():
         "\n"
         "■ تعداد اخطار : 1/5\n"
         "■ انجام دهنده : هوش مصنوعی\n"
-        "■ درصد تشخیص : 85/11\n"
-        "■ این هشدار ۶۰ ثانیهٔ دیگر خودکار پاک می‌شود"
+        "■ درصد تشخیص : 85/11"
     )
     check("متنِ هشدار دقیقاً همان عکس است", text == expected, repr(text))
     kinds = [type(e).__name__ for e in entities]
@@ -373,10 +372,8 @@ def test_warn_template():
           "■ تعداد اخطار : 3/7" in texts.render_warn("@x", 3, threshold=7))
     check("دلیل قابلِ تغییر است",
           "دلیل : کلمه ممنوعه" in texts.render_warn("@x", 2, "کلمه ممنوعه"))
-    check("یادآوریِ حذف در متن هست",
-          "۶۰ ثانیه" in text)
-    check("یادآوری قابلِ حذف است",
-          "۶۰ ثانیه" not in texts.render_warn("@x", 2, reminder=None))
+    check("کارت هیچ خطِ اضافه‌ای ندارد", len(text.split("\n")) == 6
+          and text.split("\n")[2] == "")
 
 
 def test_bot_reply_spam():

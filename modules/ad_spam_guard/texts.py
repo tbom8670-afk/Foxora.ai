@@ -89,7 +89,6 @@ CANCELLED_MESSAGE = "▫️لغو شد."
 #   ■ تعداد اخطار : 1/5                        ← فقط ارقام Bold
 #   ■ انجام دهنده : هوش مصنوعی                 ← ساده
 #   ■ درصد تشخیص : 85/32                       ← فقط ارقام Bold
-#   ■ این هشدار ۶۰ ثانیهٔ دیگر پاک می‌شود        ← یادآوری (ساده)
 WARN_REASON_DEFAULT = "هرزنامه\u200c تبلیغات"
 WARN_HEADER = "⛔ کاربر  {user}"
 WARN_BODY = "پیام شما پاک شد | دلیل : {reason}"
@@ -100,9 +99,10 @@ WARN_PERCENT_LABEL = "درصد تشخیص"
 WARN_ACTOR_NAME = "هوش مصنوعی"
 #: آستانهٔ پیش‌فرض وقتی سیستمِ اخطارِ ربات در دسترس نیست.
 WARN_DEFAULT_THRESHOLD = 5
-#: یادآوریِ کوتاه که «همین حالا» به چشمِ متخلف بیاید (چون کارت خودش
-#: ۶۰ ثانیه بعد پاک می‌شود).
-WARN_REMINDER = "این هشدار ۶۰ ثانیهٔ دیگر خودکار پاک می‌شود"
+#: خطِ اضافهٔ اختیاری در پایانِ کارت. **پیش‌فرض خالی است** (کارفرما گفت هیچ
+#: خطِ اضافه‌ای داخلِ متن نباشد)؛ فقط اگر خواست پرش کن: مثلاً
+#: ``texts.WARN_REMINDER = "…"``.
+WARN_REMINDER = ""
 
 #: متنِ کاملِ هشدار (بدونِ entity) — برای تست/لاگ/سازگاریِ عقب‌رو.
 WARN_TEMPLATE = (
@@ -111,8 +111,7 @@ WARN_TEMPLATE = (
     "\n"
     + WARN_BULLET + WARN_COUNT_LABEL + " : {count}/{threshold}" + "\n"
     + WARN_BULLET + WARN_ACTOR_LABEL + " : " + WARN_ACTOR_NAME + "\n"
-    + WARN_BULLET + WARN_PERCENT_LABEL + " : {percent}/{score}" + "\n"
-    + WARN_BULLET + WARN_REMINDER
+    + WARN_BULLET + WARN_PERCENT_LABEL + " : {percent}/{score}"
 )
 
 #: ارقامی که داخلِ خطوط Bold می‌شوند (مثلِ «1/5» و «85/32»).
@@ -159,8 +158,8 @@ def render_warn(user: str, count: int,
         count=count, threshold=threshold,
         percent=percent, score=score,
     )
-    if not reminder:
-        text = "\n".join(text.split("\n")[:-1])
+    if reminder:
+        text = text + "\n" + WARN_BULLET + str(reminder)
     return text
 
 
