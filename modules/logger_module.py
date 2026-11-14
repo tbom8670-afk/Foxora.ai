@@ -71,7 +71,66 @@ _NOISY_PREFIXES = (
     "DUPLICATE GIF DETECTED",
     "GIF DELETE SCHEDULED",
     "SPAM LOCK SET",
+    # --- Healthy-path diagnostics (one or more lines per RPC / message). ---
+    # Failures, timeouts and real slowness are still logged; see
+    # ``_is_noisy`` below for the conditional ones.
+    "CONN TRACE AWAIT START",
+    "CONN TRACE SOCKET SEND",
+    "PERFORMANCE SNAPSHOT",
+    "ACCUMULATION REPORT",
+    "RPC WINDOW",
+    "MEMORY GUARD OK",
+    "PROFILE GUARD snapshot",
+    "AUTO_NOTICE_CREATED",
+    "AUTO_NOTICE_TIMER_STARTED",
+    "AUTO_NOTICE_DELETE_TRIGGERED",
+    "GOVERNOR ACQUIRE",
+    "OUTGOING RPC NOT_SUPPORTED CACHED ",
+    "MODERATION QUEUE ENQUEUED",
+    "MODERATION WORKER START",
+    "MODERATION RPC START",
+    # These two also copied users' message text into the log.
+    "EDITED MESSAGE INCOMING",
+    "EDITED MESSAGE DETECTED",
 )
+
+# Lines that are noise only while everything is healthy: the line is dropped
+# when the marker is present, and kept (failure / leftover) otherwise.
+_NOISY_WHEN_OK = (
+    ("CONN TRACE RESPONSE", " result=success"),
+    ("BIO LINK CHECK", " status=ok"),
+    ("AUTO_NOTICE_DELETE_RESULT", " remaining=0"),
+    ("MODERATION RPC FINISHED", " result=success"),
+)
+
+# Timing lines that fire on every ordinary ~250 ms round trip.  They are kept
+# only when the measured value shows a real stall.
+_SLOW_LOG_MS = float(os.environ.get("BOT_SLOW_LOG_MS", "1000"))
+_NOISY_BELOW_MS = (
+    ("RPC GOVERNOR WAIT", " wait_ms="),
+    ("QUEUE WAIT TIME", " queue_wait_ms="),
+    ("OUTGOING RPC SLOW", " total_ms="),
+)
+
+
+def _is_noisy(text: str) -> bool:
+    """True when ``text`` is routine diagnostics that production can skip."""
+    if text.startswith(_NOISY_PREFIXES):
+        return True
+    for prefix, marker in _NOISY_WHEN_OK:
+        if text.startswith(prefix):
+            return marker in text
+    for prefix, field in _NOISY_BELOW_MS:
+        if text.startswith(prefix):
+            start = text.find(field)
+            if start < 0:
+                return False
+            raw = text[start + len(field):].split(" ", 1)[0]
+            try:
+                return float(raw) < _SLOW_LOG_MS
+            except ValueError:
+                return False
+    return False
 
 
 class _DroppingQueueHandler(QueueHandler):
@@ -232,7 +291,7 @@ class BotLogger:
 
     def log_info(self, message: str):
         text = str(message)
-        if not _VERBOSE and text.startswith(_NOISY_PREFIXES):
+        if not _VERBOSE and _is_noisy(text):
             return
         self.logger.info(text)
 

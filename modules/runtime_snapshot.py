@@ -146,6 +146,7 @@ NOTICE_GROWTH_DELTA = 5
 CACHE_GROWTH_DELTA = 10
 MEMORY_GROWTH_MB = 8.0
 ACCUMULATION_MEMORY_GROWTH_MB = 4.0
+ACCUMULATION_ROWS_DELTA = 500
 BOT_SENT_MESSAGES_MAX = 2000
 PEER_CACHE_MAX = 500
 
@@ -822,13 +823,24 @@ def detect_issues(current: Dict[str, Any], previous: Optional[Dict[str, Any]] = 
             elif metric.endswith("_ms"):
                 if delta < LAG_WARN_MS:
                     continue
-            elif delta <= 0:
+            elif delta < _growth_min_delta(metric):
+                # One extra task or one newly seen user is normal traffic,
+                # not a leak; only a real jump is worth an ERROR line.
                 continue
             lines.append(
                 f"GROWING STATE DETECTED metric={metric} "
                 f"previous={before} current={after} delta={delta if metric == 'memory_mb' or metric.endswith('_ms') else int(delta)}"
             )
     return lines
+
+
+def _growth_min_delta(metric: str) -> int:
+    """Smallest increase between two snapshots that counts as growth."""
+    if metric in ("pending_tasks", "active_tasks"):
+        return TASK_GROWTH_DELTA
+    if metric in CACHE_METRICS:
+        return CACHE_GROWTH_DELTA
+    return QUEUE_BACKLOG
 
 
 def detect_accumulation(
@@ -865,8 +877,12 @@ def detect_accumulation(
         if delta <= 0:
             continue
         if metric in CACHE_METRICS or metric.endswith("_size") or metric.endswith("_rows") or metric.endswith("_total"):
-            if delta < CACHE_GROWTH_DELTA and after < CACHE_GROWTH_DELTA * 5:
+            # Caches and tracking tables fill up with ordinary traffic; only
+            # a large 5-minute jump points at unbounded growth.
+            if delta < ACCUMULATION_ROWS_DELTA:
                 continue
+        elif delta < _growth_min_delta(metric):
+            continue
         lines.append(
             f"ACCUMULATION GROWTH metric={metric} previous={int(before)} "
             f"current={int(after)} delta={int(delta)}"
