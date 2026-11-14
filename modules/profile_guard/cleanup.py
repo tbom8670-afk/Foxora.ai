@@ -128,77 +128,244 @@ def _chat_target(bot, chat_id):
     return chat_id
 
 
+def _id_variants(chat_id):
+    """شکل‌های ممکنِ شناسهٔ گروه برای RPC حذف (خام و ``-100…``)."""
+    variants = []
+    try:
+        raw = int(chat_id)
+    except (TypeError, ValueError):
+        return [chat_id]
+    variants.append(raw)
+    # بعضی نسخه‌ها شناسهٔ کانال/گروه را بدونِ پیشوندِ -100 می‌گیرند.
+    text = str(raw)
+    if not text.startswith("-100") and len(text.lstrip("-")) >= 10:
+        try:
+            variants.append(int("-100" + text.lstrip("-")))
+        except ValueError:
+            pass
+    elif text.startswith("-100") and len(text) > 10:
+        try:
+            variants.append(int(text[4:]))
+        except ValueError:
+            pass
+    return variants
+
+
+def _targets(bot, chat_id):
+    """همهٔ مقصدهای ممکن برای حذف: peerِ ساخته‌شده و شناسه‌های خام."""
+    targets = []
+    peer = _chat_target(bot, chat_id)
+    if peer is not None:
+        targets.append(peer)
+    for value in _id_variants(chat_id):
+        if value not in targets:
+            targets.append(value)
+    return targets
+
+
 def _same_text(left, right) -> bool:
     if left is None or right is None:
         return False
     return str(left).strip() == str(right).strip()
 
 
-async def _locate_by_text(bot, chat_id, text) -> Optional[int]:
-    """پیامِ خودِ ربات را در انتهای همین گروه پیدا می‌کند (وقتی شناسه نداریم).
+#: پنجره‌های تاریخچه برای پیدا‌کردنِ پیام وقتی شناسه نداریم. اول پنجرهٔ کوچک
+#: (ارزان)، بعد پنجرهٔ بزرگ‌تر: در گروه‌های شلوغ کارت تا ۶۰ ثانیه بعد از ۲۰
+#: پیامِ آخر بیرون می‌افتد و همین باعث می‌شد حذف انجام نشود.
+LOCATE_LIMITS = (20, 50, 100)
 
-    بعضی نسخه‌ها/لفافه‌های ارسال، ``Message`` برنمی‌گردانند؛ در آن حالت
-    شناسهٔ پیام را از تاریخچهٔ کوتاهِ گروه پیدا می‌کنیم و همان را پاک می‌کنیم.
-    """
+
+async def _locate_by_text(bot, chat_id, text) -> Optional[int]:
+    """پیامِ خودِ ربات را در انتهای همین گروه پیدا می‌کند (وقتی شناسه نداریم)."""
     client = getattr(bot, "client", None)
     if client is None or not text:
         return None
-    try:
-        history = await client.get_messages(_chat_target(bot, chat_id), limit=20)
-    except Exception as error:
+    wanted = str(text).strip()
+    last_error = None
+    for limit in LOCATE_LIMITS:
+        for target in _targets(bot, chat_id)[:2]:
+            try:
+                history = await client.get_messages(target, limit=limit)
+            except Exception as error:  # noqa: BLE001
+                last_error = error
+                continue
+            # ``get_messages`` در بعضی نسخه‌ها یک ``Message`` تنها می‌دهد.
+            if history is None:
+                continue
+            if not isinstance(history, (list, tuple)):
+                history = [history]
+            for message in history:
+                body = (getattr(message, "message", None)
+                        or getattr(message, "text", None))
+                if not _same_text(body, wanted):
+                    continue
+                found = getattr(message, "id", None)
+                if isinstance(found, int) and found > 0:
+                    return found
+    if last_error is not None:
         _log(bot, f"history lookup failed chat_id={chat_id} "
-                  f"error={type(error).__name__}", error=True)
-        return None
-    # ``get_messages`` در بعضی نسخه‌ها یک ``Message`` تنها برمی‌گرداند، نه لیست.
-    if history is None:
-        return None
-    if not isinstance(history, (list, tuple)):
-        history = [history]
-    for message in history:
-        body = getattr(message, "message", None) or getattr(message, "text", None)
-        if not _same_text(body, text):
-            continue
-        found = getattr(message, "id", None)
-        if isinstance(found, int) and found > 0:
-            return found
+                  f"error={type(last_error).__name__}: "
+                  f"{str(last_error)[:120]}", error=True)
     return None
 
 
 async def _delete_now(bot, chat_id, message_id=None, text=None) -> bool:
+    """حذفِ پیام — همهٔ شکل‌های مقصد/شناسه امتحان می‌شود و خطا کامل لاگ می‌شود."""
     client = getattr(bot, "client", None)
     if client is None:
         return False
     target_id = message_id or await _locate_by_text(bot, chat_id, text)
     if not target_id:
+        _log(bot, f"no message id chat_id={chat_id} "
+                  f"text={'yes' if text else 'no'}", error=True)
         return False
-    try:
-        await client.delete_messages(int(chat_id), [int(target_id)])
-        return True
-    except Exception as error:
-        # پیام از قبل پاک شده باشد ⇒ خطا نیست.
-        name = type(error).__name__.lower()
-        if "notfound" in name or "message_ids_empty" in str(error).lower():
+    errors = []
+    for target in _targets(bot, chat_id):
+        try:
+            await client.delete_messages(target, [int(target_id)])
             return True
-        _log(bot, f"delete failed chat_id={chat_id} id={target_id} "
-                  f"error={type(error).__name__}", error=True)
-        return False
+        except Exception as error:  # noqa: BLE001
+            # پیام از قبل پاک شده باشد ⇒ خطا نیست.
+            name = type(error).__name__.lower()
+            raw = str(error).lower()
+            if "notfound" in name or "message_ids_empty" in raw:
+                return True
+            errors.append(f"{type(target).__name__}:{type(error).__name__}:"
+                          f"{str(error)[:80]}")
+    _log(bot, f"delete failed chat_id={chat_id} id={target_id} "
+              f"tries={len(errors)} errors={' | '.join(errors)[:300]}",
+         error=True)
+    return False
+
+
+#: شناسه‌هایی که همین حالا پیدا شده‌اند (تا مسیرِ حذف دوباره تاریخچه نخواند).
+_resolved: dict = {}
+
+
+def _resolved_key(chat_id, text) -> tuple:
+    return (str(chat_id), str(text or "").strip())
+
+
+async def _resolve_id(bot, chat_id, text, message_id=None) -> Optional[int]:
+    """شناسهٔ پیام را (اگر نداریم) همان اول پیدا و در ردیف ذخیره می‌کند."""
+    if message_id:
+        return int(message_id)
+    for delay in (0.0, 1.0, 3.0):
+        if delay:
+            await asyncio.sleep(delay)
+        found = await _locate_by_text(bot, chat_id, text)
+        if found:
+            _resolved[_resolved_key(chat_id, text)] = int(found)
+            try:
+                rows = _load()
+                for row in rows:
+                    if (str(row.get("chat_id")) == str(chat_id)
+                            and _same_text(row.get("text"), text)):
+                        row["message_id"] = int(found)
+                _save(rows)
+            except Exception:
+                pass
+            _log(bot, f"id resolved chat_id={chat_id} id={found}")
+            return found
+    return None
 
 
 async def _delete_after(bot, chat_id, message_id=None, delay: float = 0.0,
                         text=None) -> None:
     if delay > 0:
         await asyncio.sleep(delay)
+    target_id = message_id or _resolved.get(_resolved_key(chat_id, text))
     for attempt in range(1, RETRIES + 1):
-        if await _delete_now(bot, chat_id, message_id, text):
-            _forget(chat_id, message_id, text)
-            _log(bot, f"deleted chat_id={chat_id} id={message_id or '(by text)'} "
-                      f"attempt={attempt}")
+        if await _delete_now(bot, chat_id, target_id, text):
+            _forget(chat_id, target_id, text)
+            _log(bot, f"deleted chat_id={chat_id} "
+                      f"id={target_id or '(by text)'} attempt={attempt}")
             return
+        if target_id is None:
+            target_id = await _resolve_id(bot, chat_id, text)
         if attempt < RETRIES:
             await asyncio.sleep(RETRY_DELAY)
-    _forget(chat_id, message_id, text)
-    _log(bot, f"gave up chat_id={chat_id} id={message_id} text={'yes' if text else 'no'}",
-         error=True)
+    # ردیف را نگه می‌داریم تا جاروی دوره‌ای (``sweep_loop``) دوباره تلاش کند؛
+    # فقط اگر واقعاً متن هم نداشته باشیم رها می‌شود.
+    if text:
+        _log(bot, f"retry later chat_id={chat_id} "
+                  f"id={target_id} (sweeper will try again)", error=True)
+        return
+    _forget(chat_id, target_id, text)
+    _log(bot, f"gave up chat_id={chat_id} id={target_id} text=no", error=True)
+
+
+# ---------------------------------------------------------------------------
+# جاروی دوره‌ای — تضمینِ آخر
+# ---------------------------------------------------------------------------
+SWEEP_INTERVAL = 20.0
+#: جارو فقط ردیف‌هایی را می‌گیرد که از موعدشان این‌قدر گذشته باشد؛ وگرنه
+#: هم‌زمان با تایمرِ اصلی همان پیام را دوباره حذف می‌کرد.
+SWEEP_GRACE = 25.0
+_sweeper_task = None
+
+
+async def sweep(bot) -> int:
+    """ردیف‌های سررسیده‌ای که پاک نشده‌اند را دوباره حذف می‌کند."""
+    rows = _load()
+    if not rows:
+        return 0
+    now = time.time()
+    deleted = 0
+    for row in list(rows):
+        try:
+            due = float(row.get("due") or 0)
+        except (TypeError, ValueError):
+            continue
+        if due + SWEEP_GRACE > now:
+            continue
+        try:
+            chat_id = int(row.get("chat_id"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            message_id = int(row.get("message_id") or 0) or None
+        except (TypeError, ValueError):
+            message_id = None
+        text = row.get("text")
+        if not message_id and not text:
+            _forget(chat_id, None, None)
+            continue
+        if await _delete_now(bot, chat_id, message_id, text):
+            _forget(chat_id, message_id, text)
+            deleted += 1
+    return deleted
+
+
+async def sweep_loop(bot, logger=None, interval: float = SWEEP_INTERVAL) -> None:
+    """حلقهٔ جارو: هر ۲۰ ثانیه ردیف‌های جامانده را پاک می‌کند."""
+    _log(bot, f"notice sweeper started interval={interval:g}s")
+    while True:
+        try:
+            count = await sweep(bot)
+            if count:
+                _log(bot, f"swept pending notices count={count}")
+        except asyncio.CancelledError:  # pragma: no cover
+            raise
+        except Exception as error:  # noqa: BLE001
+            _log(bot, f"sweep failed error={type(error).__name__}: "
+                      f"{str(error)[:120]}", error=True)
+        await asyncio.sleep(interval)
+
+
+def start_sweeper(bot) -> None:
+    """جارو را یک‌بار (و فقط یک‌بار) برای این پروسه بالا می‌آورد."""
+    global _sweeper_task
+    if _sweeper_task is not None and not _sweeper_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        _sweeper_task = loop.create_task(sweep_loop(bot))
+    except Exception:
+        _sweeper_task = None
 
 
 def schedule(bot, chat_id, sent, *, ttl: Optional[float] = None,
@@ -206,8 +373,9 @@ def schedule(bot, chat_id, sent, *, ttl: Optional[float] = None,
     """پیامِ هشدار را برای حذف پس از ``ttl`` (پیش‌فرض ۶۰ ثانیه) ثبت می‌کند.
 
     اگر شناسهٔ پیام از نتیجهٔ ارسال درنیاید (بعضی لفافه‌های ارسال
-    ``Message`` برنمی‌گردانند) با ``text`` در تاریخچهٔ کوتاهِ گروه پیدا و
-    پاک می‌شود؛ پس حذف در هر حال انجام می‌شود.
+    ``Message`` برنمی‌گردانند) همان لحظه در پس‌زمینه با ``text`` پیدا و
+    ذخیره می‌شود — نه ۶۰ ثانیه بعد، که کارت در گروه‌های شلوغ از پنجرهٔ
+    تاریخچه بیرون می‌افتد.
 
     بدون await؛ یک تسکِ سبک برمی‌گرداند (برای تست) یا ``None``.
     """
@@ -229,10 +397,15 @@ def schedule(bot, chat_id, sent, *, ttl: Optional[float] = None,
         _save(rows)
     except Exception:
         pass
+    start_sweeper(bot)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:                      # خارج از لوپ (تست/استارتاپ)
         return None
+    if not message_id and text and delay >= 5:
+        # شناسه را همین حالا (در پس‌زمینه) قطعی کن تا موقعِ حذف، کارت از
+        # پنجرهٔ تاریخچه بیرون نیفتاده باشد.
+        loop.create_task(_resolve_id(bot, chat_id, text, message_id))
     return loop.create_task(
         _delete_after(bot, chat_id, message_id, delay, text))
 
@@ -242,6 +415,7 @@ def recover(bot, logger=None) -> int:
     rows = _load()
     # 🔎 نشانگرِ زنده‌بودنِ همین مسیر در استارتاپ (برای عیب‌یابی از روی لاگ)
     _log(bot, f"ready ttl={ttl_seconds()}s pending={len(rows)}")
+    start_sweeper(bot)
     if not rows:
         return 0
     try:
@@ -270,4 +444,5 @@ def recover(bot, logger=None) -> int:
 
 
 __all__ = ["FILE", "DEFAULT_TTL_SECONDS", "ttl_seconds", "message_id_of",
-           "schedule", "recover"]
+           "schedule", "recover", "sweep", "sweep_loop", "start_sweeper",
+           "LOCATE_LIMITS"]
