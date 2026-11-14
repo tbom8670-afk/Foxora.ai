@@ -169,6 +169,14 @@ class SlowProcessMonitor:
         # key -> count/max/latest event. Aggregating prevents a busy group from
         # retaining an unbounded list in memory while preserving all slow paths.
         self._batch: Dict[str, Dict[str, Any]] = {}
+        self._quiet_until = 0.0
+
+    def quiet_for(self, seconds: float) -> None:
+        """Ignore slow events for a while (restart warm-up is expected to be slow)."""
+        try:
+            self._quiet_until = time.monotonic() + max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            self._quiet_until = 0.0
 
     def _log_error(self, message: str) -> None:
         method = getattr(self.logger, "log_error", None)
@@ -223,6 +231,8 @@ class SlowProcessMonitor:
         except (TypeError, ValueError):
             return False
         if elapsed <= self.threshold_ms or self._closed:
+            return False
+        if self._quiet_until and time.monotonic() < self._quiet_until:
             return False
         if self._alert_task is None or self._alert_task.done():
             try:

@@ -2916,6 +2916,10 @@ class SoroushAntiSpamBot:
             _entry_seen[key] = (now, text_hash)
             return True
 
+        from modules.startup_ramp import StartupRamp
+        _startup_ramp = StartupRamp()
+        _startup_ramp_announced = [False, False]
+
         @self.client.on(events.NewMessage())
         @self.client.on(events.MessageEdited())
         async def new_message_handler(event):
@@ -3034,6 +3038,36 @@ class SoroushAntiSpamBot:
                 decision = None
             if decision is not None and decision.skip_heavy:
                 return
+            # 🐢 شروعِ نرم: پیام‌های انباشتهٔ زمانِ خاموشی یک‌جا روی ربات
+            # ریخته نمی‌شوند؛ با فاصله وارد می‌شوند. دستورها و پیوی صبر نمی‌کنند.
+            if (
+                _startup_ramp.active
+                and not getattr(event, "is_private", False)
+                and _startup_ramp.is_backlog(event)
+            ):
+                try:
+                    if not _startup_ramp_announced[0]:
+                        _startup_ramp_announced[0] = True
+                        _monitor = getattr(self, "performance_monitor", None)
+                        if _monitor is not None:
+                            _monitor.quiet_for(_startup_ramp.seconds + 15.0)
+                        self.logger.log_info(
+                            "STARTUP WARMUP BEGIN "
+                            f"seconds={_startup_ramp.seconds:g} "
+                            f"interval_ms={_startup_ramp.interval * 1000:g}"
+                        )
+                    await _startup_ramp.pace()
+                    if not _startup_ramp.active and not _startup_ramp_announced[1]:
+                        _startup_ramp_announced[1] = True
+                        self.logger.log_info(
+                            "STARTUP WARMUP END "
+                            f"paced={_startup_ramp.stats['paced']} "
+                            f"max_wait_ms={_startup_ramp.stats['max_wait_ms']:.0f}"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
             # فقط ترافیک عادی/ضداسپم در صف جدا می‌ماند تا موج اسپم event
             # loop را اشغال نکند.
             try:
