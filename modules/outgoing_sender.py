@@ -103,6 +103,71 @@ _SEND_PRIORITY = contextvars.ContextVar("outgoing_send_priority", default=None)
 # The low-level _call wrapper reads this to pick the right gate/bucket.
 _SEND_CHANNEL = contextvars.ContextVar("outgoing_send_channel", default="main")
 
+# 🎮 True while the current task is serving a game/fun message.  Under RPC
+# pressure, sends made in this context step aside for moderation/admin work
+# (see ``_defer_game_send``).  Deletes, bans and notices are never deferred.
+GAME_CONTEXT_VAR = contextvars.ContextVar("outgoing_game_context", default=False)
+
+
+def _game_defer_seconds():
+    """Longest a game send steps aside; 0 switches the behaviour off."""
+    try:
+        value = float(os.getenv("BOT_GAME_SEND_MAX_DEFER_SECONDS", "3"))
+    except (TypeError, ValueError):
+        value = 3.0
+    return max(0.0, min(15.0, value))
+
+
+GAME_DEFER_STATS = {"deferred": 0, "waited_ms": 0.0, "gave_up": 0}
+
+
+async def _defer_game_send(governor):
+    """Hold a game send back while more important RPCs are queued.
+
+    Returns the milliseconds waited.  Nothing is dropped: after the bound the
+    send continues through the normal, unchanged admission path.
+    """
+    limit = _game_defer_seconds()
+    if limit <= 0.0 or governor is None:
+        return 0.0
+    if not getattr(governor, "enabled", False) or getattr(governor, "shadow", False):
+        return 0.0
+    probe = getattr(governor, "_urgent_waiting", None)
+    if probe is None or not probe():
+        return 0.0
+    started = time.perf_counter()
+    GAME_DEFER_STATS["deferred"] += 1
+    while True:
+        await asyncio.sleep(0.05)
+        elapsed = time.perf_counter() - started
+        if not probe():
+            break
+        if elapsed >= limit:
+            GAME_DEFER_STATS["gave_up"] += 1
+            break
+    waited_ms = (time.perf_counter() - started) * 1000.0
+    GAME_DEFER_STATS["waited_ms"] += waited_ms
+    return waited_ms
+
+
+def _with_game_context(coro_factory, is_game):
+    """Run a queued send with the game flag of the task that enqueued it.
+
+    Queue workers are long-lived tasks; without this they would keep whatever
+    flag was active when the worker happened to be created.
+    """
+    async def run():
+        token = GAME_CONTEXT_VAR.set(bool(is_game))
+        try:
+            result = coro_factory()
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            GAME_CONTEXT_VAR.reset(token)
+    return run
+
+
 # Each client gets its own OutgoingSender via client._outgoing_sender
 _SENDER_ATTR = "_outgoing_sender"
 _PATCHED_ATTR = "_outgoing_sender_patched"
@@ -332,6 +397,12 @@ class OutgoingSender:
                 self.logger.log_info(f"OUTGOING SEND DROP chat_id={chat_id} qsize={q.qsize()} kind={qkey[1]}")
             return False
         self._seq += 1
+        try:
+            coro_factory = _with_game_context(
+                coro_factory, GAME_CONTEXT_VAR.get() and channel != "notice"
+            )
+        except Exception:
+            pass
         q.put_nowait((pri, self._seq, chat_id, coro_factory, on_done,
                       time.perf_counter(), channel))
         self.stats["enqueued"] += 1
@@ -777,6 +848,29 @@ def _wrap_call_with_gate(client, logger, governor=None):
                 except Exception:
                     pass
             raise error
+
+        # 🎮 زیر فشار، ارسالِ بازی کنار می‌ایستد تا حذف/سکوت/بن و پاسخ‌های
+        # مدیریتی اول بروند. فقط ارسال‌های متنی/رسانه‌ایِ بازی؛ هیچ‌چیز دور
+        # ریخته نمی‌شود و سقف‌ها/timeoutها دست‌نخورده‌اند.
+        if (
+            name in _LOW
+            and channel != "notice"
+            and send_priority != 0
+            and not critical_context
+            and GAME_CONTEXT_VAR.get()
+        ):
+            try:
+                game_wait = await _defer_game_send(governor)
+                if game_wait >= 20 and logger:
+                    logger.log_info(
+                        "GAME SEND DEFERRED "
+                        f"request={name} chat={chat_for_gate} "
+                        f"wait_ms={game_wait:.0f}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
         try:
             if is_low:

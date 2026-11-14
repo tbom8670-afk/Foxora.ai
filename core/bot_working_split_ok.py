@@ -54,6 +54,8 @@ from modules.message_delete_queue import MessageDeleteQueue
 from modules.notice_cleanup import NoticeCleanup
 from modules.outgoing_sender import install as install_outgoing_sender, install_event_wrapper
 from modules.group_dispatch import GroupDispatcher, classify_priority, looks_like_link
+from modules.group_dispatch import is_game_message
+from modules.outgoing_sender import GAME_CONTEXT_VAR
 from modules.light_spam_ingest import ingest_event
 from modules import connection_guard
 from modules.self_admin_shield import (
@@ -737,6 +739,17 @@ class SoroushAntiSpamBot:
         if not SPLUSTHON_AVAILABLE:
             raise RuntimeError("SPlusthon نصب نیست")
 
+        # بعد از حذفِ پیام، کتابخانه pts گروه را به‌اشتباه پای حساب می‌نوشت و
+        # برای هر حذف GetDifference/GetChannelDifference می‌فرستاد.
+        try:
+            from modules.own_update_fix import install as _install_own_update_fix
+            self.logger.log_info(
+                f"OWN_DELETE_PTS_FIX={bool(_install_own_update_fix())}"
+            )
+        except Exception as _own_fix_error:
+            self.logger.log_error(
+                f"OWN_DELETE_PTS_FIX failed error={_own_fix_error!r}"
+            )
         self.client = self._make_client()
         if not getattr(self, "bot_account_id", None):
             self.bot_account_id = (
@@ -2997,7 +3010,22 @@ class SoroushAntiSpamBot:
             # مسیر مستقیم و تک‌کلاینتی اجرا کن؛ این مسیر reply را هم مستقیم
             # با همان self.client می‌فرستد.
             if kind in {"admin", "command"}:
-                await process_priority_command(event)
+                # 🎮 پیام بازی علامت می‌خورد تا زیر فشار، ارسال‌های بازی
+                # پشت کارهای مدیریتی (حذف/سکوت/بن/دستور ادمین) بمانند.
+                _game_token = None
+                try:
+                    if kind == "command" and is_game_message(raw_text, event):
+                        _game_token = GAME_CONTEXT_VAR.set(True)
+                except Exception:
+                    _game_token = None
+                try:
+                    await process_priority_command(event)
+                finally:
+                    if _game_token is not None:
+                        try:
+                            GAME_CONTEXT_VAR.reset(_game_token)
+                        except Exception:
+                            pass
                 return
 
             try:

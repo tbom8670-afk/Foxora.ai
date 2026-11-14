@@ -242,6 +242,44 @@ def classify_priority(text, event=None):
     return PRIORITY_NORMAL, LANE_NORMAL
 
 
+# 🎮 دستورهای بازی/سرگرمی. فقط برای «اولویت ارسال زیر فشار» استفاده می‌شود؛
+# مسیر و صفِ اجرای خودِ دستور هیچ تغییری نمی‌کند.
+_GAME_EXACT = frozenset(normalize_dispatch_text(word) for word in (
+    "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "بازی ها", "بازی‌ها",
+    "جک", "دانستنی", "تیکه کلام", "تیکه‌کلام",
+    "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+    "مین یاب", "بهترین جواب", "نبرد", "بخند یا بباز", "بقا",
+    "جعبه شانسی", "خون آشام", "خون‌آشام",
+    "اسم فامیل", "اسم چین", "جدولستان", "پازل کلمه", "چهار گزینه ای",
+    "جای خالی", "چیستان", "تصحیح کلمات",
+    "کی بیشتر بلده", "دروغ یا حقیقت",
+    "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
+    "کارگاه", "زامبی", "گروه آخرالزمان", "دادگاه", "دادگاه روباه",
+    "مرکز فرماندهی", "مرکز فرماندهی روباه",
+    "شرکت", "جرعت", "جرات", "جرئت", "حقیقت", "حقیقت بگو",
+))
+
+
+def is_game_message(text, event=None):
+    """True only for game/fun commands and answers inside a running game.
+
+    Admin and management commands are never games, whatever the chat state.
+    """
+    raw = normalize_dispatch_text(text)
+    if not raw:
+        return False
+    priority, kind = classify_priority(raw, event)
+    if kind != LANE_COMMAND or priority != PRIORITY_COMMAND:
+        return False
+    if raw in _GAME_EXACT:
+        return True
+    if raw in _COMMAND_EXACT or raw.startswith(_COMMAND_PREFIXES):
+        return False
+    if raw.startswith(("روباه ", "روباه،", "روباه,", "ربات ", "ربات،", "ربات,")):
+        return False
+    return bool(_is_active_game_answer(event))
+
+
 def _event_user_id(event):
     user_id = getattr(event, "sender_id", None)
     if user_id is None:
