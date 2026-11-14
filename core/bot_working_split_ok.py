@@ -1545,6 +1545,23 @@ class SoroushAntiSpamBot:
 
         asyncio.create_task(daily_admin_report_loop())
 
+        # 🕰 «تایم جفت» (Mirror Time) — کاملاً مستقل: یک تسکِ پس‌زمینه که تا
+        # ثانیهٔ صفرِ هر ساعتِ جفت (به وقتِ تهران) می‌خوابد و پیامِ
+        # «♡ ↻ تایم : 5:5 🦊🦋» را برای گروه‌های فعال می‌فرستد. هیچ تماسی با
+        # مسیرِ پیام‌ها یا صف‌های موجود ندارد و هیچ قابلیتی را تغییر نمی‌دهد.
+        async def mirror_time_loop():
+            try:
+                from modules.mirror_time import service as mirror_time_service
+                await mirror_time_service.watcher(self, logger=self.logger)
+            except asyncio.CancelledError:
+                raise
+            except Exception as mirror_time_error:
+                self.logger.log_error(
+                    f"MIRROR TIME CRASHED error={mirror_time_error!r}"
+                )
+
+        asyncio.create_task(mirror_time_loop(), name="mirror-time")
+
         async def is_currently_restricted(chat_id, user):
             """وضعیت فعلی عضو را از SPlusthon می‌خواند؛ خطا یعنی حفظ بن فعلی."""
             try:

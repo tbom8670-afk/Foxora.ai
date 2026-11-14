@@ -205,6 +205,7 @@ from modules import message_tracker
 from modules import big_spam
 from modules import search_access
 from modules import ad_spam_guard as _ad_spam_guard
+from modules import mirror_time as _mirror_time
 # 🦊 ضد کانال و بیوگرافی — شناسایی کانالِ متصل به پروفایل + جمله‌های بیو.
 from modules import profile_guard as _profile_guard
 from modules import web_search, wiki_search_service
@@ -4415,6 +4416,29 @@ async def handle_new_message(bot, event):
                         f"chat_id={chat_id} user_id={user_id} "
                         f"error={_violator_gate_error!r}"
                     )
+
+        # ===== 🕰 پاسخِ اختصاصیِ «فدات» برای «تایم جفت» =====
+        # فقط و فقط وقتی کاربر روی **همان پیامِ تایم جفت** ریپلای کند و
+        # متنش «فدات» داشته باشد. تطبیق بر اساسِ شناسهٔ پیام است، پس در
+        # گفت‌وگوی معمولی هیچ پاسخی از این قابلیت نمی‌آید و با پاسخ‌های
+        # عادیِ ربات هم تداخل نمی‌کند (پیام مصرف می‌شود).
+        # برای بارِ ناچیز، کوروتین فقط برای پیام‌هایی صدا زده می‌شود که
+        # «فدات» دارند؛ سبک‌تر از یک مقایسهٔ رشته‌ای نیست.
+        if (not event.is_private and chat_id and not _is_own_bot_message
+                and "فدات" in (message_text or "")):
+            try:
+                if await _mirror_time.handle_reply(
+                    bot, event, chat_id, message_text, logger=bot.logger
+                ):
+                    return
+            except Exception as _mirror_time_error:
+                try:
+                    bot.logger.log_error(
+                        "MIRROR TIME FADAT FAILED "
+                        f"chat_id={chat_id} error={_mirror_time_error!r}"
+                    )
+                except Exception:
+                    pass
 
         # ===== 🛡️ گیت «ضد ربات تبلیغاتی» =====
         # مستقل از ضد-اسپم عادی: بر پایهٔ هویتِ فرستنده (نام/یوزرنیم/سری
