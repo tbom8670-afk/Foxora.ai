@@ -220,12 +220,47 @@ def main() -> int:
           texts.DISABLED_MESSAGE
           == "▪️ضد تبلیغ گر هوش مصنوعی روباه خاموش شد")
 
-    warn = texts.render_warn("@oskwma", 1)
-    check("قالب هشدار شامل نام کاربر است", "@oskwma" in warn)
-    check("قالب هشدار شامل دلیل است", "دلیل : تبلیغات گروهی" in warn)
-    check("قالب هشدار شامل تعداد اخطار است", "تعداد اخطار : 1" in warn)
+    warn = texts.render_warn("@oskwma", 1, threshold=5, score=11)
+    check("قالب هشدار شامل نام کاربر است", "⛔ کاربر  @oskwma" in warn)
+    check("قالب هشدار شامل دلیل است", "دلیل : هرزنامه\u200c تبلیغات" in warn)
+    check("قالب هشدار شامل تعداد اخطار است", "■ تعداد اخطار : 1/5" in warn)
     check("قالب هشدار شامل انجام‌دهنده است",
-          "انجام دهنده : هوش مصنوعی ضد تبلیغ" in warn)
+          "■ انجام دهنده : هوش مصنوعی" in warn)
+    check("قالب هشدار شامل درصد تشخیص است", "■ درصد تشخیص : 85/11" in warn)
+    check("قالب هشدار یادآوریِ حذف دارد",
+          "■ این هشدار ۶۰ ثانیهٔ دیگر خودکار پاک می‌شود" in warn)
+
+    # ساختارِ entityها: نقل‌قول فقط روی سرصفحه، Bold فقط روی ارقام
+    warn_text, warn_entities = texts.warn_payload("@oskwma", 1, threshold=5,
+                                                 score=11)
+    lines = warn_text.split("\n")
+    utf16 = warn_text.encode("utf-16-le")
+
+    def _slice(entity):
+        start = entity.offset * 2
+        stop = (entity.offset + entity.length) * 2
+        return utf16[start:stop].decode("utf-16-le")
+
+    blocks = [e for e in warn_entities
+              if type(e).__name__ == "MessageEntityBlockquote"]
+    bolds = [e for e in warn_entities
+             if type(e).__name__ == "MessageEntityBold"]
+    check("فقط سرصفحه نقل‌قول دارد", len(blocks) == 1
+          and _slice(blocks[0]) == lines[0])
+    check("دلیل ساده است (Bold ندارد)",
+          all(_slice(b) != lines[1] for b in bolds))
+    check("ارقامِ تعداد اخطار Bold است", any(_slice(b) == "1/5" for b in bolds))
+    check("ارقامِ درصد تشخیص Bold است",
+          any(_slice(b) == "85/11" for b in bolds))
+    check("انجام‌دهنده Bold نیست",
+          all(_slice(b) not in ("هوش مصنوعی", lines[4]) for b in bolds))
+    check("یادآوری Bold نیست", all(_slice(b) != lines[-1] for b in bolds))
+
+    # درصدِ تشخیص از امتیاز خام
+    check("درصد تشخیص از امتیاز ۱۳ برابر ۱۰۰ می‌شود",
+          texts.detect_percent(13) == 99 or texts.detect_percent(13) == 100)
+    check("درصد تشخیص صفر برای امتیاز صفر", texts.detect_percent(0) == 0)
+    check("درصد تشخیص با score=6 حدودِ ۴۶ است", texts.detect_percent(6) == 46)
 
     check("راهنمای ادمینی درست است",
           texts.HELP_HEADER
@@ -236,6 +271,44 @@ def main() -> int:
     check("کلمهٔ تایید تشخیص داده می‌شود", detector.is_confirm_word("تایید"))
     check("کلمهٔ لغو تشخیص داده می‌شود", detector.is_cancel_word("لغو"))
     check("متن عادی تایید نیست", not detector.is_confirm_word("سلام"))
+
+    # ------------------------------------------------ ۷ب. حذفِ خودکارِ هشدار
+    print("\n=== ۷ب. حذفِ خودکارِ کارتِ هشدار (۶۰ ثانیه / بدونِ شناسه) ===")
+    deletes = []
+
+    class _Msg:
+        def __init__(self, mid, body):
+            self.id = mid
+            self.message = body
+
+    class _Client:
+        async def get_messages(self, peer, limit=20):
+            # عمداً یک Messageِ تنها (نه لیست) — بعضی نسخه‌ها همین‌طورند.
+            return _Msg(4242, warn_text)
+
+        async def delete_messages(self, chat_id, ids):
+            deletes.append((chat_id, list(ids)))
+
+    class _Logger:
+        def log_info(self, *_a, **_k):
+            pass
+
+    class _Bot:
+        client = _Client()
+        logger = _Logger()
+
+    async def _ttl_case():
+        import asyncio as _asyncio
+
+        ok = detector.schedule_notice_cleanup(
+            _Bot(), -100123, None, ttl=0.05, text=warn_text)
+        await _asyncio.sleep(0.4)
+        return ok
+
+    scheduled = asyncio.run(_ttl_case())
+    check("هشدار برای حذفِ خودکار ثبت می‌شود", bool(scheduled))
+    check("هشدار بدونِ شناسه با متن پیدا و پاک می‌شود",
+          deletes == [(-100123, [4242])])
 
     # ---------------------------------------------------------------- ۸
     print("\n=== ۸. جریان تأییدیه ===")

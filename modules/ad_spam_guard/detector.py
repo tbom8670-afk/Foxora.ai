@@ -255,7 +255,7 @@ async def _delete_later(bot, chat_id, message_id, delay) -> None:
         logger.warning("ad-spam notice self-delete failed: %r", exc)
 
 
-def schedule_notice_cleanup(bot, chat_id, sent, ttl=None) -> bool:
+def schedule_notice_cleanup(bot, chat_id, sent, ttl=None, text=None) -> bool:
     """پیامِ هشدار را برای حذفِ خودکار (پیش‌فرض ۶۰ ثانیه) ثبت می‌کند.
 
     دو مسیر با هم:
@@ -268,10 +268,30 @@ def schedule_notice_cleanup(bot, chat_id, sent, ttl=None) -> bool:
 
     خروجی: آیا برای حذف ثبت شد؟
     """
-    if not P.CLEANUP_WARN_NOTICES or sent is None:
+    if not P.CLEANUP_WARN_NOTICES or (sent is None and not text):
         return False
 
     delay = P.WARN_NOTICE_TTL if ttl is None else float(ttl)
+
+    # مسیرِ اثبات‌شدهٔ ۶۰ ثانیه‌ای (همان که هشدارهای «ضد کانال/بیو» را پاک
+    # می‌کند): پایدار روی دیسک، تلاشِ دوباره، و اگر شناسهٔ پیام از نتیجهٔ
+    # ارسال درنیاید با متن در تاریخچهٔ کوتاهِ گروه پیدا و حذف می‌شود.
+    robust = False
+    try:
+        from modules.profile_guard import cleanup as _robust
+
+        robust_id = _robust.message_id_of(sent)
+        task = _robust.schedule(bot, chat_id, sent, ttl=delay, text=text)
+        robust = bool(task is not None or robust_id)
+        try:
+            bot.logger.log_info(
+                "AD SPAM WARN NOTICE TTL(robust) chat_id=%s ttl=%ss %s"
+                % (chat_id, delay, "id" if robust_id else "by_text")
+            )
+        except Exception:
+            pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam robust notice cleanup failed: %r", exc)
     message_id = None
     try:
         from modules.notice_cleanup import capture_sent, extract_sent_id
@@ -340,12 +360,12 @@ def schedule_notice_cleanup(bot, chat_id, sent, ttl=None) -> bool:
     try:
         bot.logger.log_info(
             "AD SPAM WARN NOTICE TTL chat_id=%s message_id=%s ttl=%ss "
-            "engine=%s"
-            % (chat_id, message_id, delay, registered)
+            "engine=%s robust=%s"
+            % (chat_id, message_id, delay, registered, robust)
         )
     except Exception:
         pass
-    return bool(registered)
+    return bool(registered or robust)
 
 
 def _reply_target_user_id(event):
@@ -496,12 +516,25 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
     # پیامِ هشدار به‌صورتِ مستقل فرستاده می‌شود: پیامِ متخلف همین حالا حذف
     # شده و ریپلای روی آن یا خطا می‌دهد یا نقل‌قولِ شکسته می‌سازد.
     try:
+        try:
+            raw_score = int(result.get("score") or 0)
+        except Exception:  # noqa: BLE001
+            raw_score = 0
+        # تبلیغِ «رفتاری» ممکن است هیچ نشانهٔ متنی نداشته باشد (امتیاز ۰) و
+        # فقط با شاهدهای رفتاری گرفته شود؛ هر شاهد ۳ امتیاز می‌شود تا
+        # «درصد تشخیص» در کارت هرگز 0/0 نباشد.
+        try:
+            evidence = raw_score + 3 * len(result.get("behavior_reasons") or [])
+        except Exception:  # noqa: BLE001
+            evidence = raw_score
         warn_text, warn_entities = texts.warn_payload(
-            _display(sender), count, threshold=threshold
+            _display(sender), count, threshold=threshold, score=evidence
         )
         warn_sent = await _send(bot, event, chat_id, warn_text, warn_entities)
-        # ⏱️ حذفِ خودکارِ همین هشدار بعد از ۶۰ ثانیه (تایمرِ اعلان‌های ربات)
-        schedule_notice_cleanup(bot, chat_id, warn_sent)
+        # ⏱️ حذفِ خودکارِ همین هشدار بعد از ۶۰ ثانیه (تایمرِ اعلان‌های ربات).
+        # متن هم داده می‌شود تا اگر ارسال شناسه برنگرداند، پیام در تاریخچه
+        # پیدا و پاک شود.
+        schedule_notice_cleanup(bot, chat_id, warn_sent, text=warn_text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("ad-spam warn send failed: %r", exc)
 

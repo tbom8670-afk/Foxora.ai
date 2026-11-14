@@ -149,7 +149,12 @@ async def _locate_by_text(bot, chat_id, text) -> Optional[int]:
         _log(bot, f"history lookup failed chat_id={chat_id} "
                   f"error={type(error).__name__}", error=True)
         return None
-    for message in history or []:
+    # ``get_messages`` در بعضی نسخه‌ها یک ``Message`` تنها برمی‌گرداند، نه لیست.
+    if history is None:
+        return None
+    if not isinstance(history, (list, tuple)):
+        history = [history]
+    for message in history:
         body = getattr(message, "message", None) or getattr(message, "text", None)
         if not _same_text(body, text):
             continue

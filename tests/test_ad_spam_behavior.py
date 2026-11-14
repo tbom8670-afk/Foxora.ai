@@ -153,7 +153,7 @@ def test_sequence_from_screenshot():
           all(mid in bot.client.deleted for mid in (500, 501, 502, 503, 504)),
           bot.client.deleted)
     check("پیامِ هشدار با قالبِ عکس رفت",
-          any("دلیل : تبلیغات گروهی" in text for text in bot.client.sent),
+          any("دلیل : هرزنامه\u200c تبلیغات" in text for text in bot.client.sent),
           bot.client.sent)
 
     # پیام بعدیِ همان حساب (خدماتش تمام شده) نباید دوباره جریمه شود؟
@@ -336,32 +336,47 @@ def test_warn_template():
     print("\n=== ۱۰. قالبِ پیام هشدار (مطابقِ اسکرین‌شات) ===")
     from modules.ad_spam_guard import texts
 
-    text, entities = texts.warn_payload("@Linx_cox", 1, threshold=5)
+    text, entities = texts.warn_payload("@Linx_cox", 1, threshold=5, score=11)
     expected = (
-        "⚠️ کاربر  @Linx_cox\n"
-        "پیام شما پاک شد | دلیل : تبلیغات گروهی\n"
+        "⛔ کاربر  @Linx_cox\n"
+        "پیام شما پاک شد | دلیل : هرزنامه\u200c تبلیغات\n"
         "\n"
-        "تعداد اخطار : 1/5\n"
-        "انجام دهنده : هوش مصنوعی ضد تبلیغ"
+        "■ تعداد اخطار : 1/5\n"
+        "■ انجام دهنده : هوش مصنوعی\n"
+        "■ درصد تشخیص : 85/11\n"
+        "■ این هشدار ۶۰ ثانیهٔ دیگر خودکار پاک می‌شود"
     )
     check("متنِ هشدار دقیقاً همان عکس است", text == expected, repr(text))
     kinds = [type(e).__name__ for e in entities]
-    check("کلِ متن Bold است", "MessageEntityBold" in kinds, kinds)
+    utf16 = text.encode("utf-16-le")
+
+    def _slice(entity):
+        return utf16[entity.offset * 2:(entity.offset + entity.length) * 2] \
+            .decode("utf-16-le")
+
     bold = [e for e in entities if type(e).__name__ == "MessageEntityBold"]
-    check("Bold از ابتدا تا انتهای متن است",
-          bold and bold[0].offset == 0
-          and bold[0].length == len(text.encode("utf-16-le")) // 2, bold)
-    check("خطِ عنوان نقل‌قول هم دارد", "MessageEntityBlockquote" in kinds, kinds)
+    check("Bold فقط روی ارقام است",
+          sorted(_slice(e) for e in bold) == ["1/5", "85/11"],
+          [_slice(e) for e in bold])
+    check("دلیل و متنِ خطوط Bold نیست",
+          all(_slice(e) != "پیام شما پاک شد | دلیل : هرزنامه\u200c تبلیغات"
+              for e in bold))
+    check("خطِ عنوان نقل‌قول دارد", "MessageEntityBlockquote" in kinds, kinds)
     quote = [e for e in entities
              if type(e).__name__ == "MessageEntityBlockquote"]
     check("نقل‌قول فقط خطِ عنوان را می‌گیرد",
-          quote and quote[0].offset == 0
-          and quote[0].length == len("⚠️ کاربر  @Linx_cox".encode("utf-16-le")) // 2,
-          quote)
+          len(quote) == 1 and quote[0].offset == 0
+          and _slice(quote[0]) == "⛔ کاربر  @Linx_cox", quote)
+    check("عنوان Bold نیست", all(_slice(e) != "⛔ کاربر  @Linx_cox"
+                                for e in bold))
     check("شمارنده به‌شکلِ count/threshold است",
-          "تعداد اخطار : 3/7" in texts.render_warn("@x", 3, threshold=7))
+          "■ تعداد اخطار : 3/7" in texts.render_warn("@x", 3, threshold=7))
     check("دلیل قابلِ تغییر است",
           "دلیل : کلمه ممنوعه" in texts.render_warn("@x", 2, "کلمه ممنوعه"))
+    check("یادآوریِ حذف در متن هست",
+          "۶۰ ثانیه" in text)
+    check("یادآوری قابلِ حذف است",
+          "۶۰ ثانیه" not in texts.render_warn("@x", 2, reminder=None))
 
 
 def test_bot_reply_spam():
