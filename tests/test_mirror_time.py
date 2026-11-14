@@ -158,6 +158,22 @@ check("طولِ entity = طولِ UTF-16 متن",
       entity.length == len(text.encode("utf-16-le")) // 2,
       (entity.length, len(text.encode("utf-16-le")) // 2))
 check("بدونِ صفرِ پیشتاز (۵:۵ ⇒ 5:5)", texts.render(5, 5).count("0") == 0)
+check("تایمِ عصر ۱۸:۱۸ هم تشخیص داده می‌شود", service.is_pair_time(_at(18, 18)))
+check("تایمِ بعدیِ ۱۸:۰۰ = ۱۸:۱۸",
+      service.next_pair_time(_at(18, 0)) == _at(18, 18),
+      service.next_pair_time(_at(18, 0)))
+check("۱۸:۱۸ ⇒ متنِ «6:6» (ساعتِ ۱۲ساعته)",
+      texts.render(18, 18) == "♡ ↻ تایم : 6:6 🦊🦋", repr(texts.render(18, 18)))
+check("۱۳:۱۳ ⇒ متنِ «1:1»", texts.render(13, 13) == "♡ ↻ تایم : 1:1 🦊🦋",
+      repr(texts.render(13, 13)))
+check("۲۳:۲۳ ⇒ متنِ «11:11»", texts.render(23, 23) == "♡ ↻ تایم : 11:11 🦊🦋",
+      repr(texts.render(23, 23)))
+check("۶:۶ صبح و عصر هر دو «6:6» هستند",
+      texts.render(6, 6) == texts.render(18, 18))
+check("حالتِ ۲۴ساعته انتخاب‌شدنی است (۱۸:۱۸)",
+      texts.render(18, 18, "24") == "♡ ↻ تایم : 18:18 🦊🦋",
+      repr(texts.render(18, 18, "24")))
+check("پیش‌فرض ۱۲ساعته است", texts.clock_mode() == "12")
 
 # ---------------------------------------------------------------------------
 # ۳) ارسالِ یک‌بار‌مصرف + ری‌استارت
