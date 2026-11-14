@@ -25,6 +25,7 @@ SPlusthon آپلود را با ``self(request)`` یعنی از طریق همان
 import logging
 
 import asyncio
+import logging
 
 from splusthon import SoroushClient
 from splusthon.network import MTProtoSender

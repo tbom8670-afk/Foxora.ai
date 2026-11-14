@@ -138,8 +138,9 @@ def track_gif(chat_id, user_id, message_id):
         _COUNTER_TOUCHED.pop(key, None)
         flag_user(chat_id, user_id)
         _STATS["threshold_hits"] += 1
-        # دقیقاً در آستانه کل دسته حذف می‌شود (مطابق داک‌استرینگ و تست‌ها).
-        return batch, True
+        # Keep the first GIF as the representative; only duplicates are
+        # scheduled for deletion.
+        return batch[1:], True
 
     return [], False
 

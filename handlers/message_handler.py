@@ -18,6 +18,7 @@ from modules.fill_blank import (
     TIMEOUT as FILL_TIMEOUT,
     clear as clear_fill,
     get_fill_answer,
+    get_token as get_fill_token,
     new_fill,
 )
 from modules.riddles import (
@@ -67,7 +68,6 @@ from handlers.group_expiry_handler import (
     EXPIRED_NOTICE as GROUP_EXPIRED_NOTICE,
     blocks_message as group_expiry_blocks,
     handle as handle_group_expiry,
-    _entities as _group_expiry_entities,
 )
 from modules.expiry_report import build_group_list
 from modules import group_expiry
@@ -298,14 +298,6 @@ def _message_debug_enabled(bot):
     if cfg is None:
         return False
     return bool(cfg.get("debug_message_pipeline", False))
-
-
-def _log_username_directory_failure(bot, error):
-    """ثبت خطای دفترچهٔ یوزرنیم بدون آن‌که هندلر پیام از کار بیفتد."""
-    try:
-        bot.logger.log_error(f"USERNAME DIRECTORY REMEMBER FAILED error={error!r}")
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def _debug_log(bot, message):
@@ -4915,20 +4907,16 @@ async def handle_new_message(bot, event):
                     "MANAGE TRACK FAILED "
                     f"chat_id={chat_id} error={_track_error!r}")
 
-        # پیامِ فقط‌رسانه‌ای (عکس/فیلمِ بدون متن) از دروازه عبور کرد؛ فعالیت
-        # کاربر همین‌جا ثبت می‌شود و بعد برمی‌گردیم.
-        # نکته‌ها:
-        #  * این پیام متن ندارد، پس هرگز «دستور سریع» نیست؛ fast_command
-        #    این‌جا هنوز تعریف نشده بود و UnboundLocalError می‌داد.
-        #  * _media_only_message طبق تعریف «گیف نیست» (not is_gif_media)؛
-        #    گیف‌ها در مسیر اصلی پایین‌تر شمرده می‌شوند. پس این‌جا نباید
-        #    شمارندهٔ گیف بالا برود، وگرنه هر عکس یک گیف حساب می‌شود.
+        # پیامِ فقط‌رسانه‌ای (گیف/فیلم/عکس) از دروازه عبور کرد؛ برای شمارشِ
+        # «تعداد کل گیف های ارسالی» باید همان‌جا ثبت شود و بعد برگردد.
+        # (قبلاً اینجا بی‌هیچ ثبتی return می‌شد و گیف‌ها هیچ‌وقت شمرده نمی‌شدند.)
         if _media_only_message:
-            if not event.is_private:
+            if not event.is_private and not fast_command:
                 _run_background(
                     bot, "user_activity", record_activity,
                     chat_id, user_id, event.message,
                 )
+                _record_gif_stat(bot, chat_id, user_id, sender)
             return
 
         _debug_log(bot,
@@ -6041,8 +6029,7 @@ async def handle_new_message(bot, event):
                     exp_msg, exp_spans = group_expiry.build_expired_message()
                     try:
                         await event.reply(
-                            exp_msg,
-                            formatting_entities=_group_expiry_entities(exp_spans)
+                            exp_msg, formatting_entities=_entities(exp_spans)
                         )
                     except Exception:
                         pass
