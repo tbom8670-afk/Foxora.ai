@@ -39,7 +39,31 @@ def save_admins(data):
     _cache_mtime = FILE.stat().st_mtime_ns
 
 
-def add_admin(group_id, user_id, username=None):
+def remember_name(group_id, user_id, name, username=None):
+    """نام نمایشی (و یوزرنیمِ تازه) را کنار رکوردِ ادمین نگه می‌دارد.
+
+    فقط برای نمایش در لیست‌هاست؛ شناسایی همچنان با شناسهٔ عددی است.
+    """
+    name = " ".join(str(name or "").split())
+    username = str(username or "").strip().lstrip("@")
+    if not name and not username:
+        return False
+    data = load_admins()
+    changed = False
+    for entry in data.get(normalize_group_id(group_id), []):
+        if isinstance(entry, dict) and str(entry.get("user_id")) == str(user_id):
+            if name and entry.get("name") != name:
+                entry["name"] = name
+                changed = True
+            if username and entry.get("username") != username:
+                entry["username"] = username
+                changed = True
+    if changed:
+        save_admins(data)
+    return changed
+
+
+def add_admin(group_id, user_id, username=None, name=None):
     data = load_admins()
     gid = normalize_group_id(group_id)
     entries = data.setdefault(gid, [])
@@ -51,10 +75,14 @@ def add_admin(group_id, user_id, username=None):
     ):
         return False
 
-    entries.append({
+    record = {
         "user_id": normalized_id,
         "username": username or None,
-    })
+    }
+    name = " ".join(str(name or "").split())
+    if name:
+        record["name"] = name
+    entries.append(record)
     save_admins(data)
     return True
 

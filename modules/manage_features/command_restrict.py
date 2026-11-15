@@ -236,6 +236,7 @@ async def _entity(bot, target):
 
 async def _admin_rows(bot, chat_id):
     """ادمین‌های ثبت‌شدهٔ گروه: ``[{id, username, label}]`` (مالک‌ها نه)."""
+    from modules import admin_display
     from modules.admin_storage import load_admins
     from modules.group_id import normalize_group_id
     try:
@@ -243,28 +244,15 @@ async def _admin_rows(bot, chat_id):
     except Exception:                                # noqa: BLE001
         entries = []
     rows, seen = [], set()
-    for entry in entries:
-        if isinstance(entry, dict):
-            user_id, username = entry.get("user_id"), entry.get("username")
-        else:
-            user_id, username = None, entry
-        username = str(username or "").strip().lstrip("@")
-        try:
-            user_id = int(user_id) if user_id is not None else None
-        except (TypeError, ValueError):
-            user_id = None
+    for entry in list(entries):
+        user_id, username, _name = admin_display.entry_fields(entry)
         if user_id is not None and is_any_owner(chat_id, user_id):
             continue
         key = user_id if user_id is not None else username.lower()
         if not key or key in seen:
             continue
         seen.add(key)
-        if username:
-            label = "@" + username
-        else:
-            label = format_user(await _entity(bot, user_id), fallback="")
-            if not label:
-                continue
+        label = await admin_display.admin_label(bot, chat_id, entry)
         rows.append({"id": user_id, "username": username, "label": label})
     return rows
 
@@ -360,7 +348,10 @@ async def _take_command(bot, event, chat_id, user_id, sender, text, state,
     registry = command_registry.load()
     identifier = registry.resolve_name(text)
     if identifier is None:
-        # نامِ نادرست/غیرمدیریتی: چیزی ثبت و چیزی اجرا نمی‌شود.
+        # نامِ نادرست/غیرمدیریتی: چیزی ثبت و چیزی اجرا نمی‌شود؛ مالک
+        # می‌تواند همان‌جا نامِ درست را بفرستد.
+        state["expires"] = time.monotonic() + FLOW_TTL
+        await _reply(event, texts.restrict_unknown_command(), logger)
         return True
     admin = state["admin"]
     name = registry.get(identifier)["name"]

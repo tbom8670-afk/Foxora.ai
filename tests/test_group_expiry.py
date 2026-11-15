@@ -315,8 +315,9 @@ def test_expired_message():
     print("\n### 💬 پیام غیرفعال‌سازی خودکار")
     text, spans = ge.build_expired_message()
     check("متن دقیقاً مطابق خواسته است",
-          text == ("⛔ مدت زمان فعال بودن گروه به پایان رسید و "
-                   "گروه به‌صورت خودکار غیرفعال شد"), f"-> {text}")
+          text == ("⛔️ مهلت فعالیت ربات در این گروه به پایان رسید برای "
+                   "تمدید اشتراک دستور مهلت گروه را ارسال کنید"),
+          f"-> {text}")
     check("کل متن bold است", len(spans) == 1 and spans[0][0] == "bold")
     check("bold کل متن را می‌پوشاند",
           decode_span(text, spans[0][1], spans[0][2]) == text)

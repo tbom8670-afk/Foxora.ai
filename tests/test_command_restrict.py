@@ -168,11 +168,16 @@ async def main():
 
     # ---------- ۲) نام اشتباه / ۳) دستورِ غیرمدیریتی ----------
     handled, event = await send(G1, OWNER_G1, "پاکسازی کامللل")
-    check("wrong name: consumed, silent, nothing stored",
-          handled and not event.replies and not cr.restrictions(G1, A1))
+    check("wrong name: consumed, notice, nothing stored",
+          handled and not cr.restrictions(G1, A1)
+          and [r[0] for r in event.replies]
+          == ["⛔️ : این دستور وجود ندارد یا اشتباه نوشتید"]
+          and spans(event.replies[0], "Bold") == [event.replies[0][0]])
     handled, event = await send(G1, OWNER_G1, "معما")
-    check("non-admin command: consumed, silent, nothing stored",
-          handled and not event.replies and not cr.restrictions(G1, A1))
+    check("non-admin command: consumed, notice, nothing stored",
+          handled and len(event.replies) == 1
+          and event.replies[0][0] == texts.RESTRICT_UNKNOWN_COMMAND
+          and not cr.restrictions(G1, A1))
     handled, event = await send(G1, OWNER_G1, "اخراج", username="boss")
     payload = event.replies[0]
     check("done: template", payload[0] == (
@@ -390,6 +395,59 @@ async def main():
     finally:
         group_dispatch._ADMIN_EXACT = original
         command_registry.load(force=True)
+
+    # ---------- نمایشِ ادمینِ بدون یوزرنیم / باگِ «لیست ادمین» ----------
+    from modules import admin_display
+    G3, GHOST = -1002000000003, 77
+    admin_storage.add_admin(G3, GHOST, None, name="نام ذخیره شده")
+    admin_storage.add_admin(G3, 78, None)
+    entries = admin_storage.load_admins()[str(G3)] \
+        if str(G3) in admin_storage.load_admins() \
+        else list(admin_storage.load_admins().values())[-1]
+    labels = [await admin_display.admin_label(BOT, G3, e) for e in entries]
+    check("unresolvable admin shows the stored display name",
+          labels[0] == "نام ذخیره شده", repr(labels))
+    check("admin is never dropped from the list",
+          len(labels) == 2 and all(labels), repr(labels))
+    known = {78: NS(id=78, username=None, first_name="رضا", last_name="")}
+    check("name taken from the group's admin list (no extra request)",
+          await admin_display.admin_label(BOT, G3, entries[1], known)
+          == "رضا")
+    check("resolved name is remembered for next time",
+          admin_display.entry_fields(
+              admin_storage.load_admins()[next(
+                  k for k, v in admin_storage.load_admins().items()
+                  if any(isinstance(x, dict) and x.get("user_id") == "78"
+                         for x in v))][1])[2] == "رضا")
+    calls = []
+
+    class StrictClient:
+        async def get_entity(self, target):
+            calls.append(target)
+            if target == 79:
+                return NS(id=79, username=None, first_name="Int", last_name="Only")
+            raise ValueError("string ids are not resolvable")
+
+    admin_storage.add_admin(G3, 79, None)
+    entry = admin_storage.load_admins()[next(
+        k for k, v in admin_storage.load_admins().items()
+        if any(isinstance(x, dict) and x.get("user_id") == "79" for x in v))][2]
+    check("stored string id is resolved as a number (root cause)",
+          await admin_display.admin_label(NS(client=StrictClient()), G3, entry)
+          == "Int Only" and calls == [79], repr(calls))
+    handled, event = await send(G3, OWNER_MAIN, "محدودیت دستورات")
+    check("restrict list shows admins without username by name",
+          event.replies and event.replies[0][0].endswith(
+              "⚙️1 - نام ذخیره شده\n⚙️2 - رضا\n⚙️3 - Int Only"),
+          repr(event.replies[0][0] if event.replies else None))
+    cr._clear_flow(G3, OWNER_MAIN)
+    from modules import group_expiry
+    expired_text, expired_spans = group_expiry.build_expired_message()
+    check("expiry notice text", expired_text == (
+        "⛔️ مهلت فعالیت ربات در این گروه به پایان رسید برای تمدید اشتراک "
+        "دستور مهلت گروه را ارسال کنید"))
+    check("expiry notice fully bold",
+          expired_spans == [("bold", 0, len(expired_text.encode("utf-16-le")) // 2)])
 
     # ---------- کارایی مسیرِ گرم ----------
     started = time.perf_counter()

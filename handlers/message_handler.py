@@ -8800,41 +8800,34 @@ async def handle_new_message(bot, event):
                 await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
                 return
 
-            async def admin_display(user_id=None, username=None):
-                if username:
-                    return f"@{username.lstrip('@')}"
-                if user_id is not None:
-                    try:
-                        entity = await bot.client.get_entity(user_id)
-                        return _format_admin_display(entity)
-                    except Exception:
-                        pass
-                return "Unknown User"
-
-            # بخش اول فقط از storage پایدار ادمین‌های ثبت‌شده توسط ربات.
-            registered_entries = load_admins().get(normalize_group_id(chat_id), [])
-            registered_admins = []
-            for entry in registered_entries:
-                if isinstance(entry, dict):
-                    formatted = await admin_display(
-                        user_id=entry.get("user_id"), username=entry.get("username")
-                    )
-                else:
-                    formatted = await admin_display(username=entry)
-                if formatted != "Unknown User":
-                    registered_admins.append(formatted)
-
-            # بخش دوم فقط از API ادمین‌های واقعی همین گروه.
+            # بخش دوم فقط از API ادمین‌های واقعی همین گروه. (اول گرفته
+            # می‌شود تا نامِ ادمین‌های ثبت‌شدهٔ بدون یوزرنیم هم از همین
+            # پاسخ درآید و درخواستِ اضافه لازم نشود.)
             group_admins = []
+            _native_by_id = {}
             try:
                 async for participant in bot.client.iter_participants(
                     chat_id, filter=types.ChannelParticipantsAdmins()
                 ):
+                    _native_id = getattr(participant, "id", None)
+                    if _native_id is not None:
+                        _native_by_id[_native_id] = participant
                     formatted = _format_admin_display(participant)
                     if formatted != "Unknown User":
                         group_admins.append(formatted)
             except Exception as error:
                 bot.logger.log_error(f"خطا در دریافت ادمین‌های گروه: {error}")
+
+            # بخش اول فقط از storage پایدار ادمین‌های ثبت‌شده توسط ربات.
+            # هر ادمینِ ثبت‌شده حتماً در لیست می‌آید: @یوزرنیم، وگرنه نام
+            # نمایشی (از API یا نامِ ذخیره‌شده هنگام ثبت).
+            from modules.admin_display import admin_label as _admin_label
+            registered_entries = load_admins().get(normalize_group_id(chat_id), [])
+            registered_admins = []
+            for entry in list(registered_entries):
+                registered_admins.append(
+                    await _admin_label(bot, chat_id, entry, _native_by_id)
+                )
 
             registered_text = "\n".join(
                 f"★ : {admin}" for admin in registered_admins
@@ -9160,7 +9153,15 @@ async def handle_new_message(bot, event):
                     return
 
                 admin_username = getattr(admin_user, "username", None)
-                if add_admin(chat_id, admin_user.id, admin_username):
+                if add_admin(
+                    chat_id, admin_user.id, admin_username,
+                    name=" ".join(
+                        str(part) for part in (
+                            getattr(admin_user, "first_name", None),
+                            getattr(admin_user, "last_name", None),
+                        ) if part
+                    ),
+                ):
                     # Bold با ** (Markdown پیش‌فرض). نام کاربری و در نبود
                     # آن، نام نمایشی از policy واحد format_user می‌آید.
                     # دو خط بدون فاصلهٔ خالی بینشان (طبق اسپک).

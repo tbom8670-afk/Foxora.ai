@@ -936,5 +936,12 @@ def unrestrict_done():
     return _SpanBuilder().line(UNRESTRICT_DONE, bold=True).build()
 
 
+RESTRICT_UNKNOWN_COMMAND = "⛔️ : این دستور وجود ندارد یا اشتباه نوشتید"
+
+
+def restrict_unknown_command():
+    return _Builder().line(RESTRICT_UNKNOWN_COMMAND).build()
+
+
 def restrict_blocked():
     return _Builder().line(RESTRICT_BLOCKED).build()
