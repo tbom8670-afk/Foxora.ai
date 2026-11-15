@@ -1466,6 +1466,13 @@ async def handle_private_zombie_selection(bot, user_id, text, logger=None):
 
 async def handle(bot, event, chat_id, user_id, sender, text, logger=None):
     """پیام را به بازی مربوطه می‌سپارد. True یعنی پیام مصرف شد."""
+    # 🎒 «مرخصی ادمین»: در حالتِ مدیریت پیشرفته هیچ بازی‌ای شروع یا ادامه
+    # نمی‌شود. دستورِ شروع را گاردِ مرکزیِ سرگرمی با پیامِ خودش جواب می‌دهد؛
+    # بقیهٔ ورودی‌های بازی بی‌صدا نادیده گرفته می‌شوند (امتیازها دست‌نخورده).
+    if entertainment_control.leave_blocks(chat_id):
+        if await entertainment_control.guard(event, chat_id, text):
+            return True
+        return False
     command = normalize_text(text)
 
     if command == normalize_text("گروه آخرالزمان"):

@@ -314,7 +314,45 @@ def blocks(chat_id, text):
 
     True یعنی این دستور بازی نباید اجرا شود.
     """
-    return is_game_command(text) and not is_enabled(chat_id)
+    if not is_game_command(text):
+        return False
+    return (not is_enabled(chat_id)) or leave_blocks(chat_id)
+
+
+def leave_blocks(chat_id):
+    """🎒 «مرخصی ادمین»: در حالتِ مدیریت پیشرفته بازی‌ها موقتاً بسته‌اند.
+
+    فقط یک «روکش» است: تنظیمِ روشن/خاموشِ خودِ گروه دست نمی‌خورد، پس بعد از
+    پایانِ مرخصی همان وضعیتِ قبلی برقرار است. خطا ⇒ fail-open.
+    """
+    try:
+        from modules.manage_features import admin_leave
+        return admin_leave.games_blocked(chat_id)
+    except BaseException:
+        return False
+
+
+_LEAVE_NOTICE_AT = {}
+LEAVE_NOTICE_INTERVAL = 15.0
+
+
+async def send_leave_blocked_notice(event, chat_id):
+    """پیامِ «بازی‌ها در مدتِ مرخصی بسته‌اند» — حداکثر هر ۱۵ ثانیه یک بار
+    برای هر گروه، تا خودش بارِ ارسال نسازد."""
+    import time as _time
+    now = _time.monotonic()
+    key = _key(chat_id)
+    if now - _LEAVE_NOTICE_AT.get(key, -1e9) < LEAVE_NOTICE_INTERVAL:
+        return None
+    if len(_LEAVE_NOTICE_AT) > 2000:
+        _LEAVE_NOTICE_AT.clear()
+    _LEAVE_NOTICE_AT[key] = now
+    from modules.manage_features import texts as _leave_texts
+    text, entities = _leave_texts.leave_games_blocked()
+    try:
+        return await event.reply(text, formatting_entities=entities)
+    except BaseException:
+        return await event.reply(text)
 
 
 async def guard(event, chat_id, text):
@@ -325,5 +363,8 @@ async def guard(event, chat_id, text):
     """
     if not blocks(chat_id, text):
         return False
+    if leave_blocks(chat_id):
+        await send_leave_blocked_notice(event, chat_id)
+        return True
     await send_blocked_notice(event)
     return True

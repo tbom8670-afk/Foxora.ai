@@ -705,7 +705,8 @@ def _manage_features():
     if _MANAGE_FEATURES is not None:
         return _MANAGE_FEATURES or None
     try:
-        from modules.manage_features import (exclusive_commands,
+        from modules.manage_features import (admin_leave_commands,
+                                             exclusive_commands,
                                              group_shutdown_commands,
                                              message_limit_commands,
                                              report_commands, timed_commands,
@@ -716,6 +717,7 @@ def _manage_features():
         _MANAGE_FEATURES = False
         return None
     _MANAGE_FEATURES = {
+        "admin_leave": admin_leave_commands,
         "exclusive": exclusive_commands,
         "group_shutdown": group_shutdown_commands,
         "message_limit": message_limit_commands,
@@ -4710,6 +4712,19 @@ async def handle_new_message(bot, event):
                         if await _manage["exclusive"].handle(
                             bot, event, chat_id, user_id, sender, message_text,
                             bot.logger,
+                        ):
+                            return
+                    # 🎒 «مرخصی ادمین» — تشخیص ارزان است؛ بررسیِ ادمینِ واقعی
+                    # (API) فقط برای خودِ همین دستور انجام می‌شود.
+                    if not is_edited_message and \
+                            _manage["admin_leave"].is_command(message_text):
+                        async def _leave_native_admin():
+                            return await _is_native_group_admin(
+                                bot, chat_id, user_id, sender, event_chat)
+                        if await _manage["admin_leave"].handle(
+                            bot, event, chat_id, user_id, sender, message_text,
+                            bot.logger, chat=event_chat,
+                            native_admin=_leave_native_admin,
                         ):
                             return
                     if _manage["timed"].is_command(message_text, chat_id):

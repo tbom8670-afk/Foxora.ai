@@ -1215,7 +1215,8 @@ class SoroushAntiSpamBot:
         # «متخلف» با ایندکسِ حافظه‌ای بازسازی می‌شوند. هیچ‌کدام RPC اضافه در
         # مسیر راه‌اندازی نمی‌زنند (کارها در صف اختصاصی خودشان می‌نشینند).
         try:
-            from modules.manage_features import (exclusive_commands,
+            from modules.manage_features import (admin_leave_commands,
+                                                 exclusive_commands,
                                                  group_shutdown_commands,
                                                  message_limit as _message_limit_engine,
                                                  report_commands,
@@ -1227,6 +1228,17 @@ class SoroushAntiSpamBot:
             _violators_state = _violators_engine.recover(self, self.logger)
             _msg_limit_state = _message_limit_engine.recover(self, self.logger)
             _shutdown_state = group_shutdown_commands.recover(self, self.logger)
+            # 🎒 «مرخصی ادمین»: مرخصی‌های فعال و زمانِ یادآوری/پایان از روی
+            # timestampِ ذخیره‌شده دوباره بالا می‌آیند.
+            try:
+                _leave_state = admin_leave_commands.recover(self, self.logger)
+                self.logger.log_info(
+                    "ADMIN LEAVE RECOVERY "
+                    f"groups={_leave_state.get('groups', 0)} "
+                    f"leaves={_leave_state.get('leaves', 0)}")
+            except Exception as _leave_error:         # noqa: BLE001
+                self.logger.log_error(
+                    f"ADMIN LEAVE RECOVERY FAILED error={_leave_error!r}")
             # 🛡️ «ضد کانال و بیوگرافی»: سکوت‌های دائمیِ ثبت‌شده پس از
             # ری‌استارت دوباره اعمال می‌شوند (در تسکِ پس‌زمینه، بدون بلاک).
             try:

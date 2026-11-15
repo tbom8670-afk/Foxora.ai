@@ -731,3 +731,105 @@ def group_shutdown_optional_template(kind: str, **context):
     return None
 
 
+# ---------------------------------------------------------------------------
+#  🎒 مرخصی ادمین — عیناً مطابق اسکرین‌شات‌های کارفرما
+# ---------------------------------------------------------------------------
+#: ۱) راهنمای نوشتن (پاسخِ «مرخصی» بدون مدت یا با مدتِ نامعتبر)
+LEAVE_ASK_HEADER = ("👒 : سلام ادمین گرامی لطفاً ساعت یا دقیقه ای که نیستید رو "
+                    "برای من بنویسید نحوه نوشتن")
+LEAVE_ASK_EXAMPLES = ("««« مرخصی 30 دقیقه", "««« مرخصی 2 ساعت")
+LEAVE_ASK_WARNING = (
+    "⚠️ : هشدار بعد از تایین مدت ربات به حالت مدیریت پیشرفته و "
+    "سخت\u200cگیرانه گروه خواهد رفت\n"
+    "از بازی ها نمیتوانید استفاده کنید تا سرعت دهی ربات بیشتر باشد اگر نیاز "
+    "به مرخصی ندارید انتخاب نکنید"
+)
+
+#: ۲) تأییدِ ثبت
+LEAVE_SET_TITLE = "🎒 مرخصی شما تنظیم شد"
+LEAVE_SET_DURATION = "زمان استراحت :"
+LEAVE_SET_ADMIN = "ادمین :"
+LEAVE_SET_SUBSTITUTE = "جایگزین فعالیت :"
+LEAVE_SET_BODY = (
+    "تا شما برگردید من کار های شما رو به حالت پیشرفته خواهم برد و به بهترین "
+    "نحوه مدیریت خود را انجام خواهم داد قابلیت های که به صورت خودکار در نبود "
+    "شما روشن خواهد شد"
+)
+LEAVE_SET_FEATURES = ("🔶 ضد کانال", "🔶 کلمات ممنوعه", "🔶 ضد اسپم سنگین")
+
+#: ۳) یادآوریِ دقیقهٔ ۱۷
+LEAVE_REMINDER_QUOTE = "👒 سلام : {user}"
+LEAVE_REMINDER_BODY = "نمیخای از مرخصی بیای خستم شد 🥲"
+
+#: ۴) لغو
+LEAVE_CANCELLED = ("🔐 : مرخصی ادمین لغو شد\n"
+                   "ربات به حالت عادی مدیریت بازگشت")
+
+#: ۵) پایانِ خودکار
+LEAVE_ENDED_QUOTE = "سلام دوست من : {user}"
+LEAVE_ENDED_BODY = ("مرخصیت به پایان رسید به فعالیت برگرد\n"
+                    "🔐ربات به حالت مدیریت عادی بازگشت")
+
+#: ۶) بازی‌ها در مدتِ مرخصی
+LEAVE_GAMES_BLOCKED = (
+    "»»» ⚙️ ««« بازی های روباه در حال حاضر غیر فعال می\u200cباشد من در حال "
+    "مدیریت پیشرفته گروه هستم به محض برگشتن ادمینی که مرخصی گرفت میتوانید "
+    "دوباره از بازی ها استفاده کنید\n"
+    "در حال حاضر برای بهتر شدن عملکرد و سرعت دهی بازی های من غیر فعال "
+    "می\u200cباشد"
+)
+
+
+def leave_ask():
+    builder = _Builder().line(LEAVE_ASK_HEADER)
+    for example in LEAVE_ASK_EXAMPLES:
+        builder.line(example, quote=True)
+    builder.line().line().line()
+    for row in LEAVE_ASK_WARNING.split("\n"):
+        builder.line(row)
+    return builder.build()
+
+
+def _leave_field(label, value):
+    value = str(value or "").strip()
+    return f"{label} {value}" if value else label
+
+
+def leave_set(*, duration="", admin="", substitute=""):
+    builder = _Builder().line(LEAVE_SET_TITLE, quote=True).line()
+    builder.line(_leave_field(LEAVE_SET_DURATION, duration))
+    builder.line(_leave_field(LEAVE_SET_ADMIN, admin))
+    builder.line(_leave_field(LEAVE_SET_SUBSTITUTE, substitute))
+    builder.line()
+    builder.line(LEAVE_SET_BODY)
+    for feature in LEAVE_SET_FEATURES:
+        builder.line(feature, quote=True)
+    return builder.build()
+
+
+def leave_reminder(user):
+    builder = _Builder().line(LEAVE_REMINDER_QUOTE.format(user=user),
+                              quote=True)
+    builder.line(LEAVE_REMINDER_BODY)
+    return builder.build()
+
+
+def leave_cancelled():
+    builder = _Builder()
+    for row in LEAVE_CANCELLED.split("\n"):
+        builder.line(row)
+    return builder.build()
+
+
+def leave_ended(user):
+    builder = _Builder().line(LEAVE_ENDED_QUOTE.format(user=user), quote=True)
+    for row in LEAVE_ENDED_BODY.split("\n"):
+        builder.line(row)
+    return builder.build()
+
+
+def leave_games_blocked():
+    builder = _Builder()
+    for row in LEAVE_GAMES_BLOCKED.split("\n"):
+        builder.line(row)
+    return builder.build()

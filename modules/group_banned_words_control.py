@@ -46,16 +46,28 @@ def save(data):
     _cache_mtime = _file_mtime()
 
 
+def _leave_manual_change(chat_id):
+    """🎒 «مرخصی ادمین»: تغییرِ دستیِ این تنظیم در مدتِ مرخصی ثبت می‌شود تا
+    بازیابیِ خودکارِ پایانِ مرخصی آن را از بین نبرد. بدون مرخصیِ فعال: هیچ."""
+    try:
+        from modules.manage_features import admin_leave
+        admin_leave.note_manual_change('banned_words', chat_id)
+    except Exception:
+        pass
+
+
 def enable(chat_id):
     data = load()
     data[normalize_group_id(chat_id)] = True
     save(data)
+    _leave_manual_change(chat_id)
 
 
 def disable(chat_id):
     data = load()
     data[normalize_group_id(chat_id)] = False
     save(data)
+    _leave_manual_change(chat_id)
 
 
 def is_enabled(chat_id):
