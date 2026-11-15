@@ -109,6 +109,24 @@ _SEND_CHANNEL = contextvars.ContextVar("outgoing_send_channel", default="main")
 GAME_CONTEXT_VAR = contextvars.ContextVar("outgoing_game_context", default=False)
 
 
+def detach_from_dispatch():
+    """Make the *current task* an ordinary background task.
+
+    A task created while a group worker is handling a message inherits that
+    worker's context, so its ``client.send_message`` is queued and returns
+    ``None`` instead of the sent message.  Long-lived jobs (timers, per-group
+    job queues) call this first, so their sends are real sends with real ids.
+    """
+    try:
+        _DISPATCH_ACTIVE.set(False)
+        _SEND_PRIORITY.set(None)
+        _SEND_CHANNEL.set("main")
+        GAME_CONTEXT_VAR.set(False)
+    except Exception:
+        return False
+    return True
+
+
 def _game_defer_seconds():
     """Longest a game send steps aside; 0 switches the behaviour off."""
     try:

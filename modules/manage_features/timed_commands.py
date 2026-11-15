@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import time
 from typing import Optional
 
@@ -31,6 +32,12 @@ CHOICE_TTL = 180.0
 _WATCH: dict = {}
 _CHOICES: dict = {}            # chat_key → {"ts":..., "user_id":..., "message_id":...}
 _STATUS: dict = {}
+#: هر کارتِ وضعیت فقط به «همان اجرا» تعلق دارد (کلید: زمانِ شروعِ اجرا).
+#: بدون این، اجرای دومِ یک گروه شناسهٔ کارتِ اجرای قبلی را ویرایش می‌کرد و
+#: یک شکست، کارتِ همان گروه را تا ری‌استارت از کار می‌انداخت.
+_STATUS_RUN: dict = {}
+#: اجراهایی که گزارشِ پایانی‌شان به‌صورت پیامِ جدا فرستاده شده (حداکثر یک بار).
+_FINAL_SENT: set = set()
 
 
 def normalize(text) -> str:
@@ -117,6 +124,7 @@ def register_status(chat_id, message_id):
     """
     if message_id is None:
         return None
+    _sync_run(chat_id, timed.get_record(chat_id) or {})
     _STATUS[_key(chat_id)] = message_id
     try:
         timed.register_status(chat_id, message_id)
@@ -138,9 +146,22 @@ async def _progress_hook(bot, chat_id, *, deleted, failed, elapsed_seconds,
 
 
 
+def _sync_run(chat_id, record):
+    """حافظهٔ کارتِ وضعیت را به اجرای فعلیِ همین گروه گره می‌زند."""
+    key = _key(chat_id)
+    token = (record or {}).get("start_ts")
+    if _STATUS_RUN.get(key) != token:
+        _STATUS_RUN[key] = token
+        _STATUS.pop(key, None)
+        _STATUS_FAILED.discard(key)
+        _FINAL_SENT.discard(key)
+    return key
+
+
 def status_id(chat_id):
     record = timed.get_record(chat_id) or {}
-    return record.get("status_message_id") or _STATUS.get(_key(chat_id))
+    key = _sync_run(chat_id, record)
+    return record.get("status_message_id") or _STATUS.get(key)
 
 
 #: قفلِ ساختِ پیام وضعیت به‌ازای هر گروه — جلوگیری از پیام‌های تکراری.
@@ -197,15 +218,54 @@ async def _locate_status(bot, chat_id, text, record=None, logger=None):
         return None
     if not isinstance(history, (list, tuple)):
         history = [history]
-    wanted = str(text).strip()
+    # سرور ممکن است متن را کمی عوض کند (فاصله/خطِ خالی/ایموجی)، پس مقایسهٔ
+    # دقیقِ کلِ متن شکننده بود. معیار: پیامِ خودِ ربات، با همان خطِ عنوان، و
+    # جدیدتر از همهٔ پیام‌های همین بازه (کارتِ اجرای قبلی هرگز انتخاب نشود).
+    wanted_title = _first_line(text)
+    try:
+        newest_tracked = max(timed.tracked_ids(chat_id, record) or [0])
+    except Exception:                                # noqa: BLE001
+        newest_tracked = 0
+    candidates = []
     for message in history:
+        if getattr(message, "out", True) is False:
+            continue
         body = getattr(message, "message", None) or getattr(message, "text", None)
-        if body is None or str(body).strip() != wanted:
+        if body is None or _first_line(body) != wanted_title:
             continue
         found = getattr(message, "id", None)
-        if isinstance(found, int) and found > 0:
-            return found
-    return None
+        if isinstance(found, int) and found > newest_tracked:
+            candidates.append(found)
+    return max(candidates) if candidates else None
+
+
+def _first_line(text):
+    for line in str(text or "").splitlines():
+        cleaned = " ".join(line.split())
+        if cleaned:
+            return cleaned
+    return ""
+
+
+async def _send_card(bot, chat_id, payload, record=None):
+    """ارسالِ مستقیمِ کارت (هرگز صف‌شده) تا شناسهٔ پیام حتماً برگردد."""
+    try:
+        from modules.outgoing_sender import DISPATCH_ACTIVE_VAR
+        token = DISPATCH_ACTIVE_VAR.set(False)
+    except Exception:                                # noqa: BLE001
+        DISPATCH_ACTIVE_VAR = token = None
+    try:
+        return await asyncio.wait_for(
+            bot.client.send_message(timed.resolve_peer(bot, chat_id, record),
+                                    payload[0],
+                                    formatting_entities=payload[1]),
+            timeout=timed.RPC_TIMEOUT)
+    finally:
+        if token is not None:
+            try:
+                DISPATCH_ACTIVE_VAR.reset(token)
+            except Exception:                        # noqa: BLE001
+                pass
 
 
 def _message_key(chat_id):
@@ -226,12 +286,13 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
       بخورد، پیام دوم ساخته نشود.
     """
     key = _message_key(chat_id)
+    record = record or timed.get_record(chat_id) or {}
+    _sync_run(chat_id, record)
     if key in _STATUS_FAILED:
         return None
     in_memory = _STATUS.get(key)
     if in_memory:
         return in_memory
-    record = record or timed.get_record(chat_id) or {}
     message_id = record.get("status_message_id")
     if message_id:
         _STATUS[key] = message_id
@@ -243,9 +304,12 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
         _ENSURE_LOCKS[key] = lock
     async with lock:
         # بازبینیِ دوباره زیرِ قفل (ممکن است کارِ هم‌زمان ساخته باشد).
+        fresh = timed.get_record(chat_id) or {}
+        _sync_run(chat_id, fresh)
+        if key in _STATUS_FAILED:
+            return None
         if _STATUS.get(key):
             return _STATUS[key]
-        fresh = timed.get_record(chat_id) or {}
         if fresh.get("status_message_id"):
             _STATUS[key] = fresh["status_message_id"]
             return fresh["status_message_id"]
@@ -258,11 +322,7 @@ async def ensure_status_message(bot, chat_id, *, record=None, logger=None):
                                        total=total,
                                        ended_at=fresh.get("end_at_tehran"))
         try:
-            sent = await asyncio.wait_for(
-                bot.client.send_message(timed.resolve_peer(bot, chat_id, fresh),
-                                        payload[0],
-                                        formatting_entities=payload[1]),
-                timeout=timed.RPC_TIMEOUT)
+            sent = await _send_card(bot, chat_id, payload, fresh)
         except Exception as error:                   # noqa: BLE001
             if logger is not None:
                 try:
@@ -327,9 +387,33 @@ async def publish_status(bot, chat_id, *, deleted, failed, elapsed, locked=None,
         message_id = await ensure_status_message(bot, chat_id, record=record,
                                                  logger=logger)
     if not message_id:
+        # شناسهٔ کارت به دست نیامد ⇒ کارت قابل‌ویرایش نیست. گزارشِ پایانی با
+        # شمارشِ واقعی یک بار (و فقط یک بار) به‌صورت پیامِ جدا می‌آید تا
+        # نتیجه هیچ‌وقت «۰ پیام» نماند.
+        key = _key(chat_id)
+        if state in {"done", "cancelled", "failed_timeout"} \
+                and key not in _FINAL_SENT:
+            _FINAL_SENT.add(key)
+            try:
+                sent = await _send_card(bot, chat_id, payload, record)
+            except Exception as error:               # noqa: BLE001
+                if logger is not None:
+                    try:
+                        logger.log_error(
+                            f"TIMED FINAL REPORT FAILED chat_id={chat_id} "
+                            f"error={error!r}")
+                    except Exception:                # noqa: BLE001
+                        pass
+                return None
+            return sent
         return None
     # شناسهٔ عددیِ پیام برای edit_message کافی است (همان پیامی که فرستادیم).
-    return await _edit(bot, chat_id, message_id, payload, logger)
+    edited = await _edit(bot, chat_id, message_id, payload, logger)
+    if edited is None and state in {"done", "cancelled", "failed_timeout"}:
+        # ویرایشِ پایانی نباید با یک خطای گذرا از دست برود.
+        await asyncio.sleep(1.0)
+        edited = await _edit(bot, chat_id, message_id, payload, logger)
+    return edited
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +547,79 @@ def track(chat_id, message_id, user_id=None):
         return False
 
 
+# ---------------------------------------------------------------------------
+#  پیام‌های خودِ ربات در بازه
+# ---------------------------------------------------------------------------
+def _own_message_rows(sent):
+    """(chat_id, message_id) برای نتیجهٔ یک ارسال؛ فقط گروه/کانال."""
+    items = sent if isinstance(sent, (list, tuple)) else [sent]
+    rows = []
+    for item in items:
+        message_id = getattr(item, "id", None)
+        if not isinstance(message_id, int) or message_id <= 0:
+            continue
+        peer = getattr(item, "peer_id", None)
+        chat = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
+        if chat is None:
+            chat = getattr(item, "chat_id", None)
+            if not isinstance(chat, int) or chat >= 0:
+                continue                 # پیوی یا ناشناخته
+        rows.append((chat, message_id))
+    return rows
+
+
+_OWN_RECENT = collections.deque(maxlen=64)
+
+
+def track_own(sent):
+    """پیامی که خودِ ربات در بازهٔ فعال فرستاده هم جزو همان بازه است.
+
+    پیام‌های خودِ ربات به‌صورت رویدادِ «پیام جدید» برنمی‌گردند، پس قبلاً
+    هیچ‌وقت ثبت نمی‌شدند و بعد از پاکسازی در گروه می‌ماندند. کارتِ وضعیت بعد
+    از پایانِ بازه فرستاده می‌شود (وضعیت دیگر ``active`` نیست) و ثبت نمی‌شود.
+    """
+    tracked = 0
+    try:
+        for chat, message_id in _own_message_rows(sent):
+            # send_message با فایل، send_file را هم صدا می‌زند؛ همان پیام دو
+            # بار ثبت نشود.
+            if (chat, message_id) in _OWN_RECENT:
+                continue
+            _OWN_RECENT.append((chat, message_id))
+            if timed.track_message(chat, message_id):
+                tracked += 1
+    except Exception:                                # noqa: BLE001
+        return tracked
+    return tracked
+
+
+def install_own_message_tracking(client_class):
+    """روی کلاسِ کلاینت نصب می‌شود (کلاینتِ بازسازی‌شده هم پوشش دارد)."""
+    import functools
+
+    installed = False
+    for name in ("send_message", "send_file"):
+        original = getattr(client_class, name, None)
+        if original is None or getattr(original, "_fx_timed_tracking", False):
+            continue
+
+        def make(original=original):
+            @functools.wraps(original)
+            async def tracked_send(self, *args, **kwargs):
+                sent = await original(self, *args, **kwargs)
+                track_own(sent)
+                return sent
+            tracked_send._fx_timed_tracking = True
+            return tracked_send
+
+        try:
+            setattr(client_class, name, make())
+            installed = True
+        except (AttributeError, TypeError):
+            continue
+    return installed
+
+
 async def publish_from_record(bot, chat_id, logger=None):
     """وضعیت نهایی را روی همان پیام وضعیت می‌نویسد."""
     record = timed.get_record(chat_id) or {}
@@ -520,6 +677,8 @@ def reset_all(chat_id=None):
     timed.reset_all(chat_id)
     _WATCH.clear()
     if chat_id is None:
+        _STATUS_RUN.clear()
+        _FINAL_SENT.clear()
         _CHOICES.clear()
         _STATUS.clear()
         _ENSURE_LOCKS.clear()
@@ -528,3 +687,5 @@ def reset_all(chat_id=None):
         clear_choice(chat_id)
         _STATUS.pop(_key(chat_id), None)
         _STATUS_FAILED.discard(_key(chat_id))
+        _STATUS_RUN.pop(_key(chat_id), None)
+        _FINAL_SENT.discard(_key(chat_id))

@@ -750,6 +750,15 @@ class SoroushAntiSpamBot:
             self.logger.log_error(
                 f"OWN_DELETE_PTS_FIX failed error={_own_fix_error!r}"
             )
+        # پیام‌های خودِ ربات در بازهٔ «پیام زماندار» هم باید ثبت و پاک شوند.
+        try:
+            from modules.manage_features import timed_commands as _timed_cmds
+            if hasattr(SoroushClient, "send_message"):
+                _timed_cmds.install_own_message_tracking(SoroushClient)
+        except Exception as _timed_track_error:
+            self.logger.log_error(
+                f"TIMED OWN TRACKING failed error={_timed_track_error!r}"
+            )
         self.client = self._make_client()
         if not getattr(self, "bot_account_id", None):
             self.bot_account_id = (

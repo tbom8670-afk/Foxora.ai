@@ -398,6 +398,20 @@ def schedule(bot, chat_id, *, logger=None):
     return task
 
 
+def _detach_task_context():
+    """زمان‌سنج/پایانِ بازه نباید کانتکستِ کارگرِ گروه را به ارث ببرد.
+
+    باگِ واقعی: وقتی بازه از داخلِ کارگرِ یک گروه فعال می‌شد، ارسالِ کارتِ
+    وضعیت صف می‌شد و ``None`` برمی‌گشت؛ شناسهٔ کارت گم می‌شد و شمارش هیچ‌وقت
+    روی آن نوشته نمی‌شد (فقط در بعضی گروه‌ها).
+    """
+    try:
+        from modules.outgoing_sender import detach_from_dispatch
+        detach_from_dispatch()
+    except Exception:                                # noqa: BLE001
+        pass
+
+
 async def _timer(bot, chat_id, _delay, logger):
     """تیکِ زمان‌سنج: هر ۳۰ ثانیه بیدار می‌شود و «زمان پایانِ ذخیره‌شده» را
     می‌سنجد.
@@ -412,6 +426,7 @@ async def _timer(bot, chat_id, _delay, logger):
       (``TIMED LATE``) تا اگر سرور/دستگاه خواب بوده، پنهان نماند.
     """
     key = _key(chat_id)
+    _detach_task_context()
     try:
         while True:
             record = get_record(chat_id)
@@ -553,6 +568,7 @@ async def finish(bot, chat_id, *, logger=None, now_ts=None):
     وضعیت ``failed_timeout`` ثبت و همان پیامِ وضعیت با همین گزارش ویرایش
     می‌شود تا کارِ نیمه‌کاره پنهان نماند.
     """
+    _detach_task_context()
     try:
         return await asyncio.wait_for(
             _finish(bot, chat_id, logger=logger, now_ts=now_ts),
@@ -633,6 +649,11 @@ async def _finish(bot, chat_id, *, logger=None, now_ts=None):
         except Exception as error:                   # noqa: BLE001
             log_info(logger, f"TIMED STATUS HOOK FAILED chat_id={chat_id} "
                              f"error={error!r}")
+    # شناسهٔ کارت را قلاب روی دیسک می‌نویسد؛ نسخهٔ درون‌حافظهٔ همین تابع هم
+    # باید آن را داشته باشد، وگرنه نوشتن‌های بعدیِ رکورد آن را پاک می‌کرد.
+    status_on_disk = (get_record(chat_id) or {}).get("status_message_id")
+    if status_on_disk:
+        record["status_message_id"] = status_on_disk
     if not record.get("status_message_id"):
         log_info(logger, f"TIMED STATUS MESSAGE MISSING chat_id={chat_id} "
                          f"(counts will still be recorded)")

@@ -125,6 +125,13 @@ class PerGroupQueue:
     #  کارگر
     # ------------------------------------------------------------------
     async def _worker(self, key):
+        # این کارگر ممکن است از داخلِ کارگرِ یک گروه ساخته شده باشد؛ بدون این
+        # خط، ارسال‌هایش صف می‌شد و شناسهٔ پیامِ فرستاده‌شده برنمی‌گشت.
+        try:
+            from modules.outgoing_sender import detach_from_dispatch
+            detach_from_dispatch()
+        except Exception:                            # noqa: BLE001
+            pass
         queue = self._queues.get(key)
         while queue:
             job, future, serialize, error_callback, logger, dedupe_token = \
