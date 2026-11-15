@@ -74,6 +74,7 @@ def make_bot():
 
 def reset():
     cmd.reset_all()
+    entertainment_control._LEAVE_NOTICE_AT.clear()
     for module in (anti_channel, heavy):
         module.save({})
     banned.save({})
@@ -184,8 +185,19 @@ async def main():
           and entertainment_control.is_enabled(G1))
     game_event = Event()
     blocked = await entertainment_control.guard(game_event, G1, "معما")
-    check("بازی بی‌صدا بسته است (هیچ پیامی ارسال نمی‌شود)",
-          blocked and not game_event.replies)
+    check("پیامِ مخصوصِ مرخصی برای بازی", blocked
+          and len(game_event.replies) == 1
+          and game_event.replies[0][0] == texts.LEAVE_GAMES_BLOCKED
+          and game_event.replies[0][0].startswith("««« ⚙️ »»» بازی های روباه")
+          and "\n" not in game_event.replies[0][0])
+    ents = game_event.replies[0][1]
+    check("پیامِ بازی: کل متن Bold و بدون نقل‌قول", len(ents) == 1
+          and type(ents[0]).__name__.endswith("Bold") and ents[0].offset == 0
+          and ents[0].length == texts.u16(texts.LEAVE_GAMES_BLOCKED))
+    game_event2 = Event()
+    blocked2 = await entertainment_control.guard(game_event2, G1, "زامبی")
+    check("پشت سر هم تکرار نمی‌شود ولی بازی بسته می‌ماند",
+          blocked2 and not game_event2.replies)
     check("دستور غیر بازی مسدود نمی‌شود",
           not entertainment_control.blocks(G1, "لیست بازی"))
     check("۱۶) گروه دیگر تحت تأثیر نیست", not admin_leave.is_active(G2)

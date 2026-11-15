@@ -332,6 +332,29 @@ def leave_blocks(chat_id):
         return False
 
 
+_LEAVE_NOTICE_AT = {}
+#: فاصلهٔ حداقلیِ همین پیام در یک گروه (ثانیه) تا خودش بارِ ارسال نسازد.
+LEAVE_NOTICE_INTERVAL = 10.0
+
+
+async def send_leave_blocked_notice(event, chat_id):
+    """🎒 پیامِ «بازی‌ها در مدتِ مرخصی غیر فعال‌اند» — کل متن Bold."""
+    import time as _time
+    now = _time.monotonic()
+    key = _key(chat_id)
+    if now - _LEAVE_NOTICE_AT.get(key, -1e9) < LEAVE_NOTICE_INTERVAL:
+        return None
+    if len(_LEAVE_NOTICE_AT) > 2000:
+        _LEAVE_NOTICE_AT.clear()
+    _LEAVE_NOTICE_AT[key] = now
+    from modules.manage_features import texts as _leave_texts
+    text, entities = _leave_texts.leave_games_blocked()
+    try:
+        return await event.reply(text, formatting_entities=entities)
+    except BaseException:
+        return await event.reply(text)
+
+
 async def guard(event, chat_id, text):
     """True یعنی بازی مسدود شد و هندلر باید همان‌جا return کند.
 
@@ -341,8 +364,7 @@ async def guard(event, chat_id, text):
     if not blocks(chat_id, text):
         return False
     if leave_blocks(chat_id):
-        # 🎒 در مدتِ «مرخصی ادمین» بازی بی‌صدا بسته است (به‌خواستِ کارفرما
-        # هیچ پیامی فرستاده نمی‌شود).
+        await send_leave_blocked_notice(event, chat_id)
         return True
     await send_blocked_notice(event)
     return True

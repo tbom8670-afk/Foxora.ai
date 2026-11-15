@@ -817,3 +817,16 @@ def leave_ended(user):
     for row in LEAVE_ENDED_BODY.split("\n"):
         builder.line(row)
     return builder.build()
+
+
+#: ۶) بازی‌ها در مدتِ مرخصی — یک پاراگراف، کل متن Bold، بدون نقل‌قول
+LEAVE_GAMES_BLOCKED = (
+    "««« ⚙️ »»» بازی های روباه در حال حاضر غیر فعال می\u200cباشد من در حال "
+    "مدیریت پیشرفته گروه هستم به محض برگشتن ادمینی که مرخصی گرفت میتوانید "
+    "دوباره از بازی ها استفاده کنید در حال حاضر برای بهتر شدن عملکرد و سرعت "
+    "دهی بازی های من غیر فعال می\u200cباشد"
+)
+
+
+def leave_games_blocked():
+    return _Builder().line(LEAVE_GAMES_BLOCKED).build()
