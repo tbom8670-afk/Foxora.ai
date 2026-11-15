@@ -3040,11 +3040,24 @@ class SoroushAntiSpamBot:
                 return
             # 🐢 شروعِ نرم: پیام‌های انباشتهٔ زمانِ خاموشی یک‌جا روی ربات
             # ریخته نمی‌شوند؛ با فاصله وارد می‌شوند. دستورها و پیوی صبر نمی‌کنند.
-            if (
-                _startup_ramp.active
-                and not getattr(event, "is_private", False)
-                and _startup_ramp.is_backlog(event)
-            ):
+            _is_backlog_message = False
+            try:
+                _is_backlog_message = (
+                    not getattr(event, "is_private", False)
+                    and _startup_ramp.is_backlog(event)
+                )
+                # 🐢 اگر وسطِ کار یک‌دفعه دسته‌ای پیامِ قدیمی رسید (اتصالِ
+                # گیرکرده برگشت)، همان شروعِ نرم دوباره فعال می‌شود.
+                if (
+                    _is_backlog_message
+                    and not _startup_ramp.active
+                    and _startup_ramp.note_backlog()
+                ):
+                    _startup_ramp_announced[0] = False
+                    _startup_ramp_announced[1] = False
+            except Exception:
+                _is_backlog_message = False
+            if _startup_ramp.active and _is_backlog_message:
                 try:
                     if not _startup_ramp_announced[0]:
                         _startup_ramp_announced[0] = True

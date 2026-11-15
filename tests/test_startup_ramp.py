@@ -74,6 +74,47 @@ async def main():
     os.environ.pop("BOT_STARTUP_WARMUP_SECONDS")
     check("defaults", StartupRamp().seconds == 60.0 and abs(StartupRamp().interval - 0.2) < 1e-9)
 
+    # ---- mid-run burst of old messages arms the soft start again
+    clock = Clock()
+    ramp = StartupRamp(seconds=60, interval_ms=200, clock=clock)
+    ramp._delay()
+    check("no re-arm while a window is open", ramp.note_backlog() is False)
+    clock.now += 61.0
+    check("startup window finished", not ramp.active)
+    clock.now += 600.0
+    for _ in range(ramp.burst_count - 1):
+        check_value = ramp.note_backlog()
+    check("a few old messages do not re-arm", check_value is False and not ramp.active)
+    check("a burst re-arms", ramp.note_backlog() is True and ramp.active)
+    check("re-armed window is the short one", ramp.seconds == ramp.burst_seconds == 30.0)
+    burst = [ramp._delay() for _ in range(20)]
+    check("burst is spaced again", burst[0] == 0.0 and burst[-1] > 2.0, burst[-1])
+    clock.now += 31.0
+    check("short window ends", not ramp.active)
+    for _ in range(50):
+        again = ramp.note_backlog()
+    check("no immediate re-arm right after a window", again is False)
+    clock.now += 40.0
+    hits = [ramp.note_backlog() for _ in range(ramp.burst_count)]
+    check("re-arms again later", hits[-1] is True and ramp.stats["rearmed"] == 2, ramp.stats)
+
+    # slow trickle of old messages (one every 2 s) never re-arms
+    clock = Clock()
+    ramp = StartupRamp(seconds=1, interval_ms=200, clock=clock)
+    ramp._delay(); clock.now += 100.0; ramp.active
+    trickle = []
+    for _ in range(40):
+        clock.now += 2.0
+        trickle.append(ramp.note_backlog())
+    check("slow trickle of late messages is never paced", not any(trickle))
+
+    os.environ["BOT_BURST_WARMUP_SECONDS"] = "0"
+    off = StartupRamp(seconds=1, interval_ms=200, clock=clock)
+    off._delay(); clock.now += 100.0; off.active
+    check("burst re-arm can be switched off",
+          not any(off.note_backlog() for _ in range(50)))
+    os.environ.pop("BOT_BURST_WARMUP_SECONDS")
+
     # ---- only old messages are backlog
     import datetime
     from types import SimpleNamespace as NS

@@ -17,6 +17,7 @@ chats never wait.  After the window the gate costs one comparison.
 """
 
 import asyncio
+import collections
 import datetime
 import os
 import time
@@ -57,11 +58,18 @@ class StartupRamp:
         self.backlog_age = _env_float(
             "BOT_STARTUP_BACKLOG_AGE_SECONDS", 10.0, 1.0, 3600.0
         )
+        # Mid-run bursts: BOT_BURST_WARMUP_COUNT old messages within 3 seconds
+        # open a BOT_BURST_WARMUP_SECONDS window (0 = never re-arm).
+        self.burst_seconds = _env_float("BOT_BURST_WARMUP_SECONDS", 30.0, 0.0, 600.0)
+        self.burst_count = int(_env_float("BOT_BURST_WARMUP_COUNT", 8, 2, 500))
+        self.rearm_gap = 30.0
+        self._recent_backlog = collections.deque(maxlen=512)
+        self._ended_at = None
         self._clock = clock
         self._started = None
         self._next_at = 0.0
         self._done = self.seconds <= 0.0 or self.interval <= 0.0
-        self.stats = {"paced": 0, "waited_ms": 0.0, "max_wait_ms": 0.0}
+        self.stats = {"paced": 0, "waited_ms": 0.0, "max_wait_ms": 0.0, "rearmed": 0}
 
     @property
     def active(self):
@@ -78,6 +86,36 @@ class StartupRamp:
         """True for a message that was sent while the bot was not listening."""
         age = message_age_seconds(event, now)
         return age is not None and age >= self.backlog_age
+
+    def note_backlog(self):
+        """Call for an old message seen outside a warm-up window.
+
+        If old messages suddenly arrive in a burst while the bot is running
+        (a stuck connection came back, Soroush released a held batch), the
+        soft start is armed again for a shorter window.  Returns True when a
+        new window has just been opened.
+        """
+        if self.interval <= 0.0 or self.burst_seconds <= 0.0 or self.active:
+            return False
+        now = self._clock()
+        if self._started is not None and self._ended_at is None:
+            self._ended_at = self._started + self.seconds
+        if self._ended_at is not None and now - self._ended_at < self.rearm_gap:
+            return False
+        recent = self._recent_backlog
+        recent.append(now)
+        while recent and now - recent[0] > 3.0:
+            recent.popleft()
+        if len(recent) < self.burst_count:
+            return False
+        recent.clear()
+        self.seconds = self.burst_seconds
+        self._started = None
+        self._ended_at = None
+        self._next_at = 0.0
+        self._done = False
+        self.stats["rearmed"] += 1
+        return True
 
     def remaining(self):
         """Seconds of warm-up left (full length before the first message)."""

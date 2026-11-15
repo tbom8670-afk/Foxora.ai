@@ -142,6 +142,16 @@ KEEPALIVE_REQUESTS = frozenset({
 })
 GOVERNOR_BLOCKED_MS = 500.0
 
+# 🛡️ Lookups that decide whether a user is breaking the rules (bio link,
+# profile guard).  They keep bucket=heavy (same timeout, same P3 label) but get
+# their own single lane, so an unrelated read (history, group info, member
+# list) can no longer make a violation check wait.
+_GUARD_REQUESTS = frozenset({"GetFullUserRequest"})
+
+
+def is_guard_request(request_name):
+    return str(request_name or "") in _GUARD_REQUESTS
+
 
 class RpcOverloadError(RuntimeError):
     """A disposable low-priority RPC was rejected before it could backlog."""
@@ -424,6 +434,8 @@ class RpcGovernor:
         min_interval_seconds=0.0,
         auto_delete=False,
         flood_cooldown_s=60.0,
+        adaptive_extra=0,
+        adaptive_healthy_ms=500.0,
     ):
         self.total_limit = max(1, int(total_limit))
         isolated_default = noncritical_limit is None
@@ -497,6 +509,17 @@ class RpcGovernor:
         self._next_start_at = 0.0
         self._pace_lock = asyncio.Lock()
         self._urgent_send_streak = 0
+        # 🛣️ Express lane: one extra in-flight slot, opened only while Soroush
+        # is answering quickly, and only for moderation work (P0/P1) and
+        # violation lookups.  Base limits are never lowered: when the server
+        # is slow or a FloodWait was seen, behaviour is exactly the fixed
+        # limits above.  0 = off (constructor default; runtime default is 1).
+        self.adaptive_extra = max(0, min(1, int(adaptive_extra)))
+        self.adaptive_healthy_ms = max(50.0, float(adaptive_healthy_ms))
+        self._latency_ema = None
+        self._latency_samples = 0
+        self._express_is_open = False
+        self._express_block_until = 0.0
 
         self._active_total = 0
         self._active_noncritical = 0
@@ -584,6 +607,10 @@ class RpcGovernor:
             ),
             auto_delete=auto_delete,
             flood_cooldown_s=_env_float("BOT_RPC_FLOOD_GUARD_S", 60.0),
+            adaptive_extra=_env_int("BOT_RPC_ADAPTIVE_EXTRA", 1, 0, 1),
+            adaptive_healthy_ms=_env_float(
+                "BOT_RPC_ADAPTIVE_HEALTHY_MS", 500.0, 50.0
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -604,6 +631,11 @@ class RpcGovernor:
         cooldown = self.flood_cooldown_s if cooldown is None else float(cooldown)
         until = time.monotonic() + max(0.0, min(600.0, cooldown))
         self._flood_until[bucket] = until
+        # Any FloodWait closes the express lane for at least five minutes.
+        self._express_block_until = time.monotonic() + max(300.0, cooldown)
+        if self._express_is_open:
+            self._express_is_open = False
+            self._log_warn("GOVERNOR EXPRESS CLOSED reason=flood_wait")
         try:
             self._log_warn(
                 "GOVERNOR FLOOD GUARD "
@@ -631,6 +663,51 @@ class RpcGovernor:
             return 1
         return cap
 
+    # ------------------------------------------------------------------
+    # 🛣️ Express lane (adaptive extra slot)
+    # ------------------------------------------------------------------
+    def _note_latency(self, hold_ms):
+        try:
+            value = float(hold_ms)
+        except (TypeError, ValueError):
+            return
+        if value <= 0.0:
+            return
+        if self._latency_ema is None:
+            self._latency_ema = value
+        else:
+            self._latency_ema = 0.8 * self._latency_ema + 0.2 * value
+        self._latency_samples += 1
+
+    def _express_open(self):
+        """True while the extra moderation slot may be used."""
+        if self.adaptive_extra <= 0 or not self.enabled or self.shadow:
+            return False
+        ema = self._latency_ema
+        healthy = (
+            ema is not None
+            and self._latency_samples >= 8
+            and time.monotonic() >= self._express_block_until
+            # hysteresis: open below the threshold, stay open up to 1.5x
+            and ema <= self.adaptive_healthy_ms * (
+                1.5 if self._express_is_open else 1.0
+            )
+        )
+        if healthy != self._express_is_open:
+            self._express_is_open = healthy
+            self._log_warn(
+                f"GOVERNOR EXPRESS {'OPEN' if healthy else 'CLOSED'} "
+                f"rpc_ms={0.0 if ema is None else ema:.0f} "
+                f"healthy_ms={self.adaptive_healthy_ms:g}"
+            )
+        return healthy
+
+    def _active_guard(self):
+        return sum(
+            1 for holder in self._holders
+            if is_guard_request(holder.request_name)
+        )
+
     @property
     def active(self):
         return self._active_total
@@ -639,7 +716,7 @@ class RpcGovernor:
     def waiting(self):
         return self._waiting
 
-    def _urgent_waiting(self):
+    def _urgent_waiting(self, include_p2=True):
         """True when a higher-priority waiter is queued (even if capped).
 
         🎯 دلیلِ تغییر (لاگ 22:54:08.716): قبلاً فقط P0/P1 باعثِ yield می‌شد،
@@ -649,7 +726,7 @@ class RpcGovernor:
         می‌شود؛ با ``BOT_RPC_HEAVY_YIELD_P2=0`` قابلِ برگشت است.
         """
         priorities = [P0_CRITICAL, P1_DELETE]
-        if _env_bool("BOT_RPC_HEAVY_YIELD_P2", True):
+        if include_p2 and _env_bool("BOT_RPC_HEAVY_YIELD_P2", True):
             priorities.append(P2_SEND)
         for priority in priorities:
             groups = self._queues.get(priority) or {}
@@ -677,10 +754,21 @@ class RpcGovernor:
             return self.resolve_timeout_seconds + self.watchdog_grace_seconds
         return self.watchdog_timeout_seconds
 
-    def _eligible(self, priority, bucket):
+    def _eligible(self, priority, bucket, request_name=None):
+        guard = bucket == "heavy" and is_guard_request(request_name)
         limit = self.total_limit
         if priority == P0_CRITICAL:
             limit += self.critical_reserve
+        express = (
+            self.adaptive_extra > 0
+            and (priority <= P1_DELETE or guard)
+            and self._active_total >= limit
+            and self._express_open()
+        )
+        if express:
+            # Never stacked on the P0 reserve: the peak in flight stays at
+            # total_limit + max(critical_reserve, adaptive_extra).
+            limit = max(limit, self.total_limit + self.adaptive_extra)
         if self._active_total >= limit:
             return False
         if priority == P0_CRITICAL:
@@ -701,6 +789,15 @@ class RpcGovernor:
         if cap is not None:
             if bucket in {"send", "urgent_send"}:
                 active = active_sends
+            elif bucket == "heavy":
+                # Violation lookups and other reads: one lane each.
+                guard_active = self._active_guard()
+                if guard:
+                    cap, active = 1, guard_active
+                else:
+                    active = max(
+                        0, self._active_by_bucket[bucket] - guard_active
+                    )
             else:
                 active = self._active_by_bucket[bucket]
             if active >= cap:
@@ -718,13 +815,22 @@ class RpcGovernor:
         if priority <= P1_DELETE or (
             priority == P2_SEND and bucket == "send"
         ):
-            return nonread_occupied < (self.noncritical_limit + read_active)
+            return nonread_occupied < (
+                self.noncritical_limit + read_active
+                + (self.adaptive_extra if express else 0)
+            )
         # 🎯 readهای سنگین (heavy/poll/resolve) نباید سهمِ send/notice/other را
         # بخورند. قبلاً همین شرط با ``_active_noncritical`` خام سنجیده می‌شد،
         # پس یک GetParticipantsِ در جریان + یک delete، همهٔ سهم را پر می‌کرد و
         # ``notice`` ~۵۰۳ms در صف می‌ماند (GOVERNOR HOLD SLOW bucket=notice).
-        if nonread_occupied >= self.noncritical_limit:
+        if nonread_occupied >= (
+            self.noncritical_limit + (self.adaptive_extra if express else 0)
+        ):
             return False
+        if guard:
+            # A violation check waits only for moderation itself (P0/P1),
+            # never for ordinary replies.
+            return not self._urgent_waiting(include_p2=False)
         if priority >= P3_HEAVY and self._urgent_waiting():
             return False
         return True
@@ -822,7 +928,7 @@ class RpcGovernor:
         else:
             self._burst_max_waiting = max(self._burst_max_waiting, self._waiting)
 
-    def _pop_priority(self, priority, preferred_bucket=None):
+    def _pop_priority(self, priority, preferred_bucket=None, guard_only=False):
         """Pop an eligible waiter round-robin across chats and buckets.
 
         A preferred bucket can pass a P1 command reply ahead of delete work;
@@ -848,8 +954,15 @@ class RpcGovernor:
 
             eligible_index = None
             for index, waiter in enumerate(group):
+                if guard_only and not (
+                    waiter.bucket == "heavy"
+                    and is_guard_request(waiter.request_name)
+                ):
+                    continue
                 if (preferred_bucket is None or waiter.bucket == preferred_bucket) and \
-                        self._eligible(waiter.priority, waiter.bucket):
+                        self._eligible(
+                            waiter.priority, waiter.bucket, waiter.request_name
+                        ):
                     eligible_index = index
                     break
             if eligible_index is None:
@@ -887,6 +1000,10 @@ class RpcGovernor:
         waiter = self._pop_priority(P1_DELETE)
         if waiter is not None:
             self._urgent_send_streak = 0
+            return waiter
+        # Violation lookups go ahead of ordinary replies and other reads.
+        waiter = self._pop_priority(P3_HEAVY, guard_only=True)
+        if waiter is not None:
             return waiter
         for priority in (P2_SEND, P3_HEAVY):
             waiter = self._pop_priority(priority)
@@ -958,7 +1075,9 @@ class RpcGovernor:
             )
 
         if self.shadow:
-            if not self._eligible(admission.priority, admission.bucket):
+            if not self._eligible(
+                admission.priority, admission.bucket, admission.request_name
+            ):
                 self.stats["shadow_would_wait"] += 1
             holder = self._increment_active(
                 admission.priority,
@@ -1330,6 +1449,7 @@ class RpcGovernor:
         if self._active_by_bucket.get(bucket, 0) > 0:
             self._active_by_bucket[bucket] -= 1
         self.stats["released"] += 1
+        self._note_latency(hold_ms)
         if hold_ms >= GOVERNOR_BLOCKED_MS and self.logger is not None:
             try:
                 ping_age, sender_pending, by_type = self._pending_brief()
