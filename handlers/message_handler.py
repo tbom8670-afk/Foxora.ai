@@ -699,6 +699,33 @@ async def _send_moderation_notification_once(
         raise
 
 
+_COMMAND_RESTRICT = None
+
+
+def _command_restrict():
+    """ماژولِ «محدودیت دستورات» (ایمپورتِ تنبل؛ خطا ⇒ قابلیت خاموش)."""
+    global _COMMAND_RESTRICT
+    if _COMMAND_RESTRICT is None:
+        try:
+            from modules.manage_features import command_restrict
+            _COMMAND_RESTRICT = command_restrict
+        except Exception as error:                   # noqa: BLE001
+            print(f"COMMAND RESTRICT IMPORT FAILED error={error!r}")
+            _COMMAND_RESTRICT = False
+    return _COMMAND_RESTRICT or None
+
+
+def command_restrict_interest(chat_id, user_id, text) -> bool:
+    """برای مسیرهای سریعِ هسته: این پیام باید از مسیرِ کامل رد شود؟"""
+    module = _command_restrict()
+    if module is None:
+        return False
+    try:
+        return bool(module.interest(chat_id, user_id, text))
+    except Exception:                                # noqa: BLE001
+        return False
+
+
 def _manage_features():
     """ایمپورتِ تنبلِ قابلیت‌های مدیریتی (بدون هزینه در استارتاپ)."""
     global _MANAGE_FEATURES
@@ -4337,6 +4364,35 @@ async def handle_new_message(bot, event):
                 message_text = caption
             except BaseException:
                 pass
+
+        # ⚙️ «محدودیت دستورات»: یک نقطهٔ مرکزی، پیش از همهٔ هندلرها و
+        # مسیرهای سریع. بررسیِ اول فقط چند lookup در حافظه است.
+        if not getattr(event, "is_private", False) and message_text:
+            try:
+                _restrict = _command_restrict()
+                _restrict_chat = getattr(event, "chat_id", None)
+                _restrict_user = getattr(event, "sender_id", None)
+                if _restrict is not None and _restrict.interest(
+                        _restrict_chat, _restrict_user, message_text):
+                    if await _restrict.intercept(
+                        bot, event, _restrict_chat, _restrict_user,
+                        getattr(event, "sender", None), message_text,
+                        bot.logger,
+                        edited=bool(
+                            getattr(event, "_is_edited_message", False)
+                            or getattr(event, "is_edit", False)
+                            or "messageedited" in getattr(
+                                type(event), "__module__", "").lower()
+                            or getattr(event.message, "edit_date",
+                                       None) is not None),
+                    ):
+                        return
+            except Exception as restrict_error:
+                bot.logger.log_error(
+                    "COMMAND RESTRICT FAILED "
+                    f"chat_id={getattr(event, 'chat_id', None)} "
+                    f"error={restrict_error!r}"
+                )
 
         if not getattr(event, "is_private", False):
             try:

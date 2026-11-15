@@ -830,3 +830,111 @@ LEAVE_GAMES_BLOCKED = (
 
 def leave_games_blocked():
     return _Builder().line(LEAVE_GAMES_BLOCKED).build()
+
+
+# ---------------------------------------------------------------------------
+#  ⚙️ محدودیت دستورات ادمین‌ها — متن‌ها دقیقاً مطابق نمونه‌های مالک
+# ---------------------------------------------------------------------------
+class _SpanBuilder:
+    """مثل ``_Builder`` ولی Bold فقط روی خط‌هایی که خواسته شده."""
+
+    def __init__(self):
+        self.lines = []
+        self.bolds = []
+        self.quotes = []
+
+    def line(self, text="", quote=False, bold=False):
+        start = u16("\n".join(self.lines)) + 1 if self.lines else 0
+        self.lines.append(text)
+        if text and bold:
+            self.bolds.append((start, u16(text)))
+        if text and quote:
+            self.quotes.append((start, u16(text)))
+        return self
+
+    def build(self):
+        entities = [MessageEntityBold(offset=o, length=n)
+                    for o, n in self.bolds]
+        entities += [MessageEntityBlockquote(offset=o, length=n)
+                     for o, n in self.quotes]
+        return "\n".join(self.lines), entities
+
+
+RESTRICT_START_TITLE = "⚙️سیستم محدودیت دستورات ادمین ها"
+RESTRICT_START_BODY = ("یکی از ادمین های ثبت شده زیر را انتخاب کنید گزینه "
+                       "مورد نظر عدد ارسال کنید")
+RESTRICT_START_ROW = "⚙️{index} - {user}"
+RESTRICT_ADMIN_CHOSEN = "🔐ادمین انتخاب شده : {user}"
+RESTRICT_ASK_COMMAND = (
+    "کدام دستور رو انتخاب میکنید ؟\n"
+    "این ادمین نتواند ازش استفاده کند اسم دستور رو بفرستید "
+    "اگر دستورات رو نمی‌دانید از قسمت لیست ادمینی مطاله کنید"
+)
+RESTRICT_DONE_TITLE = "⚙️ دستور انتخاب شد"
+RESTRICT_DONE_ADMIN = "ادمین محدود شده : {user}"
+RESTRICT_DONE_COMMAND = "نام دستور : {command}"
+RESTRICT_DONE_ACTOR = "انجام دهنده : {actor}"
+RESTRICT_DONE_HINT = "🔶 برای لغو محدودیت دستور زیر را بفرستید"
+RESTRICT_DONE_CANCEL = "»» لغو دستور"
+UNRESTRICT_START_TITLE = "⚙️لغو دستور های ادمین ها"
+UNRESTRICT_START_BODY = "لیست ادمین های محدود شده انتخاب کنید"
+UNRESTRICT_START_ROW = "{index}ـ {user}"
+UNRESTRICT_ADMIN_CHOSEN = "⚙️ادمین انتخاب شده : {user}"
+UNRESTRICT_PICK_BODY = ("دستوراتی که ازشون محدود هست برای لغو یک گزینه را "
+                        "ارسال کنید")
+UNRESTRICT_PICK_ROW = "{index} ـ {command}"
+UNRESTRICT_DONE = "🔐 محدودیت دستور لغو شد"
+RESTRICT_BLOCKED = ("⚙️ : شما نمیتوانید از این دستور استفاده کنید\n"
+                    "دسترسی شما توسط مالک محدود شده")
+
+
+def restrict_start(users):
+    builder = _SpanBuilder().line(RESTRICT_START_TITLE, quote=True)
+    builder.line().line().line(RESTRICT_START_BODY).line()
+    for index, user in enumerate(users, 1):
+        builder.line(RESTRICT_START_ROW.format(index=index, user=user))
+    return builder.build()
+
+
+def restrict_ask_command(user):
+    builder = _SpanBuilder().line(
+        RESTRICT_ADMIN_CHOSEN.format(user=user), quote=True)
+    for row in RESTRICT_ASK_COMMAND.split("\n"):
+        builder.line(row, bold=True)
+    return builder.build()
+
+
+def restrict_done(*, user, command, actor):
+    builder = _SpanBuilder().line(RESTRICT_DONE_TITLE, bold=True)
+    builder.line(RESTRICT_DONE_ADMIN.format(user=user), quote=True)
+    builder.line(RESTRICT_DONE_COMMAND.format(command=command), quote=True)
+    builder.line(RESTRICT_DONE_ACTOR.format(actor=actor), quote=True)
+    builder.line().line().line()
+    builder.line(RESTRICT_DONE_HINT)
+    builder.line(RESTRICT_DONE_CANCEL, bold=True)
+    return builder.build()
+
+
+def unrestrict_start(users):
+    builder = _SpanBuilder().line(UNRESTRICT_START_TITLE, quote=True)
+    builder.line(UNRESTRICT_START_BODY, bold=True)
+    for index, user in enumerate(users, 1):
+        builder.line(UNRESTRICT_START_ROW.format(index=index, user=user))
+    return builder.build()
+
+
+def unrestrict_pick(user, commands):
+    builder = _SpanBuilder().line(
+        UNRESTRICT_ADMIN_CHOSEN.format(user=user), quote=True)
+    builder.line(UNRESTRICT_PICK_BODY, bold=True).line()
+    for index, command in enumerate(commands, 1):
+        builder.line(UNRESTRICT_PICK_ROW.format(index=index, command=command))
+    return builder.build()
+
+
+def unrestrict_done():
+    return _SpanBuilder().line(UNRESTRICT_DONE, bold=True).build()
+
+
+def restrict_blocked():
+    return _Builder().line(RESTRICT_BLOCKED).build()

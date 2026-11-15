@@ -79,6 +79,7 @@ from handlers.message_handler import (
     is_fast_owner_command,
     handle_fast_moderation_command,
     is_fast_moderation_command,
+    command_restrict_interest,
     is_game_answer_active,
     _resolved_event_peer,
 )
@@ -1854,8 +1855,16 @@ class SoroushAntiSpamBot:
                 if getattr(event, "is_private", False):
                     await process_incoming_message(event)
                     return
+                # ⚙️ «محدودیت دستورات»: پیامِ ادمینِ محدودشده یا پیامِ مالک در
+                # میانهٔ انتخاب نباید از مسیرهای سریع اجرا شود؛ در مسیرِ
+                # کامل (handle_new_message) همان ابتدا رسیدگی می‌شود.
+                restrict_hold = command_restrict_interest(
+                    getattr(event, "chat_id", None),
+                    getattr(event, "sender_id", None), raw_text)
                 try:
-                    if is_fast_owner_command(text):
+                    if restrict_hold:
+                        pass
+                    elif is_fast_owner_command(text):
                         if await handle_fast_owner_command(self, event, text):
                             return
                 except Exception as fast_error:
@@ -1905,7 +1914,9 @@ class SoroushAntiSpamBot:
                     ):
                         await process_incoming_message(event)
                     return
-                if is_fast_moderation_command(text):
+                if restrict_hold:
+                    pass
+                elif is_fast_moderation_command(text):
                     if await handle_fast_moderation_command(
                         self, event, text, sender
                     ):
