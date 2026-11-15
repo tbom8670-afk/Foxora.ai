@@ -4,6 +4,7 @@
 * ``مرخصی``                  → راهنمای نوشتن
 * ``مرخصی 30 دقیقه``         → ثبتِ مرخصیِ خودِ همان ادمین
 * ``لغو مرخصی`` (ریپلای)     → فقط مالکِ ثبت‌شدهٔ گروه / مالک اصلی ربات
+* ``لغو مرخصی`` (مالک، بدون ریپلای) → همهٔ مرخصی‌های فعالِ همان گروه
 * ``لغو مرخصی`` (بدون ریپلای) → ادمین، مرخصیِ خودش را لغو می‌کند
 
 مجوزها فقط با **شناسهٔ عددی** سنجیده می‌شوند و در همین تابع (نه فقط در
@@ -241,8 +242,28 @@ async def _handle_cancel(bot, event, chat_id, user_id, logger):
             target_id = user_id
         else:
             target_id = await _reply_target(bot, event, chat_id)
+            if target_id is None:
+                # نویسندهٔ پیامِ ریپلای‌شده خوانده نشد؛ اگر فقط یک مرخصی در
+                # گروه هست، منظورِ مالک همان است.
+                only = admin_leave.active_leaves(chat_id)
+                if len(only) == 1:
+                    target_id = only[0]["user_id"]
     elif not owner:
         target_id = user_id
+    else:
+        # مالکِ ثبت‌شده / مالک اصلی بدون ریپلای: همهٔ مرخصی‌های فعالِ همین
+        # گروه لغو می‌شوند و ربات به حالت عادی برمی‌گردد (فقط یک پیام).
+        cancelled = []
+        for leave in admin_leave.active_leaves(chat_id):
+            ended, _last, _restored = admin_leave.end(chat_id,
+                                                      leave["user_id"])
+            if ended:
+                cancelled.append(leave["user_id"])
+        if cancelled:
+            _log(logger, f"ADMIN LEAVE CANCELLED ALL chat_id={chat_id} "
+                         f"admins={cancelled} by={user_id}")
+            await _reply(event, texts.leave_cancelled(), logger)
+        return True
     if target_id is None:
         return True
     leave, last, restored = admin_leave.end(chat_id, target_id)

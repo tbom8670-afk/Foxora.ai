@@ -770,15 +770,6 @@ LEAVE_ENDED_QUOTE = "سلام دوست من : {user}"
 LEAVE_ENDED_BODY = ("مرخصیت به پایان رسید به فعالیت برگرد\n"
                     "🔐ربات به حالت مدیریت عادی بازگشت")
 
-#: ۶) بازی‌ها در مدتِ مرخصی
-LEAVE_GAMES_BLOCKED = (
-    "»»» ⚙️ ««« بازی های روباه در حال حاضر غیر فعال می\u200cباشد من در حال "
-    "مدیریت پیشرفته گروه هستم به محض برگشتن ادمینی که مرخصی گرفت میتوانید "
-    "دوباره از بازی ها استفاده کنید\n"
-    "در حال حاضر برای بهتر شدن عملکرد و سرعت دهی بازی های من غیر فعال "
-    "می\u200cباشد"
-)
-
 
 def leave_ask():
     builder = _Builder().line(LEAVE_ASK_HEADER)
@@ -824,12 +815,5 @@ def leave_cancelled():
 def leave_ended(user):
     builder = _Builder().line(LEAVE_ENDED_QUOTE.format(user=user), quote=True)
     for row in LEAVE_ENDED_BODY.split("\n"):
-        builder.line(row)
-    return builder.build()
-
-
-def leave_games_blocked():
-    builder = _Builder()
-    for row in LEAVE_GAMES_BLOCKED.split("\n"):
         builder.line(row)
     return builder.build()
