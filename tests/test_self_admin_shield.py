@@ -27,10 +27,12 @@ from modules.self_admin_shield import (
     SelfAdminProtectedError,
     install_self_admin_shield,
     is_self_target,
+    known_bot_id,
     load_persisted_bot_id,
     sanitize_self_records,
     save_persisted_bot_id,
 )
+from modules.self_admin_shield import _persisted_bot_id_cached
 
 
 BOT_ID = 777001
@@ -462,3 +464,90 @@ def test_reply_to_bot_message_is_blocked_in_exclusive_commands_and_fast_mute(mon
     assert len(replies) == 1
     assert "خود ربات" in replies[0][0]
     assert client.sent_requests == []
+
+
+# ---------------------------------------------------------------------------
+# 🔑 سخت‌سازیِ محافظ: fallback دیسک + fail-closed + بذردهی از دیسک هنگامِ نصب
+# ---------------------------------------------------------------------------
+def test_known_bot_id_falls_back_to_persisted_disk(tmp_path, monkeypatch):
+    """وقتی حافظه خالی است، شناسهٔ خودِ ربات باید از دیسک خوانده شود."""
+    id_file = tmp_path / "bot_identity.json"
+    id_file.write_text(json.dumps({"bot_account_id": BOT_ID}), encoding="utf-8")
+    monkeypatch.setattr("modules.self_admin_shield.IDENTITY_FILE", id_file)
+
+    client = FakeWireClient(self_id=None, lazy_get_me_id=None)  # حافظه خالی
+    bot = SimpleNamespace(bot_account_id=None, client=client, logger=DummyLogger())
+    assert known_bot_id(bot=bot, client=client) == BOT_ID
+    assert known_bot_id(client=client) == BOT_ID
+
+
+def test_install_seeds_shield_id_from_persisted_disk(tmp_path, monkeypatch):
+    """نصبِ محافظ باید شناسه را از دیسک بذر دهد تا به get_me وابسته نباشد."""
+    id_file = tmp_path / "bot_identity.json"
+    id_file.write_text(json.dumps({"bot_account_id": BOT_ID}), encoding="utf-8")
+    monkeypatch.setattr("modules.self_admin_shield.IDENTITY_FILE", id_file)
+
+    # کلاینتی که get_me آن هیچ‌وقت موفق نمی‌شود (self_id=None, lazy=None).
+    client = FakeWireClient(self_id=None, lazy_get_me_id=None)
+    logger = DummyLogger()
+    bot = SimpleNamespace(bot_account_id=None, client=client, logger=logger)
+    install_self_admin_shield(client, bot=bot, logger=logger)
+
+    assert client._shield_bot_account_id == BOT_ID
+
+    # حالا درخواستِ خودزنی حتی بدونِ get_me هم مسدود می‌شود.
+    channel = types.InputChannel(channel_id=123456, access_hash=999)
+    self_peer = types.InputPeerUser(user_id=BOT_ID, access_hash=111)
+    with pytest.raises(SelfAdminProtectedError):
+        _run(client(functions.channels.EditBannedRequest(
+            channel=channel, participant=self_peer,
+            banned_rights=types.ChatBannedRights(until_date=None, send_messages=True),
+        )))
+    assert client.sent_requests == []
+
+
+def test_wire_shield_fails_closed_when_bot_id_unresolvable(tmp_path, monkeypatch):
+    """اگر شناسهٔ ربات هیچ‌طور معلوم نشود، محافظ باید «بسته» شود نه «باز»."""
+    id_file = tmp_path / "bot_identity.json"   # وجود ندارد → دیسک هم خالی
+    monkeypatch.setattr("modules.self_admin_shield.IDENTITY_FILE", id_file)
+
+    client = FakeWireClient(self_id=None, lazy_get_me_id=None)  # get_me → None
+    logger = DummyLogger()
+    bot = SimpleNamespace(bot_account_id=None, client=client, logger=logger)
+    install_self_admin_shield(client, bot=bot, logger=logger)
+
+    channel = types.InputChannel(channel_id=123456, access_hash=999)
+    other_peer = types.InputPeerUser(user_id=OTHER_USER_ID, access_hash=222)
+
+    # حتی درخواستی که هدفش کاربرِ دیگری است، چون نمی‌توان ثابت کرد خودِ ربات
+    # نیست، در این پنجرهٔ ناامن مسدود می‌شود (عزلِ خودکار برگشت‌ناپذیر است).
+    with pytest.raises(SelfAdminProtectedError):
+        _run(client(functions.channels.EditAdminRequest(
+            channel=channel, user_id=other_peer,
+            admin_rights=types.ChatAdminRights(), rank="",
+        )))
+    assert client.sent_requests == []
+    assert any("fail-closed" in e or "UNKNOWN" in e for e in logger.errors)
+
+
+def test_persisted_cache_is_path_aware(tmp_path, monkeypatch):
+    """کشِ شناسهٔ پایدار باید با تغییرِ مسیرِ فایلِ هویت بی‌اعتبار شود."""
+    f1 = tmp_path / "id1.json"
+    f1.write_text(json.dumps({"bot_account_id": 111}), encoding="utf-8")
+    monkeypatch.setattr("modules.self_admin_shield.IDENTITY_FILE", f1)
+    assert _persisted_bot_id_cached() == 111
+
+    f2 = tmp_path / "id2.json"
+    f2.write_text(json.dumps({"bot_account_id": 222}), encoding="utf-8")
+    monkeypatch.setattr("modules.self_admin_shield.IDENTITY_FILE", f2)
+    # مسیر عوض شد → کش باید مقدارِ تازه را از دیسک بخواند.
+    assert _persisted_bot_id_cached() == 222
+
+
+def test_save_persisted_bot_id_refreshes_cache(tmp_path, monkeypatch):
+    id_file = tmp_path / "bot_identity.json"
+    monkeypatch.setattr("modules.self_admin_shield.IDENTITY_FILE", id_file)
+    save_persisted_bot_id(BOT_ID)
+    # بدونِ خواندنِ دوبارهٔ دیسک، known_bot_id باید از کش مقدار بگیرد.
+    client = FakeWireClient(self_id=None, lazy_get_me_id=None)
+    assert known_bot_id(client=client) == BOT_ID

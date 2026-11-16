@@ -75,11 +75,38 @@ def load_persisted_bot_id() -> Optional[int]:
     return None
 
 
+# کشِ حافظه‌ایِ شناسهٔ پایدارِ اکانت ربات تا fallback دیسک در ``known_bot_id``
+# برای هر درخواستِ محافظت‌شده دوباره فایل نخواند. کش به **مسیرِ فایلِ هویت**
+# وابسته است: اگر مسیر عوض شود (مثلاً در تست‌ها که IDENTITY_FILE جابه‌جا می‌شود
+# یا مسیرِ runtime تغییر کند)، کش بی‌اعتبار و دوباره از دیسک خوانده می‌شود.
+_PERSISTED_ID_CACHE: dict[str, Any] = {"value": None, "loaded": False, "path": None}
+
+
+def _persisted_bot_id_cached() -> Optional[int]:
+    """شناسهٔ پایدارِ اکانت ربات از دیسک، با کشِ حافظه‌ایِ وابسته به مسیرِ فایل."""
+    current_path = str(_identity_file())
+    if (
+        _PERSISTED_ID_CACHE.get("loaded")
+        and _PERSISTED_ID_CACHE.get("path") == current_path
+    ):
+        return _PERSISTED_ID_CACHE.get("value")
+    uid = load_persisted_bot_id()
+    _PERSISTED_ID_CACHE["value"] = uid
+    _PERSISTED_ID_CACHE["loaded"] = True
+    _PERSISTED_ID_CACHE["path"] = current_path
+    return uid
+
+
 def save_persisted_bot_id(bot_account_id: Any, *, username: Optional[str] = None) -> bool:
     """ذخیرهٔ اتمیک شناسهٔ اکانت ربات پس از دریافت موفق از ``get_me()``."""
     uid = _safe_pos_int(bot_account_id)
     if uid is None:
         return False
+    # کشِ حافظه‌ای همین‌جا تازه می‌شود تا known_bot_id بدونِ خواندنِ دیسک،
+    # شناسهٔ خودِ ربات را بداند (حتی اگر نوشتنِ فایل موفق نشود).
+    _PERSISTED_ID_CACHE["value"] = uid
+    _PERSISTED_ID_CACHE["loaded"] = True
+    _PERSISTED_ID_CACHE["path"] = str(_identity_file())
     try:
         id_path = _identity_file()
         current = load_persisted_bot_id()
@@ -121,6 +148,15 @@ def known_bot_id(
         uid = _safe_pos_int(item)
         if uid is not None:
             return uid
+    # 🔑 آخرین چاره: شناسهٔ پایدارِ خودِ ربات از دیسک (bot_identity.json).
+    # این همان حفرهٔ اصلیِ محافظ بود: پیش‌تر فقط منابعِ حافظه‌ای خوانده می‌شد،
+    # پس در پنجرهٔ میانِ «ری‌استارت/بازسازیِ کلاینت» و «نخستین get_meٔ موفق»
+    # مقدارِ ``own_id`` هیچ بود و محافظ **باز** می‌شد — یعنی یک درخواستِ
+    # EditAdmin/EditBanned به مقصدِ خودِ ربات می‌توانست رد شود و ربات یهویی از
+    # ادمینی بیفتد. حالا حتی بدونِ get_me هم شناسه از دیسک معلوم است.
+    persisted = _persisted_bot_id_cached()
+    if persisted is not None:
+        return persisted
     return None
 
 
@@ -249,6 +285,23 @@ async def _guard_tl_request(request: Any, *, client: Any, bot: Any = None, logge
     own_id = known_bot_id(bot=bot, client=client)
     if own_id is None:
         own_id = await _lazy_resolve_bot_id(client, bot=bot, logger=logger)
+    if own_id is None:
+        # ⛔️ پنجرهٔ «ناشناخته» —fail-closed: نه حافظه، نه دیسک و نه get_me
+        # شناسهٔ خودِ ربات را نداده‌اند، پس نمی‌توان تضمین کرد هدفِ این درخواست
+        # خودِ اکانت ربات نیست. عزلِ خودکار **برگشت‌ناپذیر** است (ربات همراه با
+        # ادمینی، حقِ add_admins را هم از دست می‌دهد و دیگر نمی‌تواند خودش را
+        # برگرداند)، بنابراین محافظ به‌جای «باز» شدن، درخواست را می‌بندد و پرچم
+        # می‌زند. با fallback دیسک در known_bot_id این پنجره عملاً فقط در اولین
+        # اجرای ربات، پیش از نخستین get_meٔ موفق، ممکن است رخ دهد و خودبه‌خود
+        # خوب می‌شود. فراخوان‌ها این خطا را می‌بلعند (moderation مقدارِ False
+        # برمی‌گرداند) و اقدامِ مشروع در تلاشِ بعدی انجام می‌شود.
+        _log_blocked(
+            logger, f"{req_name} (own_id UNKNOWN → fail-closed)", chat_ref, None
+        )
+        raise SelfAdminProtectedError(
+            f"Blocked {req_name}: cannot verify the target is not the bot's own "
+            "account because bot_account_id is unresolved (fail-closed)."
+        )
     if is_self_target(target, bot=bot, client=client, bot_account_id=own_id):
         _log_blocked(logger, req_name, chat_ref, own_id)
         raise SelfAdminProtectedError(
@@ -262,8 +315,15 @@ def install_self_admin_shield(client: Any, *, bot: Any = None, logger: Any = Non
         return False
     try:
         client._shield_bot_ref = bot
+        seeded = None
         if bot is not None and getattr(bot, "bot_account_id", None):
-            client._shield_bot_account_id = _safe_pos_int(bot.bot_account_id)
+            seeded = _safe_pos_int(bot.bot_account_id)
+        if seeded is None:
+            # هنوز شناسه در حافظه نیست؛ از دیسک بذر می‌دهیم تا محافظ از همان
+            # لحظهٔ نصب «بسته» باشد و به get_meٔ نخستین وابسته نباشد.
+            seeded = _persisted_bot_id_cached()
+        if seeded is not None:
+            client._shield_bot_account_id = seeded
     except Exception:
         pass
 
