@@ -294,7 +294,14 @@ async def run_daily_admin_report_watcher(bot, interval=30, logger=None):
             now = now_local()
             # ساعت ۱۱ شب (۲۳:۰۰ به بعد)
             if now.hour == 23:
-                await check_and_send_all_groups(bot, now=now)
+                # 🪶 کاهش‌بارِ خودکار: گزارشِ روزانه کم‌اولویت است؛ وقتی
+                # اتصال کند یا صف‌ها سنگین شوند این راند عقب می‌افتد و در
+                # تیکِ بعدی (۳۰ ثانیه دیگر، هنوز داخل همان ساعتِ ۲۳) دوباره
+                # تلاش می‌شود — ارسالِ دستی با force از این مسیر نیست.
+                from modules import load_shedding
+
+                if not load_shedding.should_defer(bot, "daily_admin_report"):
+                    await check_and_send_all_groups(bot, now=now)
         except asyncio.CancelledError:
             raise
         except Exception as error:

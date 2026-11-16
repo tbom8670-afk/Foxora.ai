@@ -255,8 +255,12 @@ def _punish_at_threshold(bot, chat_id, user_id, sender, count, threshold) -> boo
             "punish",
             user_id=user_id,
             timeout_seconds=20,
+            # 🔇 اعلانِ عمومیِ مجازات (پیامِ «⛔️ کاربر … به دلیل اسپم مکرر
+            # از گروه حذف شد» / سایلنت) برای جریمهٔ هوشِ مصنوعیِ تبلیغ‌گر
+            # ارسال نمی‌شود؛ خودِ مجازات (حذف/سکوت/بن) همچنان اعمال می‌شود
+            # و اخطارهای قبلیِ همان کاربر سابقه را روشن کرده‌اند.
             operation=lambda: admin_actions.punish_user(
-                chat_id, user_id, username, announce=True, user=sender,
+                chat_id, user_id, username, announce=False, user=sender,
             ),
         )
         tracker = getattr(bot, "tracker", None)

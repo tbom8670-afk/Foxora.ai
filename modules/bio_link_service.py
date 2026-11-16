@@ -933,6 +933,20 @@ async def watcher(bot, logger=None):
                 # فقط با دستور «بررسی بیو» یا BIO_LINK_AUTO_SCAN_MEMBERS=1.
                 await asyncio.sleep(scan_interval())
                 continue
+            # 🪶 کاهش‌بارِ خودکار: اسکنِ دوره‌ایِ اعضا کم‌اولویت است؛ وقتی
+            # اتصال کند یا صف‌ها سنگین شوند این پاس عقب می‌افتد تا مدیریتِ
+            # حیاتی و پاسخ‌های ضروری قربانی نشوند. اسکنِ «هنگامِ پیام» و
+            # دستورِ دستی «بررسی بیو» از این مسیر عبور نمی‌کنند و دست‌نخورده
+            # می‌مانند.
+            from modules import load_shedding
+
+            if load_shedding.should_defer(bot, "bio_link.member_scan"):
+                await asyncio.sleep(
+                    load_shedding.stretch(
+                        bot, "bio_link.member_scan", scan_interval()
+                    )
+                )
+                continue
             groups = active_groups()
             for chat_id in groups:
                 try:
