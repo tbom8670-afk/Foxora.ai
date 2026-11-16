@@ -8263,7 +8263,7 @@ async def handle_new_message(bot, event):
             # از sender/chat resolve‌شده در ابتدای handler استفاده می‌کنیم.
             handled_group_word = (
                 not fast_command and await bot.check_group_word_commands(
-                    event, clean_text, chat_id, user_id
+                    event, clean_text, chat_id, user_id, raw_text=message_text
                 )
             )
             if handled_group_word:

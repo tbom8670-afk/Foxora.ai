@@ -1035,7 +1035,7 @@ class SoroushAntiSpamBot:
 
 
 
-    async def check_group_word_commands(self, event, text, chat_id, user_id):
+    async def check_group_word_commands(self, event, text, chat_id, user_id, raw_text=None):
         try:
             self.debug_message_log(
                 f"FILTER ARGS: {text!r} {type(text)} {chat_id} {user_id}"
@@ -1045,7 +1045,8 @@ class SoroushAntiSpamBot:
                 event,
                 text,
                 chat_id,
-                user_id
+                user_id,
+                raw_text=raw_text,
             )
         except Exception as e:
             self.logger.log_error(f"خطای فیلتر کلمه: {e}")

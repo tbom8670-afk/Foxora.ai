@@ -49,8 +49,11 @@ def is_group_filter_command_text(text: str) -> bool:
     return (
         t.startswith("/فیلتر ")
         or t.startswith("!فیلتر ")
+        or t.startswith("فیلتر ")
         or t.startswith("/رفع ")
         or t.startswith("!رفع ")
+        or (t.startswith("رفع ") and not _is_unmute_command(t))
+        or t in ("فیلتر", "/فیلتر", "!فیلتر", "رفع", "/رفع", "!رفع")
         or t in ("/فیلترها", "فیلترها", "!فیلترها")
         or t in _ADD_NAME_BARE
         or t.startswith(_ADD_NAME_PREFIXES)
@@ -258,7 +261,92 @@ async def _reply_bold_blockquote(event, msg: str):
         return await event.reply(msg)
 
 
-async def handle_group_word_command(bot, event, text, chat_id, user_id, username=None):
+async def _reply_full_bold(event, msg: str):
+    """پاسخ با Bold روی کلِ متن (بدون نقل‌قول) — قالب پاسخ‌های دسته‌جمعی."""
+    try:
+        from splusthon.tl.types import MessageEntityBold
+        u16_len = len(msg.encode("utf-16-le")) // 2
+        entities = [MessageEntityBold(offset=0, length=u16_len)]
+        return await event.reply(msg, formatting_entities=entities)
+    except ImportError:
+        return await event.reply(msg)
+
+
+def _is_unmute_command(t: str) -> bool:
+    """«رفع سکوت» دستورِ رفع سکوت است، نه رفع فیلتر — نباید بلعیده شود.
+
+    هم شکلِ لخت (``رفع سکوت`` / ``رفع سکوت @user``) و هم شکلِ اسلش‌دار
+    (``/رفع سکوت``) را پوشش می‌دهد تا هندلرِ رفع سکوت به آن برسد.
+    """
+    t = (t or "").strip()
+    return (
+        t == "رفع سکوت"
+        or t.startswith("رفع سکوت ")
+        or t.startswith("رفع سکوت@")
+        or t.startswith("/رفع سکوت")
+        or t.startswith("!رفع سکوت")
+    )
+
+
+def _parse_bulk_filter(raw_text: str):
+    """پارسرِ فیلتر/رفع دسته‌جمعیِ چندخطی.
+
+    ورودی متنِ خام (با خط‌های جدید) است؛ خروجی ``(action, words)`` که
+    ``action`` یکی از ``"add"`` / ``"remove"`` / ``None`` است.
+
+    شکلِ معتبر:
+        فیلتر
+        بیو چک
+        چک
+        پیوی
+
+    سرخط می‌تواند «فیلتر» یا «فیلتر <کلمه>» (و همین‌طور «رفع») باشد؛ در
+    حالتِ دوم، کلمهٔ همان سرخط هم جزوِ فهرست است. سرخط‌های «فیلتر اسم» /
+    «فیلتر نام» (فیلترِ نام) و «رفع سکوت» عمداً اینجا نیستند تا به مسیرِ
+    خودشان بروند.
+    """
+    if not raw_text or "\n" not in raw_text:
+        return None, []
+    lines = [ln.strip() for ln in raw_text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    if len(lines) < 2:
+        return None, []
+
+    head = lines[0]
+    if head[:1] in ("/", "!"):
+        head = head[1:].strip()
+
+    # فیلترِ نام و رفع سکوت به مسیرِ خودشان می‌روند، نه اینجا.
+    if head.startswith(("فیلتر اسم", "فیلتر نام", "رفع فیلتر اسم", "رفع فیلتر نام")):
+        return None, []
+    if _is_unmute_command(head):
+        return None, []
+
+    if head == "فیلتر" or head.startswith("فیلتر "):
+        rest = head[len("فیلتر"):].strip()
+        words = ([rest] if rest else []) + lines[1:]
+        return "add", words
+    if head == "رفع" or head.startswith("رفع "):
+        rest = head[len("رفع"):].strip()
+        words = ([rest] if rest else []) + lines[1:]
+        return "remove", words
+    return None, []
+
+
+async def handle_group_word_command(
+    bot, event, text, chat_id, user_id, username=None, raw_text=None
+):
+
+    # متنِ خام (با خط‌های جدید) برای فیلترِ دسته‌جمعی؛ ``text`` نرمال‌شده است
+    # و خط‌های جدیدش به فاصله تبدیل شده‌اند. اگر صریحاً از handler داده نشد،
+    # متنِ خودِ event را به‌عنوان fallback می‌خوانیم.
+    if not raw_text:
+        try:
+            raw_text = getattr(getattr(event, "message", None), "message", "") or ""
+        except Exception:
+            raw_text = ""
+    if not raw_text:
+        raw_text = text or ""
 
     text = (text or "").strip()
 
@@ -355,11 +443,46 @@ async def handle_group_word_command(bot, event, text, chat_id, user_id, username
         return True
 
     # ============================================================
-    # ۲. دستورات «/فیلتر» / «/رفع» / «/فیلترها» (کلمات متن پیام)
+    # ۲. دستورات «فیلتر» / «رفع» / «فیلترها» (کلمات متن پیام)
+    #    با یا بدون «/» — و فیلتر/رفع دسته‌جمعیِ چندخطی
     # ============================================================
-    if text.startswith("/فیلتر ") or text.startswith("!فیلتر "):
-        prefix = "/فیلتر " if text.startswith("/فیلتر ") else "!فیلتر "
-        word = text.replace(prefix, "", 1).strip()
+    # --- ۲-الف) دسته‌جمعی: «فیلتر» در سرخط و هر کلمه در یک خطِ زیرش ---
+    bulk_action, bulk_words = _parse_bulk_filter(raw_text)
+    if bulk_action is not None:
+        if bulk_action == "add":
+            done = sum(1 for w in bulk_words if add_word(chat_id, w))
+            if done:
+                await _reply_full_bold(
+                    event,
+                    f"🔐 کلمات کلیدی فیلتر شدند\n\nتعداد کلمات : {done}",
+                )
+            else:
+                await _reply_full_bold(
+                    event,
+                    "⚠️ این کلمات قبلاً در فیلتر ثبت شده‌اند",
+                )
+        else:
+            done = sum(1 for w in bulk_words if remove_word(chat_id, w))
+            if done:
+                await _reply_full_bold(
+                    event,
+                    f"🔐 کلمات کلیدی رفع فیلتر شدند\n\nتعداد کلمات : {done}",
+                )
+            else:
+                await _reply_full_bold(
+                    event,
+                    "⚠️ این کلمات در فیلتر نیستند",
+                )
+        return True
+
+    # --- ۲-ب) تکی: «فیلتر <کلمه>» / «رفع <کلمه>» با یا بدون «/» ---
+    if text.startswith(("/فیلتر ", "!فیلتر ", "فیلتر ")):
+        word = text
+        for prefix in ("/فیلتر ", "!فیلتر ", "فیلتر "):
+            if word.startswith(prefix):
+                word = word[len(prefix):]
+                break
+        word = word.strip()
 
         if word:
             if add_word(chat_id, word):
@@ -370,9 +493,13 @@ async def handle_group_word_command(bot, event, text, chat_id, user_id, username
             return True
 
 
-    if text.startswith("/رفع ") or text.startswith("!رفع "):
-        prefix = "/رفع " if text.startswith("/رفع ") else "!رفع "
-        word = text.replace(prefix, "", 1).strip()
+    if text.startswith(("/رفع ", "!رفع ", "رفع ")) and not _is_unmute_command(text):
+        word = text
+        for prefix in ("/رفع ", "!رفع ", "رفع "):
+            if word.startswith(prefix):
+                word = word[len(prefix):]
+                break
+        word = word.strip()
 
         if word:
             if remove_word(chat_id, word):
@@ -381,6 +508,16 @@ async def handle_group_word_command(bot, event, text, chat_id, user_id, username
                 await event.reply("⚠️ این کلمه در فیلترها نیست")
 
             return True
+
+
+    # «فیلتر» / «رفع» به‌تنهایی (بدون کلمه و بدون خطِ زیر) → راهنمای کوتاه
+    if text in ("فیلتر", "/فیلتر", "!فیلتر", "رفع", "/رفع", "!رفع"):
+        await _reply_full_bold(
+            event,
+            "⚠️ برای فیلتر دسته‌جمعی، «فیلتر» را بنویسید و هر کلمه را "
+            "در یک خط زیرش بنویسید. برای رفع هم «رفع» را همین‌طور بفرستید.",
+        )
+        return True
 
 
     if text in ("/فیلترها", "فیلترها", "!فیلترها"):

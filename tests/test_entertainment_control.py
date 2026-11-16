@@ -316,8 +316,10 @@ def test_normalize_is_idempotent_and_safe_on_empty():
 def test_toggle_commands_are_recognised():
     assert ec.normalize("سرگرمی  خاموش") in ec.COMMANDS
     assert ec.normalize("سرگرمی\u200c فعال") in ec.COMMANDS
+    assert ec.normalize("سرگرمی روشن") in ec.COMMANDS
     assert ec.COMMAND_DISABLE == "سرگرمی خاموش"
     assert ec.COMMAND_ENABLE == "سرگرمی فعال"
+    assert "سرگرمی روشن" in ec.COMMAND_ENABLE_ALIASES
 
 
 # ---------------------------------------------------------------------------
@@ -639,8 +641,13 @@ def test_owner_can_disable_games_through_real_handler():
     assert event3.replies == [ec.ENABLED_NOTICE], event3.replies
     assert ec.is_enabled(CHAT) is True
 
-    event4, _ = _drive("لیست بازی", 99999999)
-    assert any("لیست بازی‌های روباه" in reply for reply in event4.replies), event4.replies
+    _drive("سرگرمی خاموش", owner)
+    event4, _ = _drive("سرگرمی روشن", owner)
+    assert event4.replies == [ec.ENABLED_NOTICE], event4.replies
+    assert ec.is_enabled(CHAT) is True
+
+    event5, _ = _drive("لیست بازی", 99999999)
+    assert any("لیست بازی‌های روباه" in reply for reply in event5.replies), event5.replies
 
 
 def test_regular_user_cannot_change_the_state():
@@ -742,6 +749,20 @@ def test_help_labels_are_bold_and_commands_are_plain():
         assert label in bolds, label
     for command in ("سرگرمی خاموش", "سرگرمی روشن"):
         assert command not in bolds, command
+
+
+def test_bulk_filter_help_is_bold_with_bold_instructions_in_one_quote():
+    text, entities = _help_output("لیست ادمینی")
+    title = "🎪برای فیلتر دست جمعی کلمات بنویسید"
+    instructions = (
+        "فیلتر بعد جمله هارو زیرش بنویسید\n"
+        "رفع بعد جمله هارو زیرش بنویسید"
+    )
+    bolds = _spans(text, entities, "MessageEntityBold")
+    quotes = _spans(text, entities, "MessageEntityBlockquote")
+    assert any(title in span for span in bolds)
+    assert any(instructions in span for span in bolds)
+    assert instructions in quotes
 
 
 def test_help_has_no_markdown_and_all_spans_fit():
