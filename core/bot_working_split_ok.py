@@ -1745,6 +1745,15 @@ class SoroushAntiSpamBot:
 
         @self.client.on(events.Raw(types.UpdateChannelParticipant))
         async def manual_unban_update(update):
+            # راندِ ۱۸: هر تغییرِ عضویتِ کانال (پیوست/خروج/بن/آزادی) یعنی
+            # صفحه‌های کش‌شدهٔ پیمایشِ اعضا کهنه‌اند → پاک شوند.
+            try:
+                _channel_id = getattr(update, "channel_id", None)
+                if _channel_id is not None:
+                    from modules import participant_cache
+                    participant_cache.invalidate(_channel_id)
+            except Exception:
+                pass
             previous = getattr(update, "prev_participant", None)
             current = getattr(update, "new_participant", None)
             previous_name = previous.__class__.__name__ if previous else "None"
@@ -1803,6 +1812,18 @@ class SoroushAntiSpamBot:
                 chat_id = getattr(event, "chat_id", None)
                 if chat_id is None:
                     return
+                # راندِ ۱۸: رویدادِ عضویت/خروج → فهرستِ اعضای کش‌شدهٔ همان
+                # گروه کهنه شد؛ پاکش کن تا خواندنِ بعدی فهرستِ تازه بگیرد.
+                # (بی‌RPC و ارزان — فقط کلیدهای کش همان گروه می‌روند.)
+                if (getattr(event, "user_joined", False)
+                        or getattr(event, "user_added", False)
+                        or getattr(event, "user_left", False)
+                        or getattr(event, "user_kicked", False)):
+                    try:
+                        from modules import participant_cache
+                        participant_cache.invalidate(chat_id)
+                    except Exception:
+                        pass
                 # ۱) رویداد صریح تغییر نام
                 new_title = getattr(event, "new_title", None)
                 if not new_title:

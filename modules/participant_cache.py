@@ -84,6 +84,24 @@ _LAST_ERROR = {}
 
 STATS = {"calls": 0, "hits": 0, "coalesced": 0, "throttled": 0, "errors": 0}
 
+# راندِ ۱۸: تفکیکِ آمار به ازای kind — «خواندنِ واقعی» (owner/members که
+# حکمِ کاربر می‌دهند) از «اسکن/تازه‌سازی» (participants_page که خودِ
+# پیمایشِ صفحه‌به‌صفحه است) جدا می‌شود تا hit-rateِ تجمیعی گمراه‌کننده
+# نباشد: نوبت‌های اسکن همیشه callِ تازه‌اند و hit-rateِ کل را پایین
+# می‌آورند در حالی که خواندنِ واقعی می‌تواند کاملاً از کش بخورد.
+STATS_BY_KIND: dict = {}
+
+
+def _bump(kind, field):
+    try:
+        row = STATS_BY_KIND.setdefault(
+            str(kind),
+            {"calls": 0, "hits": 0, "coalesced": 0, "throttled": 0,
+             "errors": 0})
+        row[field] = int(row.get(field, 0) or 0) + 1
+    except Exception:
+        pass
+
 
 def _key(chat_id, kind, extra=""):
     try:
@@ -139,9 +157,12 @@ def put(chat_id, kind, value, extra="", ttl=None):
 def invalidate(chat_id, kind=None, extra=None):
     """پاک‌کردن کش یک گروه (مثلاً بعد از تغییر ادمین)."""
     if kind is None:
-        prefix_ids = {_key(chat_id, "owner"), _key(chat_id, "admins")}
+        # راندِ ۱۸: پاک‌کردنِ **همهٔ** کلیدهای همان گروه/کانال — شاملِ
+        # members و participants_page؛ رویدادهای عضویت/خروج فهرست را
+        # کهنه می‌کنند و کش فقط برای سرعت است، پس پاک‌کردن بی‌خطر است.
+        prefix = _chat_key(chat_id) + ":"
         for key in list(_CACHE):
-            if key in prefix_ids:
+            if key.startswith(prefix):
                 _CACHE.pop(key, None)
         return
     if extra is None:
@@ -173,6 +194,7 @@ def clear():
     _LOG_TS.clear()
     for name in STATS:
         STATS[name] = 0
+    STATS_BY_KIND.clear()
 
 
 def _log_hit(chat_id, kind, value, logger, extra="", label="GetParticipants"):
@@ -212,6 +234,7 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
             if time.monotonic() - saved_at <= ttl:
                 _CACHE.move_to_end(key)
                 STATS["hits"] += 1
+                _bump(kind, "hits")
                 _log_hit(chat_id, kind, value, logger, extra)
                 return value
             _CACHE.pop(key, None)
@@ -219,6 +242,7 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
     inflight = _INFLIGHT.get(key)
     if inflight is not None and not inflight.done():
         STATS["coalesced"] += 1
+        _bump(kind, "coalesced")
         _log(
             logger,
             f"GetParticipants coalesced chat={chat_id} kind={kind} "
@@ -237,8 +261,10 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
             cached = get_cached(chat_id, kind, extra)
             if cached is not None:
                 STATS["hits"] += 1
+                _bump(kind, "hits")
                 return cached
             STATS["throttled"] += 1
+            _bump(kind, "throttled")
             if logger is not None:
                 try:
                     logger.log_info(
@@ -255,6 +281,7 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
     if min_interval > 0:
         _LAST_CALL[chat_key] = time.monotonic()
     STATS["calls"] += 1
+    _bump(kind, "calls")
     try:
         value = await fetch()
     except asyncio.CancelledError:
@@ -264,6 +291,7 @@ async def get_or_fetch(chat_id, kind, fetch, *, extra="", ttl=None,
         raise
     except Exception as error:
         STATS["errors"] += 1
+        _bump(kind, "errors")
         _LAST_ERROR[key] = (time.monotonic(), f"{type(error).__name__}: {error}")
         _INFLIGHT.pop(key, None)
         if not future.done():

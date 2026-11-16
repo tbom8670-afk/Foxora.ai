@@ -392,13 +392,73 @@ def confirm_interval() -> float:
 
 
 def confirm_first_delay() -> float:
-    """اولین بررسی بعد از ارسال راهنما — کوتاه، تا تأیید فوری باشد."""
-    return _env_float("FORCE_JOIN_CONFIRM_FIRST_DELAY", 3.0, 1.0, 600.0)
+    """اولین بررسی بعد از ارسال راهنما — کوتاه، تا تأیید فوری باشد.
+
+    راندِ ۱۸: پیش‌فرض ۳→۱ ثانیه؛ ناظر دیگر رویدادمحور است و به‌محضِ ثبتِ
+    انتظار بیدار می‌شود، پس اولین اسکن عملاً ~۱ ثانیه بعد از راهنماست.
+    """
+    return _env_float("FORCE_JOIN_CONFIRM_FIRST_DELAY", 1.0, 1.0, 600.0)
 
 
 def confirm_tick() -> float:
     """فاصلهٔ چرخهٔ ناظر تأیید (بیشتر از این، تأخید محسوس می‌شود)."""
     return _env_float("FORCE_JOIN_CONFIRM_TICK", 2.0, 0.5, 60.0)
+
+
+def _confirm_wake() -> asyncio.Event:
+    """رویدادِ بیدارباشِ ناظر تأیید (تنبل ساخته می‌شود)."""
+    global _confirm_wake_event
+    if _confirm_wake_event is None:
+        _confirm_wake_event = asyncio.Event()
+    return _confirm_wake_event
+
+
+def sync_active_window() -> int:
+    """فعالیتِ پیامیِ گروه تا چند ثانیه برای اسکنِ اسنپ‌شات معتبر است؟
+
+    راندِ ۱۸: اسکنِ اسنپ‌شات فقط برای گروهی اجرا می‌شود که در این پنجره
+    پیام داشته باشد؛ گروهِ خاموش هیچ RPC دوره‌ای نمی‌گیرد و اولین پیامِ
+    بعدی، اسکن را در پس‌زمینه بیدار می‌کند.
+    """
+    return _env_int("FORCE_JOIN_SYNC_ACTIVE_WINDOW", 3600, 60, 7 * 24 * 3600)
+
+
+def _sync_wake() -> asyncio.Event:
+    """رویدادِ بیدارباشِ ناظرِ اسنپ‌شات (تنبل ساخته می‌شود)."""
+    global _sync_wake_event
+    if _sync_wake_event is None:
+        _sync_wake_event = asyncio.Event()
+    return _sync_wake_event
+
+
+def touch_group_activity(group_id) -> None:
+    """گروه پیام دید → فعالیتش را ثبت کن تا اسکنِ هنگامِ نیاز مجاز شود.
+
+    همین فراخوانی ناظرِ اسنپ‌شات را هم بیدار می‌کند: اگر اسنپ‌شاتِ گروه
+    کهنه باشد، ناظر در پاسِ فوریِ بعدی (به‌جای حداکثر ۳۰۰ ثانیه انتظار)
+    آن را در پس‌زمینه تازه می‌کند — بدونِ اینکه مسیرِ پیام هیچ RPC بگیرد.
+    """
+    if group_id is None:
+        return
+    key = str(group_id)
+    _group_activity[key] = time.time()
+    if len(_group_activity) > 5000:
+        for old in sorted(_group_activity, key=_group_activity.get)[:1000]:
+            _group_activity.pop(old, None)
+    try:
+        _sync_wake().set()
+    except Exception:
+        pass
+
+
+def group_active(group_id, now=None) -> bool:
+    """آیا گروه در پنجرهٔ فعالیت پیامی هست؟ (ملاکِ اسکنِ هنگامِ نیاز)"""
+    if group_id is None:
+        return False
+    now = time.time() if now is None else now
+    last = _group_activity.get(str(group_id)) or 0.0
+    return (now - last) <= sync_active_window()
+
 
 
 #: زمان‌بندی تلاش‌ها (ثانیه) — سریع شروع می‌شود، بعد عقب می‌افتد.
@@ -1450,6 +1510,14 @@ _last_diag: dict = {}
 _scan_until: dict = {}
 #: (group_key, user_id) → انتظار «تأیید عضویت» بعد از ارسال راهنما
 _awaiting_confirm: dict = {}
+#: رویدادِ بیدارباشِ ناظر تأیید — وقتی صف خالی است ناظر کاملاً می‌خوابد و
+#: فقط با ثبتِ انتظارِ تازه (یعنی پیامِ کاربر) بیدار می‌شود (راندِ ۱۸).
+_confirm_wake_event: Optional[asyncio.Event] = None
+#: گروه → آخرین زمانِ فعالیتِ پیامی (ثانیه). اسکنِ اسنپ‌شات فقط برای
+#: گروه‌های فعال اجرا می‌شود؛ گروهِ خاموش هیچ RPC دوره‌ای نمی‌گیرد.
+_group_activity: dict = {}
+#: رویدادِ بیدارباشِ ناظرِ اسنپ‌شات — اولین پیامِ گروه، پاسِ فوری می‌گیرد
+_sync_wake_event: Optional[asyncio.Event] = None
 #: پارامترهای تکرارِ بررسی برای همان انتظار
 _CONFIRM_MAX_ENTRIES = 2000
 #: channel_key → Task در حال پیمایش برای تأیید (یک پاس برای همهٔ منتظران)
@@ -1757,6 +1825,12 @@ async def gate_message(bot, event, chat_id, user_id, user_entity=None, *,
             return False
         if exempt or not user_id:
             return False
+        # راندِ ۱۸: اسکنِ اسنپ‌شات «هنگامِ نیاز» — همین پیام، گروه را فعال
+        # علامت می‌زند و ناظرِ اسنپ‌شات را بیدار می‌کند؛ خودِ ناظر (نه این
+        # مسیر) تصمیم می‌گیرد اسکن لازم است یا نه. مسیرِ پیام هیچ RPC
+        # اضافه‌ای نمی‌گیرد و سیاست‌های «کانالِ بزرگ/کول‌داون/بودجه» دست‌نخورده
+        # می‌مانند.
+        touch_group_activity(record.get("group_id"))
         if api.entity_is_channel(user_entity):
             # پست بی‌نامِ کانال، عضو گروه حساب نمی‌شود.
             return False
@@ -2023,6 +2097,12 @@ def await_join_confirmation(record, chat_id, user_id, name=None) -> bool:
         "channel_id": record.get("channel_id"),
         "name": name,
     }
+    # راندِ ۱۸: ناظرِ تأیید رویدادمحور است — همین ثبت، او را فوراً بیدار
+    # می‌کند تا اولین اسکن ~۱ ثانیه بعد از راهنما انجام شود.
+    try:
+        _confirm_wake().set()
+    except Exception:
+        pass
     return True
 
 
@@ -2200,18 +2280,48 @@ async def confirm_pending(bot, *, limit: int = 0) -> int:
 
 
 async def confirm_watcher(bot, *, logger=None) -> None:
-    """ناظر تأیید عضویت — سریع، سبک و مستقل از مسیر پیام."""
+    """ناظر تأیید عضویت — رویدادمحور (راندِ ۱۸).
+
+    خواستهٔ مالک: اسکنِ عضویت **فقط وقتی لازم است** اجرا شود:
+    - صف خالی است → ناظر بی‌قیدِ زمان می‌خوابد (هیچ تیکِ ۲ ثانیه‌ای، هیچ
+      RPC، هیچ اشغالِ صفی).
+    - کاربری راهنما گرفت (یعنی پیام داد و عضو نبود) → ثبتِ انتظار ناظر را
+      بیدار می‌کند؛ اولین پاس ~confirm_first_delay اجرا می‌شود و بعد
+      پاس‌ها با backoff تا تأیید یا پایانِ پنجره ادامه می‌یابند.
+    - همهٔ انتظارها تأیید/منقضی شدند → ناظر دوباره به خوابِ عمیق می‌رود.
+    """
+    wake = _confirm_wake()
     await asyncio.sleep(confirm_first_delay())
     while True:
         try:
-            if _awaiting_confirm:
-                await confirm_pending(bot)
+            if not _awaiting_confirm:
+                # خوابِ نامحدود تا ثبتِ انتظارِ بعدی (بدونِ تیکِ دوره‌ای).
+                wake.clear()
+                if not _awaiting_confirm:   # رقابت: ثبت بین دو بررسی
+                    await wake.wait()
+                continue
+            await confirm_pending(bot)
+            if not _awaiting_confirm:
+                continue
+            # خواب تا نزدیک‌ترین موعدِ بررسیِ بعدی؛ ثبتِ انتظارِ تازه
+            # (پیامِ کاربرِ دیگر) خواب را می‌شکند تا فوراً اسکن شود.
+            now = time.time()
+            next_at = min((entry.get("next_at") or now)
+                          for entry in _awaiting_confirm.values())
+            delay = max(0.2, next_at - now)
+            wake.clear()
+            if not _awaiting_confirm:
+                continue
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
         except asyncio.CancelledError:
             raise
         except Exception as error:
             _log(bot, f"CONFIRM WATCHER error={type(error).__name__}",
                  error=True)
-        await asyncio.sleep(confirm_tick())
+            await asyncio.sleep(confirm_tick())
 
 
 async def send_notice(bot, chat_id, record, *, event=None, name=None) -> bool:
@@ -2911,15 +3021,31 @@ def _has_unsynced_groups() -> bool:
 
 
 async def watcher(bot, *, logger=None) -> None:
-    """ناظر سبک: اسنپ‌شات جبرانی دوره‌ای + پاک‌سازی کش‌های کهنه."""
+    """ناظر سبک: اسنپ‌شات جبرانی + پاک‌سازی کش‌های کهنه (راندِ ۱۸).
+
+    «هنگامِ نیاز» به‌جای «دائمی»:
+    - فقط گروه‌هایی اسکن می‌شوند که در پنجرهٔ فعالیت پیامی باشند؛
+    - خوابِ بین پاس‌ها رویدادمحور است: اولین پیامِ هر گروه (touch در
+      gate_message) ناظر را بیدار می‌کند تا اسنپ‌شاتِ کهنهٔ همان گروه
+      فوراً در پس‌زمینه تازه شود؛ بی‌فعالیت ⇒ فقط یک تیکِ سبکِ ۳۰۰
+      ثانیه‌ای بدونِ هیچ RPC.
+    """
     delay = start_delay()
     if delay and not _has_unsynced_groups():
         await asyncio.sleep(delay)
+    wake = _sync_wake()
     while True:
+        # پاک‌کردنِ پیش از پاس: فعالیتی که حینِ پاس ثبت شود، بیدارباشِ
+        # پاسِ بعدی را حفظ می‌کند (بدونِ رقابتِ از دست رفتنِ رویداد).
+        wake.clear()
         try:
             refresh_group_cache()
             for record in list(_group_cache.values()):
                 if not record.get("force_join_enabled"):
+                    continue
+                # راندِ ۱۸: گروهِ بدونِ پیامِ تازه هیچ اسکنِ دوره‌ای نمی‌گیرد؛
+                # اولین پیامِ بعدی، اسکن را خودش بیدار می‌کند (gate_message).
+                if not group_active(record.get("group_id")):
                     continue
                 if not needs_sync(record):
                     continue
@@ -2936,7 +3062,11 @@ async def watcher(bot, *, logger=None) -> None:
             raise
         except Exception as error:
             _log(bot, f"WATCHER LOOP error={type(error).__name__}", error=True)
-        await asyncio.sleep(300)
+        # خواب تا «اولین پیامِ بعدی» (بیدارباش) و حداکثر ۳۰۰ ثانیه.
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=300.0)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
 
 
 def _prune_caches() -> None:
@@ -3368,6 +3498,17 @@ def reset_runtime_state() -> None:
     _rpc_window.clear()
     _semaphore = None
     _registered_bots.clear()
+    # راندِ ۱۸: وضعیتِ «اسکنِ هنگامِ نیاز» هم پاک شود تا تست‌ها صفحه‌های
+    # کش‌شدهٔ تستِ قبلی را نبینند (participant_cache کلیدِ مشترک دارد).
+    global _confirm_wake_event, _sync_wake_event
+    _confirm_wake_event = None
+    _sync_wake_event = None
+    _group_activity.clear()
+    try:
+        from modules import participant_cache
+        participant_cache.clear()
+    except Exception:
+        pass
     for key in STATS:
         STATS[key] = 0
     api.reset_counters()

@@ -217,6 +217,24 @@ def _cache_section(bot: Any) -> list[str]:
             f"  • کشِ اعضا (GetParticipants): calls={calls} hits={hits} "
             f"hit-rate={_pct(hits, calls)} coalesced={s.get('coalesced', 0)} "
             f"throttled={s.get('throttled', 0)} errors={s.get('errors', 0)}")
+        # راندِ ۱۸: تفکیکِ «خواندنِ واقعی» از «اسکن/تازه‌سازی» — hit-rateِ
+        # تجمیعی با نوبت‌های اسکن رقیق می‌شد و ۹٪ نمایشیِ گمراه‌کننده بود.
+        by_kind = getattr(_pc, "STATS_BY_KIND", {}) or {}
+        real = {"calls": 0, "hits": 0}
+        scan = {"calls": 0, "hits": 0}
+        for kind, row in by_kind.items():
+            bucket = scan if kind == "participants_page" else real
+            bucket["calls"] += int(row.get("calls", 0) or 0)
+            bucket["hits"] += int(row.get("hits", 0) or 0)
+        if by_kind:
+            lines.append(
+                f"    ├ خواندنِ واقعی (owner/members): calls={real['calls']} "
+                f"hits={real['hits']} hit-rate={_pct(real['hits'], real['calls'])}")
+            lines.append(
+                f"    └ اسکن/تازه‌سازی (participants_page): "
+                f"calls={scan['calls']} hits={scan['hits']} "
+                f"hit-rate={_pct(scan['hits'], scan['calls'])} "
+                f"(نوبتِ اسکن همیشه callِ تازه است — hit-rateِ پایینش طبیعی)")
     except Exception:
         lines.append("  • کشِ اعضا: در دسترس نیست.")
     try:
@@ -281,7 +299,7 @@ def _verdict_section(mem: dict, gov: dict) -> list[str]:
 #: 🏷️ راندِ استقرار — با هر راندِ رفعِ اشکال بالا می‌رود و در گزارشِ مالک چاپ
 #: می‌شود تا مالک (و پشتیبانی) بتواند تأیید کند گوشی واقعاً کدام ساخت را
 #: اجرا می‌کند (شکایتِ راندِ ۱۵: «رفع را push کردی ولی گوشی هنوز قدیمی بود»).
-BUILD_ROUND = 16
+BUILD_ROUND = 17
 
 
 def build_slow_path_report(bot: Any) -> str:
