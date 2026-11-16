@@ -69,6 +69,24 @@ def _per_chat_limit(value=None):
         return 3
 
 
+def _automatic_per_chat_limit(value=None):
+    """سقفِ هم‌زمانیِ «بن/سکوتِ خودکار» برای **هر گروه** (جدا از گروه‌های دیگر).
+
+    قبلاً یک ``Semaphore(1)`` **سراسری** همهٔ گروه‌ها را یکی‌یکی می‌کرد؛ در یک
+    گروهِ شلوغ، بنِ خودکار پشتِ بنِ گروه‌های دیگر (و پشتِ هم در همان گروه)
+    می‌ماند. حالا هر گروه بودجهٔ مستقلِ کوچکِ خودش را دارد (پیش‌فرض ۲) و
+    محافظت از اتصالِ یکتای سروش بر عهدهٔ ``RpcGovernor`` است (سقفِ کل +
+    اولویتِ P0 برای ``EditBanned`` + round-robinِ هر گروه + flood-guard)، پس
+    گروه‌های پرحاشیه اتصال را اشباع نمی‌کنند ولی همدیگر را هم قفل نمی‌کنند.
+    """
+    if value is None:
+        value = os.getenv("BOT_AUTOMATIC_PER_CHAT_LIMIT", "2")
+    try:
+        return min(3, max(1, int(value)))
+    except (TypeError, ValueError):
+        return 2
+
+
 def flood_wait_seconds(error):
     """مدت FloodWait را بدون وابستگی مستقیم به نسخهٔ SPlusthon استخراج می‌کند."""
     name = error.__class__.__name__.lower()
@@ -109,10 +127,15 @@ class ModerationQueue:
         self._workers = {}
         self._user_locks = {}
         self._pending_keys = set()
-        # Automatic spam bans are low-value background work compared with a
-        # human admin's mute. Serialise them globally so many noisy groups
-        # cannot saturate the one shared Soroush connection.
-        self._automatic_actions = asyncio.Semaphore(1)
+        # ✨ بن/سکوتِ خودکار: قبلاً یک ``Semaphore(1)`` **سراسری** همهٔ گروه‌ها
+        # را یکی‌یکی می‌کرد (head-of-line blocking: بنِ خودکارِ گروهِ شلوغ پشتِ
+        # بنِ گروه‌های دیگر و پشتِ هم در همان گروه می‌ماند). حالا هر گروه بودجهٔ
+        # مستقلِ کوچکِ خودش را دارد (``_automatic_per_chat_limit``)؛ محافظت از
+        # اتصالِ یکتای سروش همچنان بر عهدهٔ ``RpcGovernor`` است (سقفِ کل +
+        # اولویتِ P0 برای EditBanned + round-robinِ هر گروه + flood-guard)، پس
+        # گروه‌های پرحاشیه اتصال را اشباع نمی‌کنند ولی همدیگر را هم قفل نمی‌کنند.
+        self._automatic_per_chat_limit = _automatic_per_chat_limit()
+        self._automatic_actions = {}  # chat_key -> asyncio.Semaphore
         self._closed = False
         self._sequence = 0
         self._completed = 0
@@ -121,8 +144,22 @@ class ModerationQueue:
         if self.logger is not None:
             self.logger.log_info(
                 "MODERATION QUEUE READY "
-                f"per_chat_limit={self.per_chat_limit}"
+                f"per_chat_limit={self.per_chat_limit} "
+                f"automatic_per_chat_limit={self._automatic_per_chat_limit}"
             )
+
+    def _automatic_sem(self, chat_id):
+        """بودجهٔ هم‌زمانیِ بن/سکوتِ خودکارِ **همین گروه** (ساختِ تنبل).
+
+        هر گروه Semaphore مستقلِ خودش را دارد، پس گروه‌ها پشتِ هم صف نمی‌شوند.
+        ساختِ Semaphore در Python 3.10+ به loopِ در حالِ اجرا نیاز ندارد.
+        """
+        key = _chat_key(chat_id)
+        sem = self._automatic_actions.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(self._automatic_per_chat_limit)
+            self._automatic_actions[key] = sem
+        return sem
 
     def enqueue(
         self,
@@ -250,6 +287,10 @@ class ModerationQueue:
                 self._start_worker_if_needed(chat_id, queue)
             elif queue.empty() and key not in self._workers:
                 self._queues.pop(key, None)
+                # گروهِ بی‌کار: Semaphore اختصاصی‌اش را هم آزاد کن تا رشدِ
+                # نامحدودِ دیکشنری (حافظهٔ ترموکس) نداشته باشیم؛ در نیازِ بعدی
+                # با بودجهٔ کامل بازسازی می‌شود.
+                self._automatic_actions.pop(key, None)
 
     async def _execute_job(self, chat_id, job):
         rpc_started_at = time.perf_counter()
@@ -268,7 +309,10 @@ class ModerationQueue:
                 f"queue_wait_ms={queue_wait_ms:.2f} rpc_started_at={started_wall:.3f}"
             )
             if job.action in {"ban", "punish", "kick", "auto_mute"}:
-                async with self._automatic_actions:
+                # بودجهٔ مستقلِ **همین گروه**: گروه‌های دیگر پشتِ این بن/سکوتِ
+                # خودکار صف نمی‌شوند و در همان گروه هم تا سقفِ کوچکِ مجاز
+                # موازی پیش می‌رود. سقفِ سراسریِ اتصال را RpcGovernor حفظ می‌کند.
+                async with self._automatic_sem(chat_id):
                     value = await self._run_job(chat_id, job)
             else:
                 value = await self._run_job(chat_id, job)

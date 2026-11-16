@@ -205,6 +205,8 @@ from modules import message_tracker
 from modules import big_spam
 from modules import search_access
 from modules import ad_spam_guard as _ad_spam_guard
+# 🩺 تشخیصِ عملکرد: گزارشِ «کدام مسیر کند است» برای مالک در پیوی.
+from modules import perf_diagnostic as _perf_diagnostic
 # 🦊 ضد کانال و بیوگرافی — شناسایی کانالِ متصل به پروفایل + جمله‌های بیو.
 from modules import profile_guard as _profile_guard
 from modules import web_search, wiki_search_service
@@ -6013,6 +6015,40 @@ async def handle_new_message(bot, event):
             "COMMAND MATCH CHECK "
             f"command={clean_text!r} matched={clean_text in _legacy_commands}",
         )
+
+        # ------------------------------------------------------------------
+        # 🩺 گزارشِ تشخیصِ عملکرد — فقط مالکِ سراسری.
+        # دقیقاً می‌نویسد کدام مسیر باعثِ کندی شده (عضویتِ گرانِ scan/snapshot،
+        # culpritِ Governor، نرخِ برخوردِ کش‌ها) و در **پیویِ مالک** ارسال
+        # می‌شود. در گروه و پیوی کار می‌کند؛ در گروه فقط یک تأییدِ کوتاه
+        # می‌دهد تا گزارشِ بلند در گروه نیفتد.
+        # ------------------------------------------------------------------
+        if _perf_diagnostic.is_perf_diagnostic_command(message_text):
+            if not is_global_owner(user_id):
+                if event.is_private:
+                    try:
+                        await event.reply(
+                            "❌ فقط مالکِ ربات این دستور را دارد.")
+                    except Exception:
+                        pass
+                return
+            try:
+                sent = await _perf_diagnostic.send_perf_report_to_owner(bot)
+                bot.logger.log_info(
+                    "PERF DIAGNOSTIC COMMAND "
+                    f"user_id={user_id} chat_id={chat_id} sent={sent}")
+                if not event.is_private:
+                    await event.reply(
+                        "📊 گزارشِ تشخیصِ عملکرد به پیویِ شما ارسال شد."
+                        if sent else
+                        "⚠️ ارسالِ گزارش به پیوی ناموفق بود؛ لاگ را ببینید.")
+                elif not sent:
+                    await event.reply(
+                        "⚠️ ساخت/ارسالِ گزارش ناموفق بود؛ لاگ را ببینید.")
+            except Exception as error:
+                bot.logger.log_error(
+                    f"PERF DIAGNOSTIC COMMAND FAILED error={error!r}")
+            return
 
         # ------------------------------------------------------------------
         # 📋 لیست انقضا — فقط مالک اصلی و فقط در همان گروه.

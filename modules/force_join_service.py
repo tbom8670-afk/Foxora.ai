@@ -1322,6 +1322,23 @@ async def _routed_check(bot, record, user_id, user_entity=None):
                 )
                 diag["trace"].append({route: raw_state})
                 if status in (storage.STATUS_MEMBER, storage.STATUS_NOT_MEMBER):
+                    # ✨ این مسیرِ ارزان «واقعاً» پاسخِ قطعی داد (۱ RPC، مستقل از
+                    # تعدادِ اعضا). یک‌بار آن را به‌عنوانِ مسیرِ سالمِ اصلی ذخیره کن
+                    # تا بررسی‌های بعدیِ همین کانال — بدونِ probeِ مجدد و بدونِ
+                    # افتادن به اسکن/اسنپ‌شاتِ گران — مستقیم با همان ۱ RPC تصمیم
+                    # بگیرند. فقط بارِ اول نوشته می‌شود (routes.get قبلاً True نیست)،
+                    # پس روی مسیرِ داغ write اضافیِ JSON نمی‌گذارد.
+                    if not routes.get(ROUTE_PARTICIPANT):
+                        try:
+                            save_channel_routes(
+                                record["group_id"], {ROUTE_PARTICIPANT: True}
+                            )
+                            routes[ROUTE_PARTICIPANT] = True
+                            _log(bot, f"CHEAP ROUTE PROMOTED getParticipant "
+                                      f"group_id={record['group_id']} "
+                                      f"channel_id={channel_id} (1-RPC membership)")
+                        except Exception:
+                            pass
                     diag.update(route=route, state=raw_state)
                     _last_diag[key] = diag
                     return status, "api", diag
