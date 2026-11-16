@@ -16,7 +16,6 @@
 # ------------------------------------------------------------------
 set -u
 FOXORA_DIR="$(cd "$(dirname "$0")" && pwd)"
-FOXORA_DATA="$HOME/.foxora"
 cd "$FOXORA_DIR" || { echo "❌ مسیر Foxora پیدا نشد: $FOXORA_DIR"; exit 1; }
 
 # instance را برای کل زیر-پروسه‌ها قطعی کن — مستقل از .env و shell والد
@@ -31,57 +30,10 @@ case "$cmd" in
   direct)
     exec python3 foxora.py
     ;;
-  stop)
-    stopped=0
-    # فقط PIDهای ثبت‌شده در runtime خود Foxora؛ به B2/main دست نمی‌زنیم.
-    for pidfile in "$FOXORA_DATA/config/bot.pid"; do
-      if [ -f "$pidfile" ]; then
-        pid="$(cat "$pidfile" 2>/dev/null)"
-        if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-          # اطمینان: فقط اگر پروسه واقعاً متعلق به Foxora باشد
-          if grep -qa "BOT_INSTANCE=foxora\|foxora.py" \
-              "/proc/$pid/cmdline" "/proc/$pid/environ" 2>/dev/null; then
-            kill "$pid" && stopped=1 && echo "⏹ Foxora child متوقف شد (pid=$pid)"
-          else
-            echo "⚠️ pid=$pid متعلق به Foxora نیست؛ رد شد"
-          fi
-        fi
-      fi
-    done
-    # watchdog.lock خود Foxora
-    lock="$FOXORA_DATA/config/watchdog.lock"
-    if [ -f "$lock" ]; then
-      wpid="$(python3 - "$lock" <<'PY'
-import json, sys
-try:
-    print(json.load(open(sys.argv[1])).get("pid", ""))
-except Exception:
-    print("")
-PY
-)"
-      if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
-        if grep -qa "BOT_INSTANCE=foxora\|foxora" \
-            "/proc/$wpid/cmdline" "/proc/$wpid/environ" 2>/dev/null; then
-          kill "$wpid" && stopped=1 && echo "⏹ Foxora watchdog متوقف شد (pid=$wpid)"
-        fi
-      fi
-    fi
-    [ "$stopped" = 0 ] && echo "ℹ️ پروسه‌ی در حال اجرایی برای Foxora پیدا نشد"
-    ;;
-  status)
-    echo "FOXORA_DIR  = $FOXORA_DIR"
-    echo "DATA_DIR    = $FOXORA_DATA"
-    echo "PID file    = $FOXORA_DATA/config/bot.pid"
-    if [ -f "$FOXORA_DATA/config/bot.pid" ]; then
-      pid="$(cat "$FOXORA_DATA/config/bot.pid")"
-      if kill -0 "$pid" 2>/dev/null; then
-        echo "STATUS      = RUNNING (pid=$pid)"
-      else
-        echo "STATUS      = STOPPED (stale pid=$pid)"
-      fi
-    else
-      echo "STATUS      = STOPPED"
-    fi
+  stop|status)
+    # Python resolves .env and data paths exactly as the running bot does;
+    # no shell evaluation of .env content.
+    exec python3 -m modules.foxora_control "$cmd"
     ;;
   *)
     echo "استفاده: foxora [run|direct|stop|status]"

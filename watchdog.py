@@ -74,8 +74,8 @@ _SECRET_PATTERNS = (
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<redacted-github-token>"),
     (
         re.compile(
-            r"(?i)\b(SOROUSH_SESSION_STRING|BOT_TOKEN|SOROUSH_BOT_TOKEN|API_HASH)"
-            r"\s*=\s*([^\s]+)"
+            r"(?i)\b((?:SOROUSH_SESSION_STRING|BOT_TOKEN|SOROUSH_BOT_TOKEN|API_HASH)(?:_[A-Z0-9_]+)?)"
+            r"\s*=\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+)"
         ),
         r"\1=<redacted>",
     ),
@@ -580,23 +580,14 @@ class SingleInstance:
             if before is not None and record.get("token") == self.token:
                 self._remove_same_inode(before)
         else:
-            # A flock file itself is harmless after a crash, but removing our
-            # own record on clean shutdown prevents Android/FUSE fallback from
-            # ever inheriting an obsolete PID file.
-            try:
-                before = os.fstat(self.stream.fileno())
-                record = self._read_record(self.path)
-            except OSError:
-                before = None
-                record = {}
+            # Keep the inode stable: unlinking after unlock lets another
+            # contender lock a different inode while a waiter owns this one.
             try:
                 if self._fcntl is not None:
                     self._fcntl.flock(self.stream.fileno(), self._fcntl.LOCK_UN)
             except OSError:
                 pass
             self._close_stream()
-            if before is not None and record.get("token") == self.token:
-                self._remove_same_inode(before)
         self.mode = None
 
 

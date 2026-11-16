@@ -19,8 +19,8 @@
 
 Session: سلسله‌مراتب خواندن session string از محیط/.env:
     SOROUSH_SESSION_STRING_FOXORA  →  SOROUSH_SESSION_STRING
-session فقط در حافظه است (StringSession) و هیچ فایل session روی دیسک
-نوشته نمی‌شود؛ بنابراین session بین Foxora و B2 انتقال پیدا نمی‌کند.
+کلاینت از StringSession استفاده می‌کند؛ ابزار ورود session را در کلید
+اختصاصی فایل محرمانهٔ .env همین مخزن ذخیره می‌کند.
 """
 import os
 

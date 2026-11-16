@@ -36,62 +36,47 @@ import asyncio
 
 
 def _acquire_instance_lock():
-    """Single-instance guard.
-
-    دو پروس با همان session string نمی‌توانند همزمان کار کنند: سرور
-    MTProto updateها را فقط به یکی می‌دهد و پروس دیگر زنده ولی
-    بی‌تحرک می‌ماند (همه گروه‌ها «مرده» به نظر می‌رسند). این قفل از
-    اجرای همزمان جلوگیری می‌کند و دلایلش را در ترمینال می‌نویسد.
-    """
+    """Hold a kernel lock on the stable per-instance inode for this process."""
     try:
-        from pathlib import Path
+        import fcntl
         from modules.runtime_paths import runtime_config_file
-        # 🐛 fix: migrate=False الزامی است — bot.pid یک فایل گذرا و
-        # per-process است؛ کپی‌شدن bot.pid کهنهٔ instance اصلی (main) به
-        # config یک instance تازه (bot2/bot3) باعث می‌شد instance جدید فکر
-        # کند پروسه‌ی دیگری قفل را دارد و بی‌دلیل خارج شود.
-        lock = Path(runtime_config_file("bot.pid", migrate=False))
-    except Exception:
-        return None
-    pid = os.getpid()
-    if lock.exists():
+        lock = runtime_config_file("bot.pid", migrate=False)
+        stream = lock.open("a+", encoding="utf-8")
         try:
-            old_pid = int((lock.read_text(encoding="utf-8").strip() or "0"))
-        except Exception:
-            old_pid = 0
-        if 0 < old_pid and old_pid != pid:
-            alive = False
-            try:
-                os.kill(old_pid, 0)
-                alive = True
-            except ProcessLookupError:
-                alive = False
-            except PermissionError:
-                alive = False  # پروس دیگر متعلق به ما نیست؛ قفل را می‌گیریم
-            if alive:
-                print("=" * 62)
-                print(" ⛔ BOT INSTANCE ALREADY RUNNING (pid=%d)" % old_pid)
-                print("    با یک session string فقط یک پروس update می‌گیرد؛")
-                print("    پروس دوم زنده است ولی هیچ پیامی نمی‌بیند.")
-                print("    پروس فعلی (pid=%d) خارج می‌شود." % pid)
-                print("    اول پروس قدیمی را ببند: kill %d" % old_pid)
-                print("=" * 62)
-                sys.exit(1)
-    try:
-        lock.write_text(str(pid), encoding="utf-8")
-        atexit.register(
-            lambda: _release_instance_lock(lock, pid))
-    except Exception:
-        pass
-    return lock
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            stream.close()
+            raise SystemExit("BOT INSTANCE ALREADY RUNNING: bot.pid is locked")
+        try:
+            stream.seek(0)
+            stream.truncate()
+            stream.write(str(os.getpid()) + "\n")
+            stream.flush()
+        except BaseException:
+            stream.close()
+            raise
+    except SystemExit:
+        raise
+    except Exception as error:
+        raise SystemExit(f"BOT INSTANCE LOCK ERROR: {error}") from error
+    atexit.register(_release_instance_lock, stream, os.getpid())
+    return stream
 
 
-def _release_instance_lock(lock, pid):
+def _release_instance_lock(stream, pid):
+    # Clear only our own PID while still holding the lock. Never unlink: a
+    # waiter may already have the inode open when this process releases it.
     try:
-        if int((lock.read_text(encoding="utf-8").strip() or "0")) == pid:
-            lock.unlink()
-    except Exception:
+        if os.getpid() == pid:
+            stream.seek(0)
+            if stream.read().strip() == str(pid):
+                stream.seek(0)
+                stream.truncate()
+                stream.flush()
+    except (OSError, ValueError):
         pass
+    finally:
+        stream.close()  # releases flock even after an error
 
 
 async def main():

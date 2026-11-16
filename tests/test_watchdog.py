@@ -137,13 +137,35 @@ class WatchdogTests(unittest.TestCase):
         ):
             self.assertTrue(watchdog._stop_active_watchdog(999999999, 0.01))
 
-    def test_clean_flock_close_removes_its_record(self):
+    def test_clean_flock_close_keeps_inode_and_unlocks(self):
+        import fcntl
         with tempfile.TemporaryDirectory() as directory:
             lock_file = Path(directory) / "watchdog.lock"
-            instance = watchdog.SingleInstance(lock_file)
-            instance.acquire()
-            instance.close()
-            self.assertFalse(lock_file.exists())
+            first = watchdog.SingleInstance(lock_file)
+            first.acquire()
+            if first.mode != "flock":
+                self.skipTest("flock unavailable")
+            inode = lock_file.stat().st_ino
+            first.close()
+            self.assertTrue(lock_file.exists())
+            self.assertEqual(lock_file.stat().st_ino, inode)
+            with lock_file.open("r") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(stream, fcntl.LOCK_UN)
+            second = watchdog.SingleInstance(lock_file)
+            second.acquire()
+            self.assertEqual(second.mode, "flock")
+            self.assertEqual(lock_file.stat().st_ino, inode)
+            second.close()
+
+    def test_redacts_instance_suffixed_secrets(self):
+        secret = "synthetic-session-secret"
+        for key in ("SOROUSH_SESSION_STRING_FOXORA", "BOT_TOKEN_FOXORA", "API_HASH_FOXORA"):
+            redacted = watchdog._redact(f'{key}="{secret} more-secret"')
+            self.assertNotIn(secret, redacted)
+            self.assertNotIn("more-secret", redacted)
+            self.assertIn(key, redacted)
+            self.assertIn("<redacted>", redacted)
 
     def test_android_unsupported_flock_uses_stale_aware_pid_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
