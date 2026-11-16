@@ -80,7 +80,9 @@ async def _flow():
     reg.clear()
     queued = []
     original_queue = mh._queue_message_deletes
+    original_delay = mh.LATE_REPLY_CLEANUP_DELAY
     mh._queue_message_deletes = lambda bot, chat_id, ids, *a, **k: queued.extend(ids)
+    mh.LATE_REPLY_CLEANUP_DELAY = 0.1
     try:
         # 1) raw event.reply gets registered after the wrap
         ev = FakeEvent(-100123, 500)
@@ -138,9 +140,41 @@ async def _flow():
         head = "\n".join(src.splitlines()[:9])
         check("handle_new_message wraps at entry",
               "_wrap_event_reply_for_registry(event)" in head)
+
+        # 9) registration race: edit lands before the reply send registers;
+        #    the delayed re-check must still delete the late reply.
+        ev6 = FakeEvent(-100123, 900)
+        mh._wrap_event_reply_for_registry(ev6)
+        queued.clear()
+        mh._cleanup_bot_reply_for_edited_message(FakeBot(), ev6, -100123, True)
+        check("empty pop schedules late re-check",
+              ("('-100123', 900)" in str(mh._LATE_REPLY_CLEANUP_KEYS))
+              or ((str(-100123), 900) in mh._LATE_REPLY_CLEANUP_KEYS))
+        late = await ev6.reply("late greeting")   # registers AFTER the edit
+        await asyncio.sleep(0.25)                 # default delay is patched below
+        check("late-registered reply deleted by re-check",
+              late.id in queued)
+        check("late re-check key released",
+              (str(-100123), 900) not in mh._LATE_REPLY_CLEANUP_KEYS)
+
+        # 10) duplicate late re-check for the same key is a no-op
+        ev7 = FakeEvent(-100123, 950)
+        mh._wrap_event_reply_for_registry(ev7)
+        mh._cleanup_bot_reply_for_edited_message(FakeBot(), ev7, -100123, True)
+        first_sched = mh._schedule_late_reply_cleanup(FakeBot(), -100123, 950)
+        check("same key not scheduled twice", first_sched is False)
+        await asyncio.sleep(0.25)
+
+        # 11) perf diagnostic report carries the deployment round stamp
+        from modules import perf_diagnostic as pd
+        check("BUILD_ROUND exists", isinstance(getattr(pd, "BUILD_ROUND", None), int))
+        check("report header carries round stamp",
+              "راندِ استقرار" in inspect.getsource(pd.build_slow_path_report))
     finally:
         mh._queue_message_deletes = original_queue
+        mh.LATE_REPLY_CLEANUP_DELAY = original_delay
         reg.clear()
+        mh._LATE_REPLY_CLEANUP_KEYS.clear()
 
 
 def main():

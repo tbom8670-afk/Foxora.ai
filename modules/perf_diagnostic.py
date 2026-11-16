@@ -278,11 +278,18 @@ def _verdict_section(mem: dict, gov: dict) -> list[str]:
     return lines
 
 
+#: 🏷️ راندِ استقرار — با هر راندِ رفعِ اشکال بالا می‌رود و در گزارشِ مالک چاپ
+#: می‌شود تا مالک (و پشتیبانی) بتواند تأیید کند گوشی واقعاً کدام ساخت را
+#: اجرا می‌کند (شکایتِ راندِ ۱۵: «رفع را push کردی ولی گوشی هنوز قدیمی بود»).
+BUILD_ROUND = 16
+
+
 def build_slow_path_report(bot: Any) -> str:
     """گزارشِ متمرکز بر «کدام مسیر کند است» (بدونِ گزارشِ عمومیِ سلامت)."""
     header = [
         "🩺 گزارشِ تشخیصِ کندی — کدام مسیر گلوگاه است؟",
         "═" * 38,
+        f"🏷️ راندِ استقرار: {BUILD_ROUND}",
     ]
     mem_lines, mem = _membership_route_section(bot)
     gov_lines, gov = _governor_section(bot)

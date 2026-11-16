@@ -2329,6 +2329,12 @@ def _cleanup_bot_reply_for_edited_message(bot, event, chat_id, is_edited_message
                     f"chat_id={chat_id} user_msg_id={origin_msg_id} "
                     f"bot_reply_ids={bot_reply_ids!r}"
                 )
+        elif origin_msg_id is not None:
+            # ⏱️ راندِ ۱۶: هم‌زمانیِ ثبت/ویرایش (race) — اگر ویرایشِ کاربر زودتر از
+            # تمام‌شدنِ RPCِ ارسالِ پاسخ رسیده باشد، ثبت هنوز انجام نشده و
+            # pop خالی است. یک بازبررسیِ تک‌بارهٔ تأخیری ثبتِ دیررس را هم
+            # می‌گیرد تا پاسخِ ربات جا نماند.
+            _schedule_late_reply_cleanup(bot, chat_id, origin_msg_id)
     except Exception as error:
         if logger is not None:
             try:
@@ -2338,6 +2344,60 @@ def _cleanup_bot_reply_for_edited_message(bot, event, chat_id, is_edited_message
                 )
             except Exception:
                 pass
+
+
+#: کلیدهای (chat, msg) که بازبررسیِ تأخیری برایشان صف شده (جلوگیری از تکرار).
+_LATE_REPLY_CLEANUP_KEYS: set = set()
+
+#: پنجرهٔ بازبررسیِ تأخیری (ثانیه) — برای تست قابلِ تنظیم است.
+LATE_REPLY_CLEANUP_DELAY = 3.0
+
+
+def _schedule_late_reply_cleanup(bot, chat_id, user_message_id,
+                                 delay: float = None) -> bool:
+    """بازبررسیِ تک‌بارهٔ تأخیری برای ثبتِ دیررسِ پاسخِ ربات.
+
+    ⏱️ راندِ ۱۶: اگر ویرایشِ کاربر زودتر از تمام‌شدنِ RPCِ ارسالِ پاسخِ ربات
+    به دستِ ربات برسد، لحظهٔ cleanup هنوز چیزی ثبت نشده و ``pop`` خالی است؛
+    پاسخِ ربات جا می‌ماند. این تابع یک تسکِ سبک می‌سازد که ``delay`` ثانیه
+    بعد دوباره ``pop`` می‌کند و ثبتِ دیررس را هم‌زمان با خودِ پیام پاک
+    می‌کند. برای هر (chat, msg) فقط یک‌بار؛ بدونِ RPC اضافه در مسیرِ گرم.
+    """
+    if delay is None:
+        delay = LATE_REPLY_CLEANUP_DELAY
+    try:
+        key = (str(chat_id), int(user_message_id))
+    except (TypeError, ValueError):
+        return False
+    if key in _LATE_REPLY_CLEANUP_KEYS or len(_LATE_REPLY_CLEANUP_KEYS) > 1000:
+        return False
+    _LATE_REPLY_CLEANUP_KEYS.add(key)
+
+    async def _run():
+        try:
+            await _asyncio.sleep(delay)
+            from modules.bot_reply_registry import pop_reply_ids as _pop
+            ids = _pop(chat_id, user_message_id)
+            if ids:
+                _queue_message_deletes(bot, chat_id, list(ids))
+                logger = getattr(bot, "logger", None)
+                if logger is not None:
+                    logger.log_info(
+                        "LATE BOT REPLY CLEANUP "
+                        f"chat_id={chat_id} user_msg_id={user_message_id} "
+                        f"bot_reply_ids={ids!r}"
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _LATE_REPLY_CLEANUP_KEYS.discard(key)
+
+    try:
+        _asyncio.create_task(_run(), name=f"late-reply-cleanup:{chat_id}")
+        return True
+    except Exception:  # noqa: BLE001
+        _LATE_REPLY_CLEANUP_KEYS.discard(key)
+        return False
 
 
 # ---------------------------------------------------------------------------
