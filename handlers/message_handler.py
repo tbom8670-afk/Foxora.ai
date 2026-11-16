@@ -1077,6 +1077,50 @@ def _run_background(bot, name, callback, *args):
     return _asyncio.create_task(run(), name=f"bg:{name}")
 
 
+def _wrap_event_reply_for_registry(event) -> None:
+    """ثبتِ خودکارِ هر پاسخِ ربات به این پیام در ``bot_reply_registry``.
+
+    🧹 راندِ ۱۵: ثبتِ پاسخ فقط داخلِ ``_schedule_reply`` انجام می‌شد؛ پاسخ‌های
+    خامِ ``await event.reply(...)`` (سلام‌والعکس، بازی‌ها، ``INSULT_REPLY`` و
+    ده‌ها جای دیگر) ثبت نمی‌شدند. نتیجه: وقتی کاربر همان پیام را به متنِ
+    متخلف ویرایش می‌کرد و مسیرِ حذف (از جمله بیو‌چک) پیام را پاک می‌کرد،
+    پاسخِ خودِ ربات به آن پیام در گروه می‌ماند (گزارشِ کاربر با حبابِ
+    «ادب از که یاد گرفتی؟…»). حالا خودِ ``event.reply`` در ورودیِ پیام
+    روکش می‌شود تا هر پاسخی از هر مسیرِ کد ثبت شود و
+    ``_cleanup_bot_reply_for_edited_message`` بتواند آن را با خودِ پیام پاک کند.
+
+    بی‌صدا و «بهترین تلاش»: اگر روکش ممکن نباشد (شیء بدونِ setattr و…) همان
+    رفتارِ قبلی می‌ماند. ثبت تکراری بی‌ضرر است (``register`` idempotent است).
+    """
+    try:
+        if getattr(event, "_bot_reply_wrapped", False):
+            return
+        if getattr(event, "is_private", False):
+            return
+        chat_id = getattr(event, "chat_id", None)
+        msg_id = getattr(getattr(event, "message", None), "id", None)
+        original = getattr(event, "reply", None)
+        if chat_id is None or msg_id is None or not callable(original):
+            return
+
+        async def _registered_reply(*args, **kwargs):
+            sent = await original(*args, **kwargs)
+            try:
+                from modules.notice_cleanup import extract_sent_id
+                from modules.bot_reply_registry import register as _register
+                reply_id = extract_sent_id(sent)
+                if reply_id is not None:
+                    _register(chat_id, msg_id, reply_id)
+            except Exception:  # noqa: BLE001
+                pass
+            return sent
+
+        event.reply = _registered_reply
+        event._bot_reply_wrapped = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _schedule_reply(bot, event, *args, **kwargs):
     """Send a reply without holding this group's dispatcher worker on RPC RTT."""
     # شناسهٔ پیامِ کاربر و گروه را هم‌اکنون (sync) می‌گیریم تا پاسخِ ارسالیِ
@@ -4372,6 +4416,10 @@ async def _handle_google_search_group_message(bot, event, chat_id, user_id, send
 
 async def handle_new_message(bot, event):
     """هندلر اصلی برای پیام‌های جدید"""
+    # 🧹 راندِ ۱۵: قبل از هر پاسخِ ممکن، ``event.reply`` را روکش کن تا هر
+    # پاسخِ ربات به این پیام در bot_reply_registry ثبت شود و موقعِ حذفِ
+    # پیامِ ویرایش‌شده، پاسخِ ربات هم همراهش پاک شود.
+    _wrap_event_reply_for_registry(event)
     profiler = MessagePerformance()
     response_token = begin_response_measurement()
     chat_id = getattr(event, "chat_id", None)
