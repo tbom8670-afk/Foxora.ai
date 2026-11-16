@@ -202,6 +202,145 @@ def _log_inactive_gate(bot, chat_id, text):
         pass
 
 
+# ===================================================================
+# 🚪 گیتِ واحدِ «اشتراک گروه» (فعال‌سازی + انقضا)
+# ===================================================================
+# یک گروه در دو حالت باید «کاملاً خاموش» باشد — یعنی ربات هیچ کاری در آن
+# نکند: نه اخطار، نه حذف پیام، نه moderation، نه پاسخ، و حتی نه یک واکنش
+# کوچک. تنها استثنا، دستورِ خودِ مالکِ سراسری برای فعال‌سازی/تمدید است:
+#
+#   ۱) گروه هنوز «فعال» نشده (در groups.json ثبت/فعال نیست) — تا رسیدنِ
+#      دستورِ فعال‌سازی، ربات ساکت است («حتی یک جواب دادن» هم نه).
+#   ۲) مهلتِ گروه تمام شده (رکورد انقضا منقضی است) — از همان لحظهٔ انقضا
+#      همه‌چیز متوقف می‌شود، بدون این‌که منتظرِ چرخهٔ watcher بمانیم.
+#
+# این هلپرها در ابتدای دیسپچر (new_message_handler) — پیش از قلابِ حکمِ
+# دادگاه، پیش از ingestِ ضداسپم، و پیش از هر مسیرِ moderation — صدا زده
+# می‌شوند تا هیچ فعالیتی از این گیت عبور نکند. مسیرهای فعال‌سازی/تمدیدِ
+# مالک عمداً باز می‌مانند تا گروهِ منقضی/غیرفعال دوباره روشن شود.
+#
+# دستورهای «فعال‌سازی/تمدید/خاموش‌کردن» که مالکِ سراسری مجاز به ارسال آن‌هاست.
+_OWNER_GROUP_MODE_COMMANDS = {
+    "فعال", "فعال سازی", "فعال‌سازی", "ثبت گروه", "غیر فعال",
+}
+
+
+def _is_group_renewal_command(text):
+    """آیا این متن دستورِ فعال‌سازی/تمدید/انقضا/خاموش‌کردنِ گروه است؟
+
+    این‌ها همان دستورهای مالک هستند که باید از گیتِ انقضا/غیرفعال عبور کنند
+    تا گروهِ خاموش دوباره روشن (یا تمدید) شود. مقایسه روی متنِ نرمال‌شده
+    انجام می‌شود تا نیم‌فاصله/فاصلهٔ اضافه مانعِ فعال‌سازی نشود.
+    """
+    try:
+        if not text:
+            return False
+        normalized = normalize_command_text(str(text))
+        if normalized in _OWNER_GROUP_MODE_COMMANDS:
+            return True
+        # دستورهای تمدیدِ مهلت (مثل «۵ روز»، «یک هفته»، «دو هفته»، «یک ماه»).
+        # همان تابعی است که بای‌پسِ انقضای دیسپچر هم استفاده می‌کند، پس
+        # رفتارِ فعال‌سازی/تمدید یکدست می‌ماند.
+        return expiry_command(normalized) is not None
+    except Exception:
+        return False
+
+
+def _is_group_blocked(chat_id):
+    """گروه باید خاموش باشد؟ (غیرفعال یا منقضی)
+
+    - ``is_active`` منبعِ حقیقتِ «فعال‌سازی» است (پیش‌فرض False).
+    - ``is_expired`` منبعِ حقیقتِ «پایان مهلت» است (بدون رکورد → False).
+
+    Fail-closed برای انقضا: اگر بررسیِ انقضا خطا داد، «منقضی» فرض می‌شود تا
+    گروهِ مشکوک کار نکند. (برای ``is_active`` همان مقدارِ خودِ storage ملاک است.)
+    """
+    if not chat_id:
+        return False
+    try:
+        if not is_active(chat_id):
+            return True
+    except Exception:
+        return True
+    try:
+        from modules import group_expiry as _group_expiry
+        if _group_expiry.is_expired(chat_id):
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _group_subscription_gate(event):
+    """تصمیمِ گیتِ اشتراک برای یک رویدادِ گروه.
+
+    خروجی: ``(drop, reason, text, chat_id, sender_id)``.
+      - ``drop=True``  → ربات باید هیچ کاری نکند و پیام را دور بریزد.
+      - ``drop=False`` → پیام ادامه می‌یابد (گروه فعال و سالم است، یا دستورِ
+        فعال‌سازی/تمدید از طرفِ مالکِ سراسری است).
+
+    این تابع هیچ side-effect ندارد (لاگ نمی‌کند) تا کاملاً قابل تست باشد؛
+    فراخوان (دیسپچر) لاگ و ``return`` را انجام می‌دهد.
+    """
+    # چتِ خصوصی هرگز «گروه» نیست؛ گیتِ اشتراک فقط برای گروه‌هاست. این بررسی
+    # هم در دیسپچر (پیش از فراخوانی) و هم این‌جا انجام می‌شود تا تابع به‌تنهایی
+    # هم درست رفتار کند (defense-in-depth).
+    if getattr(event, "is_private", False):
+        return False, "", "", getattr(event, "chat_id", None), None
+
+    chat_id = getattr(event, "chat_id", None)
+    message = getattr(event, "message", None)
+    text = (
+        getattr(message, "message", None)
+        or getattr(message, "caption", None)
+        or ""
+    ) if message is not None else ""
+    sender_id = getattr(event, "sender_id", None)
+    if sender_id is None:
+        sender = (
+            getattr(event, "_bot_cached_sender", None)
+            or getattr(event, "sender", None)
+        )
+        sender_id = getattr(sender, "id", None)
+
+    if chat_id is None or not _is_group_blocked(chat_id):
+        return False, "", text, chat_id, sender_id
+    if _is_group_renewal_command(text) and is_global_owner(sender_id):
+        return False, "owner_renewal", text, chat_id, sender_id
+    try:
+        from modules import group_expiry as _group_expiry
+        reason = "expired" if _group_expiry.is_expired(chat_id) else "not_active"
+    except Exception:
+        reason = "blocked"
+    return True, reason, text, chat_id, sender_id
+
+
+_EXPIRY_GATE_LOGGED = {}
+
+
+def _log_expiry_gate(bot, chat_id, text, reason="not_active"):
+    """دلیلِ خاموش‌بودنِ گروه (انقضا/غیرفعال) را — با نرخِ محدود — لاگ کن."""
+    try:
+        now = time.monotonic()
+        if now - _EXPIRY_GATE_LOGGED.get(chat_id, 0.0) < 300:
+            return
+        _EXPIRY_GATE_LOGGED[chat_id] = now
+        if len(_EXPIRY_GATE_LOGGED) > 500:
+            for key in [
+                key for key, ts in _EXPIRY_GATE_LOGGED.items()
+                if now - ts > 600
+            ]:
+                _EXPIRY_GATE_LOGGED.pop(key, None)
+        bot.logger.log_error(
+            "GROUP SUBSCRIPTION GATE — activity suppressed "
+            f"chat_id={chat_id} text={str(text or '')[:30]!r} "
+            f"reason={reason} "
+            "(ربات تا فعال‌سازی/تمدیدِ مالک هیچ کاری در این گروه نمی‌کند)"
+        )
+    except Exception:
+        pass
+
+
 # ============================================================
 # 🔑 مدیریت خرابی دائم نشست سروش (AuthKeyUnregisteredError)
 #
@@ -2983,6 +3122,44 @@ class SoroushAntiSpamBot:
                                 pass
             except Exception:
                 pass
+            # 🚪 گیتِ واحدِ «اشتراک گروه» — فعال‌سازی + انقضا.
+            #
+            # اگر گروه هنوز «فعال» نشده باشد (تا رسیدنِ دستورِ فعال‌سازی) یا
+            # مهلتش تمام شده باشد، ربات باید «هیچ» کاری در آن گروه نکند:
+            # نه اخطار، نه حذف پیام، نه moderation، نه پاسخ — حتی یک واکنشِ
+            # کوچک. این گیت عمداً پیش از قلابِ حکمِ دادگاه، پیش از ingestِ
+            # ضداسپم و پیش از هر مسیرِ moderation قرار گرفته تا هیچ فعالیتی
+            # از آن عبور نکند. تنها استثنا: دستورِ فعال‌سازی/تمدید/انقضا از
+            # طرفِ مالکِ سراسری که باید برسد تا گروه دوباره روشن شود.
+            try:
+                if not getattr(event, "is_private", False):
+                    _drop, _reason, _gate_text, _gate_chat, _gate_sid = (
+                        _group_subscription_gate(event)
+                    )
+                    if _drop:
+                        _log_expiry_gate(
+                            self, _gate_chat, _gate_text, _reason
+                        )
+                        return
+                    if _reason == "owner_renewal":
+                        self.logger.log_info(
+                            "GROUP SUBSCRIPTION GATE — owner renewal command "
+                            f"allowed chat_id={_gate_chat} "
+                            f"sender_id={_gate_sid} text={str(_gate_text)[:30]!r}"
+                        )
+            except Exception as _subscription_gate_error:
+                # fail-closed: اگر خودِ گیت خطا داد، پیامِ گروه دور ریخته می‌شود
+                # تا گروهِ مشکوک هیچ فعالیتی نکند.
+                try:
+                    self.logger.log_error(
+                        "GROUP SUBSCRIPTION GATE ERROR "
+                        f"chat_id={getattr(event, 'chat_id', None)} "
+                        f"error={_subscription_gate_error!r}"
+                    )
+                except Exception:
+                    pass
+                if not getattr(event, "is_private", False):
+                    return
             # ⚖️ حکم دادگاه روباه: در پنجرهٔ ۶۰ ثانیه‌ایِ مجازات، پیام محکوم
             # حذف می‌شود — بدون هیچ استثنایی برای مالک ربات، مالک گروه، ادمین
             # ثبت‌شده، ادمین واقعی گروه یا VIP. این قلاب پیش از هر گیت و
