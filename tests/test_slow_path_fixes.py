@@ -43,7 +43,8 @@ def test_bio_bounded_wait():
     from modules import bio_link_service as bls
 
     saved = {k: os.environ.get(k) for k in
-             ("BIO_LINK_AWAIT_FIRST_CHECK", "BIO_LINK_AWAIT_TIMEOUT")}
+             ("BIO_LINK_AWAIT_FIRST_CHECK", "BIO_LINK_AWAIT_TIMEOUT",
+              "BIO_LINK_REFRESH_TIMEOUT")}
     os.environ.pop("BIO_LINK_AWAIT_FIRST_CHECK", None)
     os.environ.pop("BIO_LINK_AWAIT_TIMEOUT", None)
     try:
@@ -56,6 +57,11 @@ def test_bio_bounded_wait():
         os.environ["BIO_LINK_AWAIT_FIRST_CHECK"] = "0"
         check("bio await can still be disabled fully",
               bls.await_first_check() is False)
+        os.environ.pop("BIO_LINK_AWAIT_FIRST_CHECK", None)
+        check("bio refresh cap default 1.5s (was ~21s inline)",
+              abs(bls.refresh_timeout() - 1.5) < 1e-6)
+        os.environ["BIO_LINK_REFRESH_TIMEOUT"] = "4"
+        check("bio refresh cap env override works", bls.refresh_timeout() == 4.0)
     finally:
         for key, value in saved.items():
             if value is None:
@@ -91,10 +97,12 @@ async def _snapshot_waited_flow():
 
     original = pgs._fetch
     try:
-        # fast RPC -> first message IS moderated (contract preserved)
+        # contract case: inline wait explicitly enabled (tests/test_profile_guard
+        # does the same via env) -> fast RPC moderates the first message
+        os.environ["PROFILE_GUARD_AWAIT_TIMEOUT"] = "5"
         pgs._fetch = fast_fetch
         got = await pgs.snapshot_waited(None, FakeUser(111))
-        check("fast RPC -> first message gets snapshot inline",
+        check("fast RPC + inline enabled -> first message moderated",
               isinstance(got, dict))
         check("fast RPC fetched once", fetched["n"] == 1)
         got2 = await pgs.snapshot_waited(None, FakeUser(111))
@@ -137,6 +145,25 @@ async def _snapshot_waited_flow():
         blocked = await pgs.snapshot_waited(None, FakeUser(444))
         check("retry_after window -> None without inline RPC",
               blocked is None and fetched["n"] == 0)
+
+        # round-17 default: cap=0 -> fully background, zero inline wait even
+        # when the RPC would be fast (no bio+profile stacking anymore)
+        os.environ.pop("PROFILE_GUARD_AWAIT_TIMEOUT", None)
+        check("profile default cap = 0 (full background)",
+              pgs.await_timeout() == 0.0)
+        pgs._cache.clear()
+        pgs._bg_inflight.clear()
+        fetched["n"] = 0
+        pgs._fetch = fast_fetch
+        none = await pgs.snapshot_waited(None, FakeUser(555))
+        check("default: no inline RPC even when fetch is fast",
+              none is None and fetched["n"] == 0)
+        check("default: background refresh scheduled", "555" in pgs._bg_inflight)
+        for _ in range(30):
+            await asyncio.sleep(0.02)
+            if pgs._cache.get("555"):
+                break
+        check("default: background filled the cache", bool(pgs._cache.get("555")))
     finally:
         pgs._fetch = original
         pgs._cache.clear()
@@ -146,6 +173,80 @@ async def _snapshot_waited_flow():
             os.environ.pop("PROFILE_GUARD_AWAIT_TIMEOUT", None)
         else:
             os.environ["PROFILE_GUARD_AWAIT_TIMEOUT"] = saved
+
+
+async def _bio_semaphore_inside_cap():
+    """Round-17: the semaphore QUEUE wait must be inside the await cap.
+
+    The aggregated owner report showed bio_check=584-706ms although the cap
+    was 450ms: ``async with _loop_semaphore()`` sat OUTSIDE ``wait_for``, so
+    queue time + RPC escaped the cap.
+    """
+    from modules import bio_link_service as bls
+
+    saved_t = os.environ.get("BIO_LINK_AWAIT_TIMEOUT")
+    os.environ["BIO_LINK_AWAIT_TIMEOUT"] = "0.15"
+    original_sem = bls._loop_semaphore
+    original_storage = bls.bio_link_storage
+    original_needs = bls.needs_check
+    original_schedule = bls.schedule_check
+    scheduled = {"n": 0}
+
+    class SlowCM:
+        async def __aenter__(self):
+            await asyncio.sleep(0.6)  # semaphore queue longer than the cap
+            return None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class StubStorage:
+        @staticmethod
+        def is_enabled(chat_id):
+            return True
+
+        @staticmethod
+        def get_user(chat_id, user_id):
+            return None
+
+    class StubLogger:
+        def log_info(self, *a, **k):
+            pass
+
+        def log_error(self, *a, **k):
+            pass
+
+    class Bot:
+        bot_account_id = 1
+        logger = StubLogger()
+
+    def _schedule(bot, chat_id, user):
+        scheduled["n"] += 1
+        return True
+
+    bls._loop_semaphore = lambda: SlowCM()
+    bls.bio_link_storage = StubStorage
+    bls.needs_check = lambda chat_id, user_id: True
+    bls.schedule_check = _schedule
+    bls._inflight.clear()
+    bls._retry_after.clear()
+    try:
+        started = time.perf_counter()
+        await bls.ensure_user_now(Bot(), -777, FakeUser(666))
+        elapsed = time.perf_counter() - started
+        check("semaphore queue wait is INSIDE the cap (<0.35s)", elapsed < 0.35)
+        check("cap hit -> fell back to background check", scheduled["n"] == 1)
+    finally:
+        bls._loop_semaphore = original_sem
+        bls.bio_link_storage = original_storage
+        bls.needs_check = original_needs
+        bls.schedule_check = original_schedule
+        bls._inflight.clear()
+        bls._retry_after.clear()
+        if saved_t is None:
+            os.environ.pop("BIO_LINK_AWAIT_TIMEOUT", None)
+        else:
+            os.environ["BIO_LINK_AWAIT_TIMEOUT"] = saved_t
 
 
 def test_profile_guard_wiring():
@@ -219,8 +320,9 @@ def test_handler_wiring():
 
 
 def main():
-    print("== round-14 slow-path fixes ==")
+    print("== round-14/17 slow-path fixes ==")
     test_bio_bounded_wait()
+    asyncio.run(_bio_semaphore_inside_cap())
     asyncio.run(_snapshot_waited_flow())
     test_profile_guard_wiring()
     test_monitor_notes()

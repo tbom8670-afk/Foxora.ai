@@ -365,16 +365,20 @@ _bg_inflight: set = set()
 def await_timeout() -> float:
     """سقفِ انتظارِ inline برای اسنپ‌شاتِ کاربرِ نو (ثانیه).
 
-    ⏱️ راندِ ۱۴: قبلاً ``guard_message`` اسنپ‌شات را **بدونِ سقف** داخلِ
-    stage=RECEIVE منتظر می‌ماند (۰٫۶ تا ۱٫۲ ثانیه زیرِ فشارِ Governor —
-    همان «receive» در گزارشِ کندیِ مالک). حالا سقف ۰٫۴۵ ثانیه است: RPCِ
-    سریع همان اولین پیام را رسیدگی می‌کند؛ RPCِ کند قطع می‌شود و refresh
-    به پس‌زمینه می‌رود.
+    ⏱️ راندِ ۱۴: سقفِ ۰٫۴۵s جایِ انتظارِ بی‌سقف نشست.
+    ⏱️ راندِ ۱۷: پیش‌فرض **۰** شد (تمام‌پس‌زمینه): گزارشِ تجمیعی نشان داد
+    در گروه‌هایی که هم بیو‌چک و هم ضد کانال فعال است، دو انتظارِ inline روی
+    هم سوار می‌شدند (bio_check=601 + profile_guard=301 → spam_check=924).
+    حالا مسیرِ عادی هرگز inline منتظر نمی‌ماند: refresh در پس‌زمینه انجام
+    می‌شود و پیامِ بعدی همان کاربر با کشِ تازه رسیدگی می‌شود. کاربرِ
+    «زیرِ نظر» همان دریافتِ تازهٔ بی‌سقف را می‌گیرد. با
+    ``PROFILE_GUARD_AWAIT_TIMEOUT`` (مثلاً 0.45 یا 5) رفتارِ منتظرِ inline
+    برمی‌گردد.
     """
     try:
-        value = float(str(os.getenv("PROFILE_GUARD_AWAIT_TIMEOUT", "0.45")).strip())
+        value = float(str(os.getenv("PROFILE_GUARD_AWAIT_TIMEOUT", "0")).strip())
     except (TypeError, ValueError):
-        value = 0.45
+        value = 0.0
     return max(0.0, min(30.0, value))
 
 

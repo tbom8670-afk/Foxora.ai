@@ -103,6 +103,16 @@ def await_first_check() -> bool:
     return _env_int("BIO_LINK_AWAIT_FIRST_CHECK", 1, 0, 1) == 1
 
 
+def refresh_timeout() -> float:
+    """سقفِ انتظارِ «شاهدِ تازه» پیش از مجازات (ثانیه).
+
+    ⏱️ راندِ ۱۷: قبلاً ``fetch_timeout()+1`` (~۲۱s) بود — یک مجازات می‌توانست
+    مسیرِ پیام را ثانیه‌ها نگه دارد. حالا ۱٫۵s؛ اگر نرسد یعنی شاهد تازه
+    نداریم و این پیام مجازات نمی‌شود (جهتِ امن)، پیامِ بعدی تلاش می‌کند.
+    """
+    return _env_float("BIO_LINK_REFRESH_TIMEOUT", 1.5, 0.05, 30.0)
+
+
 def await_timeout() -> float:
     """سقف انتظار برای بررسی بیو هنگام اولین پیام (ثانیه).
 
@@ -551,13 +561,22 @@ async def refresh_before_punish(bot, chat_id, user) -> Optional[dict]:
         return None
     _inflight.add(key)
     try:
-        async with _loop_semaphore():
-            # 🧊 «شاهدِ تازه» یعنی خواندنِ همین حالا؛ نه کشِ ۴۵ ثانیه‌ای.
-            # اگر بیو در همین پنجره عوض شده باشد، فقط این خواندن می‌فهمد.
-            record = await asyncio.wait_for(
-                check_user(bot, chat_id, user, force=True, require_live=True),
-                timeout=fetch_timeout() + 1.0,
-            )
+        # ⏱️ راندِ ۱۷: سقفِ قبلی ``fetch_timeout()+1`` یعنی ~۲۱ ثانیه inline
+        # بود (و انتظارِ semaphore هم بیرونِ سقف). حالا سقفِ اختصاصیِ ۱٫۵s
+        # (BIO_LINK_REFRESH_TIMEOUT) کلِ «صف + RPC» را می‌پوشاند؛ اگر نرسید،
+        # ``None`` برمی‌گردد یعنی «شاهد تازه نداریم» → این پیام مجازات
+        # نمی‌شود (جهتِ امن) و پیامِ بعدی دوباره تلاش می‌کند.
+        async def _queued_refresh():
+            async with _loop_semaphore():
+                # 🧊 «شاهدِ تازه» یعنی خواندنِ همین حالا؛ نه کشِ ۴۵ ثانیه‌ای.
+                # اگر بیو در همین پنجره عوض شده باشد، فقط این خواندن می‌فهمد.
+                return await check_user(
+                    bot, chat_id, user, force=True, require_live=True
+                )
+
+        record = await asyncio.wait_for(
+            _queued_refresh(), timeout=refresh_timeout(),
+        )
         fresh = record if isinstance(record, dict) else bio_link_storage.get_user(chat_id, user_id)
         if isinstance(fresh, dict):
             if fresh.get("link"):
@@ -613,10 +632,15 @@ async def ensure_user_now(bot, chat_id, user) -> Optional[dict]:
         return bio_link_storage.get_user(chat_id, user_id)
     _inflight.add(key)
     try:
-        async with _loop_semaphore():
-            return await asyncio.wait_for(
-                check_user(bot, chat_id, user), timeout=await_timeout()
-            )
+        # ⏱️ راندِ ۱۷: انتظارِ semaphore باید **داخلِ** سقف باشد، نه بیرونِ
+        # آن. قبلاً صفِ semaphore + RPC با هم می‌شدند ۵۸۰ تا ۷۰۰ms یعنی
+        # بیشتر از سقفِ ۰٫۴۵ (زیرمرحلهٔ bio_check در گزارشِ تجمیعی لو داد).
+        # حالا کلِ «صف + RPC» با wait_for سقف‌دار است؛ سرِ سقف → پس‌زمینه.
+        async def _queued_check():
+            async with _loop_semaphore():
+                return await check_user(bot, chat_id, user)
+
+        return await asyncio.wait_for(_queued_check(), timeout=await_timeout())
     except asyncio.TimeoutError:
         _log(bot, f"CHECK TIMEOUT user_id={user_id} chat_id={chat_id}")
         schedule_check(bot, chat_id, user)
