@@ -219,6 +219,70 @@ def _bump_warnings(bot, chat_id, user_id, sender=None):
     return int(count or 0), int(threshold)
 
 
+def _punish_at_threshold(bot, chat_id, user_id, sender, count, threshold) -> bool:
+    """اگر ``count`` به ``threshold`` رسید، مجازاتِ تنظیم‌شدهٔ گروه را اجرا کن.
+
+    ✨ این همان حلقهٔ گمشدهٔ سیستمِ اخطارِ هوش مصنوعیِ ضد تبلیغ بود: قبلاً
+    شمارنده بالا می‌رفت ولی هیچ اخراج/سکوت/بنی انجام نمی‌شد. حالا دقیقاً
+    همان مسیرِ سیستمِ اخطارِ عمومی (دستورِ «اخطار» در ``message_handler``)
+    طی می‌شود:
+
+      * ``moderation_queue.enqueue("punish", … admin_actions.punish_user …)``
+        که مجازاتِ تنظیم‌شدهٔ گروه (``action_on_threshold`` = ``mute`` /
+        ``ban`` / ``kick``) را با مدتِ ``action_duration_seconds`` اعمال
+        می‌کند؛ اجرا از راهِ صفِ moderation است (نه RPCِ مستقیم) تا با بقیهٔ
+        مجازات‌ها هم‌اولویت بماند و اتصالِ سروش اشباع نشود.
+      * سپس ``tracker.reset_count`` تا چرخه از صفر شروع شود.
+
+    اگر صف/اکشنِ moderation موجود نباشد (حالتِ تست یا رباتِ ناتمام) بی‌صدا
+    رد می‌شود تا مسیرِ هشدار خراب نشود. برگشتی: ``True`` اگر مجازات صف شد.
+    """
+    try:
+        count = int(count or 0)
+        threshold = int(threshold or 0)
+    except Exception:  # noqa: BLE001
+        return False
+    if count <= 0 or threshold <= 0 or count < threshold:
+        return False
+    try:
+        admin_actions = getattr(bot, "admin_actions", None)
+        mod_queue = getattr(bot, "moderation_queue", None)
+        if admin_actions is None or mod_queue is None:
+            return False
+        username = getattr(sender, "username", None)
+        mod_queue.enqueue(
+            chat_id,
+            "punish",
+            user_id=user_id,
+            timeout_seconds=20,
+            operation=lambda: admin_actions.punish_user(
+                chat_id, user_id, username, announce=True, user=sender,
+            ),
+        )
+        tracker = getattr(bot, "tracker", None)
+        if tracker is not None:
+            try:
+                tracker.reset_count(chat_id, user_id)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            cfg = getattr(bot, "config_manager", None)
+            action = cfg.get("action_on_threshold", "mute") if cfg is not None else "mute"
+            logger_obj = getattr(bot, "logger", None)
+            if logger_obj is not None:
+                logger_obj.log_info(
+                    "AD SPAM GUARD PUNISH ENQUEUED chat_id=%s user_id=%s "
+                    "count=%s threshold=%s action=%s"
+                    % (chat_id, user_id, count, threshold, action)
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ad-spam punish at threshold failed: %r", exc)
+        return False
+
+
 #: ارجاعِ زنده به تسک‌های حذفِ تأخیری (تا GC نگیردشان).
 _CLEANUP_TASKS: set = set()
 
@@ -512,6 +576,13 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
         count, threshold = 0, warn_threshold(bot, chat_id)
     else:
         count, threshold = _bump_warnings(bot, chat_id, user_id, sender)
+
+    # ✨ مجازات در آستانه — رفعِ باگِ «فقط شمارنده بالا می‌رود»:
+    # قبلاً پس از رسیدنِ ``count`` به ``threshold`` هیچ اخراج/سکوت/بنی اجرا
+    # نمی‌شد؛ کاربر فقط اخطار جمع می‌کرد (دقیقاً همان شکایتِ «تعداد اخطار
+    # می‌رود بالا ولی مجازات نمی‌شود»). حالا مجازاتِ تنظیم‌شدهٔ گروه اجرا
+    # می‌شود (جزئیات در ``_punish_at_threshold``).
+    _punish_at_threshold(bot, chat_id, user_id, sender, count, threshold)
 
     # پیامِ هشدار به‌صورتِ مستقل فرستاده می‌شود: پیامِ متخلف همین حالا حذف
     # شده و ریپلای روی آن یا خطا می‌دهد یا نقل‌قولِ شکسته می‌سازد.
