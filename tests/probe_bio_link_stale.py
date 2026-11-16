@@ -17,6 +17,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# ⏱️ راندِ ۱۴: سقفِ تأخیرِ ۰٫۴۵ ثانیه‌ای در test_slow_path_fixes آزموده می‌شود؛
+# این probe «قراردادِ تازگی/مجازات» را می‌سنجد، پس سقفِ سخاوتمندانه می‌گذاریم
+# تا starvation لوپ روی ماشینِ کند/شلوغ شکستِ الکی نسازد.
+os.environ.setdefault("BIO_LINK_AWAIT_TIMEOUT", "5")
+
 from _pytest.monkeypatch import MonkeyPatch  # noqa: E402
 
 from modules import bio_link, bio_link_service, bio_link_storage  # noqa: E402

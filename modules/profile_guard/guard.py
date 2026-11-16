@@ -505,7 +505,14 @@ async def guard_message(bot, event, chat_id, user_id, sender,
     except Exception:
         watch = False
 
-    snapshot = await service.snapshot(bot, sender, force=watch)
+    # ⏱️ راندِ ۱۴: مسیرِ عادی RPC را فقط تا ۰٫۴۵ ثانیه داخلِ پیام منتظر
+    # می‌ماند (گلوگاهِ stage=RECEIVE در گزارشِ کندی همان انتظارِ بدونِ سقف
+    # بود)؛ RPCِ کند به پس‌زمینه می‌رود و این پیام با دادهٔ کهنه مجازات
+    # نمی‌گیرد. کاربرِ «زیرِ نظر» بدونِ سقف و تازه بررسی می‌شود.
+    if watch:
+        snapshot = await service.snapshot(bot, sender, force=True)
+    else:
+        snapshot = await service.snapshot_waited(bot, sender)
     if not snapshot:
         return False
 

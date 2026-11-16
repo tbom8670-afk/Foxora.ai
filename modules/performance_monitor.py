@@ -224,8 +224,15 @@ class SlowProcessMonitor:
         handler: str,
         timestamp: Optional[str] = None,
         now_epoch: Optional[float] = None,
+        notes: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Record in memory only; return True only when a severe alert queued."""
+        """Record in memory only; return True only when a severe alert queued.
+
+        ``notes`` زمانِ زیرمرحله‌های نام‌دار همان پیام است (مثلاً
+        ``bio_check=812.3`` یا ``sender_fetch=940.1``)؛ سه موردِ برتر در
+        گزارشِ مالک نمایش داده می‌شود تا «کندی از کدام مسیر است» بدونِ لاگِ
+        runtime هم قابلِ دیدن باشد.
+        """
         try:
             elapsed = float(total_ms)
         except (TypeError, ValueError):
@@ -240,12 +247,25 @@ class SlowProcessMonitor:
             except RuntimeError:
                 return False
 
+        clean_notes: Dict[str, float] = {}
+        if isinstance(notes, dict):
+            for name, value in notes.items():
+                try:
+                    ms = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if ms > 0:
+                    clean_notes[str(name)] = round(ms, 1)
+            clean_notes = dict(
+                sorted(clean_notes.items(), key=lambda kv: -kv[1])[:3]
+            )
         event = {
             "total_ms": round(elapsed, 3),
             "chat_id": chat_id,
             "message_id": message_id,
             "handler": _safe_handler(handler),
             "timestamp": timestamp or now_local().isoformat(),
+            "notes": clean_notes,
         }
         key = self._key(event["handler"], chat_id)
         aggregate = self._batch.get(key)
@@ -312,8 +332,25 @@ class SlowProcessMonitor:
             return False
 
     @staticmethod
+    def _notes_text(event: Dict[str, Any]) -> str:
+        """«زیرمرحله‌ها: bio_check=812.3ms, …» — مسیرِ دقیقِ کندی."""
+        notes = event.get("notes") or {}
+        if not isinstance(notes, dict) or not notes:
+            return ""
+        pairs = []
+        for name, value in notes.items():
+            try:
+                ms = float(value)
+            except (TypeError, ValueError):
+                continue
+            if ms > 0:
+                pairs.append((str(name), ms))
+        pairs.sort(key=lambda kv: -kv[1])
+        return "، ".join(f"{name}={ms:.1f}ms" for name, ms in pairs[:3])
+
+    @staticmethod
     def format_alert(event: Dict[str, Any]) -> str:
-        return (
+        text = (
             "⚠️ گزارش کندی شدید ربات\n\n"
             f"زمان کل پردازش: {float(event['total_ms']):.1f} ms\n"
             f"chat_id: {event.get('chat_id')}\n"
@@ -321,16 +358,24 @@ class SlowProcessMonitor:
             f"handler: {event.get('handler')}\n"
             f"timestamp: {event.get('timestamp')}"
         )
+        notes_text = SlowProcessMonitor._notes_text(event)
+        if notes_text:
+            text += f"\nزیرمرحله‌ها: {notes_text}"
+        return text
 
     @staticmethod
     def format_batch(events: list[Dict[str, Any]]) -> str:
         lines = ["📊 گزارش تجمیعی کندی ربات", "", f"تعداد مسیرهای کند: {len(events)}", ""]
         for event in events:
-            lines.append(
+            line = (
                 f"• {event['handler']} | chat={event['chat_id']} | "
                 f"تعداد={event['count']} | آخرین={float(event['total_ms']):.1f}ms | "
                 f"بیشینه={float(event['max_ms']):.1f}ms | msg={event['message_id']}"
             )
+            notes_text = SlowProcessMonitor._notes_text(event)
+            if notes_text:
+                line += f" | زیرمرحله‌ها: {notes_text}"
+            lines.append(line)
         return "\n".join(lines[:250])
 
     def _owner_snapshot(self) -> list[Dict[str, Any]]:

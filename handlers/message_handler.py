@@ -4502,6 +4502,9 @@ async def handle_new_message(bot, event):
         # cache and event fields before asking SPlusthon to resolve a chat.
         event_chat = (getattr(event, "_bot_cached_chat", None)
                       or getattr(event, "chat", None))
+        # ⏱️ راندِ ۱۴: زمانِ واکشیِ chat/sender جدا ثبت می‌شود تا در گزارشِ
+        # کندی معلوم شود RECEIVE دقیقاً صرفِ کدام RPC شده است.
+        _sender_fetch_started = time.perf_counter()
         cached_peer = getattr(bot, "reply_input_peer_cache", {}).get(
             getattr(event, "chat_id", None)
         )
@@ -4523,6 +4526,14 @@ async def handle_new_message(bot, event):
                 event._bot_cached_sender = sender
             except Exception:
                 pass
+
+        try:
+            profiler.note(
+                "sender_fetch",
+                (time.perf_counter() - _sender_fetch_started) * 1000,
+            )
+        except Exception:
+            pass
 
         is_edited_message = bool(
             getattr(event, "_is_edited_message", False)
@@ -4633,6 +4644,7 @@ async def handle_new_message(bot, event):
                     ):
                         return
                 elif _ad_spam_guard.storage.is_enabled(chat_id) and not _is_own_bot_message:
+                    _ad_guard_started = time.perf_counter()
                     if await _ad_spam_guard.guard_message(
                         bot, event, chat_id, user_id, sender,
                         getattr(event.message, "id", None),
@@ -4642,6 +4654,10 @@ async def handle_new_message(bot, event):
                             bot, event, chat_id, is_edited_message
                         )
                         return
+                    profiler.note(
+                        "ad_guard",
+                        (time.perf_counter() - _ad_guard_started) * 1000,
+                    )
             except Exception as _ad_spam_error:
                 try:
                     bot.logger.log_error(
@@ -4691,6 +4707,7 @@ async def handle_new_message(bot, event):
                     ):
                         return
                 elif _profile_guard.storage.is_enabled(chat_id):
+                    _pg_guard_started = time.perf_counter()
                     if await _profile_guard.guard_message(
                         bot, event, chat_id, user_id, sender,
                         getattr(event.message, "id", None),
@@ -4700,6 +4717,10 @@ async def handle_new_message(bot, event):
                             bot, event, chat_id, is_edited_message
                         )
                         return
+                    profiler.note(
+                        "profile_guard",
+                        (time.perf_counter() - _pg_guard_started) * 1000,
+                    )
             except Exception as _profile_guard_error:
                 try:
                     bot.logger.log_error(
@@ -5028,8 +5049,13 @@ async def handle_new_message(bot, event):
                 and not (admin_bypass or native_admin_bypass or is_vip_user)
                 and force_join_service.is_enabled_cached(chat_id)):
             try:
+                _fj_started = time.perf_counter()
                 _force_join_blocked = await force_join_service.gate_message(
                     bot, event, chat_id, user_id, sender
+                )
+                profiler.note(
+                    "force_join",
+                    (time.perf_counter() - _fj_started) * 1000,
                 )
             except Exception as force_join_error:
                 _force_join_blocked = False

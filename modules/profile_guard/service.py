@@ -358,6 +358,87 @@ async def snapshot(bot, user, *, force: bool = False,
         return fresh
 
 
+#: کلیدهایی که همین حالا refresh پس‌زمینه برایشان در جریان است.
+_bg_inflight: set = set()
+
+
+def await_timeout() -> float:
+    """سقفِ انتظارِ inline برای اسنپ‌شاتِ کاربرِ نو (ثانیه).
+
+    ⏱️ راندِ ۱۴: قبلاً ``guard_message`` اسنپ‌شات را **بدونِ سقف** داخلِ
+    stage=RECEIVE منتظر می‌ماند (۰٫۶ تا ۱٫۲ ثانیه زیرِ فشارِ Governor —
+    همان «receive» در گزارشِ کندیِ مالک). حالا سقف ۰٫۴۵ ثانیه است: RPCِ
+    سریع همان اولین پیام را رسیدگی می‌کند؛ RPCِ کند قطع می‌شود و refresh
+    به پس‌زمینه می‌رود.
+    """
+    try:
+        value = float(str(os.getenv("PROFILE_GUARD_AWAIT_TIMEOUT", "0.45")).strip())
+    except (TypeError, ValueError):
+        value = 0.45
+    return max(0.0, min(30.0, value))
+
+
+def _schedule_bg(bot, user, key: str) -> None:
+    if key in _bg_inflight:
+        return
+    _bg_inflight.add(key)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_bg_refresh(bot, user, key))
+    except RuntimeError:
+        _bg_inflight.discard(key)
+    except Exception:  # noqa: BLE001
+        _bg_inflight.discard(key)
+
+
+async def snapshot_waited(bot, user, *, force: bool = False) -> Optional[dict]:
+    """اسنپ‌شات با **سقفِ انتظار** برای مسیرِ پیام.
+
+      * کشِ تازه → بدونِ RPC برگردانده می‌شود.
+      * ``force`` (کاربرِ زیرِ نظر) → بدونِ سقف، تازه و inline (درستی مهم‌تر
+        از سرعت است).
+      * غیرِ این‌ها: حداکثر ``await_timeout()`` ثانیه منتظر می‌ماند؛ اگر RPC
+        کندتر بود قطع می‌شود، refresh به پس‌زمینه می‌رود و ``None`` برگشت
+        می‌خورد تا این پیام بر پایهٔ دادهٔ کهنه/نبود مجازات نگیرد.
+    """
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return None
+    if force:
+        return await snapshot(bot, user, force=True)
+    key = str(user_id)
+    now = time.time()
+    entry = _cache.get(key)
+    if entry and (now - entry.get("ts", 0)) < ttl_seconds():
+        return entry
+    limit = await_timeout()
+    if limit <= 0:
+        _schedule_bg(bot, user, key)
+        return None
+    try:
+        return await asyncio.wait_for(snapshot(bot, user), timeout=limit)
+    except asyncio.TimeoutError:
+        _schedule_bg(bot, user, key)
+        return None
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        return entry
+
+
+async def _bg_refresh(bot, user, key: str) -> None:
+    try:
+        await snapshot(bot, user)
+    except Exception as error:  # noqa: BLE001
+        try:
+            _log(bot, f"BG SNAPSHOT FAILED user={key} "
+                      f"error={type(error).__name__}", error=True)
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        _bg_inflight.discard(key)
+
+
 async def channel_details(bot, channel_id, access_hash=None) -> dict:
     """توضیحات/تعداد اعضای کانال (فقط وقتی لازم شد صدا زده می‌شود).
 

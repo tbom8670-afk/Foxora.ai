@@ -3035,6 +3035,10 @@ class SoroushAntiSpamBot:
                             getattr(event, "message", None), "id", None
                         ),
                         handler=handler_name,
+                        notes=(
+                            stage_result.get("notes")
+                            if isinstance(stage_result, dict) else None
+                        ),
                     )
 
 

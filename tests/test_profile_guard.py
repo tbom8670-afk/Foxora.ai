@@ -28,6 +28,10 @@ if str(ROOT) not in sys.path:
 _TMP = tempfile.mkdtemp(prefix="profile_guard_test_")
 os.environ.setdefault("BOT_HOME", _TMP)
 os.environ.setdefault("BOT_INSTANCE", "profile_guard_test")
+# ⏱️ راندِ ۱۴: سقفِ تأخیرِ ۰٫۴۵ ثانیه‌ای در test_slow_path_fixes آزموده می‌شود؛
+# این‌جا «قراردادِ رسیدگی» هدف است، پس سقفِ سخاوتمندانه می‌گذاریم تا
+# starvation لوپ روی ماشینِ کند/شلوغ شکستِ الکی نسازد.
+os.environ.setdefault("PROFILE_GUARD_AWAIT_TIMEOUT", "5")
 
 from modules.profile_guard import filters, matcher, texts  # noqa: E402
 from modules.profile_guard.storage import toggle_mode  # noqa: E402
