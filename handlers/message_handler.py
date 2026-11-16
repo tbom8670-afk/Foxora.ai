@@ -1077,9 +1077,28 @@ def _run_background(bot, name, callback, *args):
 
 def _schedule_reply(bot, event, *args, **kwargs):
     """Send a reply without holding this group's dispatcher worker on RPC RTT."""
+    # شناسهٔ پیامِ کاربر و گروه را هم‌اکنون (sync) می‌گیریم تا پاسخِ ارسالیِ
+    # ربات ثبت شود. اگر کاربر بعداً همین پیام را (مثلاً «سلام» را) به یک متنِ
+    # فیلترشده ویرایش کند، مسیرِ حذف می‌تواند پاسخِ ربات را هم‌زمان با خودِ
+    # پیام پاک کند تا گروه شلوغ/ربات‌گونه نشود. نگاه‌کن به
+    # modules/bot_reply_registry و بلوکِ «EDITED MESSAGE BOT REPLY CLEANUP».
+    _origin_chat_id = getattr(event, "chat_id", None)
+    _origin_msg_id = getattr(getattr(event, "message", None), "id", None)
+
     async def run():
         try:
-            await event.reply(*args, **kwargs)
+            sent = await event.reply(*args, **kwargs)
+            # ثبتِ بی‌صدا و بدونِ I/O؛ هر خطا فقط بلعیده می‌شود و هرگز مسیرِ
+            # پاسخ را نمی‌شکند.
+            try:
+                if _origin_msg_id is not None:
+                    from modules.notice_cleanup import extract_sent_id
+                    from modules.bot_reply_registry import register as _register_bot_reply
+                    _reply_id = extract_sent_id(sent)
+                    if _reply_id is not None:
+                        _register_bot_reply(_origin_chat_id, _origin_msg_id, _reply_id)
+            except Exception:
+                pass
         except Exception as error:
             logger = getattr(bot, "logger", None)
             if logger is not None:
@@ -2203,6 +2222,76 @@ def _queue_message_deletes(bot, chat_id, message_ids, *, priority=1):
             )
             return 0, ids
     return _asyncio.create_task(fallback(), name="delete:fallback")
+
+
+# نویسه‌های نامرئی/فاصله‌مانند که برای «خالی» جلوه دادنِ پیامِ ویرایش‌شده به کار
+# می‌روند (تکنیکِ رایجِ ربات‌های اسپمر برای فریبِ فیلتر): فاصله‌های صفر‌عرض،
+# BOM، پیوندِ کلمه، نشانه‌های راست‌به‌چپ/چپ‌به‌راست، فاصلهٔ نرم، و کاراکترِ
+# «خالیِ» بریل — به‌همراهِ همهٔ فاصله‌های معمولی.
+_BLANK_STRIP_CHARS = (
+    "\u200b\u200c\u200d\ufeff\u2060\u200e\u200f\u00ad\u2800"
+    " \t\r\n\v\f\u2028\u2029\u00a0"
+)
+
+
+def _is_blank_text(text):
+    """آیا متن پسِ برداشتنِ فاصله و نویسه‌های نامرئی «خالی» است؟
+
+    برای تشخیصِ پیامی که به «متنِ خالی» ویرایش شده؛ حتی وقتی با نویسه‌های
+    نامرئی (مثلِ ZWSP) پر شده باشد تا خالی به نظر برسد ولی ``strip()``ِ معمولی
+    آن را خالی نداند.
+    """
+    if not text:
+        return True
+    return not str(text).strip(_BLANK_STRIP_CHARS)
+
+
+def _cleanup_bot_reply_for_edited_message(bot, event, chat_id, is_edited_message):
+    """حذفِ پاسخِ خودِ ربات به پیامِ ویرایش‌شده‌ای که در حالِ حذف است.
+
+    سناریو: کاربر پیامی مثل «سلام» می‌فرستد و ربات پاسخ می‌دهد («سلام 👋»)،
+    سپس همان پیام را خیلی سریع به یک متنِ فیلترشده/هرزنامه ویرایش می‌کند.
+    پیامِ ویرایش‌شده در یکی از مسیرهای حذف (اسپمِ بزرگ، قفلِ اسپم، یا بلوکِ
+    اصلیِ اسپم/فیلتر) پاک می‌شود، اما پاسخِ قبلیِ ربات سرِ جایش می‌ماند و گروه
+    شلوغ و «ربات‌گونه» به نظر می‌رسد (انگار خودِ ربات دارد «سلام» یا پیامِ خالی
+    می‌فرستد). چون ویرایش شناسهٔ پیام را تغییر نمی‌دهد، پاسخِ(های) ثبت‌شدهٔ
+    ربات برای همین شناسه (در ``_schedule_reply``) بیرون کشیده و هم‌زمان با خودِ
+    پیام از صفِ حذف می‌گذرد.
+
+    این هلپر باید در **همهٔ** مسیرهایی صدا زده شود که پیامِ ویرایش‌شده را حذف
+    می‌کنند. بی‌صدا و «بهترین تلاش» است: هیچ RPC اضافه‌ای در مسیرِ گرم ندارد
+    (ثبت از قبل انجام شده) و هرگز مسیرِ پیام را نمی‌شکند. فقط وقتی عمل می‌کند
+    که پیام واقعاً «ویرایش‌شده» باشد و «حذفِ هرزنامه» فعال باشد — تا وقتی
+    پیامِ خودِ کاربر پاک نمی‌شود، پاسخِ ربات بی‌دلیل پاک نشود.
+    """
+    if not is_edited_message:
+        return
+    logger = getattr(bot, "logger", None)
+    try:
+        config = getattr(bot, "config_manager", None)
+        delete_spam = True if config is None else config.get("delete_spam", True)
+        if not delete_spam:
+            return
+        from modules.bot_reply_registry import pop_reply_ids as _pop_bot_reply_ids
+        origin_msg_id = getattr(getattr(event, "message", None), "id", None)
+        bot_reply_ids = _pop_bot_reply_ids(chat_id, origin_msg_id)
+        if bot_reply_ids:
+            _queue_message_deletes(bot, chat_id, list(bot_reply_ids))
+            if logger is not None:
+                logger.log_info(
+                    "EDITED MESSAGE BOT REPLY CLEANUP "
+                    f"chat_id={chat_id} user_msg_id={origin_msg_id} "
+                    f"bot_reply_ids={bot_reply_ids!r}"
+                )
+    except Exception as error:
+        if logger is not None:
+            try:
+                logger.log_error(
+                    "BOT REPLY CLEANUP FAILED "
+                    f"chat_id={chat_id} error={error!r}"
+                )
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -4453,6 +4542,30 @@ async def handle_new_message(bot, event):
             or is_self_target(sender, bot=bot)
         )
 
+        # ===== 🧹 ویرایش به «متنِ خالی» — پاکسازیِ پاسخِ ربات =====
+        # اگر کاربر پیامی مثل «سلام» را (که ربات به آن پاسخ داده: «سلام 👋») به
+        # متنِ خالی/سفید — یا پرشده با نویسه‌های نامرئی — ویرایش کند، هیچ فیلترِ
+        # هرزنامه‌ای آن پیامِ خالی را حذف نمی‌کند؛ ولی پاسخِ قبلیِ ربات به یک
+        # پیامِ خالی می‌ماند و گروه ربات‌گونه به نظر می‌رسد (انگار خودِ ربات دارد
+        # «سلام» یا پیامِ خالی می‌فرستد). این‌جا — پیش از هر گیتِ دیگری و مستقل از
+        # مسیرِ اسپم — همان پاسخِ ثبت‌شدهٔ ربات پاک می‌شود.
+        #
+        # ایمنی: کلید فقط به پیام‌هایی می‌خورد که ربات **واقعاً** به آن‌ها پاسخ
+        # داده (در ``_schedule_reply`` ثبت شده)، پس پیامِ خالیِ کاربرانِ عادی هیچ
+        # پاسخِ اضافه‌ای را حذف نمی‌کند. پیامِ خالیِ خودِ کاربر عمداً حذف نمی‌شود
+        # (محتوای هرزنامه نیست)؛ فقط پاسخِ ربات پاک می‌شود. هلپر برای پیامِ
+        # غیرِویرایشی no-op است و ``pop`` هم ورودی را مصرف می‌کند، پس اگر بعداً
+        # همان پیام در مسیرِ اسپم/فیلتر هم حذف شود، حذفِ دوباره رخ نمی‌دهد.
+        if (
+            is_edited_message
+            and not _is_own_bot_message
+            and not getattr(event, "is_private", False)
+            and _is_blank_text(message_text)
+        ):
+            _cleanup_bot_reply_for_edited_message(
+                bot, event, chat_id, is_edited_message
+            )
+
         # ===== ⛔️ گیت «متخلف» — اولین نقطهٔ خط لولهٔ پیام =====
         # پیش از ضد اسپم، بازی‌ها، آمار، فیلترها و روتر دستورها: اگر
         # فرستنده در این گروه «متخلف» باشد، پیام بلافاصله حذف و پردازش
@@ -4474,6 +4587,10 @@ async def handle_new_message(bot, event):
                         getattr(event.message, "id", None),
                         logger=bot.logger,
                     ):
+                        # 🧹 اگر پیامِ ویرایش‌شده بود، پاسخِ قبلیِ ربات هم پاک شود.
+                        _cleanup_bot_reply_for_edited_message(
+                            bot, event, chat_id, is_edited_message
+                        )
                         return
                 except Exception as _violator_gate_error:
                     bot.logger.log_error(
@@ -4518,6 +4635,10 @@ async def handle_new_message(bot, event):
                         bot, event, chat_id, user_id, sender,
                         getattr(event.message, "id", None),
                     ):
+                        # 🧹 اگر پیامِ ویرایش‌شده بود، پاسخِ قبلیِ ربات هم پاک شود.
+                        _cleanup_bot_reply_for_edited_message(
+                            bot, event, chat_id, is_edited_message
+                        )
                         return
             except Exception as _ad_spam_error:
                 try:
@@ -4572,6 +4693,10 @@ async def handle_new_message(bot, event):
                         bot, event, chat_id, user_id, sender,
                         getattr(event.message, "id", None),
                     ):
+                        # 🧹 اگر پیامِ ویرایش‌شده بود، پاسخِ قبلیِ ربات هم پاک شود.
+                        _cleanup_bot_reply_for_edited_message(
+                            bot, event, chat_id, is_edited_message
+                        )
                         return
             except Exception as _profile_guard_error:
                 try:
@@ -5098,6 +5223,10 @@ async def handle_new_message(bot, event):
                         f"chat_id={chat_id} user_id={user_id} "
                         f"reason={big_reason!r}"
                     )
+                # 🧹 پاسخِ قبلیِ ربات به این پیامِ ویرایش‌شده هم پاک شود.
+                _cleanup_bot_reply_for_edited_message(
+                    bot, event, chat_id, is_edited_message
+                )
                 _queue_big_spam_ban(
                     bot, event, chat_id, user_id, sender, big_ids, big_reason
                 )
@@ -5145,11 +5274,19 @@ async def handle_new_message(bot, event):
                     f"chat_id={chat_id} user_id={user_id} "
                     f"message_id={event.message.id}"
                 )
+                # 🧹 پاسخِ قبلیِ ربات به این پیامِ ویرایش‌شده هم پاک شود.
+                _cleanup_bot_reply_for_edited_message(
+                    bot, event, chat_id, is_edited_message
+                )
                 return
             _debug_log(bot,
                 f"SPAM FLOW TRACE chat_id={chat_id} user_id={user_id} message_id={_trace_msg_id} stage=INSIDE_SPAM_LOCK"
             )
             _queue_message_deletes(bot, chat_id, [event.message.id])
+            # 🧹 پاسخِ قبلیِ ربات به این پیامِ ویرایش‌شده هم پاک شود.
+            _cleanup_bot_reply_for_edited_message(
+                bot, event, chat_id, is_edited_message
+            )
             _debug_log(bot, f"SPAM LOCK DROP QUEUED chat_id={chat_id} user_id={user_id} message_id={event.message.id}")
             locked_ids = message_tracker.spam_snapshot(
                 chat_id, user_id, getattr(event.message, "id", None)
@@ -11226,6 +11363,11 @@ async def handle_new_message(bot, event):
                 f"user={user_id} chat_id={chat_id} message_id={getattr(event.message, 'id', None)}"
             )
             profiler.mark("AUTO_MODERATION")
+            # 🧹 اگر این پیامِ ویرایش‌شده پاسخِ قبلیِ ربات را دارد (مثلاً
+            # «سلام 👋») هم‌زمان با خودِ پیام پاکش کن تا گروه شلوغ/ربات‌گونه نشود.
+            _cleanup_bot_reply_for_edited_message(
+                bot, event, chat_id, is_edited_message
+            )
             rejoin_state = getattr(bot, "rejoin_spam_state", {}).get(
                 (chat_id, user_id), {}
             )
