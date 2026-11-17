@@ -78,7 +78,7 @@ def rpc_min_interval() -> float:
 
 
 def error_retry_seconds() -> int:
-    return _env_int("PROFILE_GUARD_ERROR_RETRY", 1800, 60, 86400)
+    return _env_int("PROFILE_GUARD_ERROR_RETRY", 30, 5, 86400)
 
 
 # ---------------------------------------------------------------------------
@@ -342,17 +342,21 @@ async def snapshot(bot, user, *, force: bool = False,
     if entry and not force and (now - entry.get("ts", 0)) < age_limit:
         return entry
     if _retry_after.get(key, 0) > now and not force:
-        return entry
+        return None
 
     async with _lock(user_id):
         entry = _cache.get(key)
         if entry and not force and (time.time() - entry.get("ts", 0)) < age_limit:
             return entry
+        # Another waiter may have just failed while we waited on this lock.
+        if _retry_after.get(key, 0) > time.time() and not force:
+            return None
         async with _loop_semaphore():
             fresh = await _fetch(bot, user, fresh=force)
-        if fresh is None:
+        if fresh is None or fresh.get("status") not in {STATUS_OK, STATUS_EMPTY}:
             _retry_after[key] = time.time() + error_retry_seconds()
-            return entry
+            # Failure is unknown, never fresh evidence and never an empty bio.
+            return None
         _retry_after.pop(key, None)
         _cache[key] = fresh
         return fresh
@@ -427,7 +431,7 @@ async def snapshot_waited(bot, user, *, force: bool = False) -> Optional[dict]:
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001
-        return entry
+        return None
 
 
 async def _bg_refresh(bot, user, key: str) -> None:

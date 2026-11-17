@@ -149,7 +149,7 @@ _inflight: set = set()
 # کاربرانی که سرویس برایشان خطا/محدودیت داده است، تا مدتی بررسی نمی‌شوند تا
 # پیام‌های پیاپی همان کاربر یک RPC در هر پیام نسازند.
 _retry_after: dict = {}
-RETRY_AFTER_ERROR_SECONDS = _env_int("BIO_LINK_ERROR_RETRY_SECONDS", 1800, 60, 86400)
+RETRY_AFTER_ERROR_SECONDS = _env_int("BIO_LINK_ERROR_RETRY_SECONDS", 30, 5, 86400)
 
 # «تازگیِ لازم برای مجازات»: تصمیم مجازات هرگز بر پایهٔ رکورد کهنه گرفته
 # نمی‌شود. اگر رکورد «لینک دارد» از این مدت قدیمی‌تر باشد، یک‌بار (و فقط
@@ -406,7 +406,7 @@ def needs_check(chat_id, user_id) -> bool:
     if (time.time() - checked_at) >= bio_link_storage.ttl_seconds():
         return True
     # خطای API باید دیرتر ولی دوباره بررسی شود (نه هر پیام).
-    return record.get("status") in {STATUS_ERROR, STATUS_FLOOD}
+    return record.get("status") in {STATUS_ERROR, STATUS_FLOOD, STATUS_NO_ACCESS}
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +643,9 @@ async def ensure_user_now(bot, chat_id, user) -> Optional[dict]:
         return await asyncio.wait_for(_queued_check(), timeout=await_timeout())
     except asyncio.TimeoutError:
         _log(bot, f"CHECK TIMEOUT user_id={user_id} chat_id={chat_id}")
+        # wait_for has finished cancelling the inline check. Release ownership
+        # BEFORE enqueueing: schedule_check rejects keys still in _inflight.
+        _inflight.discard(key)
         schedule_check(bot, chat_id, user)
         return bio_link_storage.get_user(chat_id, user_id)
     except asyncio.CancelledError:
