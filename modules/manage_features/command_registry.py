@@ -30,7 +30,7 @@ import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 
 #: هندلرهایی که دستورِ مدیریتی ندارند (روترِ بازی/اقتصاد/پیوی).
 _NON_ADMIN_HANDLER_FILES = frozenset({

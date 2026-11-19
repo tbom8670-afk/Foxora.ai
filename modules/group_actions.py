@@ -88,6 +88,11 @@ BANNED_RIGHT_FLAGS = (
 # "قفل works, باز does not" symptom.
 TEXT_MESSAGE_FLAGS = ("send_messages", "send_plain")
 
+#: Flags that make up «گیف و رسانه». فقط این‌ها در قفلِ رسانهٔ «سپر
+#: محافظتی» دست می‌خورند؛ بقیهٔ حقوق از سرور خوانده و دست‌نخورده نوشته
+#: می‌شوند (همان سیاستِ «قفل/باز»).
+MEDIA_RIGHT_FLAGS = ("send_media", "send_stickers", "send_gifs")
+
 _LOCK_STATE_FILE = runtime_config_file("group_message_lock_state.json")
 
 
@@ -477,6 +482,107 @@ class GroupActions:
         _save_lock_state(state)
 
         self.logger.log_info(f"UNLOCK RPC SUCCESS chat_id={chat_id}")
+        return True
+
+    # ------------------------------------------------------------------
+    # 🔒 قفلِ «گیف و رسانه» — برایِ «سپر محافظتی» (modules/emergency_shield)
+    # ------------------------------------------------------------------
+    async def _set_media_banned(self, chat_id, banned, operation):
+        """Flip only the media flags, then verify the server agreed.
+
+        Exactly like ``_set_text_messages_banned``: every unrelated right is
+        cloned from the live server state and written back untouched, and the
+        result is read back before the operation is reported as successful.
+        """
+        peer = await self._group_peer(chat_id)
+        current, source = await self._fetch_default_banned_rights(chat_id, peer)
+
+        overrides = {flag: banned for flag in MEDIA_RIGHT_FLAGS}
+        updated = clone_banned_rights(current, **overrides)
+
+        changed = [
+            flag
+            for flag in BANNED_RIGHT_FLAGS
+            if bool(getattr(current, flag, None) if current is not None else False)
+            != bool(getattr(updated, flag))
+        ]
+        self.logger.log_info(
+            f"{operation} RIGHTS DIFF chat_id={chat_id} source={source} "
+            f"before=[{describe_rights(current)}] after=[{describe_rights(updated)}] "
+            f"changed={changed or ['<none>']}"
+        )
+        unexpected = [flag for flag in changed if flag not in MEDIA_RIGHT_FLAGS]
+        if unexpected:
+            raise ValueError(
+                f"Refusing to edit media rights for chat_id={chat_id}: "
+                f"unexpected changed flags {unexpected}"
+            )
+
+        await self.client(
+            functions.messages.EditChatDefaultBannedRightsRequest(
+                peer=peer,
+                banned_rights=updated,
+            )
+        )
+        verified, verify_source = await self._fetch_default_banned_rights(
+            chat_id, peer
+        )
+        self.logger.log_info(
+            f"{operation} RPC VERIFY chat_id={chat_id} source={verify_source} "
+            f"sent=[{describe_rights(updated)}] "
+            f"server_now=[{describe_rights(verified)}]"
+        )
+        return {
+            "previous": rights_to_dict(current),
+            "sent": rights_to_dict(updated),
+            "verified": rights_to_dict(verified),
+        }
+
+    async def lock_media(self, chat_id):
+        """بستنِ ارسالِ گیف و رسانه برایِ اعضایِ عادی.
+
+        خروجی، snapshotِ کاملِ حقوقِ قبل از قفل است (برایِ بازگرداندنِ دقیق).
+        """
+        result = await self._set_media_banned(chat_id, True, "MEDIA LOCK")
+        self.logger.log_info(f"MEDIA LOCK RPC SUCCESS chat_id={chat_id}")
+        return result["previous"]
+
+    async def unlock_media(self, chat_id, snapshot=None):
+        """بازکردنِ رسانه — در نبودِ snapshot فقط خاموش؛ وگرنه بازگشتِ دقیق.
+
+        ``snapshot`` همان خروجیِ ``lock_media`` است: حقوقِ واقعیِ گروه پیش از
+        قفل. آن‌ها دقیقاً بازنویسی می‌شوند تا چیزی که مالکِ گروه عمداً بسته
+        بود هم برگردد.
+        """
+        peer = await self._group_peer(chat_id)
+        current, _source = await self._fetch_default_banned_rights(chat_id, peer)
+        if isinstance(snapshot, dict):
+            overrides = {}
+            for flag in MEDIA_RIGHT_FLAGS:
+                if flag in snapshot:
+                    overrides[flag] = bool(snapshot[flag])
+                else:
+                    overrides[flag] = (
+                        bool(getattr(current, flag, False))
+                        if current is not None else False
+                    )
+        else:
+            overrides = {flag: False for flag in MEDIA_RIGHT_FLAGS}
+        restored = clone_banned_rights(current, **overrides)
+        await self.client(
+            functions.messages.EditChatDefaultBannedRightsRequest(
+                peer=peer,
+                banned_rights=restored,
+            )
+        )
+        verified, verify_source = await self._fetch_default_banned_rights(
+            chat_id, peer
+        )
+        self.logger.log_info(
+            f"MEDIA UNLOCK RPC VERIFY chat_id={chat_id} source={verify_source} "
+            f"sent=[{describe_rights(restored)}] "
+            f"server_now=[{describe_rights(verified)}]"
+        )
         return True
 
     async def change_title(self, chat_id, title):

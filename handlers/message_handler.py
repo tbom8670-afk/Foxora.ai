@@ -198,6 +198,8 @@ from modules import bio_link
 from modules import bio_link_storage
 from modules import bio_link_service
 from modules import force_join_service
+# 🌡 حالت بحرانی «سپر محافظتی» — منطق، storage و قالب‌ها کاملاً مستقل.
+from modules import emergency_shield
 from modules.user_display import format_user
 # 🧹 پاکسازی کامل پیام‌های یک کاربر («پاک کامل») — هستهٔ مستقل و خودکار.
 from modules import user_message_purge
@@ -6060,6 +6062,30 @@ async def handle_new_message(bot, event):
                     f"error={bio_command_error!r}"
                 )
                 await event.reply("❌ خطا در اجرای دستور فیلتر لینک بیو.")
+            return
+
+        # ===== 🌡 حالت بحرانی «سپر محافظتی» =====
+        # همان سطحِ دسترسی مثل فیلتر لینک بیو: مالک ربات/مالک گروه/ادمینِ
+        # ثبتشده. اجرای خودِ دستور در ماژول است تا منطق تست‌پذیر بماند.
+        shield_command = emergency_shield.match_command(clean_text)
+        if shield_command:
+            sender_username = getattr(sender, "username", None)
+            if not _has_group_management_permission(
+                bot, chat_id, user_id, sender_username
+            ):
+                await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
+                return
+            try:
+                await emergency_shield.run_command(
+                    bot, event, chat_id, clean_text, actor=sender,
+                )
+            except Exception as shield_command_error:
+                bot.logger.log_error(
+                    "EMERGENCY SHIELD COMMAND FAILED "
+                    f"chat_id={chat_id} action={shield_command!r} "
+                    f"error={shield_command_error!r}"
+                )
+                await event.reply("❌ خطا در اجرای دستور سپر محافظتی.")
             return
 
 

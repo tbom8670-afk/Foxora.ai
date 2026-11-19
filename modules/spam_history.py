@@ -53,13 +53,24 @@ def is_repeat(chat_id, user_id, text, limit=3):
     if not current:
         return False
 
+    # 🌡 «سپر محافظتی»: پنجرهٔ ضدتکرار کوتاه‌تر می‌شود تا موجِ تکراری زودتر
+    # گرفته شود. در نبودِ سپر دقیقاً رفتارِ قبلی می‌ماند.
+    window = REPEAT_WINDOW_SECONDS
+    try:
+        from modules import emergency_shield
+        if emergency_shield.is_active(chat_id):
+            window = emergency_shield.repeat_window(chat_id)
+            limit = emergency_shield.repeat_limit(chat_id)
+    except Exception:
+        pass
+
     now = time.monotonic()
     recent_count = sum(
         1
         for item in MESSAGE_HISTORY.get((chat_id, user_id), [])
         if (
             item["normalized_text"] == current
-            and now - item["timestamp"] <= REPEAT_WINDOW_SECONDS
+            and now - item["timestamp"] <= window
         )
     )
     return recent_count >= limit

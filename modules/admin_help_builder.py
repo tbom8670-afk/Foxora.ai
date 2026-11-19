@@ -353,6 +353,16 @@ def _admin_rows():
             continue
         add_item(title, cmds)
 
+    # 🌡 «سپر محافظتی» — عنوان Bold و هر دو دستور Bold داخل **یک** نقل‌قول
+    # سروش پلاس (الگویِ «ضد کانال»). بلوکِ تازه از پایینِ لیست اضافه می‌شود
+    # تا آفست‌هایِ بلوک‌هایِ بالایی جابه‌جا نشوند.
+    add_item(
+        "🌡 برای روشن کردن حالت بحرانی سپر محافظتی گروه بنویسید",
+        ["سپر روشن", "سپر خاموش"],
+        bold_cmds=True,
+        quote=True,
+    )
+
     contact = "تماس با سازنده : @OSINE2"
     rows.append((contact, [
         MessageEntityBold(offset=0, length=_u16(contact)),

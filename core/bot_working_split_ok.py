@@ -1719,6 +1719,14 @@ class SoroushAntiSpamBot:
 
         asyncio.create_task(daily_admin_report_loop())
 
+        # 🌡 ناظرِ «سپر محافظتی» — بازگشتِ خودکارِ تنظیمات پس از پایانِ
+        # تایمرِ سپر. کاملاً مستقل است و فقط لاگ/اعلان می‌فرستد.
+        async def emergency_shield_loop():
+            from modules import emergency_shield
+            await emergency_shield.watcher(self, logger=self.logger)
+
+        asyncio.create_task(emergency_shield_loop())
+
         async def is_currently_restricted(chat_id, user):
             """وضعیت فعلی عضو را از SPlusthon می‌خواند؛ خطا یعنی حفظ بن فعلی."""
             try:

@@ -359,6 +359,16 @@ class SpamDetector:
             text,
         ):
             return True, "لایو تبلیغاتی"
+        # 🌡 «سپر محافظتی»: حساسیتِ بالاتر — پیام‌هایِ «مرزی» (آیدیِ کوتاه،
+        # دامنهٔ بدونِ پیشوند، شمارهٔ موبایل) هم اسپم حساب می‌شوند. فقط در
+        # طولِ سپر و فقط وقتی هیچ‌کدام از بررسی‌هایِ بالا نگرفته باشند.
+        try:
+            from modules import emergency_shield
+            if chat_id is not None and emergency_shield.is_active(chat_id) \
+                    and emergency_shield.is_borderline(text):
+                return True, "پیام مرزی (حالت سپر)"
+        except Exception:
+            pass
         return False, ""
 
     def analyze(self, text: str) -> dict:
