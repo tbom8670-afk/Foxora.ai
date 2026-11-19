@@ -12,6 +12,11 @@
   * **مجازات را سکوت دائم می‌کند** (``punishment_mode``).
   * **آستانهٔ اخطار را به ۱** می‌رساند (بیشترین حساسیت).
 
+دو شکلِ دستور پذیرفته می‌شود: ``سپر روشن 20 دقیقه`` یک‌جا، یا ``سپر روشن``
+(بدونِ عدد) و بعد فقط ``20 دقیقه`` — در شکلِ دوم ربات أولاً پیامِ «تایم را
+تعیین کنید» را می‌فرستد و همان پیامِ بعدیِ همان کاربر در همان گروه به‌عنوانِ
+زمان شناخته می‌شود.
+
 قبل از روشن‌شدن، وضعیتِ همهٔ این تنظیمات در همان گروه **snapshot** می‌شود و
 پس از پایانِ تایمر یا دستورِ ``سپر خاموش`` **دقیقاً** همان وضعیت برمی‌گردد
 (هر قابلیتی که خاموش بوده خاموش، هر کدام که روشن بوده روشن).
@@ -543,6 +548,32 @@ async def watcher(bot, logger=None) -> None:
 # دستورها
 # ---------------------------------------------------------------------------
 
+#: پاسخِ مرحله‌ایِ «تایم» — بعد از «سپر روشن» بدونِ عدد، کاربر فقط زمان را
+#: می‌فرستد («20 دقیقه»). این نگه‌داری کوتاهِ درخواست است تا همان پیامِ بعدی
+#: به‌عنوانِ تایمِ همان کاربر در همان گروه شناخته شود.
+_PENDING_TTL = 120
+_PENDING_MAX = 2000
+_pending = {}
+
+_TIME_RE = re.compile(r"(\d{1,4})\s*(ساعت|دقیقه)?")
+
+
+def parse_time_value(text: str) -> Optional[int]:
+    """فقط زمان — ``20`` ، ``20 دقیقه`` ، ``1 ساعت`` ؛ ``None`` اگر زمان نبود."""
+    value = normalize_text(text)
+    if not value:
+        return None
+    match = _TIME_RE.fullmatch(value)
+    if not match:
+        return None
+    number = int(match.group(1))
+    if match.group(2) == "ساعت":
+        number *= 60
+    if not (MIN_MINUTES <= number <= MAX_MINUTES):
+        return None
+    return number
+
+
 def parse_minutes(text: str) -> Optional[int]:
     """عددِ دقیقه از دستور — ``20`` ، ``20 دقیقه`` ، ``1 ساعت`` ؛ ``None`` اگر نبود."""
     value = normalize_text(text)
@@ -551,16 +582,7 @@ def parse_minutes(text: str) -> Optional[int]:
     rest = value[len(ON_COMMAND):].strip()
     if not rest:
         return None
-    match = re.fullmatch(r"(\d{1,4})\s*(ساعت|دقیقه)?", rest)
-    if not match:
-        return None
-    number = int(match.group(1))
-    unit = match.group(2)
-    if unit == "ساعت":
-        number *= 60
-    if not (MIN_MINUTES <= number <= MAX_MINUTES):
-        return None
-    return number
+    return parse_time_value(rest)
 
 
 def match_command(text: str) -> Optional[str]:
@@ -582,34 +604,103 @@ def is_command(text: str) -> bool:
     return match_command(text) is not None
 
 
+# --- درخواستِ مرحله‌ایِ تایم -------------------------------------------------
+
+def _pending_key(chat_id, user_id) -> tuple:
+    return (_key(chat_id), str(user_id))
+
+
+def set_pending(chat_id, user_id) -> None:
+    """ثبتِ اینکه این کاربر در این گروه «سپر روشن» را بدونِ زمان زده است."""
+    if user_id is None:
+        return
+    if len(_pending) >= _PENDING_MAX:
+        now = time.time()
+        for key in [k for k, ts in _pending.items() if now - ts > _PENDING_TTL]:
+            _pending.pop(key, None)
+    _pending[_pending_key(chat_id, user_id)] = time.time()
+
+
+def has_pending(chat_id, user_id) -> bool:
+    key = _pending_key(chat_id, user_id)
+    stamp = _pending.get(key)
+    if stamp is None:
+        return False
+    if time.time() - stamp > _PENDING_TTL:
+        _pending.pop(key, None)
+        return False
+    return True
+
+
+def take_pending(chat_id, user_id) -> bool:
+    """درخواستِ تایم را می‌گیرد و یک بار مصرف می‌کند."""
+    if not has_pending(chat_id, user_id):
+        return False
+    _pending.pop(_pending_key(chat_id, user_id), None)
+    return True
+
+
+def clear_pending(chat_id, user_id) -> None:
+    _pending.pop(_pending_key(chat_id, user_id), None)
+
+
+def is_time_reply(text: str) -> bool:
+    return parse_time_value(text) is not None
+
+
+def is_shield_message(chat_id, user_id, text: str) -> bool:
+    """آیا این پیام به مسیرِ سپر برده شود؟ (دستور، یا زمانِ پاسخ به درخواست)."""
+    if match_command(text):
+        return True
+    if user_id is None:
+        return False
+    return has_pending(chat_id, user_id) and is_time_reply(text)
+
+
+async def _activate_and_reply(bot, event, chat_id, minutes: int, actor) -> None:
+    await activate(bot, chat_id, minutes, actor=actor)
+    record = get_record(chat_id) or {}
+    body, entities = build_on_message(
+        duration=format_duration(record.get("duration_minutes") or minutes),
+        actor=record.get("actor") or _display_actor(actor),
+        chat_id=chat_id,
+    )
+    await event.reply(body, formatting_entities=entities)
+
+
 async def run_command(bot, event, chat_id, text: str, *, actor=None) -> bool:
     """اجرایِ دستور؛ خروجی ``True`` اگر متن دستورِ این قابلیت باشد."""
+    user_id = getattr(actor, "id", None)
     action = match_command(text)
-    if not action:
-        return False
     if action == "ask":
+        set_pending(chat_id, user_id)
         body, entities = build_ask_message()
         await event.reply(body, formatting_entities=entities)
         return True
     if action == "on":
-        minutes = parse_minutes(text) or DEFAULT_MINUTES
-        await activate(bot, chat_id, minutes, actor=actor)
-        record = get_record(chat_id) or {}
-        body, entities = build_on_message(
-            duration=format_duration(record.get("duration_minutes") or minutes),
-            actor=record.get("actor") or _display_actor(actor),
-            chat_id=chat_id,
+        clear_pending(chat_id, user_id)
+        await _activate_and_reply(
+            bot, event, chat_id, parse_minutes(text) or DEFAULT_MINUTES, actor,
         )
+        return True
+    if action == "off":
+        clear_pending(chat_id, user_id)
+        await restore(bot, chat_id, reason="command")
+        body, entities = build_off_message()
         await event.reply(body, formatting_entities=entities)
         return True
-    # off
-    await restore(bot, chat_id, reason="command")
-    body, entities = build_off_message()
-    await event.reply(body, formatting_entities=entities)
-    return True
+    if action is None and user_id is not None and is_time_reply(text):
+        # پاسخِ مرحله‌ای: کاربر بعد از «سپر روشن» فقط زمان را فرستاده است.
+        if take_pending(chat_id, user_id):
+            await _activate_and_reply(
+                bot, event, chat_id, parse_time_value(text), actor,
+            )
+            return True
+    return False
 
 
 def reset_runtime_state():
     """پاک‌کردنِ state درون‌حافظه — فقط برایِ تست."""
     _tasks.clear()
+    _pending.clear()
     reset_cache()

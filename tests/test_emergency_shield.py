@@ -211,6 +211,19 @@ def test_commands():
     check("«.سپر خاموش» → off", es.match_command(".سپر خاموش") == "off")
     check("متنِ نامرتبط → None", es.match_command("سلام") is None)
 
+    check("زمانِ تنها: 20", es.parse_time_value("20") == 20)
+    check("زمانِ تنها: 20 دقیقه", es.parse_time_value("20 دقیقه") == 20)
+    check("زمانِ تنها: 1 ساعت", es.parse_time_value("1 ساعت") == 60)
+    check("زمانِ تنها: ۲۰ دقیقه", es.parse_time_value("۲۰ دقیقه") == 20)
+    check("زمانِ تنها: ۰ → None", es.parse_time_value("0") is None)
+    check("زمانِ تنها: ۵۰۰۰ → None", es.parse_time_value("5000") is None)
+    check("زمانِ تنها: «سلام دوستان» → None",
+          es.parse_time_value("سلام دوستان") is None)
+    check("زمانِ تنها: «سپر روشن 20» → None",
+          es.parse_time_value("سپر روشن 20") is None)
+    check("«سپر روشن 0» → None", es.parse_minutes("سپر روشن 0") is None)
+    check("«سپر روشن 5000» → None", es.parse_minutes("سپر روشن 5000") is None)
+
     check("۲۰ دقیقه", es.format_duration(20) == "20 دقیقه")
     check("۱ ساعت", es.format_duration(60) == "1 ساعت")
     check("۱ ساعت و ۳۰ دقیقه", es.format_duration(90) == "1 ساعت و 30 دقیقه")
@@ -436,6 +449,42 @@ def test_run_command():
         asyncio.run(es.run_command(bot, event3, chat, "سپر خاموش", actor=actor))
         check("پیامِ خاموش‌شدن داده شد", reply3.texts[0] == es.OFF_TEXT)
         check("گروه خاموش شد", es.is_active(chat) is False)
+
+        # پاسخِ مرحله‌ای: «سپر روشن» بعد فقط «20 دقیقه»
+        reply4 = FakeReply()
+        event4 = types.SimpleNamespace(reply=reply4.reply)
+        asyncio.run(es.run_command(bot, event4, chat, "سپر روشن", actor=actor))
+        check("درخواستِ تایم ثبت شد",
+              es.has_pending(chat, actor.id) is True)
+        check("is_shield_message برایِ زمان → True",
+              es.is_shield_message(chat, actor.id, "20 دقیقه") is True)
+        reply5 = FakeReply()
+        event5 = types.SimpleNamespace(reply=reply5.reply)
+        handled = asyncio.run(
+            es.run_command(bot, event5, chat, "20 دقیقه", actor=actor)
+        )
+        check("پاسخِ زمان پردازش شد", handled is True)
+        check("پیامِ روشن‌شدن با ۲۰ دقیقه",
+              "20 دقیقه" in reply5.texts[0])
+        check("گروه با ۲۰ دقیقه فعال شد",
+              (es.get_record(chat) or {}).get("duration_minutes") == 20)
+        check("درخواستِ تایم مصرف شد",
+              es.has_pending(chat, actor.id) is False)
+
+        # پیامِ معمولی بعد از درخواست، درخواست را نمی‌خورد
+        reply6 = FakeReply()
+        event6 = types.SimpleNamespace(reply=reply6.reply)
+        asyncio.run(es.run_command(bot, event6, chat, "سپر روشن", actor=actor))
+        reply7 = FakeReply()
+        event7 = types.SimpleNamespace(reply=reply7.reply)
+        check("پیامِ غیرزمان مصرف نمی‌شود",
+              asyncio.run(es.run_command(
+                  bot, event7, chat, "سلام دوستان", actor=actor)) is False)
+        check("درخواست هنوز است", es.has_pending(chat, actor.id) is True)
+        # کاربرِ دیگر نمی‌تواند تایم را بدهد
+        other = types.SimpleNamespace(id=2, username="bob", first_name="B")
+        check("کاربرِ دیگر → پاسخ نیست",
+              es.is_shield_message(chat, other.id, "20 دقیقه") is False)
     finally:
         cleanup_storage()
 

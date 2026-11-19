@@ -6067,7 +6067,13 @@ async def handle_new_message(bot, event):
         # ===== 🌡 حالت بحرانی «سپر محافظتی» =====
         # همان سطحِ دسترسی مثل فیلتر لینک بیو: مالک ربات/مالک گروه/ادمینِ
         # ثبتشده. اجرای خودِ دستور در ماژول است تا منطق تست‌پذیر بماند.
+        # هم دستورِ مستقیم («سپر روشن 20 دقیقه») و هم پاسخِ مرحله‌ایِ تایم
+        # (بعد از «سپر روشن»، فقط «20 دقیقه») به این مسیر می‌روند.
         shield_command = emergency_shield.match_command(clean_text)
+        if not shield_command and emergency_shield.is_shield_message(
+            chat_id, user_id, clean_text
+        ):
+            shield_command = "time"
         if shield_command:
             sender_username = getattr(sender, "username", None)
             if not _has_group_management_permission(
