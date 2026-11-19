@@ -96,8 +96,8 @@ OFF_COMMAND = "سپر خاموش"
 # قالب‌هایِ پیام — عیناً مطابقِ خواستهٔ کارفرما (بدونِ هیچ تغییری)
 # ---------------------------------------------------------------------------
 
-TITLE_ON = "«حالت بحرانی » سپر روشن شد ✅"
-TITLE_ASK = "«حالت بحرانی » سپر محافظتی"
+TITLE_ON = "⪻ «حالت بحرانی » سپر روشن شد ✅"
+TITLE_ASK = "⪻ «حالت بحرانی » سپر محافظتی"
 ASK_LINE = "تایم فعال سازی سپر رو تایین کنید مثال دستوری"
 ASK_EXAMPLES = ("20 دقیقه", "1 ساعت")
 STATUS_LINES = (
@@ -106,7 +106,6 @@ STATUS_LINES = (
     "ضد تبلیغ هوش مصنوعی روشن شد",
     "تشخیص سریع هرزنامه روشن شد",
     "حالت به سکوت دائم تغییر کرد",
-    "ارسال رسانه و گیف گروه بسته شد",
 )
 OFF_TEXT = (
     "⚙️ : سپر محافظتی خاموش شد تنظیمات مدیریتی به قبل بازگشت "
@@ -198,19 +197,17 @@ def build_on_message(*, duration: str, actor: str, chat_id) -> tuple:
     """قالبِ ۱ — پیامِ روشن‌شدنِ سپر."""
     parts = []
     entities = []
-    _emit(parts, entities, TITLE_ON, "bold_quote")
-    parts.append("\n\n")
-    _emit(parts, entities, "\n".join(STATUS_LINES), "quote")
-    parts.append("\n\n")
-    info = (
-        f"⚙ مـدت زمان فعال بودن : {duration}",
-        f"⚙ تنـظیم کننده : {actor}",
-        f"⚙ شـناسه گروه : {chat_id}",
-    )
-    for index, line in enumerate(info):
-        if index:
-            parts.append("\n")
-        _emit(parts, entities, line, "plain")
+    _emit(parts, entities, TITLE_ON, "bold")
+    parts.append("\n")
+    for status in STATUS_LINES:
+        parts.append("\n")
+        _emit(parts, entities, "〶 " + status, "bold_quote")
+    parts.append("\n")
+    for label, value in (("مدت زمان فعال بودن", duration),
+                         ("تنظیم کننده", actor), ("شناسه گروه", chat_id)):
+        parts.append("\n")
+        _emit(parts, entities, f"⚙️ {label} :", "bold")
+        parts.append(f" {value}")
     return "".join(parts), entities
 
 
@@ -218,17 +215,18 @@ def build_ask_message() -> tuple:
     """قالبِ ۲ — وقتی دستور بدونِ تایم زده شود."""
     parts = []
     entities = []
-    _emit(parts, entities, TITLE_ASK, "bold_quote")
-    parts.append("\n\n")
-    _emit(parts, entities, ASK_LINE, "plain")
-    parts.append("\n\n")
-    _emit(parts, entities, "\n".join(ASK_EXAMPLES), "quote")
+    _emit(parts, entities, TITLE_ASK, "bold")
+    parts.append("\n")
+    _emit(parts, entities, ASK_LINE, "bold")
+    for example in ASK_EXAMPLES:
+        parts.append("\n")
+        _emit(parts, entities, "⏱ " + example, "quote")
     return "".join(parts), entities
 
 
 def build_off_message() -> tuple:
     """قالبِ ۳ — خاموش‌شدنِ سپر."""
-    return OFF_TEXT, []
+    return OFF_TEXT, [MessageEntityBold(offset=0, length=_u16(OFF_TEXT))]
 
 
 # ---------------------------------------------------------------------------

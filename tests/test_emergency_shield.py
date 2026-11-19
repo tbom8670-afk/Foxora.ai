@@ -238,41 +238,23 @@ def test_templates():
     body, entities = es.build_on_message(
         duration="1 ساعت", actor="@osine", chat_id="123456"
     )
-    lines = body.split("\n")
-    check("تیترِ روشن‌شدن", lines[0] == "«حالت بحرانی » سپر روشن شد ✅")
-    check("شش خطِ وضعیت", lines[2:8] == list(es.STATUS_LINES))
-    check("مدتِ زمان", lines[9] == "⚙ مـدت زمان فعال بودن : 1 ساعت")
-    check("تنظیم‌کننده", lines[10] == "⚙ تنـظیم کننده : @osine")
-    check("شناسهٔ گروه", lines[11] == "⚙ شـناسه گروه : 123456")
-    quotes = [e for e in entities if _is_entity(e, "MessageEntityBlockquote")]
-    bolds = [e for e in entities if _is_entity(e, "MessageEntityBold")]
-    check("تیتر داخل نقل‌قول", any(q.offset == 0 for q in quotes))
-    check("تیتر Bold", any(b.offset == 0 for b in bolds))
-    check("بلوکِ وضعیت یک نقل‌قولِ واحد", len(quotes) == 2)
-    body_len = es._u16(body)
-    check("طولِ موجودیت‌ها در محدوده",
-          all(0 <= e.offset and e.offset + e.length <= body_len
-              for e in entities))
-    check("نقل‌قولِ وضعیت شش‌خطِ کامل را می‌گیرد",
-          any(q.offset == es._u16("«حالت بحرانی » سپر روشن شد ✅\n\n")
-              and q.length == es._u16("\n".join(es.STATUS_LINES))
-              for q in quotes))
+    def spans(text, entities, kind):
+        raw = text.encode("utf-16-le")
+        return [raw[e.offset*2:(e.offset+e.length)*2].decode("utf-16-le")
+                for e in entities if _is_entity(e, kind)]
 
-    ask, ask_entities = es.build_ask_message()
-    ask_lines = ask.split("\n")
-    check("تیترِ درخواستِ تایم", ask_lines[0] == "«حالت بحرانی » سپر محافظتی")
-    check("خطِ راهنما", ask_lines[2] == es.ASK_LINE)
-    check("مثال‌ها", ask_lines[4:6] == list(es.ASK_EXAMPLES))
-    ask_quotes = [e for e in ask_entities
-                  if _is_entity(e, "MessageEntityBlockquote")]
-    check("مثال‌ها در یک نقل‌قولِ واحد",
-          any(q.length == es._u16("\n".join(es.ASK_EXAMPLES))
-              for q in ask_quotes))
-    check("طولِ موجودیت‌های پیامِ ۲ در محدوده",
-          all(0 <= e.offset and e.offset + e.length <= es._u16(ask)
-              for e in ask_entities))
-
-    off, _ = es.build_off_message()
+    statuses = ["〶 " + line for line in es.STATUS_LINES]
+    check("پنج نقل‌قول مستقل", len(statuses) == 5 and
+          spans(body, entities, "MessageEntityBlockquote") == statuses)
+    check("تیتر و وضعیت‌ها بولد", spans(body, entities, "MessageEntityBold") ==
+          [es.TITLE_ON, *statuses, "⚙️ مدت زمان فعال بودن :", "⚙️ تنظیم کننده :", "⚙️ شناسه گروه :"])
+    check("مقادیر پویا", all(v in body for v in ("1 ساعت", "@osine", "123456")))
+    ask, entities = es.build_ask_message()
+    check("دو مثال زمان جدا", spans(ask, entities, "MessageEntityBlockquote") ==
+          ["⏱ 20 دقیقه", "⏱ 1 ساعت"])
+    check("تیتر و راهنما بولد", spans(ask, entities, "MessageEntityBold") == [es.TITLE_ASK, es.ASK_LINE])
+    off, entities = es.build_off_message()
+    check("خاموشی بدون نقل‌قول", len(entities) == 1 and spans(off, entities, "MessageEntityBold") == [off])
     check("پیامِ خاموش‌شدن", off == es.OFF_TEXT)
     check("متنِ خاموش‌شدن دقیق",
           off == "⚙️ : سپر محافظتی خاموش شد تنظیمات مدیریتی به قبل بازگشت "
