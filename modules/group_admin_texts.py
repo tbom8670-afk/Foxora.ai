@@ -47,7 +47,7 @@ def title_prompt():
 
 
 def rights_board(label, choices):
-    """The six displayed booleans are exactly the booleans sent on confirm."""
+    """The six displayed defaults; the next valid answer executes the edit."""
     message = _Message()
     message.add(f"🧑‍🌾 کاربر برای ادمینی گروه انتخاب شد : {label}",
                 quote=True, bold=True)
@@ -56,16 +56,9 @@ def rights_board(label, choices):
         state = "روشن" if choices[number] else "خاموش"
         message.add(f"{number}_ {description}     ◐ {state}\n")
     message.add("\n⚙️ برای خاموش کردن مثلا بنویسید 1 و 2\n")
-    message.add("⚙️ برای روشن کردن بنویسید روشن 6\n")
     message.add("⚙️ اگر انتخابی ندارید بنویسید هیچکدام\n")
-    message.add("⚙️ برای ثبت بنویسید تایید ادمین گروه؛ برای انصراف بنویسید انصراف ادمین گروه")
+    message.add("⚙️ همین پاسخ ادمینی را ثبت می‌کند؛ برای انصراف بنویسید انصراف ادمین گروه")
     return message.done()
-
-
-def rights_changed(numbers, enabled):
-    sequence = " - ".join(str(number) for number in numbers)
-    state = "روشن" if enabled else "خاموش"
-    return bold(f"🪁 انجام شد گزینه {sequence} {state} شد")
 
 
 def promoted(label, rank):

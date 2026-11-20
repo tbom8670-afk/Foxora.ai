@@ -3,8 +3,9 @@
 
 The only bridge to the large existing message pipeline is ``handle``.  The
 short-lived workflow lives here, scoped by (group, registered owner); every
-step rechecks groups.json.  A title and a fully explicit six-right choice are
-required before any native EditAdminRequest.  Interactive text is isolated in
+step rechecks groups.json.  After the title, a single message with numbers
+to disable (or «هیچکدام» for the displayed defaults) executes the edit; no
+extra confirmation is required.  Interactive text is isolated in
 modules/group_admin_texts.py for the remaining reference screenshots.
 """
 from __future__ import annotations
@@ -139,15 +140,12 @@ async def _target(bot, event, chat_id):
 
 def _numbers(text):
     translated = normalize(text).translate(_DIGITS)
-    enabled = False
-    if translated.startswith("روشن "):
-        enabled, translated = True, translated[5:].strip()
-    elif translated.startswith("خاموش "):
+    if translated.startswith("خاموش "):
         translated = translated[6:].strip()
     if not _SELECTION.fullmatch(translated):
         return None
     numbers = [int(item) for item in re.findall(r"[0-9]+", translated)]
-    return sorted(set(numbers)), enabled
+    return sorted(set(numbers))
 
 
 def _other_project_command(cleaned):
@@ -237,44 +235,38 @@ async def _continue(bot, event, chat_id, actor_id, raw, state):
                 _FLOWS.pop(_key(chat_id, actor_id), None)
             raise
         return
-    if cleaned == CONFIRM:
-        if not any(state.choices.values()):
-            await _reply(event, texts.bold(
-                "❌ برای ادمین شدن حداقل یکی از شش دسترسی باید روشن باشد."))
-            return
-        state.phase = "busy"
-        try:
-            # This locks only this group/target; never admins.json, other
-            # groups, or the existing bot administration paths.
-            async with _lock(chat_id, state.target_id):
-                await native.promote(bot, chat_id, actor_id, state.target,
-                                     state.rank, dict(state.choices))
-        finally:
-            if _FLOWS.get(_key(chat_id, actor_id)) is state:
-                _FLOWS.pop(_key(chat_id, actor_id), None)
-        await _reply(event, texts.promoted(state.label, state.rank))
-        return
     if cleaned in {"هیچکدام", "هیچ کدام"}:
-        state.updated = time.monotonic()
-        await _reply(event, texts.rights_board(state.label, state.choices))
-        return
-    selection = _numbers(cleaned)
-    if selection is None:
-        await _reply(event, texts.bold(
-            "❌ شماره‌های ۱ تا ۶ را بنویسید؛ برای روشن‌کردن «روشن ۶»، "
-            "و برای ثبت «تایید ادمین گروه» را بفرستید."))
-        return
-    numbers, enabled = selection
+        numbers = []
+    else:
+        numbers = _numbers(cleaned)
+        if numbers is None:
+            await _reply(event, texts.bold(
+                "❌ شماره‌های ۱ تا ۶ را برای خاموش‌کردن بنویسید، "
+                "یا برای ثبتِ تنظیماتِ نمایش‌داده‌شده «هیچکدام» را بفرستید."))
+            return
+    # Each answer is the complete, final choice.  In particular, 6 is OFF
+    # by default, and selecting it must not silently turn it on.
+    choices = dict(native.DEFAULT_CHOICES)
     for number in numbers:
-        state.choices[number] = enabled
-    state.updated = time.monotonic()
+        choices[number] = False
     try:
-        await _reply(event, texts.rights_changed(numbers, enabled))
-        await _reply(event, texts.rights_board(state.label, state.choices))
-    except BaseException:
+        native.build_rights(choices)  # all-off is demotion on this API
+    except native.GroupAdminError as exc:
+        await _reply(event, texts.bold(str(exc)))
+        return
+    state.choices = choices
+    state.updated = time.monotonic()
+    state.phase = "busy"
+    try:
+        # This locks only this group/target; never admins.json, other groups,
+        # or the existing bot administration and «اختصاصی» paths.
+        async with _lock(chat_id, state.target_id):
+            await native.promote(bot, chat_id, actor_id, state.target,
+                                 state.rank, dict(choices))
+    finally:
         if _FLOWS.get(_key(chat_id, actor_id)) is state:
             _FLOWS.pop(_key(chat_id, actor_id), None)
-        raise
+    await _reply(event, texts.promoted(state.label, state.rank))
 
 
 async def handle(bot, event, chat_id, actor_id, sender, raw, logger=None):

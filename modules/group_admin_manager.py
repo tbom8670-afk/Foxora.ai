@@ -7,14 +7,17 @@ and no changes to the existing bot-admin or «اختصاصی» systems.
 
 SPlusthon 1.1.4 (and the project's existing «اختصاصی» route) uses
 channels.EditAdminRequest(channel, user_id, ChatAdminRights, rank).  ``rank``
-is the actual custom administrator title.  GetParticipantRequest provides a
-server-side read-back of the title and rights.  A zero-rights promotion would
-be a demotion on this API, so it is never sent as a promotion.
+is the actual custom administrator title.  Some Soroush servers reject
+GetParticipantRequest with 422 NOT_SUPPORTED: use fresh, paginated
+GetParticipantsRequest reads instead, never treating a partial list as a
+negative.  A zero-rights promotion would be a demotion on this API, so it is
+never sent as a promotion.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 
 from modules.group_actions import GroupActions
 from modules.group_storage import get_group_owner
@@ -44,6 +47,11 @@ DEFAULT_CHOICES = {number: number != 6 for number, _label, _flag in PERMISSIONS}
 READ_TIMEOUT = 8.0
 WRITE_TIMEOUT = 12.0
 VERIFY_DELAYS = (0.0, 0.5, 1.5, 2.5)
+PARTICIPANT_PAGE_SIZE = 200  # SPlusthon's GetParticipants page limit.
+PARTICIPANT_PAGE_DELAY = 0.1  # Avoid bursting heavy RPCs in large groups.
+MAX_SCAN_SECONDS = 20.0     # An unfinished scan never proves absence.
+MAX_ADMIN_PAGES = 10         # Never trust a truncated admin list as a negative.
+MAX_MEMBER_PAGES = 10        # A member must be found explicitly to be promoted.
 
 
 class GroupAdminError(RuntimeError):
@@ -178,16 +186,126 @@ async def _inputs(bot, chat_id, entity):
     return channel, input_user, participant_peer, user_id
 
 
-async def _read(bot, channel, participant_peer, expected_id):
-    result = await asyncio.wait_for(
-        bot.client(functions.channels.GetParticipantRequest(
-            channel=channel, participant=participant_peer)), READ_TIMEOUT)
-    participant = getattr(result, "participant", None)
-    if participant is None:
-        raise RuntimeError("GetParticipantRequest returned no participant")
-    if _target_id(participant) != expected_id:
-        raise RuntimeError("GetParticipantRequest returned a different user")
-    return participant
+class _NoAdminInCompleteList:
+    """Only proves *not admin*; never proves that a user is a normal member."""
+
+    def __init__(self, user_id):
+        self.user_id = user_id
+
+
+def _role_id(role):
+    """TL participant IDs are on the role, NOT aligned with ``page.users``."""
+    known = (types.ChannelParticipant, types.ChannelParticipantSelf,
+             types.ChannelParticipantAdmin, types.ChannelParticipantCreator,
+             types.ChannelParticipantLeft, types.ChannelParticipantBanned)
+    if not isinstance(role, known):
+        raise RuntimeError("unknown participant role in server response")
+    # Left/Banned contain a PeerUser instead of a top-level user_id.
+    return _target_id(getattr(role, "peer", role))
+
+
+async def _scan_roles(bot, channel, filter_type, expected_id, *, max_pages,
+                      admins_only=False):
+    """Find a positively identified role, or prove a *complete* filter list.
+
+    ``hash=0`` bypasses NotModified/cached snapshots: read-back after an edit
+    must be fresh.  A missing/invalid count, missing role metadata, repeated
+    page, premature empty page, or the page cap is UNKNOWN, not an absence.
+    ``page.users`` must not be zipped with ``page.participants``: TL does not
+    promise they are in the same order or that all referenced users are roles.
+    """
+    offset, seen = 0, set()
+    total, started = None, time.monotonic()
+    for _page_number in range(max_pages):
+        remaining = MAX_SCAN_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("participants scan exceeded its time budget")
+        page = await asyncio.wait_for(
+            bot.client(functions.channels.GetParticipantsRequest(
+                channel=channel, filter=filter_type(), offset=offset,
+                limit=PARTICIPANT_PAGE_SIZE, hash=0)),
+            min(READ_TIMEOUT, remaining))
+        count = getattr(page, "count", None)
+        rows = getattr(page, "participants", None)
+        if type(count) is not int or count < 0 or not isinstance(rows, (list, tuple)) \
+                or len(rows) > PARTICIPANT_PAGE_SIZE \
+                or count < offset + len(rows) \
+                or (total is not None and total != count):
+            raise RuntimeError("invalid or changing participants page")
+        total = count
+        if not rows and offset < total:
+            raise RuntimeError("incomplete participants page")
+        for role in rows:
+            role_id = _role_id(role)
+            if (role_id in seen or
+                    (admins_only and not isinstance(
+                        role, (types.ChannelParticipantAdmin,
+                               types.ChannelParticipantCreator)))):
+                raise RuntimeError("duplicated or unfiltered participants page")
+            seen.add(role_id)
+            if role_id == expected_id:
+                return role
+        offset += len(rows)
+        if offset >= total:
+            return None
+        await asyncio.sleep(PARTICIPANT_PAGE_DELAY)
+    raise RuntimeError("participants list exceeded the safe page limit")
+
+
+async def _read_via_lists(bot, channel, expected_id, *, admins_only=False):
+    # An existing admin must be found BEFORE any ordinary-member promotion.
+    # In particular, not seeing someone in the first 200 admins proves nothing.
+    admin = await _scan_roles(bot, channel, types.ChannelParticipantsAdmins,
+                              expected_id, max_pages=MAX_ADMIN_PAGES,
+                              admins_only=True)
+    if admin is not None:
+        return admin
+    not_admin = _NoAdminInCompleteList(expected_id)
+    if admins_only:
+        return not_admin
+    try:
+        member = await _scan_roles(bot, channel, types.ChannelParticipantsRecent,
+                                   expected_id, max_pages=MAX_MEMBER_PAGES)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # The complete admin list still proves non-admin for demotion checks,
+        # but an unknown member list can NEVER authorize a promotion.
+        logger = getattr(bot, "logger", None)
+        if logger is not None:
+            try:
+                logger.log_error("NATIVE GROUP ADMIN MEMBER LIST FAILED "
+                                 f"user={expected_id} error={exc!r}")
+            except Exception:
+                pass
+        return not_admin
+    return member if member is not None else not_admin
+
+
+async def _read(bot, channel, participant_peer, expected_id, *, admins_only=False):
+    try:
+        result = await asyncio.wait_for(
+            bot.client(functions.channels.GetParticipantRequest(
+                channel=channel, participant=participant_peer)), READ_TIMEOUT)
+        participant = getattr(result, "participant", None)
+        if _role_id(participant) != expected_id:
+            raise RuntimeError("GetParticipantRequest returned a different user")
+        return participant
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        # Documented by force_join_api: some Soroush servers answer
+        # channels.getParticipant with 422 NOT_SUPPORTED.  A fresh, typed
+        # participants list can also recover from other direct-read failures.
+        logger = getattr(bot, "logger", None)
+        if logger is not None:
+            try:
+                logger.log_info("NATIVE GROUP ADMIN DIRECT READ FAILED "
+                                f"user={expected_id} error={error!r}; trying list")
+            except Exception:
+                pass
+        return await _read_via_lists(bot, channel, expected_id,
+                                     admins_only=admins_only)
 
 
 def _admin(participant):
@@ -198,18 +316,38 @@ def _creator(participant):
     return isinstance(participant, types.ChannelParticipantCreator)
 
 
+def _not_admin(participant):
+    """Positive non-admin role, or absence in a complete admin-filtered list."""
+    return isinstance(participant, (
+        _NoAdminInCompleteList, types.ChannelParticipant,
+        types.ChannelParticipantSelf, types.ChannelParticipantLeft,
+        types.ChannelParticipantBanned))
+
+
 async def _bot_promote_right(bot, channel):
     bot_id = known_bot_id(bot=bot)
-    if bot_id is None:
-        try:
-            me = await asyncio.wait_for(bot.client.get_me(), READ_TIMEOUT)
-            bot_id = _target_id(me)
-        except Exception as exc:
-            raise GroupAdminError("❌ هویت حساب ربات برای بررسی مجوز ادمینی مشخص نیست.") from exc
+    bot_entity = bot_id
     try:
-        bot_peer = await bot.client.get_input_entity(bot_id)
+        # The get_me entity carries its own access_hash.  Resolving just the
+        # numeric bot ID can fail when SPlusthon has no cached user entity.
+        me = await asyncio.wait_for(bot.client.get_me(), READ_TIMEOUT)
+        me_id = _target_id(me)
+        if bot_id is not None and me_id != bot_id:
+            raise GroupAdminError("❌ شناسهٔ حساب ربات با نشست فعلی سازگار نیست.")
+        bot_id, bot_entity = me_id, me
+    except asyncio.CancelledError:
+        raise
+    except GroupAdminError:
+        raise
+    except Exception as exc:
+        if bot_id is None:
+            raise GroupAdminError(
+                "❌ هویت حساب ربات برای بررسی مجوز ادمینی مشخص نیست.") from exc
+    try:
+        bot_peer = await bot.client.get_input_entity(bot_entity)
         bot_peer = utils.get_input_peer(bot_peer)
-        participant = await _read(bot, channel, bot_peer, bot_id)
+        participant = await _read(bot, channel, bot_peer, bot_id,
+                                  admins_only=True)
     except Exception as exc:
         raise GroupAdminError("❌ دسترسی «افزودن مدیر» حساب ربات در این گروه قابل بررسی نیست.") from exc
     if _creator(participant):
@@ -248,36 +386,13 @@ async def _verify(bot, channel, participant_peer, user_id, predicate):
     return False, observed
 
 
-async def _rollback_incorrect_promotion(bot, chat_id, channel, input_user,
-                                        participant_peer, user_id, bot_id, observed):
-    """Undo ONLY a newly promoted admin whose title/rights the server changed.
-
-    A pre-existing admin is never overwritten.  If another promoter took over,
-    or the registered owner changed to this target, don't touch their role.
-    """
-    if not _admin(observed) or str(getattr(observed, "promoted_by", None)) != str(bot_id) \
-            or str(get_group_owner(chat_id)) == str(user_id):
-        return False
-    try:
-        await asyncio.wait_for(
-            bot.client(functions.channels.EditAdminRequest(
-                channel=channel, user_id=input_user,
-                admin_rights=types.ChatAdminRights(), rank="")), WRITE_TIMEOUT)
-        done, _ = await _verify(bot, channel, participant_peer, user_id,
-                                lambda role: not _admin(role) and not _creator(role))
-        return done
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return False
-
-
 async def promote(bot, chat_id, actor_id, target, rank, choices):
-    """One atomic native promotion with title+rights, plus read-back.
+    """One native promotion with title+rights, plus read-back.
 
     Never write admins.json.  Timeout/unknown verification is NOT reported as
-    success.  An observed promotion missing its title is rolled back when
-    safely attributable to this bot; otherwise the owner gets a warning.
+    success.  A mismatched/partial read is not grounds for automatic demotion:
+    ``promoted_by`` alone cannot prove this exact write created the admin (a
+    pre-existing admin may have been promoted by the same bot).
     """
     require_owner(chat_id, actor_id)
     rank = validate_rank(rank)
@@ -294,9 +409,11 @@ async def promote(bot, chat_id, actor_id, target, rank, choices):
         raise GroupAdminError("❌ مالک اصلی گروه را نمی‌توان دوباره ادمین کرد.")
     if _admin(before):
         raise GroupAdminError("⚠️ این کاربر از قبل ادمین گروه است؛ دسترسی‌هایش تغییر نکرد.")
+    if isinstance(before, _NoAdminInCompleteList):
+        raise GroupAdminError("❌ عضویت عادی این کاربر قابل تأیید نیست؛ ارتقا انجام نشد.")
     if not isinstance(before, (types.ChannelParticipant, types.ChannelParticipantSelf)):
         raise GroupAdminError("❌ این کاربر عضو عادی گروه نیست؛ ارتقا انجام نشد.")
-    bot_id = await _bot_promote_right(bot, channel)
+    await _bot_promote_right(bot, channel)
     require_owner(chat_id, actor_id)  # owner may have changed while RPCs ran
     _protect_existing_exclusive(chat_id, user_id)
     write_error = None
@@ -315,15 +432,13 @@ async def promote(bot, chat_id, actor_id, target, rank, choices):
     if confirmed:
         return user_id
     if observed is not None and _admin(observed):
-        reverted = await _rollback_incorrect_promotion(
-            bot, chat_id, channel, input_user, participant_peer, user_id,
-            bot_id, observed)
-        if reverted:
-            raise GroupAdminError("❌ لقب یا دسترسی‌ها مطابق انتخاب شما ثبت نشد؛ ارتقا لغو شد.")
+        # A partial admin listing can omit rank/rights.  Even promoted_by ==
+        # bot_id cannot prove this exact write created that role.  Never send
+        # a destructive second EditAdminRequest based on such a read.
         raise UncertainOperation(
-            "⚠️ ارتقا روی سرور دیده شد، اما لقب یا دسترسی‌ها تأیید نشد؛ "
-            "امکان بازگردانی خودکار نبود. وضعیت ادمین‌های گروه را بررسی کنید."
-        )
+            "⚠️ ادمینی در سرور دیده شد، اما لقب یا دسترسی‌ها تأیید نشد؛ "
+            "برای جلوگیری از عزل ناخواسته، وضعیت گروه را بررسی کنید."
+        ) from write_error
     if observed is None:
         raise UncertainOperation(
             "⚠️ پاسخ سرور برای لقب و دسترسی‌ها قابل بررسی نیست؛ "
@@ -363,7 +478,7 @@ async def demote(bot, chat_id, actor_id, target):
     except Exception as exc:
         write_error = exc
     confirmed, observed = await _verify(bot, channel, participant_peer, user_id,
-                                        lambda role: not _admin(role) and not _creator(role))
+                                        _not_admin)
     if confirmed:
         return user_id
     if observed is None:

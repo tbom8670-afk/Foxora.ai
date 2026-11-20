@@ -2,8 +2,8 @@
 """Native group-admin workflow against the real SPlusthon 1.1.4 TL classes.
 
 No account credentials/server are present: the fake transports actual
-EditAdminRequest/GetParticipantRequest objects and models their group-scoped
-results.  These tests must not be described as live Soroush server tests.
+EditAdminRequest/GetParticipantRequest/GetParticipantsRequest TL objects and
+models their group-scoped results.  These are not live Soroush server tests.
 """
 import asyncio
 import inspect
@@ -61,12 +61,15 @@ class Client:
         self.roles = {}
         self.replied = {}
         self.reads = []
+        self.list_reads = []
         self.edits = []
         self.lookups = []
         self.ignore_rank = False
         self.fail_write = False
         self.no_read_after_write = False
         self.always_fail_read = False
+        self.direct_unsupported = False
+        self.list_override = None
         self.members = {}
         for group in self.group_ids:
             self.roles[group, bot_id] = types.ChannelParticipantAdmin(
@@ -110,14 +113,37 @@ class Client:
             return types.InputPeerUser(entity, entity * 13)
         raise ValueError("uncached entity")
 
+    def _list_page(self, request):
+        group = request.channel.channel_id
+        rows = list(self.roles[group, user_id] for gid, user_id in self.roles
+                    if gid == group)
+        if isinstance(request.filter, types.ChannelParticipantsAdmins):
+            rows = [row for row in rows if isinstance(
+                row, (types.ChannelParticipantAdmin,
+                      types.ChannelParticipantCreator))]
+        page = rows[request.offset:request.offset + request.limit]
+        users = [self.members.get(native._role_id(row), User(native._role_id(row)))
+                 for row in page]
+        return types.channels.ChannelParticipants(
+            count=len(rows), participants=page, chats=[], users=users)
+
     async def __call__(self, request):
         if isinstance(request, functions.channels.GetParticipantRequest):
             group = request.channel.channel_id
             user_id = request.participant.user_id
             self.reads.append((group, user_id))
+            if self.direct_unsupported:
+                raise RuntimeError("RPCError 422: NOT_SUPPORTED")
             if self.always_fail_read or self.no_read_after_write and self.edits:
                 raise RuntimeError("GetParticipant unavailable")
             return SimpleNamespace(participant=self.roles[group, user_id])
+        if isinstance(request, functions.channels.GetParticipantsRequest):
+            self.list_reads.append(request)
+            if self.always_fail_read or self.no_read_after_write and self.edits:
+                raise RuntimeError("GetParticipants unavailable")
+            if self.list_override is not None:
+                return self.list_override(request)
+            return self._list_page(request)
         assert isinstance(request, functions.channels.EditAdminRequest)
         self.edits.append(request)
         if self.fail_write:
@@ -219,7 +245,7 @@ def test_real_splusthon_schema_and_all_permission_combinations(setup):
         '{"1234": [{"user_id": "101"}]}'
 
 
-def test_reply_title_six_rights_confirmation_and_no_early_write(setup):
+def test_reply_title_and_one_numbers_message_executes_without_confirmation(setup):
     bot, _owners, bot_admins = setup
     target = User(101, "کاربر 🦊", username="Cowe")
     bot.client.add_user(1234, target)
@@ -229,23 +255,40 @@ def test_reply_title_six_rights_confirmation_and_no_early_write(setup):
     board = send(bot, "مدیر آزادِ نمونه 🦊")
     assert "Cowe" in board.sent[-1][0]
     assert "6_ افزودن مدیر جدید" in board.sent[-1][0]
+    assert "تایید ادمین گروه" not in board.sent[-1][0]
+    assert "روشن 6" not in board.sent[-1][0]
     assert bot.client.edits == []
-    changed = send(bot, "۱ و ۲")
-    assert "1 - 2 خاموش" in changed.sent[0][0]
-    assert len(bot.client.edits) == 0
-    toggled = send(bot, "روشن ۶")
-    assert "6 روشن" in toggled.sent[0][0]
-    assert len(bot.client.edits) == 0
-    done = send(bot, handler.CONFIRM)
+    done = send(bot, "۱ و ۲")
+    assert len(done.sent) == 1  # no intermediate changed/board messages
     assert "ادمین گروه شد" in done.sent[-1][0]
+    assert len(bot.client.edits) == 1
     request = bot.client.edits[-1]
     assert request.rank == "مدیر آزادِ نمونه 🦊"
-    expected = {1: False, 2: False, 3: True, 4: True, 5: True, 6: True}
+    expected = {1: False, 2: False, 3: True, 4: True, 5: True, 6: False}
     assert all(getattr(request.admin_rights, flag) is expected[n]
                for n, _label, flag in native.PERMISSIONS)
     assert bot_admins.read_text(encoding="utf-8") == \
         '{"1234": [{"user_id": "101"}]}'
     assert not handler.is_awaiting(1234, 111)
+    late = Event(handler.CONFIRM, 111)
+    assert run(handler.handle(bot, late, 1234, 111, late.sender,
+                              late.message.message)) is False
+    assert len(bot.client.edits) == 1
+
+
+def test_none_and_selection_of_already_off_six_execute_defaults(setup):
+    bot, _owners, _ = setup
+    for answer, target_id in (("هیچکدام", 101), ("۶", 202)):
+        target = User(target_id)
+        bot.client.add_user(1234, target, message_id=target_id)
+        send(bot, "ادمین گروه", reply_id=target_id)
+        send(bot, "لقب")
+        done = send(bot, answer)
+        assert len(done.sent) == 1 and "ادمین گروه شد" in done.sent[0][0]
+        assert [bool(getattr(bot.client.edits[-1].admin_rights, flag))
+                for _n, _label, flag in native.PERMISSIONS] == \
+            [True, True, True, True, True, False]
+        assert not handler.is_awaiting(1234, 111)
 
 
 def test_demote_only_replied_user_in_this_group_and_preserve_bot_admins(setup):
@@ -314,23 +357,24 @@ def test_owner_change_during_workflow_revokes_permission(setup):
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "مدیر")
     owners[1234] = 333
-    event = send(bot, handler.CONFIRM)
+    event = send(bot, "هیچکدام")
     assert "فقط مالک ثبت‌شدهٔ همین گروه" in event.sent[-1][0]
     assert not bot.client.edits
     assert not handler.is_awaiting(1234, 111)
 
 
-def test_rank_missing_is_rolled_back_without_false_success(setup):
+def test_missing_rank_is_unconfirmed_without_auto_demoting_admin(setup):
     bot, _owners, _ = setup
     bot.client.add_user(1234, User(101))
     bot.client.ignore_rank = True
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب دلخواه")
-    result = send(bot, handler.CONFIRM)
-    assert "ارتقا لغو شد" in result.sent[-1][0]
+    result = send(bot, "هیچکدام")
+    assert "لقب یا دسترسی‌ها تأیید نشد" in result.sent[-1][0]
     assert "ادمین گروه شد" not in result.sent[-1][0]
-    assert len(bot.client.edits) == 2
-    assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipant)
+    assert len(bot.client.edits) == 1
+    assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipantAdmin)
+    assert bot.client.roles[1234, 101].rank is None
 
 
 def test_api_failure_and_unconfirmed_reply_are_not_success(setup):
@@ -339,7 +383,7 @@ def test_api_failure_and_unconfirmed_reply_are_not_success(setup):
     bot.client.fail_write = True
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
-    failed = send(bot, handler.CONFIRM)
+    failed = send(bot, "هیچکدام")
     assert "درخواست ادمین‌کردن را نپذیرفت" in failed.sent[-1][0]
     assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipant)
     bot.client.fail_write = False
@@ -347,7 +391,7 @@ def test_api_failure_and_unconfirmed_reply_are_not_success(setup):
     send(bot, "لقب ۲")
     bot.client.edits.clear()
     bot.client.no_read_after_write = True
-    unknown = send(bot, handler.CONFIRM)
+    unknown = send(bot, "هیچکدام")
     assert "موفقیت اعلام نشد" in unknown.sent[-1][0]
     assert "ادمین گروه شد" not in unknown.sent[-1][0]
 
@@ -357,7 +401,7 @@ def test_existing_admin_creator_self_and_missing_bot_rights_fail_closed(setup):
     bot.client.seed_admin(1234, User(101))
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب تازه")
-    already = send(bot, handler.CONFIRM)
+    already = send(bot, "۱")
     assert "از قبل ادمین" in already.sent[-1][0]
     assert not bot.client.edits
     bot.client.roles[1234, 101] = types.ChannelParticipantCreator(
@@ -371,13 +415,13 @@ def test_existing_admin_creator_self_and_missing_bot_rights_fail_closed(setup):
         admin_rights=types.ChatAdminRights(add_admins=False), rank="bot")
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
-    no_right = send(bot, handler.CONFIRM)
+    no_right = send(bot, "هیچکدام")
     assert "دسترسی «افزودن مدیر جدید» ندارد" in no_right.sent[-1][0]
     assert not bot.client.edits
     owners[1234] = 101
     no_owner_target = send(bot, "ادمین گروه", actor=101, reply_id=4)
     send(bot, "لقب", actor=101)
-    denied = send(bot, handler.CONFIRM, actor=101)
+    denied = send(bot, "هیچکدام", actor=101)
     assert "مالک ثبت‌شدهٔ گروه" in denied.sent[-1][0]
     assert not bot.client.edits
 
@@ -413,6 +457,40 @@ def test_cancel_expiry_edit_and_old_command_do_not_mutate(setup, monkeypatch):
         .read_text(encoding="utf-8")
     assert source.index("native_group_admin.is_command(clean_text)") \
         < source.index('if _reserved_command in {"برکناری ادمین", "لغو ادمین"}')
+
+
+def test_one_choice_is_not_applied_twice_when_messages_overlap(setup, monkeypatch):
+    bot, _owners, _ = setup
+    bot.client.add_user(1234, User(101))
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    calls = []
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_promote(*args):
+            calls.append(args)
+            started.set()
+            await release.wait()
+            return 101
+
+        monkeypatch.setattr(native, "promote", slow_promote)
+        first = Event("۱", 111)
+        task = asyncio.create_task(handler.handle(
+            bot, first, 1234, 111, first.sender, first.message.message))
+        await started.wait()
+        second = Event("هیچکدام", 111)
+        assert await handler.handle(bot, second, 1234, 111, second.sender,
+                                    second.message.message) is True
+        assert "در حال بررسی" in second.sent[-1][0]
+        assert len(calls) == 1
+        release.set()
+        await task
+        assert "ادمین گروه شد" in first.sent[-1][0]
+
+    run(scenario())
+    assert not handler.is_awaiting(1234, 111)
 
 
 def test_start_reply_failure_clears_only_its_own_flow(setup, monkeypatch):
@@ -500,12 +578,14 @@ def test_real_message_pipeline_reaches_independent_handler(setup, monkeypatch):
 
     for text, reply, expected_edits in (
             ("ادمین گروه", True, 0), ("مدیر آزاد", False, 0),
-            ("هیچکدام", False, 0), (handler.CONFIRM, False, 1)):
+            ("۱ و ۲", False, 1)):
         event = PipelineEvent(text, reply)
         run(main_handler.handle_new_message(bot, event))
         assert event.replies, (text, bot.logger.errors)
         assert len(bot.client.edits) == expected_edits
     assert bot.client.edits[0].rank == "مدیر آزاد"
+    assert bot.client.edits[0].admin_rights.change_info is False
+    assert bot.client.edits[0].admin_rights.delete_messages is False
     assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipantAdmin)
 
     # The actual group message route sends precisely the two original help
@@ -531,11 +611,48 @@ def test_exclusive_temporary_admin_cannot_be_overwritten_or_auto_regranted(
     bot.client.roles[1234, 101] = types.ChannelParticipant(user_id=101, date=None)
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "مدیر")
-    result = send(bot, handler.CONFIRM)
+    result = send(bot, "هیچکدام")
     assert "لغو اختصاصی" in result.sent[-1][0]
     assert not bot.client.edits
     assert bot_admins.read_text(encoding="utf-8") == \
         '{"1234": [{"user_id": "101"}]}'
+
+
+@pytest.mark.parametrize("exclusive_state", ("active", "pending_grant",
+                                             "pending_revoke"))
+def test_exclusive_active_and_pending_records_block_native_writes(
+        setup, monkeypatch, exclusive_state):
+    bot, _owners, _ = setup
+    from modules.manage_features import exclusive
+    bot.client.direct_unsupported = True
+    bot.client.add_user(1234, User(101))
+    monkeypatch.setattr(exclusive, "list_entries", lambda _chat: [
+        {"user_id": "101", "state": exclusive_state}])
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "لغو اختصاصی" in refused.sent[-1][0]
+    assert not bot.client.edits and not bot.client.list_reads
+
+
+def test_exclusive_starting_during_role_checks_blocks_late_write(
+        setup, monkeypatch):
+    bot, _owners, _ = setup
+    from modules.manage_features import exclusive
+    bot.client.add_user(1234, User(101))
+    calls = []
+
+    def changing_entries(_chat):
+        calls.append(1)
+        return [] if len(calls) == 1 else [
+            {"user_id": "101", "state": "pending_grant"}]
+
+    monkeypatch.setattr(exclusive, "list_entries", changing_entries)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert len(calls) == 2 and "لغو اختصاصی" in refused.sent[-1][0]
+    assert not bot.client.edits
 
 
 def test_pending_input_admin_lane_and_invalid_choices_never_write(setup):
@@ -549,20 +666,284 @@ def test_pending_input_admin_lane_and_invalid_choices_never_write(setup):
     empty = send(bot, "   ")
     assert "غیرخالی" in empty.sent[-1][0]
     send(bot, "مدیر دلخواه")
-    invalid = send(bot, "روشن ۷")
-    assert "شماره‌های ۱ تا ۶" in invalid.sent[-1][0]
-    assert not bot.client.edits
-    for n in range(1, 7):
-        send(bot, f"خاموش {n}")
-    rejected = send(bot, handler.CONFIRM)
+    for invalid_text in ("روشن ۷", "روشن ۶", handler.CONFIRM, "۷", "1, 7"):
+        invalid = send(bot, invalid_text)
+        assert "شماره‌های ۱ تا ۶" in invalid.sent[-1][0]
+        assert not bot.client.edits
+    rejected = send(bot, "۱ و ۲ و ۳ و ۴ و ۵ و ۶")
     assert "حداقل یکی" in rejected.sent[-1][0]
     assert not bot.client.edits
-    send(bot, "روشن ۶")
-    success = send(bot, handler.CONFIRM)
+    assert handler.is_awaiting(1234, 111)
+    success = send(bot, "خاموش ۱ و ۳")
     assert "ادمین گروه شد" in success.sent[-1][0]
     assert [bool(getattr(bot.client.edits[-1].admin_rights, flag))
             for _n, _label, flag in native.PERMISSIONS] == \
-        [False, False, False, False, False, True]
+        [False, True, False, True, True, False]
+
+
+def test_422_not_supported_uses_fresh_tl_lists_for_promote_and_demote(setup):
+    bot, _owners, _ = setup
+    target = User(101)
+    bot.client.add_user(1234, target)
+    bot.client.direct_unsupported = True
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب نیو")
+    promoted = send(bot, "۱ و ۲")
+    assert len(promoted.sent) == 1 and "ادمین گروه شد" in promoted.sent[0][0]
+    assert bot.client.roles[1234, 101].rank == "لقب نیو"
+    assert len(bot.client.edits) == 1
+    assert {type(req.filter) for req in bot.client.list_reads} == {
+        types.ChannelParticipantsAdmins, types.ChannelParticipantsRecent}
+    assert all(req.hash == 0 and req.limit == native.PARTICIPANT_PAGE_SIZE
+               and req.channel.channel_id == 1234
+               for req in bot.client.list_reads)
+    assert (1234, 101) in bot.client.reads and (1234, 999) in bot.client.reads
+    demoted = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert len(demoted.sent) == 1 and "از ادمینی گروه لغو شد" in demoted.sent[0][0]
+    assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipant)
+    assert len(bot.client.edits) == 2
+    # The screenshot's «نیو» + «هیچکدام» path also works when direct read
+    # responds NOT_SUPPORTED for target, bot, and post-write verification.
+    bot.client.add_user(1234, User(202), message_id=5)
+    send(bot, "ادمین گروه", reply_id=5)
+    send(bot, "نیو")
+    default = send(bot, "هیچکدام")
+    assert len(default.sent) == 1 and "ادمین گروه شد" in default.sent[0][0]
+    assert bot.client.edits[-1].rank == "نیو"
+    assert [bool(getattr(bot.client.edits[-1].admin_rights, flag))
+            for _n, _label, flag in native.PERMISSIONS] == \
+        [True, True, True, True, True, False]
+
+
+def test_fallback_identifies_admin_by_role_id_not_user_array_order(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.seed_admin(1234, User(101), rank="لقب قبلی")
+    client.seed_admin(1234, User(202), rank="ادمین دیگر", message_id=5)
+
+    def reordered(req):
+        page = client._list_page(req)
+        return types.channels.ChannelParticipants(
+            count=page.count, participants=page.participants,
+            chats=[], users=list(reversed(page.users)))
+
+    client.list_override = reordered
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب تازه")
+    already = send(bot, "هیچکدام")
+    assert "از قبل ادمین" in already.sent[-1][0]
+    assert not client.edits
+    assert client.roles[1234, 101].rank == "لقب قبلی"
+    done = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert "از ادمینی گروه لغو شد" in done.sent[-1][0]
+    assert client.edits[-1].user_id.user_id == 101
+    assert client.roles[1234, 202].rank == "ادمین دیگر"
+
+
+def test_truncated_admin_page_never_overwrites_or_demotes_existing_admin(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    for user_id in range(1000, 1210):
+        client.seed_admin(1234, User(user_id), message_id=user_id)
+    client.seed_admin(1234, User(101), rank="لقب قبلی")  # beyond page 0
+
+    def truncated(req):
+        if isinstance(req.filter, types.ChannelParticipantsAdmins) \
+                and req.offset >= native.PARTICIPANT_PAGE_SIZE:
+            raise RuntimeError("second page unavailable")
+        return client._list_page(req)
+
+    client.list_override = truncated
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب تازه")
+    refused = send(bot, "هیچکدام")
+    assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    refused = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    assert not client.edits
+    assert client.roles[1234, 101].rank == "لقب قبلی"
+    assert any(req.offset == 200 for req in client.list_reads)
+    client.list_override = None
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب تازه")
+    already = send(bot, "هیچکدام")
+    assert "از قبل ادمین" in already.sent[-1][0]
+    assert not client.edits
+    done = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert "از ادمینی گروه لغو شد" in done.sent[-1][0]
+    assert client.edits[-1].user_id.user_id == 101
+
+
+@pytest.mark.parametrize("recent", ("users_only", "empty", "capped"))
+def test_missing_member_role_is_unknown_and_never_authorizes_promotion(
+        setup, monkeypatch, recent):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.add_user(1234, User(101))
+    monkeypatch.setattr(native, "MAX_MEMBER_PAGES", 1)
+
+    def incomplete(req):
+        if isinstance(req.filter, types.ChannelParticipantsAdmins):
+            return client._list_page(req)
+        if recent == "empty":
+            return types.channels.ChannelParticipants(
+                count=0, participants=[], chats=[], users=[])
+        if recent == "users_only":
+            return types.channels.ChannelParticipants(
+                count=1, participants=[], chats=[], users=[client.members[101]])
+        return types.channels.ChannelParticipants(
+            count=201, participants=[types.ChannelParticipant(
+                user_id=2000 + i, date=None) for i in range(200)],
+            chats=[], users=[User(2000 + i) for i in range(200)])
+
+    client.list_override = incomplete
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "عضویت عادی این کاربر قابل تأیید نیست" in refused.sent[-1][0]
+    assert "ادمین گروه شد" not in refused.sent[-1][0]
+    assert not client.edits
+
+
+@pytest.mark.parametrize("left_or_banned", ("left", "banned"))
+def test_explicit_nonmember_role_never_qualifies_for_promotion(
+        setup, left_or_banned):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.add_user(1234, User(101))
+    peer = types.PeerUser(user_id=101)
+    client.roles[1234, 101] = (
+        types.ChannelParticipantLeft(peer=peer) if left_or_banned == "left"
+        else types.ChannelParticipantBanned(
+            peer=peer, kicked_by=999, date=None,
+            banned_rights=types.ChatBannedRights(until_date=None)))
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "عضو عادی گروه نیست" in refused.sent[-1][0]
+    assert not client.edits
+
+
+@pytest.mark.parametrize("admin_page", ("missing_roles", "not_modified", "bad_count"))
+def test_malformed_admin_page_fails_closed_for_both_commands(
+        setup, admin_page):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.seed_admin(1234, User(101), rank="قبلی")
+
+    def broken(req):
+        if isinstance(req.filter, types.ChannelParticipantsAdmins):
+            if admin_page == "not_modified":
+                return types.channels.ChannelParticipantsNotModified()
+            if admin_page == "bad_count":
+                return SimpleNamespace(count=None, participants=[
+                    client.roles[1234, 999]])
+            return types.channels.ChannelParticipants(
+                count=1, participants=[], chats=[], users=[User(999)])
+        return client._list_page(req)
+
+    client.list_override = broken
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب تازه")
+    refused = send(bot, "هیچکدام")
+    assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    refused = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    assert not client.edits
+    assert client.roles[1234, 101].rank == "قبلی"
+
+
+def test_fallback_checks_bot_add_admins_right_and_partial_rank(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.add_user(1234, User(101))
+    client.roles[1234, 999].admin_rights = types.ChatAdminRights(add_admins=False)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "دسترسی «افزودن مدیر جدید» ندارد" in refused.sent[-1][0]
+    assert not client.edits
+    client.roles[1234, 999].admin_rights = types.ChatAdminRights(add_admins=True)
+    client.ignore_rank = True
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    unconfirmed = send(bot, "هیچکدام")
+    assert "لقب یا دسترسی‌ها تأیید نشد" in unconfirmed.sent[-1][0]
+    assert "ادمین گروه شد" not in unconfirmed.sent[-1][0]
+    assert len(client.edits) == 1
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
+
+
+def test_bot_rights_use_get_me_entity_not_uncached_numeric_id(setup, monkeypatch):
+    bot, _owners, _ = setup
+    bot.client.direct_unsupported = True
+    bot.client.add_user(1234, User(101))
+    original = Client.get_input_entity
+
+    async def resolve(self, entity):
+        if isinstance(entity, int) and entity == 999:
+            raise ValueError("bot's numeric entity is not cached")
+        return await original(self, entity)
+
+    monkeypatch.setattr(Client, "get_input_entity", resolve)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    result = send(bot, "هیچکدام")
+    assert "ادمین گروه شد" in result.sent[-1][0]
+    assert len(bot.client.edits) == 1
+
+
+def test_unsupported_read_after_write_outage_is_never_reported_as_success(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.add_user(1234, User(101))
+    client.no_read_after_write = True
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    unknown = send(bot, "هیچکدام")
+    assert "موفقیت اعلام نشد" in unknown.sent[-1][0]
+    assert "ادمین گروه شد" not in unknown.sent[-1][0]
+    assert len(client.edits) == 1
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
+    client.edits.clear()  # simulate a fresh command, then a later read outage
+    demoted = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert "نتیجهٔ لغو ادمینی از سرور قابل بررسی نیست" in demoted.sent[-1][0]
+    assert "لغو شد" not in demoted.sent[-1][0]
+    assert len(client.edits) == 1
+
+
+def test_ambiguous_write_with_changed_admin_must_not_auto_demote(
+        setup, monkeypatch):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.add_user(1234, User(101))
+    original = Client.__call__
+
+    async def ambiguous(self, request):
+        if isinstance(request, functions.channels.EditAdminRequest):
+            self.edits.append(request)
+            self.roles[1234, 101] = types.ChannelParticipantAdmin(
+                user_id=101, promoted_by=999, date=None,
+                admin_rights=request.admin_rights, rank="شخص دیگر")
+            raise TimeoutError("unknown edit outcome")
+        return await original(self, request)
+
+    monkeypatch.setattr(Client, "__call__", ambiguous)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    uncertain = send(bot, "هیچکدام")
+    assert "برای جلوگیری از عزل ناخواسته" in uncertain.sent[-1][0]
+    assert "ادمین گروه شد" not in uncertain.sent[-1][0]
+    assert len(client.edits) == 1  # no second, destructive EditAdminRequest
+    assert client.roles[1234, 101].rank == "شخص دیگر"
 
 
 def _slice_entity(text, entity):
@@ -587,6 +968,8 @@ def test_interactive_board_uses_real_entities_and_utf16_offsets(setup):
     assert [f"{number}_ {label}" in board for number, label, _ in native.PERMISSIONS] \
         == [True] * 6
     assert "6_ افزودن مدیر جدید     ◐ خاموش" in board
+    assert "هیچکدام" in board and "1 و 2" in board
+    assert "تایید ادمین گروه" not in board and "روشن 6" not in board
     assert all(item.length > 0 and item.offset >= 0
                and item.offset + item.length <= len(board.encode("utf-16-le")) // 2
                for item in entities)
