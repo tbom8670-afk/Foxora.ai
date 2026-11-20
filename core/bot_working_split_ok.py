@@ -57,6 +57,7 @@ from modules.group_dispatch import GroupDispatcher, classify_priority, looks_lik
 from modules.group_dispatch import is_game_message
 from modules.outgoing_sender import GAME_CONTEXT_VAR
 from modules.light_spam_ingest import ingest_event
+from modules import native_admin_warning_lock
 from modules import connection_guard
 from modules.self_admin_shield import (
     install_self_admin_shield,
@@ -1095,6 +1096,10 @@ class SoroushAntiSpamBot:
                 sender = getattr(event, "sender", None)
                 user_id = getattr(sender, "id", None)
             if chat_id is None or message_id is None:
+                return
+            # The separate native-admin warning period applies even to
+            # captionless media if the ordinary dispatcher has overflowed.
+            if native_admin_warning_lock.drop_if_active(self, event):
                 return
             locked = bool(
                 user_id is not None
@@ -3212,6 +3217,20 @@ class SoroushAntiSpamBot:
                     )
                 except Exception:
                     pass
+            # The warning period is a deletion-only gate, distinct from the
+            # generic spam/ban lock. Apply it before dispatch classification:
+            # management text, game answers, edits and captionless media all
+            # count as the native admin's later messages. A registered owner
+            # or bot admin issuing «حذف اخطار» is never blocked by this gate.
+            try:
+                if native_admin_warning_lock.drop_if_active(self, event):
+                    return
+            except Exception as warning_drop_error:
+                self.logger.log_error(
+                    "NATIVE ADMIN WARNING DELETE FAILED "
+                    f"chat_id={getattr(event, 'chat_id', None)} "
+                    f"error={warning_drop_error!r}"
+                )
             try:
                 if await try_handle_private_start(self, event):
                     return

@@ -197,6 +197,7 @@ from modules import bot_detector
 from modules import ad_name_detector
 from modules import warning_threshold
 from modules import punishment_mode
+from modules import native_admin_warning_lock
 # 🖇 تشخیص لینک در بیوگرافی — منطق، storage و سرویس کاملاً مستقل.
 from modules import bio_link
 from modules import bio_link_storage
@@ -1963,12 +1964,23 @@ _OWNER_ONLY_NATIVE_SKIP = frozenset({
 
 
 def _should_check_native_admin(is_private, registered_admin, text):
-    """Native role RPC is only for management commands, never filters."""
+    """The eager native-role RPC is for management commands, never chat."""
     if is_private or registered_admin:
         return False
     if normalize_command(text) in _OWNER_ONLY_NATIVE_SKIP:
         return False
     return _is_management_command(text)
+
+
+def _cached_native_group_admin(bot, chat_id, user_id):
+    """Reuse confirmed, unexpired roles for regular chat without any RPC."""
+    key = (normalize_group_id(chat_id), str(user_id))
+    now = _loop_now()
+    cached = (getattr(bot, "native_group_admin_cache", None) or {}).get(key)
+    if cached and cached[1] > now and cached[0]:
+        return True
+    admin_list = (getattr(bot, "native_group_admin_ids_cache", None) or {}).get(key[0])
+    return bool(admin_list and admin_list[1] > now and key[1] in admin_list[0])
 
 
 def _store_native_admin_cache(cache, key, value, expires_at):
@@ -2083,11 +2095,11 @@ async def _native_admin_from_resolved_peer(
 async def _is_native_group_admin(
     bot, chat_id, user_id, sender, resolved_chat=None
 ):
-    """Read the actual Soroush group role for a management command only.
+    """Read the actual Soroush group role on a management command or violation.
 
-    Regular chat and content-filter paths must never call this.  The result
-    is short-lived cached so a later management command does not repeat the
-    RPC, while role changes are still seen after the TTL.
+    Unflagged regular chat never calls this. A confirmed content violation
+    may need one role check so its native admin cannot enter a ban/mute path;
+    the result is short-lived cached, and role changes are seen after the TTL.
 
     ``get_permissions`` first resolves its chat argument. Passing only the
     short numeric Soroush id can miss SPlusthon's entity cache and raise a
@@ -2154,6 +2166,88 @@ def _clear_native_admin_moderation_state(bot, chat_id, user_id, *, force=False):
     cleared.add(key)
     if len(cleared) > 5000:
         cleared.pop()
+    return True
+
+
+def _native_admin_threshold_notice(user):
+    """The two real Soroush quotes and bold body from the reference image."""
+    header = f"🪸 ادمین گرامی : {format_user(user)}"
+    body = (
+        "به دلیل کامل شدن تخلفات شما\n"
+        "پیام های شما به مدت 5 دقیقه پاک میشوند"
+    )
+    footer = (
+        "⚠️ : برای رفع زودتر مالک یا ادمین ثبت شده ریپلای\n"
+        "کنید روی پیام ادمین بنویسید\n"
+        "حذف اخطار"
+    )
+    prefix = header + "\n"
+    text = prefix + body + "\n\n" + footer
+    u16 = lambda value: len(value.encode("utf-16-le")) // 2
+    entities = [
+        MessageEntityBlockquote(offset=0, length=u16(header)),
+        MessageEntityBold(offset=u16(prefix), length=u16(body)),
+        MessageEntityBlockquote(
+            offset=u16(prefix + body + "\n\n"), length=u16(footer)
+        ),
+    ]
+    return text, entities
+
+
+async def _begin_native_admin_warning_period(
+    bot, chat_id, user_id, user, *, trigger_message_id
+):
+    """Claim the period before any await; send its one notice immediately."""
+    started = native_admin_warning_lock.begin(
+        bot, chat_id, user_id, trigger_message_id=trigger_message_id
+    )
+    if not started:
+        # A second, in-flight warning must neither restart the timer nor make
+        # a full counter trigger a fresh period as soon as this one expires.
+        bot.tracker.reset_count(chat_id, user_id)
+        return False
+
+    try:
+        _clear_native_admin_moderation_state(bot, chat_id, user_id, force=True)
+    except Exception as error:
+        bot.tracker.reset_count(chat_id, user_id)
+        bot.logger.log_error(
+            "NATIVE ADMIN WARNING STATE CLEAR FAILED "
+            f"chat_id={chat_id} user_id={user_id} error={error!r}"
+        )
+
+    text, entities = _native_admin_threshold_notice(user)
+    try:
+        sender = getattr(bot, "outgoing_sender", None)
+        enqueue_notice = getattr(sender, "enqueue_notice", None)
+        if callable(enqueue_notice):
+            accepted = enqueue_notice(
+                chat_id,
+                lambda: bot.client.send_message(
+                    chat_id, text, formatting_entities=entities
+                ),
+                priority=0,
+                on_done=lambda sent: capture_sent(bot, chat_id, sent),
+            )
+            if accepted is not False:
+                bot.logger.log_info(
+                    "NATIVE ADMIN WARNING DELETE STARTED "
+                    f"chat_id={chat_id} user_id={user_id} seconds=300"
+                )
+                return True
+        sent = await bot.client.send_message(
+            chat_id, text, formatting_entities=entities
+        )
+        capture_sent(bot, chat_id, sent)
+    except Exception as error:
+        bot.logger.log_error(
+            "NATIVE ADMIN WARNING NOTICE FAILED "
+            f"chat_id={chat_id} user_id={user_id} error={error!r}"
+        )
+    bot.logger.log_info(
+        "NATIVE ADMIN WARNING DELETE STARTED "
+        f"chat_id={chat_id} user_id={user_id} seconds=300"
+    )
     return True
 
 
@@ -4159,7 +4253,7 @@ def cleanup_expired_handler_state(bot, now=None):
     as unique senders accumulate.
     """
     now = _loop_now(now)
-    removed = 0
+    removed = native_admin_warning_lock.cleanup_expired(bot, now=now)
     removed += _prune_ttl_cache(
         getattr(bot, "native_group_admin_cache", None), now
     )
@@ -4604,6 +4698,20 @@ async def handle_new_message(bot, event):
                 message_text = caption
             except BaseException:
                 pass
+
+        # Independent five-minute native-admin warning consequence. This is
+        # before owner/command/game/profile/media shortcuts, so no later
+        # bypass can leave a post undeleted; the core also checks before
+        # dispatch and when the normal queue overflows.
+        if not getattr(event, "is_private", False):
+            try:
+                if native_admin_warning_lock.drop_if_active(bot, event):
+                    return
+            except Exception as warning_drop_error:
+                bot.logger.log_error(
+                    "NATIVE ADMIN WARNING DELETE FAILED "
+                    f"chat_id={chat_id} error={warning_drop_error!r}"
+                )
 
         # ⚙️ «محدودیت دستورات»: یک نقطهٔ مرکزی، پیش از همهٔ هندلرها و
         # مسیرهای سریع. بررسیِ اول فقط چند lookup در حافظه است.
@@ -5161,15 +5269,23 @@ async def handle_new_message(bot, event):
             )
         )
         native_admin_bypass = bool(
-            _should_check_native_admin(
-                event.is_private, registered_admin_bypass, message_text
-            )
-            and await _is_native_group_admin(
-                bot, chat_id, user_id, sender, resolved_permission_chat
+            not event.is_private
+            and not registered_admin_bypass
+            and (
+                _cached_native_group_admin(bot, chat_id, user_id)
+                or (
+                    _should_check_native_admin(
+                        event.is_private, registered_admin_bypass, message_text
+                    )
+                    and await _is_native_group_admin(
+                        bot, chat_id, user_id, sender, resolved_permission_chat
+                    )
+                )
             )
         )
         # A native group admin who is not registered in the bot follows the
-        # warning counter, but can never enter automatic delete/ban/mute state.
+        # warning counter; the only threshold consequence is the separate
+        # five-minute deletion period (no ban, silence or generic spam lock).
         # Registered bot admins retain the existing full bypass policy.
         native_admin_warn_only = native_admin_bypass and not registered_admin_bypass
         admin_bypass = registered_admin_bypass
@@ -6734,8 +6850,8 @@ async def handle_new_message(bot, event):
                 bot, chat_id, user_id, sender_username
             )
         )
-        # Native admins may receive ordinary warnings, but none of the
-        # automatic delete/mute/ban branches may act on them.
+        # Native admins may receive ordinary warnings, but not automatic
+        # ban/mute. Only their separate threshold period deletes later posts.
         auto_punish_protected = is_group_moderator or native_admin_warn_only or is_vip_user
         profiler.mark("ADMIN_CHECK")
         if not is_group_moderator and not is_gif_message(event.message):
@@ -6932,6 +7048,7 @@ async def handle_new_message(bot, event):
                     return
 
                 bot.tracker.reset_count(chat_id, target_user.id)
+                native_admin_warning_lock.release(bot, chat_id, target_user.id)
                 admin_tools.log_action(
                     chat_id, sender, "صفر کردن تخلفات", target=target_user)
                 await event.reply("✅ تخلفات کاربر صفر شد.")
@@ -6964,10 +7081,16 @@ async def handle_new_message(bot, event):
 
                 before = bot.tracker.get_count(chat_id, target_user.id)
                 bot.tracker.reset_count(chat_id, target_user.id)
+                stopped = native_admin_warning_lock.release(
+                    bot, chat_id, target_user.id
+                )
                 admin_tools.log_action(
                     chat_id, sender, "حذف اخطار", target=target_user,
                     note=f"{before} → 0")
-                await event.reply("✅ تمام اخطارهای کاربر حذف شد.")
+                await event.reply(
+                    "✅ تمام اخطارهای کاربر حذف شد."
+                    + ("\n🛑 حذف پیام‌های این ادمین متوقف شد." if stopped else "")
+                )
             except Exception as e:
                 bot.logger.log_error(f"خطا در حذف اخطار: {e}")
                 await event.reply(f"❌ خطا: {e}")
@@ -6997,6 +7120,7 @@ async def handle_new_message(bot, event):
 
                 before = bot.tracker.get_count(chat_id, target_user.id)
                 bot.tracker.reset_count(chat_id, target_user.id)
+                native_admin_warning_lock.release(bot, chat_id, target_user.id)
                 admin_tools.log_action(
                     chat_id, sender, "حذف اخطارها", target=target_user,
                     note=f"{before} → 0")
@@ -10493,6 +10617,22 @@ async def handle_new_message(bot, event):
                     return
 
                 username = getattr(user, "username", None) or "کاربر"
+                # Cache a confirmed native role even before a manual warning
+                # reaches its limit; the light spam lane then cannot mistake
+                # this admin for a regular user on their next message.
+                target_native_warn_only = bool(
+                    not admin_tools.has_admin_permission(
+                        chat_id, user.id, getattr(user, "username", None)
+                    )
+                    and (
+                        native_admin_warning_lock.is_active(bot, chat_id, user.id)
+                        or _cached_native_group_admin(bot, chat_id, user.id)
+                        or await _is_native_group_admin(
+                            bot, chat_id, user.id, user,
+                            resolved_permission_chat,
+                        )
+                    )
+                )
 
                 count = bot.tracker.increment(chat_id, user.id)
                 threshold = warning_threshold.get_threshold(
@@ -10508,6 +10648,16 @@ async def handle_new_message(bot, event):
                 except Exception as history_error:
                     bot.logger.log_error(
                         f"USER HISTORY WARN FAILED: {history_error}")
+
+                # A manual warning uses the same counter. A native group
+                # admin who is not registered with the bot must not fall into
+                # the generic punish_user (ban/mute) at this threshold either.
+                if count >= threshold and target_native_warn_only:
+                    await _begin_native_admin_warning_period(
+                        bot, chat_id, user.id, user,
+                        trigger_message_id=getattr(event.message, "id", None),
+                    )
+                    return
 
                 manual_name = _format_group_member(user)
                 manual_header = f"⚠️ کاربر {manual_name}"
@@ -11630,6 +11780,26 @@ async def handle_new_message(bot, event):
                 f"user={user_id} chat_id={chat_id} message_id={getattr(event.message, 'id', None)}"
             )
             profiler.mark("AUTO_MODERATION")
+            # Ordinary chat makes no native-role RPC. On the first *actual*
+            # violation, however, resolve the sender's role before warning or
+            # punishing. Its cached result protects a native admin's later
+            # warnings from the light/large-spam ban path as well, even if the
+            # admin has never sent a management command to this bot.
+            if (not event.is_private and not native_admin_warn_only
+                    and not (is_group_moderator or is_vip_user) and user_id):
+                native_admin_warn_only = await _is_native_group_admin(
+                    bot, chat_id, user_id, sender, resolved_permission_chat
+                )
+                if native_admin_warn_only:
+                    auto_punish_protected = True
+            # Another worker may have completed the warning threshold while
+            # this event awaited a role/profile RPC. Do not count or announce
+            # a second warning after the five-minute period has started.
+            if native_admin_warning_lock.is_active(bot, chat_id, user_id):
+                if native_admin_warning_lock.drop_if_active(bot, event):
+                    return
+                if native_admin_warning_lock.is_active(bot, chat_id, user_id):
+                    return  # An older queued message predates the threshold.
             # 🧹 اگر این پیامِ ویرایش‌شده پاسخِ قبلیِ ربات را دارد (مثلاً
             # «سلام 👋») هم‌زمان با خودِ پیام پاکش کن تا گروه شلوغ/ربات‌گونه نشود.
             _cleanup_bot_reply_for_edited_message(
@@ -11661,7 +11831,7 @@ async def handle_new_message(bot, event):
                     and len(set(normalized.split())) < 20
                 )
 
-                if repeat_spam:
+                if repeat_spam and not auto_punish_protected:
                     bot.logger.log_deleted_message(
                         user_id=user_id,
                         username=username,
@@ -11738,23 +11908,18 @@ async def handle_new_message(bot, event):
             threshold = warning_threshold.get_threshold(
                 chat_id, bot.config_manager.get("spam_threshold", 3))
             if native_admin_warn_only and count >= threshold:
-                # Native admins may accumulate ordinary warnings, but reaching
-                # the threshold resets their moderation lifecycle instead of
-                # creating a lock, deletion job, or ban attempt.
-                _asyncio.create_task(bot.admin_actions.send_warning(
-                    chat_id=chat_id, username=username, user=sender,
-                    reason=reason, count=count, threshold=threshold,
-                    reply_to=event.message.id if is_edited_message else None,
-                    is_edit=is_edited_message,
-                ), name="warn:send")
-                _clear_native_admin_moderation_state(
-                    bot, chat_id, user_id, force=True
+                # Do not use spam_lock: that is a ban/mute incident and the
+                # stale-state reconciler clears it for native admins. Leave
+                # this triggering message for the owner's reply; delete only
+                # later posts for exactly five minutes and announce just once.
+                started = await _begin_native_admin_warning_period(
+                    bot, chat_id, user_id, sender,
+                    trigger_message_id=getattr(event.message, "id", None),
                 )
-                bot.logger.log_info(
-                    "NATIVE ADMIN WARNING CYCLE RESET "
-                    f"chat_id={chat_id} user_id={user_id} count={count} "
-                    "reason=threshold_no_auto_punish"
-                )
+                if not started:
+                    # A second handler already claimed the period while this
+                    # one was in flight; its later message is still deleted.
+                    native_admin_warning_lock.drop_if_active(bot, event)
                 return
             if count >= threshold:
                 bot.set_spam_lock((chat_id, user_id))
