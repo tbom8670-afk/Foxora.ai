@@ -6,6 +6,7 @@ import asyncio
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,11 +49,16 @@ class Client:
     def __init__(self, target):
         self.target = target
         self.get_messages_calls = 0
+        self.deleted = []
 
     async def get_messages(self, chat_id, ids=None):
         self.get_messages_calls += 1
         await asyncio.sleep(0.05)
         return ReplyMessage(self.target)
+
+    async def delete_messages(self, chat_id, ids, revoke=True):
+        self.deleted.append((chat_id, list(ids), revoke))
+        return []
 
 
 class AdminActions:
@@ -152,6 +158,70 @@ class FastModerationTests(unittest.TestCase):
             finally:
                 mh._has_group_management_permission = original_permission
                 mh._is_native_group_admin = original_native
+
+        asyncio.run(scenario())
+
+    def test_successful_reply_mute_deletes_both_messages_not_the_notice(self):
+        async def scenario():
+            sender = User(1501, "admin")
+            target = User(1502, "target")
+            event = Event(sender)
+            bot = Bot(sender, target)
+
+            async def not_native_admin(*_args, **_kwargs):
+                return False
+
+            with (patch.object(mh, "_has_group_management_permission",
+                               side_effect=lambda _bot, _chat, uid, _name: uid == sender.id),
+                  patch.object(mh, "_is_native_group_admin", not_native_admin),
+                  patch.object(mh, "add_mute"),
+                  patch.object(mh.admin_tools, "log_action"),
+                  patch.object(mh.user_history, "add_mute"),
+                  patch("modules.manual_mute_storage.is_manual_muted", return_value=False),
+                  patch("modules.manual_mute_storage.add_manual_mute")):
+                handled = await mh.handle_fast_moderation_command(
+                    bot, event, "سکوت", sender
+                )
+                self.assertTrue(handled)
+                self.assertEqual(bot.client.deleted, [])  # هنوز سکوت انجام نشده
+                job = bot.moderation_queue.job
+                result = await job["operation"]()
+                await job["on_success"](result)
+                return bot, event
+
+        bot, event = asyncio.run(scenario())
+        self.assertEqual(bot.client.deleted, [(-100123, [321, 900], True)])
+        self.assertEqual(len(event.replies), 1)
+        self.assertIn("سکوت دائم شد", event.replies[0])
+
+    def test_protected_or_failed_mute_never_deletes_reply_or_command(self):
+        async def scenario():
+            sender = User(1601, "admin")
+            target = User(1602, "target")
+            event = Event(sender)
+            bot = Bot(sender, target)
+            with patch.object(
+                mh, "_has_group_management_permission",
+                side_effect=lambda _bot, _chat, uid, _name: uid in {sender.id, target.id},
+            ):
+                await mh.handle_fast_moderation_command(bot, event, "سکوت", sender)
+                job = bot.moderation_queue.job
+                result = await job["operation"]()
+                self.assertTrue(result["protected_admin"])
+                await job["on_success"](result)
+            self.assertEqual(bot.client.deleted, [])
+            self.assertEqual(bot.admin_actions.calls, [])
+            self.assertIn("ادمین است", event.replies[0])
+
+            # شکستِ واقعیِ RPC هم نباید پیامِ فرمان را پاک کند.
+            event2 = Event(sender)
+            bot2 = Bot(sender, target)
+            with patch.object(mh, "_has_group_management_permission",
+                              side_effect=lambda _bot, _chat, uid, _name: uid == sender.id):
+                await mh.handle_fast_moderation_command(bot2, event2, "سکوت", sender)
+                await bot2.moderation_queue.job["on_failure"](RuntimeError("RPC"))
+            self.assertEqual(bot2.client.deleted, [])
+            self.assertIn("ناموفق", event2.replies[0])
 
         asyncio.run(scenario())
 

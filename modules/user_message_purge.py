@@ -16,14 +16,11 @@
     مرجع، ``client.iter_messages`` سروش‌پلاس (SPlusthon) است.
 
 حذف:
-    مسیر اصلی همان صفِ حذف موجود پروژه (``MessageDeleteQueue`` با
-    ``priority=0`` مثل «پاک» دستی) است؛ آن صف خودش حذف را دسته‌ای
-    (در عمل ۱۵تایی — طبق کامنت core، سروش درخواست حذف ۱۰۰تایی را
-    مرتب timeout می‌کند)، با timeout و مدیریت FloodWait انجام می‌دهد و
-    ``delete_messages`` در SPlusthon به‌صورت پیش‌فرض ``revoke=True``
-    دارد (حذف برای همه). اگر صف روی bot نبود (تست/حداقل‌سازی)، مسیر
-    جایگزین مستقیم با دسته‌های ۱۰۰تایی، ``revoke=True`` صریح و
-    retry روی FloodWait/خطای شبکه اجرا می‌شود.
+    «پاک کامل» از مسیرِ مستقیم و مستقل با حداکثر ۱۰۰ شناسه در هر RPC
+    و چهار RPC هم‌زمان استفاده می‌کند؛ در کمتر از ۱۰۰ پیام فقط یک RPC
+    بدون مکث مصنوعی لازم است. صفِ عمومیِ ۱۵تاییِ حذفِ خودکار تغییر
+    نمی‌کند و تنها در نبودِ API مستقیمِ کلاینت، مسیرِ جایگزین است.
+    حذف با ``revoke=True``، timeout و retry برای FloodWait/خطای گذراست.
 
 محدودهٔ اسکن:
     «از زمان فعال بودن ربات» تاریخ دقیقی در ``groups.json`` ندارد
@@ -50,8 +47,9 @@ DEFAULT_SCAN_LIMIT = 5000
 _MIN_SCAN_LIMIT = 100
 _MAX_SCAN_LIMIT = 20000
 
-# فقط مسیر جایگزینِ بدون صف؛ مسیر اصلی اندازهٔ دسته را از صف موجود می‌گیرد.
-DELETE_BATCH_SIZE = 100
+DELETE_BATCH_SIZE = 100  # سقف امنِ هر RPC سروش
+DELETE_PARALLEL = 4        # هم‌زمانی محدود، مستقل از صفِ حذفِ خودکار
+_DELETE_RPC_TIMEOUT_SECONDS = 10.0
 
 _FLOOD_WAIT_CAP_SECONDS = 30.0
 _MAX_BATCH_ATTEMPTS = 3
@@ -231,16 +229,16 @@ async def _resolve_sender_id(message, target_id):
 def _make_history_iterator(iterator_factory, target, *, limit, from_user):
     """ساخت ایتریتور تاریخچه با سازگاری امضای کلاینت‌های مختلف.
 
-    SPlusthon واقعی ``from_user`` و ``wait_time`` را دارد؛ کلاینت‌های
-    جعلی تست‌ها معمولاً فقط ``(target, limit)`` — با ``TypeError`` پله‌پله
-    به ساده‌ترین امضا برمی‌گردیم. خطای RPC سرور اینجا رخ نمی‌دهد و در
-    حلقهٔ ``async for`` مدیریت می‌شود.
+    SPlusthon واقعی ``from_user`` و ``wait_time`` را دارد؛ برای دستور دستی
+    منتظرِ یک ثانیه مکثِ پیش‌فرض میان صفحه‌های تاریخچه نمی‌مانیم (FloodWait
+    واقعی همچنان جداگانه رعایت می‌شود). کلاینت‌های جعلی معمولاً فقط
+    ``(target, limit)`` دارند — با ``TypeError`` پله‌پله عقب می‌نشینیم.
     """
     attempts = []
     if from_user is not None:
-        attempts.append({"limit": limit, "from_user": from_user, "wait_time": 1})
+        attempts.append({"limit": limit, "from_user": from_user, "wait_time": 0})
         attempts.append({"limit": limit, "from_user": from_user})
-    attempts.append({"limit": limit, "wait_time": 1})
+    attempts.append({"limit": limit, "wait_time": 0})
     attempts.append({"limit": limit})
 
     last_error = None
@@ -411,80 +409,103 @@ async def _delete_batch_revoke(client, chat_id, batch):
         await client.delete_messages(chat_id, batch)
 
 
-async def _delete_direct_in_batches(bot, chat_id, pending, *, batch_size):
-    """مسیر جایگزین بدون صف: دسته‌های bounded با retry روی FloodWait/شبکه."""
-    deleted = 0
-    remaining = []
-    client = getattr(bot, "client", None)
-    for start in range(0, len(pending), batch_size):
-        batch = pending[start:start + batch_size]
-        await asyncio.sleep(0)
-        succeeded = False
-        last_error = None
-        for attempt in range(1, _MAX_BATCH_ATTEMPTS + 1):
-            try:
-                await _delete_batch_revoke(client, chat_id, batch)
-                succeeded = True
-                deleted += len(batch)
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                last_error = error
-                _log_error(
-                    bot,
-                    "USER PURGE DELETE BATCH FAILED "
-                    f"chat_id={chat_id} count={len(batch)} "
-                    f"attempt={attempt} error={error!r}",
-                )
-                if attempt >= _MAX_BATCH_ATTEMPTS:
-                    break
-                flood_wait = _flood_wait_seconds(error)
-                if flood_wait is not None:
-                    if flood_wait > _FLOOD_WAIT_CAP_SECONDS:
-                        # انتظار خیلی طولانی: این دسته و بقیه را نگه دار و
-                        # با همان تعداد واقعیِ حذف‌شده گزارش بده.
-                        remaining.extend(pending[start:])
-                        _log_error(
-                            bot,
-                            "USER PURGE DELETE ABORTED FLOODWAIT "
-                            f"chat_id={chat_id} wait_s={flood_wait:.1f} "
-                            f"deleted={deleted} remaining={len(remaining)}",
-                        )
-                        return deleted, remaining
-                    await asyncio.sleep(flood_wait)
-                else:
-                    await asyncio.sleep(0.5 * attempt)
-        if succeeded:
-            continue
-        # فقط خطای خاصِ یک ID بد جداسازی تکی را توجیه می‌کند؛ مثل صف حذف.
-        if last_error is not None and _id_specific_error(last_error):
-            for message_id in batch:
+async def _delete_direct_in_batches(bot, chat_id, pending, *, batch_size, rpc_peer=None):
+    """تا ۱۰۰ شناسه در هر RPC و تا چهار RPC موازی؛ بدون صف/مکث اضافی.
+
+    یک خطای خاصِ شناسه تنها موردی است که دسته را به حذف‌های تک‌تک
+    می‌شکند. خطای کلیِ دسترسی/موجودیت هرگز به صد RPC اضافه تبدیل نمی‌شود.
+    """
+    client = bot.client
+    target = rpc_peer if rpc_peer is not None else chat_id
+    semaphore = asyncio.Semaphore(DELETE_PARALLEL)
+    stop_for_flood = asyncio.Event()
+    batches = [pending[start:start + batch_size]
+               for start in range(0, len(pending), batch_size)]
+
+    async def delete_batch(batch):
+        async with semaphore:
+            if stop_for_flood.is_set():
+                return 0, batch
+            last_error = None
+            for attempt in range(1, _MAX_BATCH_ATTEMPTS + 1):
                 try:
-                    await _delete_batch_revoke(client, chat_id, [message_id])
-                    deleted += 1
+                    await asyncio.wait_for(
+                        _delete_batch_revoke(client, target, batch),
+                        timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                    )
+                    return len(batch), []
                 except asyncio.CancelledError:
                     raise
-                except Exception as item_error:
-                    remaining.append(message_id)
+                except Exception as error:
+                    last_error = error
                     _log_error(
                         bot,
-                        "USER PURGE DELETE ITEM FAILED "
-                        f"chat_id={chat_id} message_id={message_id} "
-                        f"error={item_error!r}",
+                        "USER PURGE DELETE BATCH FAILED "
+                        f"chat_id={chat_id} count={len(batch)} "
+                        f"attempt={attempt} error={error!r}",
                     )
-        else:
-            remaining.extend(batch)
+                    if _id_specific_error(error):
+                        break
+                    flood_wait = _flood_wait_seconds(error)
+                    if flood_wait is not None:
+                        if flood_wait > _FLOOD_WAIT_CAP_SECONDS:
+                            stop_for_flood.set()
+                            break
+                        if attempt < _MAX_BATCH_ATTEMPTS:
+                            await asyncio.sleep(flood_wait)
+                            continue
+                    # فقط برای خطای شبکه/سرور تکرار کن؛ مجوز و موجودیتِ
+                    # نامعتبر با انتظار و retry درست نمی‌شوند.
+                    transient = isinstance(error, (
+                        TimeoutError, ConnectionError, OSError,
+                    )) or any(word in type(error).__name__.lower() for word in (
+                        "timeout", "connection", "server", "network",
+                    ))
+                    if transient and attempt < _MAX_BATCH_ATTEMPTS:
+                        await asyncio.sleep(0.1 * attempt)
+                        continue
+                    break
+
+            if last_error is not None and _id_specific_error(last_error):
+                deleted = 0
+                remaining = []
+                for message_id in batch:
+                    if stop_for_flood.is_set():
+                        remaining.append(message_id)
+                        continue
+                    try:
+                        await asyncio.wait_for(
+                            _delete_batch_revoke(client, target, [message_id]),
+                            timeout=_DELETE_RPC_TIMEOUT_SECONDS,
+                        )
+                        deleted += 1
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as item_error:
+                        remaining.append(message_id)
+                        _log_error(
+                            bot,
+                            "USER PURGE DELETE ITEM FAILED "
+                            f"chat_id={chat_id} message_id={message_id} "
+                            f"error={item_error!r}",
+                        )
+                return deleted, remaining
+            return 0, batch
+
+    # برای کمتر از ۱۰۰ پیام دقیقاً یک RPC؛ برای بیشتر از آن فقط کارهای
+    # bounded زیرِ سمافور اجرا می‌شوند، نه ۱۵ RPC سریالِ صفِ عمومی.
+    results = await asyncio.gather(*(delete_batch(batch) for batch in batches))
+    deleted = sum(count for count, _remaining in results)
+    remaining = [message_id for _count, ids in results for message_id in ids]
     return deleted, remaining
 
 
 async def delete_ids_in_batches(
-    bot, chat_id, message_ids, *, batch_size=DELETE_BATCH_SIZE
+    bot, chat_id, message_ids, *, batch_size=DELETE_BATCH_SIZE, rpc_peer=None
 ):
-    """حذف دسته‌ای با اولویت دستی؛ صف موجود پروژه اول، حذف مستقیم بعد.
+    """حذف فوریِ «پاک کامل»؛ صف عمومی فقط اگر کلاینت API حذف نداشت.
 
-    برمی‌گرداند ``(deleted_count, remaining_ids)`` با تعداد واقعی موفق —
-    همان قراردادی که «پاک + عدد» برای گزارش نهایی استفاده می‌کند.
+    برمی‌گرداند ``(deleted_count, remaining_ids)`` با تعداد واقعی موفق.
     """
     pending = sorted({
         message_id
@@ -494,20 +515,30 @@ async def delete_ids_in_batches(
     if not pending:
         return 0, []
 
+    client = getattr(bot, "client", None)
+    if callable(getattr(client, "delete_messages", None)):
+        return await _delete_direct_in_batches(
+            bot, chat_id, pending,
+            batch_size=min(DELETE_BATCH_SIZE, max(1, int(batch_size))),
+            rpc_peer=rpc_peer,
+        )
+
     queue = getattr(bot, "message_delete_queue", None)
     if queue is not None:
         try:
-            result = queue.enqueue(chat_id, pending, priority=0)
+            result = queue.enqueue(chat_id, pending, priority=0, rpc_peer=rpc_peer)
         except TypeError:
-            result = queue.enqueue(chat_id, pending)
+            try:
+                result = queue.enqueue(chat_id, pending, priority=0)
+            except TypeError:
+                result = queue.enqueue(chat_id, pending)
         if inspect.isawaitable(result):
             result = await result
         deleted, remaining = result
         return int(deleted), list(remaining or ())
 
-    return await _delete_direct_in_batches(
-        bot, chat_id, pending, batch_size=max(1, int(batch_size))
-    )
+    _log_error(bot, f"USER PURGE DELETE UNAVAILABLE chat_id={chat_id} count={len(pending)}")
+    return 0, pending
 
 
 async def purge_user_messages(
@@ -534,7 +565,9 @@ async def purge_user_messages(
         limit=limit,
         since=since,
     )
-    deleted, remaining = await delete_ids_in_batches(bot, chat_id, ids)
+    deleted, remaining = await delete_ids_in_batches(
+        bot, chat_id, ids, rpc_peer=rpc_peer
+    )
     if deleted:
         # شناسه‌های واقعاً حذف‌شده از ردیاب حافظه‌ای هم فراموش شوند.
         deleted_ids = set(ids) - set(remaining or ())

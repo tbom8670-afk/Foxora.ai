@@ -4,7 +4,7 @@
 گرفته می‌شوند. فایل‌ها با mtime کش می‌شوند، پس ویرایش دستی فایل بدون
 ری‌استارت ربات اعمال می‌شود و خواندن در مسیر داغ تقریباً رایگان است.
 
-مسیر فایل‌ها (اولی که وجود داشته باشد):
+مسیر فایل‌ها (اگر هر دو وجود داشته باشند، فایلِ جدیدتر خوانده می‌شود):
 
 1. ``runtime_config_file(name)`` — پوشهٔ config همان instance (پیشنهادشده)
 2. ``<project>/config/<name>`` — نسخهٔ داخل مخزن
@@ -22,6 +22,12 @@ CHANNEL_LIST_FILE = "profile_channel_names.txt"
 BIO_LIST_FILE = "profile_bio_sentences.txt"
 
 _SOURCE_COMMENT = "#"
+
+# These new defaults must also reach instances with a newer, customized
+# runtime copy of the old lists. Other runtime entries are not overwritten.
+_NEW_CHANNEL_BIO_DEFAULTS = (
+    "چنلم", "کانال", "چنل", "کانالم", "میشه عضو شی", "عضو شو",
+)
 
 
 def _mtime(path: Path) -> float:
@@ -51,13 +57,19 @@ def _resolve(name: str) -> Path:
     return max(existing, key=_mtime)
 
 
-def _read(path: Path) -> Tuple[str, List[str]]:
-    """``(امضای فایل, عبارت‌ها)`` — امضا برای کش mtime است."""
+def _signature(path: Path) -> str:
     try:
         stat = os.stat(path)
-        signature = f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
+        return f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
     except OSError:
-        return f"{path}:missing", []
+        return f"{path}:missing"
+
+
+def _read(path: Path) -> Tuple[str, List[str]]:
+    """``(امضای فایل, عبارت‌ها)`` — امضا برای کش mtime است."""
+    signature = _signature(path)
+    if signature.endswith(":missing"):
+        return signature, []
     items: List[str] = []
     try:
         with open(path, "r", encoding="utf-8") as stream:
@@ -76,10 +88,34 @@ _cache: dict = {}
 
 def _load(name: str) -> List[str]:
     path = _resolve(name)
-    signature, items = _read(path)
+    repository = Path(PROJECT_ROOT) / "config" / name
+    # Include the shipped file's signature only when a separate runtime copy
+    # won the mtime race. This keeps the hot path stat-only, not two file reads
+    # for every message, while newly shipped defaults still reach old copies.
+    use_release_defaults = path != repository and name in {
+        CHANNEL_LIST_FILE, BIO_LIST_FILE,
+    }
+    signature = (_signature(path),
+                 _signature(repository) if use_release_defaults else None)
     cached = _cache.get(name)
     if cached is not None and cached[0] == signature:
         return cached[1]
+    _, items = _read(path)
+    if use_release_defaults:
+        _, shipped = _read(repository)
+        shipped_set = set(shipped)
+        disabled = set()
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                disabled = {
+                    line.strip()[1:].strip() for line in stream
+                    if line.strip().startswith(_SOURCE_COMMENT)
+                }
+        except OSError:
+            pass
+        for phrase in _NEW_CHANNEL_BIO_DEFAULTS:
+            if phrase in shipped_set and phrase not in items and phrase not in disabled:
+                items.append(phrase)
     _cache[name] = (signature, items)
     return items
 

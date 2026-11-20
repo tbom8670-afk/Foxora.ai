@@ -3549,6 +3549,38 @@ def is_fast_moderation_command(text):
         return False
 
 
+async def _delete_successful_mute_messages(bot, event, chat_id, reply_id):
+    """پس از سکوتِ موفق، پیام کاربر و خودِ فرمان ریپلای را با هم حذف کن.
+
+    مسیر سریع و مسیر سازگاری هر دو همین تابع را فرا می‌خوانند؛ در حالتِ
+    ادمین/VIP، سکوتِ قبلی یا شکستِ RPC اصلاً به آن نمی‌رسند. اعلانِ نتیجه
+    بعد از حذف فرستاده می‌شود تا خودش به‌اشتباه در دستهٔ حذف قرار نگیرد.
+    """
+    command_id = getattr(getattr(event, "message", None), "id", None)
+    ids = list(dict.fromkeys(
+        value for value in (reply_id, command_id)
+        if isinstance(value, int) and value > 0
+    ))
+    if not ids:
+        return
+    try:
+        deleted, remaining = await user_message_purge.delete_ids_in_batches(
+            bot, chat_id, ids, rpc_peer=_delete_rpc_target(bot, chat_id),
+        )
+        if remaining:
+            bot.logger.log_error(
+                "MANUAL MUTE MESSAGE DELETE INCOMPLETE "
+                f"chat_id={chat_id} deleted={deleted} remaining={remaining!r}"
+            )
+    except _asyncio.CancelledError:
+        raise
+    except Exception as error:
+        # حذفِ ناموفق نباید سکوتِ واقعاً انجام‌شده را شکست‌خورده اعلام کند.
+        bot.logger.log_error(
+            f"MANUAL MUTE MESSAGE DELETE FAILED chat_id={chat_id} error={error!r}"
+        )
+
+
 async def handle_fast_moderation_command(
     bot, event, text=None, sender=None
 ):
@@ -3736,7 +3768,7 @@ async def handle_fast_moderation_command(
             await event.reply("⚠️ این کاربر قبلا سکوت شده")
             return
         target_user = result.get("target_user") if isinstance(result, dict) else None
-        if target_user is None:
+        if target_user is None or not result.get("muted"):
             await event.reply("❌ انجام سکوت ناموفق بود")
             return
         add_mute(chat_id)
@@ -3755,6 +3787,7 @@ async def handle_fast_moderation_command(
         except Exception as mm_error:
             bot.logger.log_error(
                 f"MANUAL MUTE MARK FAILED: {mm_error}")
+        await _delete_successful_mute_messages(bot, event, chat_id, reply_id)
         admin_tools.log_action(
             chat_id, sender, "سکوت کاربر", target=target_user
         )
@@ -10593,6 +10626,9 @@ async def handle_new_message(bot, event):
                     return
 
                 async def mute_succeeded(_result):
+                    if _result is False:
+                        await event.reply("❌ انجام سکوت ناموفق بود")
+                        return
                     add_mute(chat_id)
                     # ثبت «سکوت دستی»: «آزاد» روی این سکوت عمل نمی‌کند و
                     # رفعش فقط با «رفع سکوت» است.
@@ -10609,6 +10645,9 @@ async def handle_new_message(bot, event):
                     except Exception as mm_error:
                         bot.logger.log_error(
                             f"MANUAL MUTE MARK FAILED: {mm_error}")
+                    await _delete_successful_mute_messages(
+                        bot, event, chat_id, event.reply_to.reply_to_msg_id,
+                    )
                     admin_tools.log_action(
                         chat_id, sender, "سکوت کاربر", target=target_user)
                     # 🗂 ثبت در سابقه‌ها (فایل جدا؛ سیستم سکوت دست‌نخورده).

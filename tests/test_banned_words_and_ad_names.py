@@ -97,3 +97,34 @@ def test_ad_name_detector_legitimate_names():
     for user in legit_users:
         reason = ad_name_reason(user)
         assert reason is None, f"False positive for user name: {user.first_name}"
+
+
+@pytest.mark.parametrize("name", [
+    "عسل خانوم", "خانوم", "پی", "استوری", "استوریم", "استوررررری",
+    "پیوی", "چنلم", "فیلم", "فلم", "فی لم", "🤤", "😈", "💦", "🔥",
+    "فیللللللللم", "ف.ی.ل.ل.ل.م", "فـيـلـلـم", "ف🔥ی✨ل✨م",
+    "عَسَل خـااانوم", "ا‌س‌ت‌و‌ررری", "چ.ن.ل.م", "پـی", "پ.پ.ی",
+])
+def test_builtin_name_filter_detects_new_names_censorship_and_elongation(name):
+    user = SimpleNamespace(first_name=name, last_name=None, username=None)
+    assert ad_name_reason(user) is not None, name
+
+
+def test_builtin_name_filter_checks_last_name_and_username_too():
+    assert ad_name_reason(SimpleNamespace(
+        first_name="سارا", last_name="فی لللللم", username=None,
+    )) is not None
+    assert ad_name_reason(SimpleNamespace(
+        first_name="سارا", last_name=None, username="چنل_م",
+    )) is not None
+    assert ad_name_reason(SimpleNamespace(
+        first_name="سارا", last_name="🔥", username=None,
+    )) == "🔥"
+
+
+@pytest.mark.parametrize("name", [
+    "پیام", "پیرمرد", "پیروز", "پیمان", "پیشرو", "سپیدار",
+])
+def test_short_pi_name_filter_does_not_match_parts_of_normal_names(name):
+    user = SimpleNamespace(first_name=name, last_name=None, username=None)
+    assert ad_name_reason(user) is None, name

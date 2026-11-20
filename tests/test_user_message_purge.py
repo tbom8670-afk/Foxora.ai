@@ -4,8 +4,8 @@
   ۱. تشخیص دستور (فارسی/انگلیسی، نیم‌فاصله، پیشوند) و رد دستورهای هم‌خانواده
   ۲. جمع‌آوری شناسه‌ها: ردیاب حافظه‌ای ∪ اسکن ``iter_messages``، پرش از
      پیام سیستمی/ربات/دیگران، کف تاریخ، FloodWait و fallback از ``from_user``
-  ۳. حذف دسته‌ای: صف موجود پروژه با ``priority=0`` و مسیر مستقیم با
-     دسته‌های ۱۰۰تایی + ``revoke=True`` + retry
+  ۳. حذف فوری مستقل از صف عمومی، دسته‌های ۱۰۰تاییِ موازی، بدون مکث برای
+     کمتر از ۱۰۰ پیام + ``revoke=True`` + retry؛ صف فقط جایگزینِ نبود API
   ۴. مسیریابی واقعی هندلر: مجوز admins.json/مالک، نبود ریپلای، و اینکه
      «پاک کامل» توسط بلوک «پاک + عدد» بلعیده نمی‌شود
   ۵. قالب دقیق تأیید نهایی: «پیام های کاربر پاک شد تعداد : 𝟒»
@@ -234,6 +234,101 @@ def test_delete_direct_batches_of_100_with_revoke():
     assert all(revoke is True for _ids, revoke in calls)
 
 
+def test_delete_350_parallel_even_when_general_queue_exists():
+    async def scenario():
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.active = 0
+                self.max_active = 0
+
+            async def delete_messages(self, target, ids, revoke=True):
+                self.calls.append((target, list(ids), revoke))
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    await asyncio.sleep(0.01)
+                finally:
+                    self.active -= 1
+
+        class UnusedQueue:
+            def enqueue(self, *args, **kwargs):
+                raise AssertionError("پاک کامل نباید پشتِ صف ۱۵تایی بماند")
+
+        client = Client()
+        bot = SimpleNamespace(
+            client=client, logger=FakeLogger(), message_delete_queue=UnusedQueue(),
+        )
+        result = await purge.delete_ids_in_batches(bot, -1010, range(1, 351))
+        return client, result
+
+    client, result = asyncio.run(scenario())
+    assert result == (350, [])
+    assert [len(ids) for _peer, ids, _revoke in client.calls] == [100, 100, 100, 50]
+    assert all(revoke is True for _peer, _ids, revoke in client.calls)
+    assert 2 <= client.max_active <= purge.DELETE_PARALLEL
+
+
+def test_fewer_than_100_uses_one_immediate_rpc_and_resolved_peer():
+    async def scenario():
+        calls = []
+        peer = object()
+
+        class Client:
+            async def delete_messages(self, target, ids, revoke=True):
+                calls.append((target, list(ids), revoke))
+
+        bot = SimpleNamespace(client=Client(), logger=FakeLogger())
+        result = await purge.delete_ids_in_batches(
+            bot, -1011, range(1, 74), rpc_peer=peer,
+        )
+        return peer, calls, result
+
+    peer, calls, result = asyncio.run(scenario())
+    assert result == (73, [])
+    assert len(calls) == 1 and calls[0] == (peer, list(range(1, 74)), True)
+
+
+def test_delete_direct_isolates_only_invalid_message_id():
+    class MessageIdInvalidError(Exception):
+        pass
+
+    async def scenario():
+        calls = []
+
+        class Client:
+            async def delete_messages(self, _chat_id, ids, revoke=True):
+                calls.append(list(ids))
+                if len(ids) > 1 or ids == [2]:
+                    raise MessageIdInvalidError("MESSAGE_ID_INVALID")
+
+        bot = SimpleNamespace(client=Client(), logger=FakeLogger())
+        result = await purge.delete_ids_in_batches(bot, -1012, [1, 2, 3])
+        return calls, result
+
+    calls, result = asyncio.run(scenario())
+    assert result == (2, [2])
+    assert calls == [[1, 2, 3], [1], [2], [3]]
+
+
+def test_delete_direct_long_floodwait_returns_remaining_without_sleep():
+    async def scenario():
+        calls = []
+
+        class Client:
+            async def delete_messages(self, _chat_id, ids, revoke=True):
+                calls.append(list(ids))
+                raise FloodWaitError(90)
+
+        bot = SimpleNamespace(client=Client(), logger=FakeLogger())
+        result = await purge.delete_ids_in_batches(bot, -1013, [1, 2, 3])
+        return calls, result
+
+    calls, result = asyncio.run(scenario())
+    assert calls == [[1, 2, 3]]
+    assert result == (0, [1, 2, 3])
+
+
 def test_delete_direct_retries_floodwait_batch():
     async def scenario():
         state = {"failed_once": False}
@@ -332,6 +427,7 @@ class _HandlerClient:
         self._reply_sender = reply_sender
         self._history = history
         self.iter_calls = []
+        self.deleted = []
 
     async def get_messages(self, chat_id, ids=None, limit=None):
         sender = self._reply_sender
@@ -348,7 +444,8 @@ class _HandlerClient:
     async def get_entity(self, target):
         return self._reply_sender
 
-    async def delete_messages(self, *args, **kwargs):
+    async def delete_messages(self, target, ids, revoke=True):
+        self.deleted.append((target, list(ids), revoke))
         return None
 
 
@@ -450,8 +547,12 @@ def test_handler_purge_success_exact_confirmation(tmp_path, monkeypatch):
     # دقیقاً قالب خواسته‌شده و دقیقاً ۴ پیام کاربر هدف (نه کاربر دیگر).
     assert "پیام های کاربر پاک شد تعداد : 𝟒" in event.replies
     assert not any("استفاده: پاک + عدد" in str(r) for r in event.replies)
-    assert queue.calls and queue.calls[0][1] == [101, 103, 104, 105]
-    assert queue.calls[0][2] == 0  # priority دستی ادمین
+    assert len(client.deleted) == 1
+    delete_target, deleted_ids, revoke = client.deleted[0]
+    assert getattr(delete_target, "id", delete_target) == chat_id
+    assert deleted_ids == [101, 103, 104, 105] and revoke is True
+    assert queue.calls == []  # صف عمومی ۱۵تایی پشتِ پاکسازی قرار نگیرد
+    assert client.iter_calls and client.iter_calls[0]["wait_time"] == 0
 
 
 def test_handler_purge_denied_for_unregistered_user(tmp_path, monkeypatch):
@@ -503,3 +604,138 @@ def test_handler_purge_requires_reply(tmp_path, monkeypatch):
     event = asyncio.run(scenario())
     assert any("باید روی پیام کاربر ریپلای کنید" in str(r) for r in event.replies)
     assert queue.calls == []
+
+
+def test_compatibility_reply_mute_deletes_reply_and_command_only_after_success(
+    tmp_path, monkeypatch,
+):
+    """مسیر غیرسریعِ هندلر هم باید دو پیام را فقط بعد از سکوت واقعی پاک کند."""
+    from modules import manual_mute_storage, user_history
+
+    _isolate_handler_storage(tmp_path, monkeypatch)
+    chat_id = -100777041
+    owner = _HandlerUser(8001, username="mute_owner")
+    target = _HandlerUser(8002, username="mute_target")
+    group_storage.activate_group(chat_id, "گروه تست سکوت")
+    group_storage.set_group_owner(chat_id, owner.id)
+    monkeypatch.setattr(manual_mute_storage, "is_manual_muted", lambda *_: False)
+    monkeypatch.setattr(manual_mute_storage, "add_manual_mute", lambda *a, **k: None)
+    monkeypatch.setattr(user_history, "add_mute", lambda *a, **k: None)
+    monkeypatch.setattr(mh, "add_mute", lambda *a, **k: None)
+
+    async def not_native_admin(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(mh, "_is_native_group_admin", not_native_admin)
+    client = _HandlerClient(target, [])
+    bot, queue = _handler_bot(client)
+    jobs = []
+
+    def enqueue(_chat, action, **kwargs):
+        jobs.append((action, kwargs))
+        return True
+
+    bot.moderation_queue = SimpleNamespace(enqueue=enqueue)
+
+    async def mute(_chat, _uid, **_kwargs):
+        return True
+
+    bot.admin_actions.mute_user = mute
+
+    async def scenario():
+        event = _HandlerEvent(chat_id, owner, "سکوت", reply_to_id=401, mid=402)
+        await handle_new_message(bot, event)  # عمداً از مسیر سازگاری، نه fast
+        assert client.deleted == []
+        assert len(jobs) == 1 and jobs[0][0] == "mute"
+        result = await jobs[0][1]["operation"]()
+        assert result is True
+        await jobs[0][1]["on_success"](result)
+        return event
+
+    event = asyncio.run(scenario())
+    assert len(client.deleted) == 1
+    _peer, ids, revoke = client.deleted[0]
+    assert ids == [401, 402] and revoke is True
+    assert queue.calls == []
+    assert len(event.replies) == 1 and "سکوت دائم شد" in event.replies[0]
+
+
+def test_compatibility_mute_failure_keeps_both_messages(tmp_path, monkeypatch):
+    from modules import manual_mute_storage
+
+    _isolate_handler_storage(tmp_path, monkeypatch)
+    chat_id = -100777042
+    owner = _HandlerUser(8011, username="mute_owner2")
+    target = _HandlerUser(8012, username="mute_target2")
+    group_storage.activate_group(chat_id, "گروه تست سکوت ناموفق")
+    group_storage.set_group_owner(chat_id, owner.id)
+    monkeypatch.setattr(manual_mute_storage, "is_manual_muted", lambda *_: False)
+
+    async def not_native_admin(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(mh, "_is_native_group_admin", not_native_admin)
+    client = _HandlerClient(target, [])
+    bot, _queue = _handler_bot(client)
+    jobs = []
+
+    def enqueue(_chat, action, **kwargs):
+        jobs.append((action, kwargs))
+        return True
+
+    bot.moderation_queue = SimpleNamespace(enqueue=enqueue)
+
+    async def scenario():
+        event = _HandlerEvent(chat_id, owner, "سکوت", reply_to_id=410, mid=411)
+        await handle_new_message(bot, event)
+        assert jobs and jobs[0][0] == "mute"
+        await jobs[0][1]["on_failure"](RuntimeError("mute rejected"))
+        return event
+
+    event = asyncio.run(scenario())
+    assert client.deleted == []
+    assert len(event.replies) == 1 and "ناموفق" in event.replies[0]
+
+
+@pytest.mark.parametrize("name", ["فیللللللللم", "💦"])
+def test_builtin_censored_name_reaches_real_delete_and_punish_branch(
+    tmp_path, monkeypatch, name,
+):
+    """تشخیص تنها کافی نیست: نامِ جدید باید در هندلر به مجازات برسد."""
+    _isolate_handler_storage(tmp_path, monkeypatch)
+    chat_id = -100777051 if name == "💦" else -100777050
+    owner = _HandlerUser(8101, username="group_owner")
+    target = _HandlerUser(8102, username="member", name=name)
+    group_storage.activate_group(chat_id, "گروه تست نام")
+    group_storage.set_group_owner(chat_id, owner.id)
+    client = _HandlerClient(target, [])
+    bot, delete_queue = _handler_bot(client)
+    logged_deletes = []
+    bot.logger.log_deleted_message = lambda **kw: logged_deletes.append(kw)
+    jobs = []
+
+    def enqueue(_chat, action, **kwargs):
+        jobs.append((action, kwargs))
+        return True
+
+    bot.moderation_queue = SimpleNamespace(enqueue=enqueue)
+    banned = []
+
+    async def ban(_chat, uid, **kwargs):
+        banned.append(uid)
+        return True
+
+    bot.admin_actions.ban_user = ban
+
+    async def scenario():
+        event = _HandlerEvent(chat_id, target, "سلام", mid=777)
+        await handle_new_message(bot, event)
+        assert jobs and jobs[0][0] == "ban"
+        result = await jobs[0][1]["operation"]()
+        assert result is True
+        return event
+
+    asyncio.run(scenario())
+    assert banned == [target.id]
+    assert delete_queue.calls and 777 in delete_queue.calls[0][1]
+    assert logged_deletes and "نام تبلیغاتی" in logged_deletes[0]["reason"]
