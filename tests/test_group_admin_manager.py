@@ -778,7 +778,7 @@ def test_truncated_admin_page_never_overwrites_or_demotes_existing_admin(setup):
 
 
 @pytest.mark.parametrize("recent", ("users_only", "empty", "capped"))
-def test_missing_member_role_is_unknown_and_never_authorizes_promotion(
+def test_replied_user_can_be_promoted_when_recent_omits_them(
         setup, monkeypatch, recent):
     bot, _owners, _ = setup
     client = bot.client
@@ -803,10 +803,60 @@ def test_missing_member_role_is_unknown_and_never_authorizes_promotion(
     client.list_override = incomplete
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
-    refused = send(bot, "هیچکدام")
-    assert "عضویت عادی این کاربر قابل تأیید نیست" in refused.sent[-1][0]
-    assert "ادمین گروه شد" not in refused.sent[-1][0]
-    assert not client.edits
+    promoted = send(bot, "هیچکدام")
+    assert promoted.sent[-1][0] == (
+        "⚙ کاربر : سارا\nادمین گروه شد مدیریت گروه را بررسی کنید")
+    assert client.lookups == [(1234, 4)]  # resolved from this group's reply
+    assert len(client.edits) == 1
+    assert client.edits[0].user_id.user_id == 101
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
+
+
+def test_recent_absence_does_not_mask_server_rejection(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.fail_write = True
+    client.add_user(1234, User(101))
+
+    def no_recent(req):
+        if isinstance(req.filter, types.ChannelParticipantsRecent):
+            return types.channels.ChannelParticipants(
+                count=0, participants=[], chats=[], users=[])
+        return client._list_page(req)
+
+    client.list_override = no_recent
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    result = send(bot, "هیچکدام")
+    assert "درخواست ادمین‌کردن را نپذیرفت" in result.sent[-1][0]
+    assert "ادمین گروه شد" not in result.sent[-1][0]
+    assert len(client.edits) == 1  # sent to the server, but not accepted
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipant)
+
+
+def test_recent_absence_and_stale_admin_list_are_not_false_success(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.direct_unsupported = True
+    client.add_user(1234, User(101))
+
+    def stale(req):
+        if isinstance(req.filter, types.ChannelParticipantsAdmins):
+            return types.channels.ChannelParticipants(
+                count=1, participants=[client.roles[1234, 999]],
+                chats=[], users=[User(999)])
+        return types.channels.ChannelParticipants(
+            count=0, participants=[], chats=[], users=[])
+
+    client.list_override = stale
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    result = send(bot, "هیچکدام")
+    assert "ادمینی و لقب در سرور تأیید نشد" in result.sent[-1][0]
+    assert "ادمین گروه شد" not in result.sent[-1][0]
+    assert len(client.edits) == 1  # server fake applied it, but read-back hid it
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
 
 
 @pytest.mark.parametrize("left_or_banned", ("left", "banned"))

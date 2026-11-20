@@ -51,7 +51,7 @@ PARTICIPANT_PAGE_SIZE = 200  # SPlusthon's GetParticipants page limit.
 PARTICIPANT_PAGE_DELAY = 0.1  # Avoid bursting heavy RPCs in large groups.
 MAX_SCAN_SECONDS = 20.0     # An unfinished scan never proves absence.
 MAX_ADMIN_PAGES = 10         # Never trust a truncated admin list as a negative.
-MAX_MEMBER_PAGES = 10        # A member must be found explicitly to be promoted.
+MAX_MEMBER_PAGES = 10        # Best-effort: Recent absence never proves nonmembership.
 
 
 class GroupAdminError(RuntimeError):
@@ -253,7 +253,7 @@ async def _scan_roles(bot, channel, filter_type, expected_id, *, max_pages,
 
 
 async def _read_via_lists(bot, channel, expected_id, *, admins_only=False):
-    # An existing admin must be found BEFORE any ordinary-member promotion.
+    # An existing admin must be found BEFORE any promotion.
     # In particular, not seeing someone in the first 200 admins proves nothing.
     admin = await _scan_roles(bot, channel, types.ChannelParticipantsAdmins,
                               expected_id, max_pages=MAX_ADMIN_PAGES,
@@ -269,8 +269,10 @@ async def _read_via_lists(bot, channel, expected_id, *, admins_only=False):
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        # The complete admin list still proves non-admin for demotion checks,
-        # but an unknown member list can NEVER authorize a promotion.
+        # A complete admin list still proves non-admin.  Recent may omit a
+        # perfectly valid replied-to user; an unreadable/partial Recent page
+        # is NOT proof that the user left the group.  The edit request and
+        # subsequent positive admin read-back decide whether promotion worked.
         logger = getattr(bot, "logger", None)
         if logger is not None:
             try:
@@ -411,9 +413,17 @@ async def promote(bot, chat_id, actor_id, target, rank, choices):
         raise GroupAdminError("❌ مالک اصلی گروه را نمی‌توان دوباره ادمین کرد.")
     if _admin(before):
         raise GroupAdminError("⚠️ این کاربر از قبل ادمین گروه است؛ دسترسی‌هایش تغییر نکرد.")
-    if isinstance(before, _NoAdminInCompleteList):
-        raise GroupAdminError("❌ عضویت عادی این کاربر قابل تأیید نیست؛ ارتقا انجام نشد.")
-    if not isinstance(before, (types.ChannelParticipant, types.ChannelParticipantSelf)):
+    # _NoAdminInCompleteList means the *complete* admin list excludes this
+    # user; the Recent list cannot prove current ordinary membership (it may
+    # omit an older member even when we can resolve their group-message
+    # sender).  Do not turn that missing page into a denial.  Ask the server
+    # to edit the resolved InputUser and only announce success after an admin
+    # role is actually observed in the same group.  Explicit Left/Banned and
+    # unknown role types still fail closed; existing admins/creators were
+    # rejected above, and an incomplete admin list raises before any write.
+    if not isinstance(before, (types.ChannelParticipant,
+                               types.ChannelParticipantSelf,
+                               _NoAdminInCompleteList)):
         raise GroupAdminError("❌ این کاربر عضو عادی گروه نیست؛ ارتقا انجام نشد.")
     await _bot_promote_right(bot, channel)
     require_owner(chat_id, actor_id)  # owner may have changed while RPCs ran
