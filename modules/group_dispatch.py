@@ -104,6 +104,7 @@ _ADMIN_EXACT = frozenset({
     "اختصاصی", "لغو اختصاصی",
     "سکوت", "رفع سکوت", "آزاد", "اخطار",
     "ثبت ادمین", "لغو ادمین", "برکناری ادمین",
+    "ادمین گروه", "لغو ادمین گروه",
     "فعال", "غیر فعال", "فعال سازی",
     "ثبت گروه", "حذف گروه", "ثبت مالک", "لغو مالک", "برکناری مالک",
     "لیست انقضا", "مهلت گروه", "صفر",
@@ -235,6 +236,8 @@ def classify_priority(text, event=None):
         return PRIORITY_ADMIN, LANE_ADMIN
     if _is_active_group_shutdown_input(event):
         return PRIORITY_ADMIN, LANE_ADMIN
+    if _is_active_group_admin_input(event):
+        return PRIORITY_ADMIN, LANE_ADMIN
     if raw.startswith(_COMMAND_PREFIXES):
         return PRIORITY_COMMAND, LANE_COMMAND
     # پاسخ/ثبت‌نام داخل یک بازیِ در جریان (دادگاه روباه، بقا، زامبی، …) هم
@@ -304,6 +307,21 @@ def _is_active_group_shutdown_input(event):
         from modules.manage_features import group_shutdown_commands
 
         return group_shutdown_commands.is_awaiting(chat_id, user_id)
+    except Exception:
+        return False
+
+
+def _is_active_group_admin_input(event):
+    """Keep a registered owner's pending title/rights on the admin lane."""
+    if event is None or getattr(event, "is_private", False):
+        return False
+    chat_id = getattr(event, "chat_id", None)
+    user_id = _event_user_id(event)
+    if chat_id is None or user_id is None:
+        return False
+    try:
+        from handlers import group_admin_handler
+        return group_admin_handler.is_awaiting(chat_id, user_id)
     except Exception:
         return False
 

@@ -60,7 +60,8 @@ def test_blocks_count_and_contact():
     # + ۱ بلوک «مرخصی ادمین»
     # + ۱ بلوک «محدودیت دستورات»
     # + ۱ بلوک «سپر محافظتی» (سپر روشن/سپر خاموش) = ۶۰)
-    assert len(bquote_entities) == 60
+    # + ۲ نقل‌قول جداگانهٔ «ادمین گروه» / «لغو ادمین گروه» = ۶۲
+    assert len(bquote_entities) == 62
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -144,8 +145,8 @@ def test_blockquotes_span_exact_lines():
     # + ۱ نقل‌قولِ «محدودیت دستورات»
     # + ۱ نقل‌قولِ «مرخصی ادمین»
     # + ۱ نقل‌قولِ «محدودیت دستورات»
-    # + ۱ نقل‌قولِ «سپر محافظتی» = ۶۰.
-    assert len(bquote_entities) == 60
+    # + ۱ نقل‌قولِ «سپر محافظتی» = ۶۰؛ دو نقل‌قولِ گروه = ۶۲.
+    assert len(bquote_entities) == 62
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -169,8 +170,8 @@ def test_bold_entities_content():
     # + ۱ بلوکِ «👒 مرخصی ادمین» (کلِ متن Bold)
     # + ۱ بلوکِ «⚠️ محدودیت دستورات» (کلِ متن Bold)
     # + ۱ هدرِ «🌡 سپر محافظتی» + 2 دستورِ Boldِ «سپر روشن/سپر خاموش»
-    # = ۶۷
-    assert len(bold_entities) == 67
+    # + عنوان و دو دستورِ Bold برای «ادمین گروه» = ۷۰
+    assert len(bold_entities) == 70
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
@@ -183,7 +184,7 @@ def test_bold_entities_content():
             # چندخطی‌اند (کلِ بلوک Bold، دستورها داخل یک نقل‌قول).
             assert sliced.startswith(
                 ("🕹️", "🔐", "🧬", "📊", "⏰", "⛔️", "💥", "🛎", "🌖",
-                 "👒", "⚠️")
+                 "👒", "⚠️", "🎪")
             ), sliced
 
 
@@ -214,18 +215,15 @@ def test_message_limit_admin_help_block():
     assert expected_full in bold_slices
     assert expected_quote in quote_slices
 
-    # بلوک «محدودیت پیام» نباید به یک پیام سوم جداگانه سرریز شود؛ باید دقیقاً
-    # داخل همان پیامِ لیستِ بالایی (زیر «متخلف» و بالای «تماس با سازنده») باشد.
-    assert len(ADMIN_HELP_MESSAGES) == 2
-    last_chunk_text = ADMIN_HELP_MESSAGES[-1][0]
-    assert "⛔️ : برای اینکه یک کاربر" in last_chunk_text
-    assert expected_full in last_chunk_text
-    assert "تماس با سازنده : @OSINE2" in last_chunk_text
-    assert (
-        last_chunk_text.index("⛔️ : برای اینکه یک کاربر")
-        < last_chunk_text.index(expected_full)
-        < last_chunk_text.index("تماس با سازنده : @OSINE2")
-    )
+    # این بلوک همراه «متخلف» در همان پیام می‌ماند. بخش تازهٔ ادمینِ گروه
+    # به پیام سوم می‌رود تا سقف ۳۰ نقل‌قولِ واقعیِ هر پیام نقض نشود.
+    assert len(ADMIN_HELP_MESSAGES) == 3
+    block_chunk_text = next(text for text, _ in ADMIN_HELP_MESSAGES
+                            if expected_full in text)
+    assert "⛔️ : برای اینکه یک کاربر" in block_chunk_text
+    assert (ADMIN_HELP_TEXT.index("⛔️ : برای اینکه یک کاربر")
+            < ADMIN_HELP_TEXT.index(expected_full)
+            < ADMIN_HELP_TEXT.index("تماس با سازنده : @OSINE2"))
 
 
 def test_group_shutdown_admin_help_block():
@@ -248,20 +246,24 @@ def test_group_shutdown_admin_help_block():
     ]
     assert expected_full in bold_slices
     assert expected_quote in quote_slices
-    assert len(ADMIN_HELP_MESSAGES) == 2
-    last_chunk_text = ADMIN_HELP_MESSAGES[-1][0]
-    assert (
-        last_chunk_text.index("🛎 برای ایجاد محدودیت ارسال پیام")
-        < last_chunk_text.index(expected_full)
-        < last_chunk_text.index("تماس با سازنده : @OSINE2")
-    )
+    assert len(ADMIN_HELP_MESSAGES) == 3
+    block_chunk_text = next(text for text, _ in ADMIN_HELP_MESSAGES
+                            if expected_full in text)
+    assert block_chunk_text.index("🛎 برای ایجاد محدودیت ارسال پیام") \
+        < block_chunk_text.index(expected_full)
+    assert ADMIN_HELP_TEXT.index(expected_full) \
+        < ADMIN_HELP_TEXT.index("تماس با سازنده : @OSINE2")
 
 
 def test_n2_and_n3_examples():
     """بررسی نمونه‌های n2 و n3 در متن خروجی."""
     # فیلتر کلمات (n3)
     assert "🪤فیلتر کردن کلمات گروه با دستورات" in ADMIN_HELP_TEXT
-    assert "/فیلتر ← /فیلتر بیو\n/رفع ← / رفع بیو\n/فیلترها ← نمایش لیست فیلتر" in ADMIN_HELP_TEXT
+    # انتظارِ قدیمیِ «/فیلتر بیو» از نسخهٔ قبل مانده بود؛ متنِ زندهٔ
+    # لیست اکنون «فیلتر بیو چک» است (کد محصول در این قسمت تغییر نکرده).
+    assert ("فیلتر بیو چک ← افزودن کلمه/عبارت\n"
+            "رفع بیو چک ← حذف کلمه/عبارت\n"
+            "فیلترها ← نمایش لیست فیلتر") in ADMIN_HELP_TEXT
 
     # پاکسازی چند پیام آخر (n2)
     assert "🔘 حذف گروهی چند پیام آخر با دستور" in ADMIN_HELP_TEXT

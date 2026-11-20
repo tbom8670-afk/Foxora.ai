@@ -3220,6 +3220,23 @@ class SoroushAntiSpamBot:
                     "PRIVATE START FAILED "
                     f"error={private_start_error!r}"
                 )
+            # 👑 این دو دستور در پیوی به گروهی route نمی‌شوند. پاسخِ روشن
+            # بده، ولی هیچ وضعیت/درخواستِ ادمینی ایجاد نکن.
+            if getattr(event, "is_private", False):
+                from handlers import group_admin_handler as _native_group_admin
+                _private_text = (
+                    getattr(getattr(event, "message", None), "message", None)
+                    or getattr(getattr(event, "message", None), "caption", None)
+                    or ""
+                )
+                if _native_group_admin.is_command(_private_text):
+                    await _native_group_admin.handle(
+                        self, event, getattr(event, "chat_id", None),
+                        getattr(event, "sender_id", None),
+                        getattr(event, "sender", None), _private_text,
+                        logger=self.logger,
+                    )
+                    return
             raw_text = ""
             try:
                 message = getattr(event, "message", None)

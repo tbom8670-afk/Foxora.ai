@@ -62,6 +62,8 @@ from modules import truth_or_lie as _truth_lie
 from modules import speed_bomb as _speed_bomb
 # 📥 قابلیت مستقل «دانلود عکس».
 from handlers.photo_download_handler import handle as handle_photo_download
+# 👑 مدیریت ادمین واقعی گروه: فقط مالک ثبت‌شده، مستقل از admins.json.
+from handlers import group_admin_handler as native_group_admin
 # ⏳ تاریخ انقضای گروه — قابلیتی کاملاً مستقل با مسیر پردازش جدا.
 from handlers.group_expiry_handler import (
     EXPIRED_NOTICE as GROUP_EXPIRED_NOTICE,
@@ -1953,6 +1955,7 @@ _OWNER_ONLY_NATIVE_SKIP = frozenset({
     "فعال", "غیر فعال", "فعال سازی", "کپی بورد", "کپی",
     "ثبت گروه", "حذف گروه",
     "ثبت مالک", "لغو مالک", "برکناری مالک",
+    "ادمین گروه", "لغو ادمین گروه",  # only groups.json owner_id, no native bypass
 })
 
 
@@ -5743,6 +5746,16 @@ async def handle_new_message(bot, event):
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
         # می‌بلعید و «راهنما»/«روباه» هیچ‌وقت به handler نمی‌رسیدند.
         clean_text = normalize_command(message_text)
+
+        # 👑 مسیر مستقل ادمینِ واقعیِ همین گروه، پیش از تطبیقِ پیشوندیِ
+        # «لغو ادمین» قدیمی (که فقط admins.json ربات را تغییر می‌دهد).
+        # پاسخ‌های مرحله‌ای تنها از مالک ثبت‌شده و همین گروه پذیرفته می‌شوند.
+        if (native_group_admin.is_command(clean_text)
+                or native_group_admin.is_awaiting(chat_id, user_id)):
+            if await native_group_admin.handle(
+                    bot, event, chat_id, user_id, sender, message_text,
+                    logger=bot.logger):
+                return
 
         # ===== 🔒 دستورهای عضویت اجباری کانال =====
         # ثبت/تغییر/حذف/فعال‌سازی/غیرفعال‌سازی فقط با مالکِ گروه (یا مالک

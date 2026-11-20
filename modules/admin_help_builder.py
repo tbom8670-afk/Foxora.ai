@@ -363,6 +363,25 @@ def _admin_rows():
         quote=True,
     )
 
+    # راهنمای مدیریت ادمینِ واقعی گروه — مستقل از «ثبت/لغو ادمین» ربات.
+    # هر فرمان یک نقل‌قول واقعی جدا و Bold واقعی دارد؛ خط خالی‌ها عین
+    # نمونهٔ داده‌شده‌اند (نه گیومه/Markdown داخل متن خام).
+    group_admin_title = "🌐 برای اضافه کردن یک کاربر به ادمین های گروه"
+    group_admin_add = "ادمین گروه"
+    group_admin_remove = "لغو ادمین گروه"
+    group_admin_text = (
+        f"{group_admin_title}\n\n{group_admin_add}\n\n{group_admin_remove}"
+    )
+    add_offset = _u16(group_admin_title + "\n\n")
+    remove_offset = _u16(group_admin_title + "\n\n" + group_admin_add + "\n\n")
+    rows.append((group_admin_text, [
+        MessageEntityBold(offset=0, length=_u16(group_admin_title)),
+        MessageEntityBlockquote(offset=add_offset, length=_u16(group_admin_add)),
+        MessageEntityBold(offset=add_offset, length=_u16(group_admin_add)),
+        MessageEntityBlockquote(offset=remove_offset, length=_u16(group_admin_remove)),
+        MessageEntityBold(offset=remove_offset, length=_u16(group_admin_remove)),
+    ]))
+
     contact = "تماس با سازنده : @OSINE2"
     rows.append((contact, [
         MessageEntityBold(offset=0, length=_u16(contact)),
