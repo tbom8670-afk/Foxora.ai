@@ -363,15 +363,16 @@ def test_owner_change_during_workflow_revokes_permission(setup):
     assert not handler.is_awaiting(1234, 111)
 
 
-def test_missing_rank_is_unconfirmed_without_auto_demoting_admin(setup):
+def test_missing_rank_reports_observed_admin_without_claiming_title(setup):
     bot, _owners, _ = setup
     bot.client.add_user(1234, User(101))
     bot.client.ignore_rank = True
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب دلخواه")
     result = send(bot, "هیچکدام")
-    assert "لقب یا دسترسی‌ها تأیید نشد" in result.sent[-1][0]
-    assert "ادمین گروه شد" not in result.sent[-1][0]
+    assert result.sent[-1][0] == (
+        "⚙ کاربر : سارا\nادمین گروه شد مدیریت گروه را بررسی کنید")
+    assert "لقب دلخواه" not in result.sent[-1][0]
     assert len(bot.client.edits) == 1
     assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipantAdmin)
     assert bot.client.roles[1234, 101].rank is None
@@ -873,9 +874,9 @@ def test_fallback_checks_bot_add_admins_right_and_partial_rank(setup):
     client.ignore_rank = True
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
-    unconfirmed = send(bot, "هیچکدام")
-    assert "لقب یا دسترسی‌ها تأیید نشد" in unconfirmed.sent[-1][0]
-    assert "ادمین گروه شد" not in unconfirmed.sent[-1][0]
+    role_seen = send(bot, "هیچکدام")
+    assert "ادمین گروه شد مدیریت گروه را بررسی کنید" in role_seen.sent[-1][0]
+    assert "لقب :" not in role_seen.sent[-1][0]
     assert len(client.edits) == 1
     assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
 
@@ -939,9 +940,9 @@ def test_ambiguous_write_with_changed_admin_must_not_auto_demote(
     monkeypatch.setattr(Client, "__call__", ambiguous)
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
-    uncertain = send(bot, "هیچکدام")
-    assert "برای جلوگیری از عزل ناخواسته" in uncertain.sent[-1][0]
-    assert "ادمین گروه شد" not in uncertain.sent[-1][0]
+    role_seen = send(bot, "هیچکدام")
+    assert "ادمین گروه شد مدیریت گروه را بررسی کنید" in role_seen.sent[-1][0]
+    assert "شخص دیگر" not in role_seen.sent[-1][0]
     assert len(client.edits) == 1  # no second, destructive EditAdminRequest
     assert client.roles[1234, 101].rank == "شخص دیگر"
 
@@ -952,32 +953,58 @@ def _slice_entity(text, entity):
         .decode("utf-16-le")
 
 
-def test_interactive_board_uses_real_entities_and_utf16_offsets(setup):
+def test_interactive_board_exact_rows_spacing_and_real_bolds(setup):
     from modules import group_admin_texts as texts
 
     prompt, prompt_entities = texts.title_prompt()
     assert [_slice_entity(prompt, item) for item in prompt_entities
             if isinstance(item, types.MessageEntityBold)] == [prompt]
+    rows = [
+        "1_ تغییر اطلاعات گروه" + " " * 18 + "روشن ◨",
+        "2_ حذف پیام ها" + " " * 28 + "روشن ◨",
+        "3_ محروم کردن کاربران" + " " * 16 + "روشن ◨",
+        "4_ افزودن اعضا" + " " * 28 + "روشن ◨",
+        "5_ سنجاق کردن پیام ها" + " " * 17 + "روشن ◨",
+        "6_ افزودن مدیر جدید" + " " * 21 + "خاموش ◧",
+    ]
+    first_line = "👨‍🌾 کاربر برای ادمین گروه  : @Cowe 🦊"
+    question = "کدام یک از قابلیت های زیر برای کاربر غیر فعال شود !؟"
+    hints = ["⚙ برای انتخاب مثلا بنویسید 1 و 2",
+             "⚙ اگر انتخابی ندارید بنویسید هیچکدام"]
     board, entities = texts.rights_board("@Cowe 🦊", native.DEFAULT_CHOICES)
-    first_line = board.splitlines()[0]
-    assert first_line.startswith("🧑‍🌾 کاربر برای ادمینی گروه انتخاب شد")
+    assert board == (first_line + "\n\n" + question + "\n\n\n"
+                     + "\n".join(rows) + "\n\n\n" + "\n\n".join(hints))
     assert [_slice_entity(board, item) for item in entities
             if isinstance(item, types.MessageEntityBlockquote)] == [first_line]
     assert [_slice_entity(board, item) for item in entities
-            if isinstance(item, types.MessageEntityBold)] == [first_line]
-    assert [f"{number}_ {label}" in board for number, label, _ in native.PERMISSIONS] \
-        == [True] * 6
-    assert "6_ افزودن مدیر جدید     ◐ خاموش" in board
-    assert "هیچکدام" in board and "1 و 2" in board
+            if isinstance(item, types.MessageEntityBold)] == \
+        [first_line, question, *rows, *hints]
     assert "تایید ادمین گروه" not in board and "روشن 6" not in board
     assert all(item.length > 0 and item.offset >= 0
                and item.offset + item.length <= len(board.encode("utf-16-le")) // 2
                for item in entities)
+    choices = dict(native.DEFAULT_CHOICES)
+    choices[1], choices[6] = False, True
+    changed, _ = texts.rights_board("@Cowe", choices)
+    assert "1_ تغییر اطلاعات گروه" + " " * 18 + "خاموش ◧" in changed
+    assert "6_ افزودن مدیر جدید" + " " * 21 + "روشن ◨" in changed
 
 
-def test_exact_admin_help_two_real_quotes_and_three_real_bolds(setup):
+def test_success_message_exact_text_and_bold_entities(setup):
+    from modules import group_admin_texts as texts
+
+    text, entities = texts.promoted("@oert")
+    assert text == "⚙ کاربر : @oert\nادمین گروه شد مدیریت گروه را بررسی کنید"
+    assert [_slice_entity(text, item) for item in entities
+            if isinstance(item, types.MessageEntityBold)] == text.split("\n")
+    assert not any(isinstance(item, types.MessageEntityBlockquote)
+                   for item in entities)
+    assert "⚠️" not in text and "لقب" not in text
+
+
+def test_exact_admin_help_one_two_line_quote_and_three_real_bolds(setup):
     title = "🌐 برای اضافه کردن یک کاربر به ادمین های گروه"
-    expected = f"{title}\n\nادمین گروه\n\nلغو ادمین گروه"
+    expected = f"{title}\n\nادمین گروه\nلغو ادمین گروه"
     assert ADMIN_HELP_TEXT.count(expected) == 1
     assert '"ادمین گروه"' not in ADMIN_HELP_TEXT
     fragment = [chunk for chunk in ADMIN_HELP_MESSAGES if expected in chunk[0]]
@@ -991,7 +1018,8 @@ def test_exact_admin_help_two_real_quotes_and_three_real_bolds(setup):
               if isinstance(entity, types.MessageEntityBlockquote)]
     bolds = [_slice_entity(text, entity) for entity in entities
              if isinstance(entity, types.MessageEntityBold)]
-    assert quotes[-3:] == ["ادمین گروه", "لغو ادمین گروه", "تماس با سازنده : @OSINE2"]
+    assert quotes[-2:] == ["ادمین گروه\nلغو ادمین گروه", "تماس با سازنده : @OSINE2"]
+    assert "ادمین گروه" not in quotes and "لغو ادمین گروه" not in quotes
     assert title in bolds and "ادمین گروه" in bolds and "لغو ادمین گروه" in bolds
     assert all(sum(isinstance(ent, types.MessageEntityBlockquote) for ent in entities)
                <= MAX_QUOTES_PER_MESSAGE for _, entities in ADMIN_HELP_MESSAGES)

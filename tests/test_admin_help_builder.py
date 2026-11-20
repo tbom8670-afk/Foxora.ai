@@ -60,8 +60,8 @@ def test_blocks_count_and_contact():
     # + ۱ بلوک «مرخصی ادمین»
     # + ۱ بلوک «محدودیت دستورات»
     # + ۱ بلوک «سپر محافظتی» (سپر روشن/سپر خاموش) = ۶۰)
-    # + ۲ نقل‌قول جداگانهٔ «ادمین گروه» / «لغو ادمین گروه» = ۶۲
-    assert len(bquote_entities) == 62
+    # + ۱ نقل‌قول دوسطریِ مشترکِ «ادمین گروه» / «لغو ادمین گروه» = ۶۱
+    assert len(bquote_entities) == 61
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -145,8 +145,8 @@ def test_blockquotes_span_exact_lines():
     # + ۱ نقل‌قولِ «محدودیت دستورات»
     # + ۱ نقل‌قولِ «مرخصی ادمین»
     # + ۱ نقل‌قولِ «محدودیت دستورات»
-    # + ۱ نقل‌قولِ «سپر محافظتی» = ۶۰؛ دو نقل‌قولِ گروه = ۶۲.
-    assert len(bquote_entities) == 62
+    # + ۱ نقل‌قولِ «سپر محافظتی» = ۶۰؛ نقل‌قول دوسطریِ گروه = ۶۱.
+    assert len(bquote_entities) == 61
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -289,6 +289,20 @@ def test_handler_admin_help_integration():
 # ---------------------------------------------------------------------------
 #  تکه‌تکه ارسال (محدودیت نقل‌قول سروش‌پلاس)
 # ---------------------------------------------------------------------------
+def test_group_admin_commands_share_one_two_line_real_quote():
+    assert len(ADMIN_HELP_MESSAGES) == 2
+    text, entities = ADMIN_HELP_MESSAGES[1]
+    quotes = [_slice_u16(text, entity.offset, entity.length)
+              for entity in entities if isinstance(entity, MessageEntityBlockquote)]
+    bolds = [_slice_u16(text, entity.offset, entity.length)
+             for entity in entities if isinstance(entity, MessageEntityBold)]
+    assert quotes[-2:] == ["ادمین گروه\nلغو ادمین گروه",
+                           "تماس با سازنده : @OSINE2"]
+    assert "ادمین گروه" not in quotes and "لغو ادمین گروه" not in quotes
+    assert "🌐 برای اضافه کردن یک کاربر به ادمین های گروه" in bolds
+    assert "ادمین گروه" in bolds and "لغو ادمین گروه" in bolds
+
+
 def test_messages_are_chunked_to_avoid_lost_quotes():
     """سروش‌پلاس نقل‌قول‌های اضافیِ یک پیام بلند را بی‌صدا حذف می‌کند.
 
@@ -299,7 +313,7 @@ def test_messages_are_chunked_to_avoid_lost_quotes():
     chunks = ADMIN_HELP_MESSAGES
     assert len(chunks) == 2, "بلوک جدید باید داخل پیام دومِ همان لیست باشد"
     assert [sum(isinstance(entity, MessageEntityBlockquote)
-                for entity in entities) for _, entities in chunks] == [31, 31]
+                for entity in entities) for _, entities in chunks] == [31, 30]
 
     total_quotes = 0
     for text, entities in chunks:

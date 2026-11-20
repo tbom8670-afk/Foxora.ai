@@ -34,8 +34,8 @@ GROWTH_HELP_TEXT = (
 READY_BLOCK = object()
 
 #: ⚠️ ارسال همهٔ نقل‌قول‌های لیست در یک پیام، برخی نقل‌قول‌های آخر را
-#: در سروش‌پلاس بی‌اثر می‌کند. ۶۲ نقل‌قول فعلی بین *همان دو پیامِ موجود*
-#: به‌صورت ۳۱/۳۱ تقسیم می‌شوند؛ بلوک «ادمین گروه» نباید پیام سومی بسازد.
+#: در سروش‌پلاس بی‌اثر می‌کند. ۶۱ نقل‌قول فعلی بین *همان دو پیامِ موجود*
+#: به‌صورت ۳۱/۳۰ تقسیم می‌شوند؛ بلوک «ادمین گروه» نباید پیام سومی بسازد.
 #: هر نقل‌قول و Bold قدیمی سر جای خود می‌ماند. نمایش ۳۱ نقل‌قول در نسخهٔ
 #: سروشِ نصب‌شده هنوز نیازمند تأییدِ تصویری/زنده است؛ این عدد سقفِ قطعی
 #: همهٔ نسخه‌های سرور فرض نشده است.
@@ -365,21 +365,20 @@ def _admin_rows():
     )
 
     # راهنمای مدیریت ادمینِ واقعی گروه — مستقل از «ثبت/لغو ادمین» ربات.
-    # هر فرمان یک نقل‌قول واقعی جدا و Bold واقعی دارد؛ خط خالی‌ها عین
-    # نمونهٔ داده‌شده‌اند (نه گیومه/Markdown داخل متن خام).
+    # هر دو فرمان پشت‌سرهم در یک نقل‌قولِ دوخطی واقعی‌اند؛ عنوان و هر
+    # فرمان Bold واقعی خود را دارند. این بلوک در پیام دوم باقی می‌ماند.
     group_admin_title = "🌐 برای اضافه کردن یک کاربر به ادمین های گروه"
     group_admin_add = "ادمین گروه"
     group_admin_remove = "لغو ادمین گروه"
-    group_admin_text = (
-        f"{group_admin_title}\n\n{group_admin_add}\n\n{group_admin_remove}"
-    )
+    group_admin_commands = f"{group_admin_add}\n{group_admin_remove}"
+    group_admin_text = f"{group_admin_title}\n\n{group_admin_commands}"
     add_offset = _u16(group_admin_title + "\n\n")
-    remove_offset = _u16(group_admin_title + "\n\n" + group_admin_add + "\n\n")
+    remove_offset = add_offset + _u16(group_admin_add + "\n")
     rows.append((group_admin_text, [
         MessageEntityBold(offset=0, length=_u16(group_admin_title)),
-        MessageEntityBlockquote(offset=add_offset, length=_u16(group_admin_add)),
+        MessageEntityBlockquote(offset=add_offset,
+                                length=_u16(group_admin_commands)),
         MessageEntityBold(offset=add_offset, length=_u16(group_admin_add)),
-        MessageEntityBlockquote(offset=remove_offset, length=_u16(group_admin_remove)),
         MessageEntityBold(offset=remove_offset, length=_u16(group_admin_remove)),
     ]))
 

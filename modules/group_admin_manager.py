@@ -389,10 +389,12 @@ async def _verify(bot, channel, participant_peer, user_id, predicate):
 async def promote(bot, chat_id, actor_id, target, rank, choices):
     """One native promotion with title+rights, plus read-back.
 
-    Never write admins.json.  Timeout/unknown verification is NOT reported as
-    success.  A mismatched/partial read is not grounds for automatic demotion:
-    ``promoted_by`` alone cannot prove this exact write created the admin (a
-    pre-existing admin may have been promoted by the same bot).
+    Never write admins.json.  A role explicitly read back as admin may be
+    reported as *admin*, even when its optional title/rights are unavailable:
+    the user-facing message asks the owner to inspect those details, without
+    claiming they were verified.  An unreadable role is never called success.
+    Neither case triggers automatic demotion: ``promoted_by`` alone does not
+    prove that this particular write created the role.
     """
     require_owner(chat_id, actor_id)
     rank = validate_rank(rank)
@@ -432,13 +434,20 @@ async def promote(bot, chat_id, actor_id, target, rank, choices):
     if confirmed:
         return user_id
     if observed is not None and _admin(observed):
-        # A partial admin listing can omit rank/rights.  Even promoted_by ==
-        # bot_id cannot prove this exact write created that role.  Never send
-        # a destructive second EditAdminRequest based on such a read.
-        raise UncertainOperation(
-            "⚠️ ادمینی در سرور دیده شد، اما لقب یا دسترسی‌ها تأیید نشد؛ "
-            "برای جلوگیری از عزل ناخواسته، وضعیت گروه را بررسی کنید."
-        ) from write_error
+        # The server positively reports this user as admin, but may omit rank
+        # or rights in a participant-list response.  The visible reply only
+        # confirms the role and explicitly asks the owner to check management;
+        # it does NOT claim that the selected title/rights were verified.  Do
+        # not issue a destructive rollback for an already-existing admin.
+        logger = getattr(bot, "logger", None)
+        if logger is not None:
+            try:
+                logger.log_info(
+                    "NATIVE GROUP ADMIN ROLE SEEN, DETAILS UNVERIFIED "
+                    f"group={chat_id} user={user_id} write_error={write_error!r}")
+            except Exception:
+                pass
+        return user_id
     if observed is None:
         raise UncertainOperation(
             "⚠️ پاسخ سرور برای لقب و دسترسی‌ها قابل بررسی نیست؛ "

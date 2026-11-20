@@ -266,7 +266,7 @@ async def _continue(bot, event, chat_id, actor_id, raw, state):
     finally:
         if _FLOWS.get(_key(chat_id, actor_id)) is state:
             _FLOWS.pop(_key(chat_id, actor_id), None)
-    await _reply(event, texts.promoted(state.label, state.rank))
+    await _reply(event, texts.promoted(state.label))
 
 
 async def handle(bot, event, chat_id, actor_id, sender, raw, logger=None):
