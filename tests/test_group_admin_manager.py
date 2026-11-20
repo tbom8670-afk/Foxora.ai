@@ -508,6 +508,15 @@ def test_real_message_pipeline_reaches_independent_handler(setup, monkeypatch):
     assert bot.client.edits[0].rank == "مدیر آزاد"
     assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipantAdmin)
 
+    # The actual group message route sends precisely the two original help
+    # messages: the new block and contact are in the SECOND, not a third.
+    help_event = PipelineEvent("لیست ادمینی")
+    run(main_handler.handle_new_message(bot, help_event))
+    assert len(help_event.replies) == 2, (help_event.replies, bot.logger.errors)
+    assert "🌡 برای روشن کردن حالت بحرانی" in help_event.replies[1]
+    assert "🌐 برای اضافه کردن یک کاربر به ادمین های گروه" in help_event.replies[1]
+    assert help_event.replies[1].endswith("تماس با سازنده : @OSINE2")
+
 
 def test_exclusive_temporary_admin_cannot_be_overwritten_or_auto_regranted(
         setup, monkeypatch):
@@ -589,13 +598,17 @@ def test_exact_admin_help_two_real_quotes_and_three_real_bolds(setup):
     assert ADMIN_HELP_TEXT.count(expected) == 1
     assert '"ادمین گروه"' not in ADMIN_HELP_TEXT
     fragment = [chunk for chunk in ADMIN_HELP_MESSAGES if expected in chunk[0]]
-    assert len(fragment) == 1  # a block is not split between messages
+    assert len(ADMIN_HELP_MESSAGES) == 2
+    assert len(fragment) == 1  # in the existing second help message
     text, entities = fragment[0]
+    assert text == ADMIN_HELP_MESSAGES[-1][0]
+    assert text.index("🌡 برای روشن کردن حالت بحرانی") \
+        < text.index(expected) < text.index("تماس با سازنده : @OSINE2")
     quotes = [_slice_entity(text, entity) for entity in entities
               if isinstance(entity, types.MessageEntityBlockquote)]
     bolds = [_slice_entity(text, entity) for entity in entities
              if isinstance(entity, types.MessageEntityBold)]
-    assert quotes == ["ادمین گروه", "لغو ادمین گروه", "تماس با سازنده : @OSINE2"]
+    assert quotes[-3:] == ["ادمین گروه", "لغو ادمین گروه", "تماس با سازنده : @OSINE2"]
     assert title in bolds and "ادمین گروه" in bolds and "لغو ادمین گروه" in bolds
     assert all(sum(isinstance(ent, types.MessageEntityBlockquote) for ent in entities)
                <= MAX_QUOTES_PER_MESSAGE for _, entities in ADMIN_HELP_MESSAGES)

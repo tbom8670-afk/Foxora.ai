@@ -215,12 +215,14 @@ def test_message_limit_admin_help_block():
     assert expected_full in bold_slices
     assert expected_quote in quote_slices
 
-    # این بلوک همراه «متخلف» در همان پیام می‌ماند. بخش تازهٔ ادمینِ گروه
-    # به پیام سوم می‌رود تا سقف ۳۰ نقل‌قولِ واقعیِ هر پیام نقض نشود.
-    assert len(ADMIN_HELP_MESSAGES) == 3
+    # بلوک تازهٔ «ادمین گروه» نیز در همین پیام دوم و کنار بخش‌های قبلی است؛
+    # هیچ پیامِ سومِ مستقل برای آن ارسال نمی‌شود.
+    assert len(ADMIN_HELP_MESSAGES) == 2
     block_chunk_text = next(text for text, _ in ADMIN_HELP_MESSAGES
                             if expected_full in text)
     assert "⛔️ : برای اینکه یک کاربر" in block_chunk_text
+    assert "🌐 برای اضافه کردن یک کاربر به ادمین های گروه" in block_chunk_text
+    assert "تماس با سازنده : @OSINE2" in block_chunk_text
     assert (ADMIN_HELP_TEXT.index("⛔️ : برای اینکه یک کاربر")
             < ADMIN_HELP_TEXT.index(expected_full)
             < ADMIN_HELP_TEXT.index("تماس با سازنده : @OSINE2"))
@@ -246,7 +248,7 @@ def test_group_shutdown_admin_help_block():
     ]
     assert expected_full in bold_slices
     assert expected_quote in quote_slices
-    assert len(ADMIN_HELP_MESSAGES) == 3
+    assert len(ADMIN_HELP_MESSAGES) == 2
     block_chunk_text = next(text for text, _ in ADMIN_HELP_MESSAGES
                             if expected_full in text)
     assert block_chunk_text.index("🛎 برای ایجاد محدودیت ارسال پیام") \
@@ -295,7 +297,9 @@ def test_messages_are_chunked_to_avoid_lost_quotes():
     * هیچ ردیفی بین دو تکه نصف نشود باشد (هر تکه با «\\n\\n» کامل جدا شود).
     """
     chunks = ADMIN_HELP_MESSAGES
-    assert len(chunks) >= 2, "لیست باید حداقل دو تکه شود"
+    assert len(chunks) == 2, "بلوک جدید باید داخل پیام دومِ همان لیست باشد"
+    assert [sum(isinstance(entity, MessageEntityBlockquote)
+                for entity in entities) for _, entities in chunks] == [31, 31]
 
     total_quotes = 0
     for text, entities in chunks:
