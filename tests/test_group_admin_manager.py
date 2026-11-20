@@ -371,7 +371,7 @@ def test_missing_rank_reports_observed_admin_without_claiming_title(setup):
     send(bot, "لقب دلخواه")
     result = send(bot, "هیچکدام")
     assert result.sent[-1][0] == (
-        "⚙ کاربر : سارا\nادمین گروه شد مدیریت گروه را بررسی کنید")
+        "⚙ کاربر : سارا\n\nادمین گروه شد مدیریت گروه را برسی کنید")
     assert "لقب دلخواه" not in result.sent[-1][0]
     assert len(bot.client.edits) == 1
     assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipantAdmin)
@@ -805,7 +805,7 @@ def test_replied_user_can_be_promoted_when_recent_omits_them(
     send(bot, "لقب")
     promoted = send(bot, "هیچکدام")
     assert promoted.sent[-1][0] == (
-        "⚙ کاربر : سارا\nادمین گروه شد مدیریت گروه را بررسی کنید")
+        "⚙ کاربر : سارا\n\nادمین گروه شد مدیریت گروه را برسی کنید")
     assert client.lookups == [(1234, 4)]  # resolved from this group's reply
     assert len(client.edits) == 1
     assert client.edits[0].user_id.user_id == 101
@@ -925,7 +925,7 @@ def test_fallback_checks_bot_add_admins_right_and_partial_rank(setup):
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
     role_seen = send(bot, "هیچکدام")
-    assert "ادمین گروه شد مدیریت گروه را بررسی کنید" in role_seen.sent[-1][0]
+    assert "ادمین گروه شد مدیریت گروه را برسی کنید" in role_seen.sent[-1][0]
     assert "لقب :" not in role_seen.sent[-1][0]
     assert len(client.edits) == 1
     assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
@@ -991,7 +991,7 @@ def test_ambiguous_write_with_changed_admin_must_not_auto_demote(
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
     role_seen = send(bot, "هیچکدام")
-    assert "ادمین گروه شد مدیریت گروه را بررسی کنید" in role_seen.sent[-1][0]
+    assert "ادمین گروه شد مدیریت گروه را برسی کنید" in role_seen.sent[-1][0]
     assert "شخص دیگر" not in role_seen.sent[-1][0]
     assert len(client.edits) == 1  # no second, destructive EditAdminRequest
     assert client.roles[1234, 101].rank == "شخص دیگر"
@@ -1044,9 +1044,9 @@ def test_success_message_exact_text_and_bold_entities(setup):
     from modules import group_admin_texts as texts
 
     text, entities = texts.promoted("@oert")
-    assert text == "⚙ کاربر : @oert\nادمین گروه شد مدیریت گروه را بررسی کنید"
+    assert text == "⚙ کاربر : @oert\n\nادمین گروه شد مدیریت گروه را برسی کنید"
     assert [_slice_entity(text, item) for item in entities
-            if isinstance(item, types.MessageEntityBold)] == text.split("\n")
+            if isinstance(item, types.MessageEntityBold)] == [line for line in text.split("\n") if line]
     assert not any(isinstance(item, types.MessageEntityBlockquote)
                    for item in entities)
     assert "⚠️" not in text and "لقب" not in text

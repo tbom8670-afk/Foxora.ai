@@ -61,7 +61,8 @@ def test_blocks_count_and_contact():
     # + ۱ بلوک «محدودیت دستورات»
     # + ۱ بلوک «سپر محافظتی» (سپر روشن/سپر خاموش) = ۶۰)
     # + ۱ نقل‌قول دوسطریِ مشترکِ «ادمین گروه» / «لغو ادمین گروه» = ۶۱
-    assert len(bquote_entities) == 61
+    # + ۱ نقل‌قول تک‌خطیِ «تگ ادمین ها» = ۶۲
+    assert len(bquote_entities) == 62
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -146,7 +147,8 @@ def test_blockquotes_span_exact_lines():
     # + ۱ نقل‌قولِ «مرخصی ادمین»
     # + ۱ نقل‌قولِ «محدودیت دستورات»
     # + ۱ نقل‌قولِ «سپر محافظتی» = ۶۰؛ نقل‌قول دوسطریِ گروه = ۶۱.
-    assert len(bquote_entities) == 61
+    # + ۱ نقل‌قول «تگ ادمین ها» = ۶۲.
+    assert len(bquote_entities) == 62
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -171,7 +173,8 @@ def test_bold_entities_content():
     # + ۱ بلوکِ «⚠️ محدودیت دستورات» (کلِ متن Bold)
     # + ۱ هدرِ «🌡 سپر محافظتی» + 2 دستورِ Boldِ «سپر روشن/سپر خاموش»
     # + عنوان و دو دستورِ Bold برای «ادمین گروه» = ۷۰
-    assert len(bold_entities) == 70
+    # + عنوان و دستورِ Bold برای «تگ ادمین ها» = ۷۲
+    assert len(bold_entities) == 72
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
@@ -303,6 +306,24 @@ def test_group_admin_commands_share_one_two_line_real_quote():
     assert "ادمین گروه" in bolds and "لغو ادمین گروه" in bolds
 
 
+def test_tag_admins_help_is_bold_and_quoted_in_second_message():
+    """The title and command are real Bold; only the command is quoted."""
+    assert len(ADMIN_HELP_MESSAGES) == 2
+    text, entities = ADMIN_HELP_MESSAGES[1]
+    title = "🦊برای تگ کردن ادمین های ثبت شده و گروه"
+    command = "تگ ادمین ها"
+    bolds = [_slice_u16(text, e.offset, e.length) for e in entities
+             if isinstance(e, MessageEntityBold)]
+    quotes = [_slice_u16(text, e.offset, e.length) for e in entities
+              if isinstance(e, MessageEntityBlockquote)]
+    assert f"{title}\n{command}" in text
+    assert title in bolds and command in bolds
+    assert quotes[-3:] == [command, "ادمین گروه\nلغو ادمین گروه",
+                           "تماس با سازنده : @OSINE2"]
+    assert title not in quotes
+    assert command not in ADMIN_HELP_MESSAGES[0][0]
+
+
 def test_messages_are_chunked_to_avoid_lost_quotes():
     """سروش‌پلاس نقل‌قول‌های اضافیِ یک پیام بلند را بی‌صدا حذف می‌کند.
 
@@ -313,7 +334,7 @@ def test_messages_are_chunked_to_avoid_lost_quotes():
     chunks = ADMIN_HELP_MESSAGES
     assert len(chunks) == 2, "بلوک جدید باید داخل پیام دومِ همان لیست باشد"
     assert [sum(isinstance(entity, MessageEntityBlockquote)
-                for entity in entities) for _, entities in chunks] == [31, 30]
+                for entity in entities) for _, entities in chunks] == [31, 31]
 
     total_quotes = 0
     for text, entities in chunks:

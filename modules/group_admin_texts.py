@@ -77,8 +77,8 @@ def rights_board(label, choices):
 def promoted(label):
     message = _Message()
     message.add(f"⚙ کاربر : {label}", bold=True)
-    message.add("\n")
-    message.add("ادمین گروه شد مدیریت گروه را بررسی کنید", bold=True)
+    message.add("\n\n")
+    message.add("ادمین گروه شد مدیریت گروه را برسی کنید", bold=True)
     return message.done()
 
 

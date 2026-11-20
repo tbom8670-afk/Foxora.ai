@@ -64,6 +64,8 @@ from modules import speed_bomb as _speed_bomb
 from handlers.photo_download_handler import handle as handle_photo_download
 # 👑 مدیریت ادمین واقعی گروه: فقط مالک ثبت‌شده، مستقل از admins.json.
 from handlers import group_admin_handler as native_group_admin
+# 🦊 منشنِ یک‌بارهٔ ادمین‌های واقعی و ثبت‌شدهٔ همین گروه.
+from modules import admin_tagging
 # ⏳ تاریخ انقضای گروه — قابلیتی کاملاً مستقل با مسیر پردازش جدا.
 from handlers.group_expiry_handler import (
     EXPIRED_NOTICE as GROUP_EXPIRED_NOTICE,
@@ -1949,13 +1951,14 @@ def _is_management_command(text):
     return int(priority) <= PRIORITY_ADMIN
 
 
-# Owner-only commands authorize with is_global_owner. A native
-# get_permissions RTT (~1.7s) cannot change that decision.
+# These commands authorize from registered owners/bot admins (not native
+# roles). A native get_permissions RTT cannot change that decision.
 _OWNER_ONLY_NATIVE_SKIP = frozenset({
     "فعال", "غیر فعال", "فعال سازی", "کپی بورد", "کپی",
     "ثبت گروه", "حذف گروه",
     "ثبت مالک", "لغو مالک", "برکناری مالک",
     "ادمین گروه", "لغو ادمین گروه",  # only groups.json owner_id, no native bypass
+    "تگ ادمین ها",  # groups.json owner_id or admins.json; never native-only
 })
 
 
@@ -4216,7 +4219,7 @@ def cleanup_expired_handler_state(bot, now=None):
 _INTERNAL_EXACT_COMMANDS = frozenset({
     "تست دکمه", "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
     "سرگرمی خاموش", "سرگرمی فعال",
-    "لیست کاربران", "لیست ادمین", "لیست ادمینی", "آمارم", "بیوگرافی",
+    "لیست کاربران", "لیست ادمین", "لیست ادمینی", "تگ ادمین ها", "آمارم", "بیوگرافی",
     "یاد آوری", "ترجمه", "قفل", "باز", "جک", "تصحیح کلمات",
     "اسم فامیل", "اسم چین", "اسم‌چین", "جدولستان", "بازی جدولستان",
     "پازل کلمه", "پازل کلمات", "پازل",
@@ -6446,6 +6449,15 @@ async def handle_new_message(bot, event):
                     except Exception:
                         pass
                 return
+
+        # 🦊 یک پیامِ منشنِ واقعی به‌ازای هر ادمینِ گروه/ربات. این مسیر بعد
+        # از کنترل انقضا و پیش از اسکن‌ها و دستورهای سنگین قرار دارد؛ فقط
+        # مالک/ادمین ثبت‌شده مجاز است، و ویرایشِ پیام تگِ دوباره نمی‌فرستد.
+        if clean_text == admin_tagging.COMMAND and not event.is_private:
+            await admin_tagging.handle(
+                bot, event, chat_id, user_id, sender, clean_text,
+                edited=is_edited_message)
+            return
 
         # ------------------------------------------------------------------
         # ⏳ «مهلت گروه» — نمایش مهلت باقی‌ماندهٔ همین گروه به مالک/ادمین.
