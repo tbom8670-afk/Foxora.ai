@@ -260,6 +260,14 @@ def add(chat_id, user_id, coin_type, amount, *, kind=ledger.KIND_RECEIVE,
             user["name"] = str(name)
         if win:
             user["wins"] = int(user.get("wins", 0)) + 1
+            # 🏅 برد per-game برای «استاد بازی» در کارت دستاورد؛ فقط
+            # همین‌جا که جایزه واقعاً پرداخت شده (مرجع تکراری بالاتر
+            # برگشته) و فقط با نام بازیِ داخل note — بدون حدس.
+            try:
+                from modules import user_achievements
+                user_achievements.record_game_win(chat_id, user_id, note)
+            except Exception:
+                pass
         total = _refresh_total(data, user)
         ledger.record(
             data, key, kind, {coin_type: amount},

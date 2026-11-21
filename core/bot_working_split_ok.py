@@ -41,6 +41,7 @@ from economy import flush as flush_economy, settle_previous_days
 from economy import upgrade_migration
 from modules.group_stats import flush as flush_group_stats
 from modules.user_activity import flush as flush_user_activity
+from modules.user_achievements import flush as flush_user_achievements
 from modules.game_progress_storage import flush_all as flush_game_progress
 from modules.reminders import due as due_reminders, mark_sent as mark_reminder_sent
 from modules.moderation_queue import ModerationQueue
@@ -1598,6 +1599,7 @@ class SoroushAntiSpamBot:
                 try:
                     await asyncio.to_thread(flush_group_stats)
                     await asyncio.to_thread(flush_user_activity)
+                    await asyncio.to_thread(flush_user_achievements)
                     await asyncio.to_thread(flush_game_progress)
                     await asyncio.to_thread(flush_economy)
                     await asyncio.to_thread(self.tracker.save, True)
