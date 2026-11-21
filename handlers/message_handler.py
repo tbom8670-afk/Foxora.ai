@@ -192,6 +192,7 @@ from modules import entertainment_control
 from modules.group_dispatch import PRIORITY_ADMIN, classify_priority
 # 🗂 سیستم سابقه‌ها و 🏆 سطح گروه — دو قابلیتِ مستقل با فایل و ماژولِ جدا.
 from modules import user_history
+from modules import user_achievements
 from modules import group_level
 from modules import bot_detector
 from modules import ad_name_detector
@@ -4346,7 +4347,7 @@ def cleanup_expired_handler_state(bot, now=None):
 _INTERNAL_EXACT_COMMANDS = frozenset({
     "تست دکمه", "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
     "سرگرمی خاموش", "سرگرمی فعال",
-    "لیست کاربران", "لیست ادمین", "لیست ادمینی", "تگ ادمین ها", "آمارم", "بیوگرافی",
+    "لیست کاربران", "لیست ادمین", "لیست ادمینی", "تگ ادمین ها", "آمارم", "دستاورد", "بیوگرافی",
     "یاد آوری", "ترجمه", "قفل", "باز", "جک", "تصحیح کلمات",
     "اسم فامیل", "اسم چین", "اسم‌چین", "جدولستان", "بازی جدولستان",
     "پازل کلمه", "پازل کلمات", "پازل",
@@ -4385,7 +4386,7 @@ def _is_known_internal_command(clean_text, chat_id, user_id):
     if clean_text.startswith((
         "ثبت ", "ثبت اسم ", "شخصیت ", "جستجو ", "فونت ",
         "فیلتر کلمه", "حذف کلمه", "افزودن کلمه", "ثبت کلمه",
-        "لیست کلمات", "پاک کردن کلمات",
+        "لیست کلمات", "پاک کردن کلمات", "دستاورد ",
     )):
         return True
     # During a game, answers must be delivered to that game's existing handler
@@ -5394,6 +5395,13 @@ async def handle_new_message(bot, event):
                     bot, "user_activity", record_activity,
                     chat_id, user_id, event.message,
                 )
+                _run_background(
+                    bot, "user_achievements",
+                    user_achievements.record_message,
+                    chat_id, user_id,
+                    getattr(sender, "username", "") or "",
+                    _display_name_of(sender),
+                )
             return
 
         _debug_log(bot,
@@ -5609,7 +5617,7 @@ async def handle_new_message(bot, event):
                 "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
                 "اسم چین", "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
                 "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "زامبی", "گروه آخرالزمان",
-                "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه",
+                "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه", "دستاورد",
                 "فعال", "غیر فعال", "فعال سازی",
                 "کپی بورد", "کپی",
                 "ثبت مالک", "لغو مالک", "برکناری مالک",
@@ -5619,6 +5627,7 @@ async def handle_new_message(bot, event):
                 "نمودار",
             }
             or norm_cmd_text.startswith((
+                "دستاورد @",
                 "سکوت نام", "اخراج نام",
                 "فیلتر اسم", "لغو اسم", "فیلتر نام", "لغو نام",
                 "لغو فیلتر اسم", "حذف فیلتر اسم", "رفع فیلتر اسم",
@@ -6839,6 +6848,14 @@ async def handle_new_message(bot, event):
         if not event.is_private and not fast_command:
             _run_background(
                 bot, "user_activity", record_activity, chat_id, user_id, event.message
+            )
+            # 🏅 روز فعالیت «دستاورد کاربران» کنار همان ثبت فعالیت پیام.
+            _run_background(
+                bot, "user_achievements",
+                user_achievements.record_message,
+                chat_id, user_id,
+                getattr(sender, "username", "") or "",
+                _display_name_of(sender),
             )
         sender_username = getattr(sender, "username", None)
         # فرمان‌های سریع permission مخصوص خود را در branch فرمان بررسی می‌کنند.
@@ -8828,6 +8845,9 @@ async def handle_new_message(bot, event):
                 "آمار یک کاربر:\n"
                 "برای دریافت آمار بنویسید:\n"
                 "آمارم\n\n"
+                "برای دستاورد ها و دیدن فعالیت خود یا کاربر بنویسید:\n"
+                "دستاورد\n"
+                "دستاورد @aifox\n\n"
                 "برای گرفتن بیوگرافی:\n"
                 "بیوگرافی\n\n"
                 "📥 دانلود عکس مستقیم:\n"
@@ -9010,6 +9030,7 @@ async def handle_new_message(bot, event):
                 "برای نمایش اصل بنویسید:",
                 "آمار یک کاربر:",
                 "برای دریافت آمار بنویسید:",
+                "برای دستاورد ها و دیدن فعالیت خود یا کاربر بنویسید:",
                 "برای گرفتن بیوگرافی:",
                 "📥 دانلود عکس مستقیم:",
                 "برای دانلود عکس به صورت مستقیم، بنویسید:",
@@ -9528,6 +9549,30 @@ async def handle_new_message(bot, event):
                 entities.append(MessageEntityBlockquote(offset=ranking_u16(ranking_text[:cursor]), length=ranking_u16(entry)))
                 cursor += len(entry) + 2
             await event.reply(ranking_text, formatting_entities=entities)
+            return
+
+        _achievement_parsed = user_achievements.parse_command(clean_text)
+        if _achievement_parsed is not None:
+            # 🏅 «دستاورد» / «دستاورد @username» — خروجی دقیقاً همان قالب
+            # مصوب کارت است؛ هیچ عنوان یا متن اضافه‌ای ارسال نمی‌شود.
+            try:
+                user_achievements.record_message(
+                    chat_id, user_id,
+                    getattr(sender, "username", "") or "",
+                    _display_name_of(sender),
+                )
+            except Exception:
+                pass
+            _achievement_kind, _achievement_username = _achievement_parsed
+            if _achievement_kind == "user":
+                _target_id, _target_display = user_achievements.resolve_target(
+                    chat_id, _achievement_username)
+                await event.reply(user_achievements.build_card(
+                    chat_id, _target_id, display=_target_display))
+            else:
+                await event.reply(user_achievements.build_card(
+                    chat_id, user_id,
+                    display=_format_admin_display(sender)))
             return
 
         if clean_text == "آمارم":

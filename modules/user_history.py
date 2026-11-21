@@ -212,6 +212,13 @@ def add_record(chat_id, user, kind, reason="", user_id=None):
     records.append(record)
     if len(records) > MAX_RECORDS_PER_USER:
         del records[:-MAX_RECORDS_PER_USER]
+    # 🏅 شمارندهٔ تجمعی تخلف برای «دستاورد کاربران»: جدا از این سابقهٔ
+    # ۲۴ساعته زیاد می‌شود تا با ریست خودکار این فایل از بین نرود.
+    try:
+        from modules import user_achievements
+        user_achievements.record_violation(chat_id, user_id)
+    except Exception:
+        pass
     # Save even when only the key form changed, so future reads are stable.
     _save(data)
     return record
