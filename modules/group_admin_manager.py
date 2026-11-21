@@ -8,15 +8,19 @@ and no changes to the existing bot-admin or «اختصاصی» systems.
 SPlusthon 1.1.4 (and the project's existing «اختصاصی» route) uses
 channels.EditAdminRequest(channel, user_id, ChatAdminRights, rank).  ``rank``
 is the actual custom administrator title.  Some Soroush servers reject
-GetParticipantRequest with 422 NOT_SUPPORTED: use fresh, paginated
-GetParticipantsRequest reads instead, never treating a partial list as a
-negative.  A zero-rights promotion would be a demotion on this API, so it is
-never sent as a promotion.
+GetParticipantRequest with 422 NOT_SUPPORTED.  For promotion, the target comes
+from the replied-to message: an unavailable target-role read must not require
+a member/admin list scan before trying EditAdminRequest.  Explicitly known
+nonmembers still cannot be promoted.  Bot-right checks, demotion, and
+post-write verification can use fresh, paginated GetParticipantsRequest reads;
+a partial list is never proof of a negative.  A zero-rights promotion would
+be a demotion on this API, so it is never sent as a promotion.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 
 from modules.group_actions import GroupActions
@@ -28,6 +32,11 @@ try:
     from splusthon.tl import functions, types
 except ImportError:  # Fail closed on an incomplete Termux installation.
     utils = functions = types = None
+
+try:
+    from splusthon.errors import UserNotParticipantError
+except ImportError:  # Older library versions may expose only a raw RPC code.
+    UserNotParticipantError = None
 
 
 # The six rights visible in Soroush Plus's group administrator screen.  These
@@ -204,6 +213,22 @@ def _role_id(role):
     return _target_id(getattr(role, "peer", role))
 
 
+def _confirmed_nonmember_error(error):
+    """Only an explicit server 'not a participant' code proves departure."""
+    return ((UserNotParticipantError is not None
+             and isinstance(error, UserNotParticipantError))
+            or type(error).__name__ == "UserNotParticipantError"
+            or bool(re.search(r"\bUSER_NOT_PARTICIPANT\b",
+                              f"{getattr(error, 'message', '')} {error}".upper())))
+
+
+def _confirmed_left(role):
+    # A Banned role with left=False is a *restricted member*, not an exit.
+    return (isinstance(role, types.ChannelParticipantLeft)
+            or (isinstance(role, types.ChannelParticipantBanned)
+                and getattr(role, "left", None) is True))
+
+
 async def _scan_roles(bot, channel, filter_type, expected_id, *, max_pages,
                       admins_only=False):
     """Find a positively identified role, or prove a *complete* filter list.
@@ -284,21 +309,52 @@ async def _read_via_lists(bot, channel, expected_id, *, admins_only=False):
     return member if member is not None else not_admin
 
 
+async def _read_direct(bot, channel, participant_peer, expected_id):
+    result = await asyncio.wait_for(
+        bot.client(functions.channels.GetParticipantRequest(
+            channel=channel, participant=participant_peer)), READ_TIMEOUT)
+    participant = getattr(result, "participant", None)
+    if _role_id(participant) != expected_id:
+        raise RuntimeError("GetParticipantRequest returned a different user")
+    return participant
+
+
+async def _promotion_target_role(bot, channel, participant_peer, expected_id):
+    """Best-effort direct status, never a member-list prerequisite to write.
+
+    A replied-to sender's InputUser is already resolved from that group.
+    Unavailable/unsupported/malformed status is unknown, NOT 'left'; the edit
+    request itself can reject a departed user.  Only a positively identified
+    exit (including the specific RPC error) stops promotion in advance.
+    """
+    try:
+        return await _read_direct(bot, channel, participant_peer, expected_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        if _confirmed_nonmember_error(error):
+            raise GroupAdminError(
+                "❌ این کاربر از گروه خارج شده است؛ ارتقا انجام نشد."
+            ) from error
+        logger = getattr(bot, "logger", None)
+        if logger is not None:
+            try:
+                logger.log_info("NATIVE GROUP ADMIN TARGET STATUS UNKNOWN "
+                                f"user={expected_id} error={error!r}; trying edit")
+            except Exception:
+                pass
+        return None
+
+
 async def _read(bot, channel, participant_peer, expected_id, *, admins_only=False):
     try:
-        result = await asyncio.wait_for(
-            bot.client(functions.channels.GetParticipantRequest(
-                channel=channel, participant=participant_peer)), READ_TIMEOUT)
-        participant = getattr(result, "participant", None)
-        if _role_id(participant) != expected_id:
-            raise RuntimeError("GetParticipantRequest returned a different user")
-        return participant
+        return await _read_direct(bot, channel, participant_peer, expected_id)
     except asyncio.CancelledError:
         raise
     except Exception as error:
         # Documented by force_join_api: some Soroush servers answer
-        # channels.getParticipant with 422 NOT_SUPPORTED.  A fresh, typed
-        # participants list can also recover from other direct-read failures.
+        # channels.getParticipant with 422 NOT_SUPPORTED.  Bot rights,
+        # demotion and post-write verification may need a fresh role list.
         logger = getattr(bot, "logger", None)
         if logger is not None:
             try:
@@ -371,14 +427,16 @@ def _matches(participant, rank, choices):
                for flag, enabled in values.items())
 
 
-async def _verify(bot, channel, participant_peer, user_id, predicate):
+async def _verify(bot, channel, participant_peer, user_id, predicate, *,
+                  admins_only=False):
     """Read after a write, tolerating Soroush's short propagation delay."""
     observed = None
     for delay in VERIFY_DELAYS:
         if delay:
             await asyncio.sleep(delay)
         try:
-            observed = await _read(bot, channel, participant_peer, user_id)
+            observed = await _read(bot, channel, participant_peer, user_id,
+                                   admins_only=admins_only)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -405,26 +463,18 @@ async def promote(bot, chat_id, actor_id, target, rank, choices):
     if str(get_group_owner(chat_id)) == str(user_id):
         raise GroupAdminError("❌ مالک ثبت‌شدهٔ گروه را با این دستور تغییر ندهید.")
     _protect_existing_exclusive(chat_id, user_id)
-    try:
-        before = await _read(bot, channel, participant_peer, user_id)
-    except Exception as exc:
-        raise GroupAdminError("❌ وضعیت فعلی کاربر در گروه قابل بررسی نیست؛ ارتقا انجام نشد.") from exc
+    before = await _promotion_target_role(bot, channel, participant_peer, user_id)
     if _creator(before):
         raise GroupAdminError("❌ مالک اصلی گروه را نمی‌توان دوباره ادمین کرد.")
     if _admin(before):
         raise GroupAdminError("⚠️ این کاربر از قبل ادمین گروه است؛ دسترسی‌هایش تغییر نکرد.")
-    # _NoAdminInCompleteList means the *complete* admin list excludes this
-    # user; the Recent list cannot prove current ordinary membership (it may
-    # omit an older member even when we can resolve their group-message
-    # sender).  Do not turn that missing page into a denial.  Ask the server
-    # to edit the resolved InputUser and only announce success after an admin
-    # role is actually observed in the same group.  Explicit Left/Banned and
-    # unknown role types still fail closed; existing admins/creators were
-    # rejected above, and an incomplete admin list raises before any write.
-    if not isinstance(before, (types.ChannelParticipant,
-                               types.ChannelParticipantSelf,
-                               _NoAdminInCompleteList)):
-        raise GroupAdminError("❌ این کاربر عضو عادی گروه نیست؛ ارتقا انجام نشد.")
+    if _confirmed_left(before):
+        raise GroupAdminError("❌ این کاربر از گروه خارج شده است؛ ارتقا انجام نشد.")
+    # No admin/member-list search to locate a replied-to target.  Unknown
+    # status must not prevent the edit.  If a server cannot read the target's
+    # role, it is impossible to rule out a pre-existing admin: this request
+    # may replace that admin's rights.  The server decides whether the
+    # InputUser is still eligible; only a positive read-back proves the role.
     await _bot_promote_right(bot, channel)
     require_owner(chat_id, actor_id)  # owner may have changed while RPCs ran
     _protect_existing_exclusive(chat_id, user_id)
@@ -440,7 +490,11 @@ async def promote(bot, chat_id, actor_id, target, rank, choices):
         write_error = exc
     confirmed, observed = await _verify(
         bot, channel, participant_peer, user_id,
-        lambda participant: _matches(participant, rank, choices))
+        lambda participant: _matches(participant, rank, choices),
+        admins_only=True)  # No Recent/member scan needed to verify a grant.
+    if write_error is not None and _confirmed_nonmember_error(write_error):
+        # A definitive rejection cannot become success via a stale admin page.
+        raise GroupAdminError("❌ این کاربر از گروه خارج شده است؛ ارتقا انجام نشد.") from write_error
     if confirmed:
         return user_id
     if observed is not None and _admin(observed):

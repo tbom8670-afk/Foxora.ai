@@ -693,13 +693,17 @@ def test_422_not_supported_uses_fresh_tl_lists_for_promote_and_demote(setup):
     assert len(promoted.sent) == 1 and "ادمین گروه شد" in promoted.sent[0][0]
     assert bot.client.roles[1234, 101].rank == "لقب نیو"
     assert len(bot.client.edits) == 1
+    # Promotion never looks for the replied-to sender in Recent.  Admin-only
+    # lists are for verifying the bot's right and the result of the write.
     assert {type(req.filter) for req in bot.client.list_reads} == {
-        types.ChannelParticipantsAdmins, types.ChannelParticipantsRecent}
+        types.ChannelParticipantsAdmins}
     assert all(req.hash == 0 and req.limit == native.PARTICIPANT_PAGE_SIZE
                and req.channel.channel_id == 1234
                for req in bot.client.list_reads)
     assert (1234, 101) in bot.client.reads and (1234, 999) in bot.client.reads
     demoted = send(bot, "لغو ادمین گروه", reply_id=4)
+    assert {type(req.filter) for req in bot.client.list_reads} == {
+        types.ChannelParticipantsAdmins, types.ChannelParticipantsRecent}
     assert len(demoted.sent) == 1 and "از ادمینی گروه لغو شد" in demoted.sent[0][0]
     assert isinstance(bot.client.roles[1234, 101], types.ChannelParticipant)
     assert len(bot.client.edits) == 2
@@ -716,7 +720,7 @@ def test_422_not_supported_uses_fresh_tl_lists_for_promote_and_demote(setup):
         [True, True, True, True, True, False]
 
 
-def test_fallback_identifies_admin_by_role_id_not_user_array_order(setup):
+def test_demote_fallback_identifies_admin_by_role_id_not_user_array_order(setup):
     bot, _owners, _ = setup
     client = bot.client
     client.direct_unsupported = True
@@ -730,25 +734,21 @@ def test_fallback_identifies_admin_by_role_id_not_user_array_order(setup):
             chats=[], users=list(reversed(page.users)))
 
     client.list_override = reordered
-    send(bot, "ادمین گروه", reply_id=4)
-    send(bot, "لقب تازه")
-    already = send(bot, "هیچکدام")
-    assert "از قبل ادمین" in already.sent[-1][0]
-    assert not client.edits
-    assert client.roles[1234, 101].rank == "لقب قبلی"
     done = send(bot, "لغو ادمین گروه", reply_id=4)
     assert "از ادمینی گروه لغو شد" in done.sent[-1][0]
+    assert len(client.edits) == 1
     assert client.edits[-1].user_id.user_id == 101
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipant)
     assert client.roles[1234, 202].rank == "ادمین دیگر"
 
 
-def test_truncated_admin_page_never_overwrites_or_demotes_existing_admin(setup):
+def test_truncated_admin_page_does_not_block_grant_or_falsely_confirm_it(setup):
     bot, _owners, _ = setup
     client = bot.client
     client.direct_unsupported = True
     for user_id in range(1000, 1210):
         client.seed_admin(1234, User(user_id), message_id=user_id)
-    client.seed_admin(1234, User(101), rank="لقب قبلی")  # beyond page 0
+    client.add_user(1234, User(101))  # would appear beyond page 0 after grant
 
     def truncated(req):
         if isinstance(req.filter, types.ChannelParticipantsAdmins) \
@@ -759,22 +759,27 @@ def test_truncated_admin_page_never_overwrites_or_demotes_existing_admin(setup):
     client.list_override = truncated
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب تازه")
-    refused = send(bot, "هیچکدام")
-    assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    unknown = send(bot, "هیچکدام")
+    assert "موفقیت اعلام نشد" in unknown.sent[-1][0]
+    assert "ادمین گروه شد" not in unknown.sent[-1][0]
+    assert len(client.edits) == 1 and client.edits[0].user_id.user_id == 101
+    assert client.roles[1234, 101].rank == "لقب تازه"  # fake server applied it
+    assert any(req.offset == 200 for req in client.list_reads)  # read-back only
+    assert all(isinstance(req.filter, types.ChannelParticipantsAdmins)
+               for req in client.list_reads)
     refused = send(bot, "لغو ادمین گروه", reply_id=4)
     assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
-    assert not client.edits
-    assert client.roles[1234, 101].rank == "لقب قبلی"
-    assert any(req.offset == 200 for req in client.list_reads)
+    assert len(client.edits) == 1  # demotion still requires a known admin
     client.list_override = None
+    client.direct_unsupported = False
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب تازه")
     already = send(bot, "هیچکدام")
     assert "از قبل ادمین" in already.sent[-1][0]
-    assert not client.edits
+    assert len(client.edits) == 1
     done = send(bot, "لغو ادمین گروه", reply_id=4)
     assert "از ادمینی گروه لغو شد" in done.sent[-1][0]
-    assert client.edits[-1].user_id.user_id == 101
+    assert len(client.edits) == 2 and client.edits[-1].user_id.user_id == 101
 
 
 @pytest.mark.parametrize("recent", ("users_only", "empty", "capped"))
@@ -807,6 +812,8 @@ def test_replied_user_can_be_promoted_when_recent_omits_them(
     assert promoted.sent[-1][0] == (
         "⚙ کاربر : سارا\n\nادمین گروه شد مدیریت گروه را برسی کنید")
     assert client.lookups == [(1234, 4)]  # resolved from this group's reply
+    assert not any(isinstance(req.filter, types.ChannelParticipantsRecent)
+                   for req in client.list_reads)
     assert len(client.edits) == 1
     assert client.edits[0].user_id.user_id == 101
     assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
@@ -859,33 +866,146 @@ def test_recent_absence_and_stale_admin_list_are_not_false_success(setup):
     assert isinstance(client.roles[1234, 101], types.ChannelParticipantAdmin)
 
 
-@pytest.mark.parametrize("left_or_banned", ("left", "banned"))
-def test_explicit_nonmember_role_never_qualifies_for_promotion(
+@pytest.mark.parametrize("left_or_banned", ("left", "kicked"))
+def test_explicit_departure_role_prevents_promotion_without_a_list(
         setup, left_or_banned):
     bot, _owners, _ = setup
     client = bot.client
-    client.direct_unsupported = True
     client.add_user(1234, User(101))
     peer = types.PeerUser(user_id=101)
     client.roles[1234, 101] = (
         types.ChannelParticipantLeft(peer=peer) if left_or_banned == "left"
         else types.ChannelParticipantBanned(
-            peer=peer, kicked_by=999, date=None,
+            peer=peer, kicked_by=999, date=None, left=True,
             banned_rights=types.ChatBannedRights(until_date=None)))
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب")
     refused = send(bot, "هیچکدام")
-    assert "عضو عادی گروه نیست" in refused.sent[-1][0]
-    assert not client.edits
+    assert "از گروه خارج شده" in refused.sent[-1][0]
+    assert not client.edits and not client.list_reads
+
+
+def test_restricted_member_is_not_misclassified_as_departed(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.add_user(1234, User(101))
+    client.roles[1234, 101] = types.ChannelParticipantBanned(
+        peer=types.PeerUser(user_id=101), kicked_by=999, date=None,
+        banned_rights=types.ChatBannedRights(until_date=None), left=False)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    result = send(bot, "هیچکدام")
+    assert "ادمین گروه شد" in result.sent[-1][0]
+    assert len(client.edits) == 1 and client.edits[0].user_id.user_id == 101
+    assert not client.list_reads
+
+
+@pytest.mark.parametrize("error_kind", ("typed", "raw_code"))
+def test_explicit_not_participant_error_prevents_promotion_without_a_list(
+        setup, monkeypatch, error_kind):
+    from splusthon.errors import UserNotParticipantError
+
+    bot, _owners, _ = setup
+    client = bot.client
+    client.add_user(1234, User(101))
+    original = Client.__call__
+
+    async def not_participant(self, request):
+        if (isinstance(request, functions.channels.GetParticipantRequest)
+                and request.participant.user_id == 101):
+            self.reads.append((request.channel.channel_id, 101))
+            if error_kind == "typed":
+                raise UserNotParticipantError(request)
+            raise RuntimeError("RPCError 400: USER_NOT_PARTICIPANT")
+        return await original(self, request)
+
+    monkeypatch.setattr(Client, "__call__", not_participant)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "از گروه خارج شده" in refused.sent[-1][0]
+    assert not client.edits and not client.list_reads
+
+
+@pytest.mark.parametrize("read_problem", ("not_supported", "timeout", "wrong_user"))
+def test_replied_target_is_promoted_without_a_member_or_admin_list_precheck(
+        setup, monkeypatch, read_problem):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.add_user(1234, User(101))
+    original = Client.__call__
+
+    async def direct_unknown_until_edit(self, request):
+        if (isinstance(request, functions.channels.GetParticipantRequest)
+                and request.participant.user_id == 101 and not self.edits):
+            self.reads.append((request.channel.channel_id, 101))
+            if read_problem == "wrong_user":
+                return SimpleNamespace(participant=types.ChannelParticipant(
+                    user_id=202, date=None))
+            if read_problem == "timeout":
+                raise TimeoutError("target role read timed out")
+            raise RuntimeError("RPCError 422: NOT_SUPPORTED")
+        return await original(self, request)
+
+    monkeypatch.setattr(Client, "__call__", direct_unknown_until_edit)
+    client.list_override = lambda _req: (_ for _ in ()).throw(
+        RuntimeError("no participant list is readable"))
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    promoted = send(bot, "هیچکدام")
+    assert "ادمین گروه شد" in promoted.sent[-1][0]
+    assert client.lookups == [(1234, 4)]
+    assert len(client.edits) == 1 and client.edits[0].user_id.user_id == 101
+    assert not client.list_reads  # bot and post-write reads succeeded directly
+
+
+def test_departed_reply_with_unavailable_read_is_rejected_by_edit_server(
+        setup, monkeypatch):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.add_user(1234, User(101))
+    client.roles[1234, 101] = types.ChannelParticipantLeft(
+        peer=types.PeerUser(user_id=101))
+    original = Client.__call__
+
+    async def server_rejects_departed(self, request):
+        if (isinstance(request, functions.channels.GetParticipantRequest)
+                and request.participant.user_id == 101):
+            self.reads.append((request.channel.channel_id, 101))
+            raise RuntimeError("RPCError 422: NOT_SUPPORTED")
+        if isinstance(request, functions.channels.EditAdminRequest):
+            self.edits.append(request)
+            raise RuntimeError("RPCError 400: USER_NOT_PARTICIPANT")
+        return await original(self, request)
+
+    monkeypatch.setattr(Client, "__call__", server_rejects_departed)
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "از گروه خارج شده" in refused.sent[-1][0]
+    assert "ادمین گروه شد" not in refused.sent[-1][0]
+    assert len(client.edits) == 1 and client.edits[0].user_id.user_id == 101
+    assert isinstance(client.roles[1234, 101], types.ChannelParticipantLeft)
+    assert all(isinstance(req.filter, types.ChannelParticipantsAdmins)
+               for req in client.list_reads)
 
 
 @pytest.mark.parametrize("admin_page", ("missing_roles", "not_modified", "bad_count"))
-def test_malformed_admin_page_fails_closed_for_both_commands(
-        setup, admin_page):
+def test_malformed_admin_page_does_not_block_grant_but_cannot_confirm_it(
+        setup, monkeypatch, admin_page):
     bot, _owners, _ = setup
     client = bot.client
-    client.direct_unsupported = True
-    client.seed_admin(1234, User(101), rank="قبلی")
+    client.add_user(1234, User(101))
+    original = Client.__call__
+
+    async def target_unreadable(self, request):
+        if (isinstance(request, functions.channels.GetParticipantRequest)
+                and request.participant.user_id == 101):
+            self.reads.append((request.channel.channel_id, 101))
+            raise RuntimeError("RPCError 422: NOT_SUPPORTED")
+        return await original(self, request)
+
+    monkeypatch.setattr(Client, "__call__", target_unreadable)
 
     def broken(req):
         if isinstance(req.filter, types.ChannelParticipantsAdmins):
@@ -901,12 +1021,29 @@ def test_malformed_admin_page_fails_closed_for_both_commands(
     client.list_override = broken
     send(bot, "ادمین گروه", reply_id=4)
     send(bot, "لقب تازه")
-    refused = send(bot, "هیچکدام")
-    assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    unknown = send(bot, "هیچکدام")
+    assert "موفقیت اعلام نشد" in unknown.sent[-1][0]
+    assert "ادمین گروه شد" not in unknown.sent[-1][0]
+    assert len(client.edits) == 1 and client.edits[0].user_id.user_id == 101
+    assert client.roles[1234, 101].rank == "لقب تازه"  # server accepted it
     refused = send(bot, "لغو ادمین گروه", reply_id=4)
     assert "وضعیت فعلی کاربر" in refused.sent[-1][0]
+    assert len(client.edits) == 1  # demotion remains strict
+    assert all(isinstance(req.filter, types.ChannelParticipantsAdmins)
+               for req in client.list_reads)
+
+
+def test_unverifiable_bot_promote_right_still_blocks_write(setup):
+    bot, _owners, _ = setup
+    client = bot.client
+    client.add_user(1234, User(101))
+    client.direct_unsupported = True
+    client.list_override = lambda _req: types.channels.ChannelParticipantsNotModified()
+    send(bot, "ادمین گروه", reply_id=4)
+    send(bot, "لقب")
+    refused = send(bot, "هیچکدام")
+    assert "دسترسی «افزودن مدیر» حساب ربات" in refused.sent[-1][0]
     assert not client.edits
-    assert client.roles[1234, 101].rank == "قبلی"
 
 
 def test_fallback_checks_bot_add_admins_right_and_partial_rank(setup):
