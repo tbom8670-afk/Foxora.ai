@@ -525,7 +525,7 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
             from modules import native_admin_exemption
 
             if await native_admin_exemption.exempt(
-                    bot, chat_id, user_id, sender):
+                    bot, chat_id, user_id, sender, fresh=True):
                 return False
         except Exception as exc:  # noqa: BLE001
             logger.warning("ad-spam guard native admin check failed: %r", exc)

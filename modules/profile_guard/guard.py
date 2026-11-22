@@ -489,7 +489,8 @@ async def guard_message(bot, event, chat_id, user_id, sender,
     # ادمین خودِ گروه گیر نمی‌دهد؛ ولی هیچ مجوز دستوری‌ای نمی‌سازد.
     try:
         from modules import native_admin_exemption
-        if await native_admin_exemption.exempt(bot, chat_id, user_id, sender):
+        if await native_admin_exemption.exempt(
+                bot, chat_id, user_id, sender, fresh=True):
             return False
     except Exception:
         pass

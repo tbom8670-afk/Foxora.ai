@@ -39,9 +39,9 @@ ADMIN_PARTICIPANT_NAMES = frozenset({
     "ChatParticipantAdmin", "ChatParticipantCreator",
 })
 
-_POSITIVE_TTL = 60.0    # نقش ادمین تأییدشده؛ کوتاه تا عزل سریع دیده شود.
-_NEGATIVE_TTL = 90.0    # عضو عادی؛ هم‌ارز _NATIVE_ADMIN_NEGATIVE_TTL هندلر.
-_FAIL_TTL = 180.0       # خطای RPC؛ هم‌ارز _NATIVE_ADMIN_FAIL_TTL هندلر.
+_POSITIVE_TTL = 10.0    # نقش ادمین تأییدشده؛ فقط راهنماست، تصمیم با fresh.
+_NEGATIVE_TTL = 30.0    # عضو عادی؛ هم‌ارز _NATIVE_ADMIN_NEGATIVE_TTL هندلر.
+_FAIL_TTL = 60.0        # خطای RPC؛ هم‌ارز _NATIVE_ADMIN_FAIL_TTL هندلر.
 
 
 def enabled() -> bool:
@@ -103,12 +103,13 @@ def _store_role(bot, chat_id, user_id, value, ttl):
 
 
 #: عمر کش فهرست ادمین‌های گروه. کوتاه نگه داشته می‌شود تا حتی اگر رویداد
-#: تغییر نقش سروش‌پلاس از دست رفت، عزلِ ادمین حداکثر یکی‌دو دقیقه بعد
+#: تغییر نقش سروش‌پلاس از دست رفت، عزلِ ادمین حداکثر چند ثانیه بعد
 #: دیده شود و کاربرِ عادی‌شده دوباره مثل بقیه مشمول قوانین گروه شود.
-#: (مسیر اصلیِ تشخیص عزل، رویداد آنیِ ``note_participant_role`` است.)
-GROUP_ADMINS_TTL = 120.0
+#: (مسیرهای اصلی: رویداد آنیِ ``note_participant_role`` و بررسی تازهٔ
+#: ``fresh=True`` در نقطهٔ تصمیم.)
+GROUP_ADMINS_TTL = 20.0
 #: فاصلهٔ حداقلی سینک پس‌زمینهٔ فهرست ادمین‌ها برای هر گروه.
-SYNC_MIN_INTERVAL = 60.0
+SYNC_MIN_INTERVAL = 15.0
 
 
 def _list_cache(bot):
@@ -280,7 +281,7 @@ def note_participant_role(bot, chat_id, user_id, participant):
 
 
 async def sync_group_admins(bot, chat_id, resolved_chat=None):
-    """سینک پس‌زمینه و کم‌هزینهٔ فهرست ادمین‌های گروه (حداکثر هر ۱ دقیقه).
+    """سینک پس‌زمینه و کم‌هزینهٔ فهرست ادمین‌های گروه (حداکثر هر ۱۵ ثانیه).
 
     از مسیر پیام صدا زده می‌شود تا کش ادمین‌ها **پیش از** اولین تخلف
     گرم باشد و معافیت به RPC لحظهٔ تخلف وابسته نماند. اگر فهرست تازه
@@ -314,13 +315,17 @@ async def sync_group_admins(bot, chat_id, resolved_chat=None):
 
 
 async def is_native_admin(bot, chat_id, user_id, user=None,
-                          resolved_chat=None) -> bool:
+                          resolved_chat=None, *, fresh=False) -> bool:
     """نقش واقعی کاربر در همین گروه: ادمین/سازندهٔ بومی هست یا نه.
 
     ترتیب منابع (از ارزان/مطمئن به گران): نقش همراه رویداد → کش نقش و
     فهرست ادمین‌های گروه → خواندن فهرست ادمین‌های گروه → یک
     ``get_permissions`` (با کش نتیجه). خطای همهٔ مسیرها یعنی «نامعلوم»
     و محافظه‌کارانه ``False`` برگردانده می‌شود تا مسیر عادی خراب نشود.
+
+    ``fresh=True`` برای نقطهٔ تصمیم است: کش‌ها کنار گذاشته می‌شوند و
+    نقش همین لحظه خوانده می‌شود تا ارتقا/عزل چند ثانیه پیش هم درست
+    دیده شود.
     """
     if bot is None or chat_id is None or user_id is None:
         return False
@@ -328,10 +333,12 @@ async def is_native_admin(bot, chat_id, user_id, user=None,
     if participant_is_admin(participant):
         _store_role(bot, chat_id, user_id, True, _POSITIVE_TTL)
         return True
-    cached = _cached_role(bot, chat_id, user_id)
-    if cached is not None:
-        return cached
-    ids = await fetch_group_admin_ids(bot, chat_id, resolved_chat)
+    if not fresh:
+        cached = _cached_role(bot, chat_id, user_id)
+        if cached is not None:
+            return cached
+    ids = await fetch_group_admin_ids(bot, chat_id, resolved_chat,
+                                      force=fresh)
     if ids is not None:
         result = str(user_id) in ids
         _store_role(bot, chat_id, user_id, result,
