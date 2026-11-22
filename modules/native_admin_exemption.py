@@ -102,10 +102,13 @@ def _store_role(bot, chat_id, user_id, value, ttl):
         cache.pop(next(iter(cache)), None)
 
 
-#: عمر کش فهرست ادمین‌های گروه (تغییر نقش ادمین‌ها نادر است).
-GROUP_ADMINS_TTL = 600.0
+#: عمر کش فهرست ادمین‌های گروه. کوتاه نگه داشته می‌شود تا حتی اگر رویداد
+#: تغییر نقش سروش‌پلاس از دست رفت، عزلِ ادمین حداکثر یکی‌دو دقیقه بعد
+#: دیده شود و کاربرِ عادی‌شده دوباره مثل بقیه مشمول قوانین گروه شود.
+#: (مسیر اصلیِ تشخیص عزل، رویداد آنیِ ``note_participant_role`` است.)
+GROUP_ADMINS_TTL = 120.0
 #: فاصلهٔ حداقلی سینک پس‌زمینهٔ فهرست ادمین‌ها برای هر گروه.
-SYNC_MIN_INTERVAL = 300.0
+SYNC_MIN_INTERVAL = 60.0
 
 
 def _list_cache(bot):
@@ -226,8 +229,58 @@ async def fetch_group_admin_ids(bot, chat_id, resolved_chat=None, *,
     return ids
 
 
+def invalidate_native_admin(bot, chat_id, user_id) -> bool:
+    """حذف آنیِ نقش ادمینِ کش‌شده — کاربر از همین لحظه «کاربر عادی» است.
+
+    وقتی سروش‌پلاس خبر می‌دهد کاربر دیگر ادمین/سازندهٔ گروه نیست (عزل،
+    تنزل به عضو عادی، خروج یا اخراج)، نباید تا انقضای کش صبر کرد: هم
+    رکورد تک‌کاربره می‌رود، هم شناسه‌اش از فهرست ادمین‌های گروه خط
+    می‌خورد تا هیچ‌یک از مسیرهای معافیت (هندلر اصلی، لاین سبک اسپم،
+    گاردها، دورهٔ حذف) او را دیگر ادمین نبینند. فقط حافظه است؛ RPC ندارد.
+    """
+    if bot is None or chat_id is None or user_id is None:
+        return False
+    changed = False
+    key = (normalize_group_id(chat_id), str(user_id))
+    cache = getattr(bot, "native_group_admin_cache", None)
+    if isinstance(cache, dict) and cache.pop(key, None) is not None:
+        changed = True
+    entry = _list_cache(bot).get(key[0])
+    if entry and key[1] in entry[0]:
+        _list_cache(bot)[key[0]] = (
+            frozenset(item for item in entry[0] if item != key[1]),
+            entry[1],
+        )
+        changed = True
+    return changed
+
+
+def note_participant_role(bot, chat_id, user_id, participant):
+    """اعمال آنیِ نقش تازهٔ کاربر از روی رویداد تغییر عضویت سروش‌پلاس.
+
+    ``participant`` نقش **فعلی** است (``new_participant`` رویداد خام)؛
+    ``None`` یعنی دیگر عضویتی ندارد. اگر ادمین/سازنده شده، نقش و فهرست
+    همان لحظه به‌روز می‌شود؛ وگرنه — مهم‌تر از همه برای عزل — معافیتش
+    همان لحظه باطل می‌شود و از پیام بعدی مثل کاربر عادی با او رفتار
+    می‌شود. خروجی: ``True`` ادمین است، ``False`` نیست، ``None`` نامعلوم.
+    """
+    if bot is None or chat_id is None or user_id is None:
+        return None
+    if participant_is_admin(participant):
+        _store_role(bot, chat_id, user_id, True, _POSITIVE_TTL)
+        cache = _list_cache(bot)
+        key = normalize_group_id(chat_id)
+        entry = cache.get(key)
+        if entry and entry[1] > time.monotonic():
+            cache[key] = (
+                frozenset(set(entry[0]) | {str(user_id)}), entry[1])
+        return True
+    invalidate_native_admin(bot, chat_id, user_id)
+    return False
+
+
 async def sync_group_admins(bot, chat_id, resolved_chat=None):
-    """سینک پس‌زمینه و کم‌هزینهٔ فهرست ادمین‌های گروه (حداکثر هر ۵ دقیقه).
+    """سینک پس‌زمینه و کم‌هزینهٔ فهرست ادمین‌های گروه (حداکثر هر ۱ دقیقه).
 
     از مسیر پیام صدا زده می‌شود تا کش ادمین‌ها **پیش از** اولین تخلف
     گرم باشد و معافیت به RPC لحظهٔ تخلف وابسته نماند. اگر فهرست تازه

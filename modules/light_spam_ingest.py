@@ -132,7 +132,9 @@ def _cheap_admin_bypass(bot, chat_id, user_id):
         try:
             from modules.group_id import normalize_group_id
             cached = cache.get((normalize_group_id(chat_id), str(user_id)))
-            if cached and cached[0]:
+            # انقضای کش حتماً باید رعایت شود؛ قبلاً فقط «ادمین بوده» چک
+            # می‌شد و ادمینِ عزل‌شده برای همیشه از این لاین معاف می‌ماند.
+            if cached and cached[0] and cached[1] > time.monotonic():
                 return True
         except Exception:
             pass
