@@ -1702,6 +1702,10 @@ def _start_big_spam_cleanup(bot, event, chat_id, user_id, incident):
     return task
 
 
+class _NativeAdminExemptBan(Exception):
+    """بنِ صف در لحظهٔ اجرا لغو شد چون کاربر (تازه) ادمین بومی گروه است."""
+
+
 def _queue_big_spam_ban(bot, event, chat_id, user_id, sender, seed_ids, reason):
     """Ban at once and start deleting whatever IDs are already recorded."""
     if sender is None:
@@ -1762,16 +1766,42 @@ def _queue_big_spam_ban(bot, event, chat_id, user_id, sender, seed_ids, reason):
         incident["ban_state"] = "failed"
         bot.punished_users.discard(punish_key)
         bot.clear_spam_lock(key)
+        if isinstance(error, _NativeAdminExemptBan):
+            # لغوِ درستِ بن است، نه خطا: کاربر در لحظهٔ اجرا ادمین گروه
+            # بوده و نباید بن می‌شد.
+            bot.logger.log_info(
+                "BIG SPAM BAN ABORTED (NATIVE ADMIN) "
+                f"chat_id={chat_id} user_id={user_id} reason={reason}"
+            )
+            return
         bot.logger.log_error(
             "BIG SPAM BAN FAILED "
             f"chat_id={chat_id} user_id={user_id} reason={reason} error={error!r}"
         )
 
+    async def _ban_operation():
+        # 🛡️ تصمیم نهاییِ بن در لحظهٔ اجرا با نقش تازه بازبینی می‌شود؛
+        # بین صف‌شدن و اجرای بن ممکن است کاربر ادمین شده باشد (یا برعکس).
+        if native_admin_exemption.enabled():
+            try:
+                if await _is_native_group_admin(
+                        bot, chat_id, user_id, sender, resolved_peer,
+                        fresh=True):
+                    raise _NativeAdminExemptBan()
+            except _NativeAdminExemptBan:
+                raise
+            except Exception:
+                pass  # خطای بررسی نقش نباید بنِ اسپمر واقعی را متوقف کند.
+        _ban_result = bot.admin_actions.ban_user(
+            chat_id, user_id, reason="اسپم بزرگ تکراری", user=sender,
+        )
+        if inspect.isawaitable(_ban_result):
+            _ban_result = await _ban_result
+        return _ban_result
+
     queued = bot.moderation_queue.enqueue(
         chat_id, "ban", user_id=user_id, timeout_seconds=45,
-        operation=lambda: bot.admin_actions.ban_user(
-            chat_id, user_id, reason="اسپم بزرگ تکراری", user=sender,
-        ),
+        operation=_ban_operation,
         on_success=succeeded, on_failure=failed,
     )
     if not queued:
@@ -1794,9 +1824,10 @@ def _queue_big_spam_ban(bot, event, chat_id, user_id, sender, seed_ids, reason):
 # Negative results (KeyError miss or confirmed non-admin) stay cached long
 # enough that a later management command does not retry get_permissions.
 # A newly promoted native admin is still re-checked after this window.
-_NATIVE_ADMIN_FAIL_TTL = 180
-_NATIVE_ADMIN_NEGATIVE_TTL = 90
-_NATIVE_ADMIN_LIST_TTL = 60
+_NATIVE_ADMIN_FAIL_TTL = 60
+_NATIVE_ADMIN_NEGATIVE_TTL = 30
+_NATIVE_ADMIN_LIST_TTL = 20
+_NATIVE_ADMIN_POSITIVE_TTL = 10
 
 
 def _log_logger(bot):
@@ -2001,7 +2032,7 @@ def _native_participant_is_admin(participant):
 
 
 async def _native_admin_from_resolved_peer(
-    bot, resolved_chat, sender, user_id
+    bot, resolved_chat, sender, user_id, *, force=False
 ):
     """Query the Soroush participant directly, bypassing entity re-resolution.
 
@@ -2095,13 +2126,18 @@ async def _native_admin_from_resolved_peer(
 
 
 async def _is_native_group_admin(
-    bot, chat_id, user_id, sender, resolved_chat=None
+    bot, chat_id, user_id, sender, resolved_chat=None, *, fresh=False
 ):
     """Read the actual Soroush group role on a management command or violation.
 
     Unflagged regular chat never calls this. A confirmed content violation
     may need one role check so its native admin cannot enter a ban/mute path;
     the result is short-lived cached, and role changes are seen after the TTL.
+
+    ``fresh=True`` یعنی تصمیم نهایی (اخطار/بن/سکوت/اخراج یا معافیت در نقطهٔ
+    تخلف): کش نقش و فهرست ادمین‌ها کاملاً کنار گذاشته می‌شوند و نقش همین
+    لحظه از سروش خوانده می‌شود تا ارتقا/عزل ادمین بی‌درنگ اثر کند. نتیجه
+    با عمر کوتاه در کش می‌نشیند تا موج تخلف‌های پشت‌سرهم RPC نسازد.
 
     ``get_permissions`` first resolves its chat argument. Passing only the
     short numeric Soroush id can miss SPlusthon's entity cache and raise a
@@ -2114,13 +2150,14 @@ async def _is_native_group_admin(
         cache = bot.native_group_admin_cache = {}
     key = (normalize_group_id(chat_id), str(user_id))
     now = _asyncio.get_running_loop().time()
-    cached = cache.get(key)
-    if cached and cached[1] > now:
-        return cached[0]
+    if not fresh:
+        cached = cache.get(key)
+        if cached and cached[1] > now:
+            return cached[0]
     try:
         try:
             is_admin = await _native_admin_from_resolved_peer(
-                bot, resolved_chat, sender, user_id
+                bot, resolved_chat, sender, user_id, force=fresh
             )
         except Exception:
             # 🩹 مسیر مستقیم (فهرست ادمین‌ها) روی بعضی گروه‌ها/نسخه‌های
@@ -2137,7 +2174,8 @@ async def _is_native_group_admin(
         # repeating get_permissions on every ordinary group message.
         _store_native_admin_cache(
             cache, key, is_admin,
-            now + (60 if is_admin else _NATIVE_ADMIN_NEGATIVE_TTL),
+            now + (_NATIVE_ADMIN_POSITIVE_TTL if is_admin
+                   else _NATIVE_ADMIN_NEGATIVE_TTL),
         )
         return is_admin
     except Exception as error:
@@ -3834,6 +3872,7 @@ async def handle_fast_moderation_command(
             target_user.id,
             target_user,
             resolved_permission_chat,
+            fresh=True,
         ):
             return {
                 "protected_admin": True,
@@ -5189,7 +5228,8 @@ async def handle_new_message(bot, event):
                             _manage["admin_leave"].is_command(message_text):
                         async def _leave_native_admin():
                             return await _is_native_group_admin(
-                                bot, chat_id, user_id, sender, event_chat)
+                                bot, chat_id, user_id, sender, event_chat,
+                                fresh=True)
                         if await _manage["admin_leave"].handle(
                             bot, event, chat_id, user_id, sender, message_text,
                             bot.logger, chat=event_chat,
@@ -5559,6 +5599,18 @@ async def handle_new_message(bot, event):
                         f"chat_id={chat_id} user_id={user_id} "
                         f"reason={big_reason!r}"
                     )
+                # 🛡️ تصمیم بن با نقش تازه: ادمینی که تازه ارتقا گرفته
+                # (و هنوز در کش نیست) نباید وارد موج بن شود.
+                if (native_admin_exemption.enabled()
+                        and await _is_native_group_admin(
+                            bot, chat_id, user_id, sender,
+                            resolved_permission_chat, fresh=True)):
+                    bot.logger.log_info(
+                        "NATIVE ADMIN EXEMPT "
+                        f"chat_id={chat_id} user_id={user_id} "
+                        f"reason=big_spam {big_reason!r} ignored"
+                    )
+                    return
                 # 🧹 پاسخِ قبلیِ ربات به این پیامِ ویرایش‌شده هم پاک شود.
                 _cleanup_bot_reply_for_edited_message(
                     bot, event, chat_id, is_edited_message
@@ -10109,16 +10161,16 @@ async def handle_new_message(bot, event):
                     return
 
                 # 🛡️ معافیت سراسری ادمین بومی: ادمین خودِ گروه (که ادمین
-                # ثبت‌شدهٔ ربات نیست) اخراج/بن نمی‌شود (مثل VIP).
+                # ثبت‌شدهٔ ربات نیست) اخراج/بن نمی‌شود (مثل VIP). نقش در
+                # لحظهٔ اقدام تازه خوانده می‌شود تا عزل/ارتقای چند ثانیه
+                # پیش هم درست دیده شود.
                 if (native_admin_exemption.enabled()
                         and not admin_tools.has_admin_permission(
                             chat_id, target_user.id,
                             getattr(target_user, "username", None))
-                        and (_cached_native_group_admin(
-                                bot, chat_id, target_user.id)
-                             or await _is_native_group_admin(
-                                 bot, chat_id, target_user.id, target_user,
-                                 resolved_permission_chat))):
+                        and await _is_native_group_admin(
+                            bot, chat_id, target_user.id, target_user,
+                            resolved_permission_chat, fresh=True)):
                     await event.reply("⚠️ این کاربر ادمین این گروه است و نمی‌تواند اخراج شود")
                     return
 
@@ -10711,22 +10763,32 @@ async def handle_new_message(bot, event):
                     return
 
                 username = getattr(user, "username", None) or "کاربر"
-                # Cache a confirmed native role even before a manual warning
-                # reaches its limit; the light spam lane then cannot mistake
-                # this admin for a regular user on their next message.
-                target_native_warn_only = bool(
-                    not admin_tools.has_admin_permission(
-                        chat_id, user.id, getattr(user, "username", None)
+                if (native_admin_exemption.enabled()
+                        and not admin_tools.has_admin_permission(
+                            chat_id, user.id, getattr(user, "username", None))):
+                    # نقش در لحظهٔ اخطار تازه خوانده می‌شود (بدون کش) تا
+                    # ادمینِ عزل‌شده اخطار بگیرد و ادمینِ تازه نه.
+                    target_native_warn_only = await _is_native_group_admin(
+                        bot, chat_id, user.id, user,
+                        resolved_permission_chat, fresh=True,
                     )
-                    and (
-                        native_admin_warning_lock.is_active(bot, chat_id, user.id)
-                        or _cached_native_group_admin(bot, chat_id, user.id)
-                        or await _is_native_group_admin(
-                            bot, chat_id, user.id, user,
-                            resolved_permission_chat,
+                else:
+                    # Cache a confirmed native role even before a manual warning
+                    # reaches its limit; the light spam lane then cannot mistake
+                    # this admin for a regular user on their next message.
+                    target_native_warn_only = bool(
+                        not admin_tools.has_admin_permission(
+                            chat_id, user.id, getattr(user, "username", None)
+                        )
+                        and (
+                            native_admin_warning_lock.is_active(bot, chat_id, user.id)
+                            or _cached_native_group_admin(bot, chat_id, user.id)
+                            or await _is_native_group_admin(
+                                bot, chat_id, user.id, user,
+                                resolved_permission_chat,
+                            )
                         )
                     )
-                )
 
                 # 🛡️ معافیت سراسری ادمین بومی: اخطار دستی هم روی او ثبت
                 # نمی‌شود (مثل VIP). با BOT_NATIVE_ADMIN_EXEMPT=0 رفتار
@@ -10860,7 +10922,7 @@ async def handle_new_message(bot, event):
                 # Reuse the bounded filtered admin-list cache instead.
                 if await _is_native_group_admin(
                     bot, chat_id, target_user.id, target_user,
-                    resolved_permission_chat,
+                    resolved_permission_chat, fresh=True,
                 ):
                     await event.reply("⚠️ این کاربر ادمین است و سکوت نشد")
                     return
@@ -11890,8 +11952,12 @@ async def handle_new_message(bot, event):
             # admin has never sent a management command to this bot.
             if (not event.is_private and not native_admin_warn_only
                     and not (is_group_moderator or is_vip_user) and user_id):
+                # تصمیم نهایی همین‌جا با نقش تازه گرفته می‌شود (بدون کش)
+                # تا ادمینِ تازه‌ارتقایافته اخطار نگیرد و ادمینِ عزل‌شده
+                # هم معاف نماند.
                 native_admin_warn_only = await _is_native_group_admin(
-                    bot, chat_id, user_id, sender, resolved_permission_chat
+                    bot, chat_id, user_id, sender, resolved_permission_chat,
+                    fresh=True,
                 )
                 if native_admin_warn_only:
                     auto_punish_protected = True

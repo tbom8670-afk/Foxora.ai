@@ -385,3 +385,72 @@ def test_demoted_admin_is_warned_again(tmp_path, monkeypatch):
         assert len(actions.warnings) == 1
 
     asyncio.run(scenario())
+
+
+# ===========================================================================
+# رگرسیون: تصمیم در نقطهٔ تخلف باید با نقش تازه باشد، نه کش کهنه
+# (ارتقا/عزل چند ثانیه پیش هم بی‌درنگ دیده شود)
+# ===========================================================================
+def test_fresh_role_check_ignores_stale_caches():
+    chat, uid = -1001, 7
+    state = {"admin": False}
+
+    async def get_permissions(chat_arg, user_arg):
+        return SimpleNamespace(is_admin=state["admin"])
+
+    bot = SimpleNamespace(
+        client=SimpleNamespace(get_permissions=get_permissions),
+        logger=SimpleNamespace(log_error=lambda *_a, **_kw: None),
+    )
+    user = SimpleNamespace(id=uid)
+
+    async def scenario():
+        now = asyncio.get_running_loop().time()
+        key = (normalize_group_id(chat), str(uid))
+        # کش می‌گوید ادمین است، ولی در واقعیت عزل شده:
+        bot.native_group_admin_cache = {key: (True, now + 600)}
+        assert await handler._is_native_group_admin(
+            bot, chat, uid, user) is True            # راهنمای کش
+        assert await handler._is_native_group_admin(
+            bot, chat, uid, user, fresh=True) is False  # تصمیم تازه: عزل
+        # کش می‌گوید عضو عادی است، ولی در واقعیت تازه ادمین شده:
+        state["admin"] = True
+        bot.native_group_admin_cache[key] = (False, now + 600)
+        assert await handler._is_native_group_admin(
+            bot, chat, uid, user) is False
+        assert await handler._is_native_group_admin(
+            bot, chat, uid, user, fresh=True) is True   # تصمیم تازه: ارتقا
+
+    asyncio.run(scenario())
+
+
+def test_promoted_admin_is_exempt_without_cache_invalidation(
+        tmp_path, monkeypatch):
+    """یکپارچه: کاربر عادی اخطار می‌گیرد؛ به‌محض ادمین‌شدن (بدون هیچ
+    رویداد/ابطال کشی) تخلف بعدی‌اش نادیده گرفته می‌شود."""
+    chat = -1_000_000_911_208
+    bot, deleted, tracker, actions = _scenario(tmp_path, monkeypatch, chat)
+    user = _user()
+    state = {"admin": False}
+
+    async def permissions(chat_arg, user_arg):
+        return SimpleNamespace(is_admin=state["admin"])
+
+    bot.client.get_permissions = permissions
+
+    async def scenario():
+        event = FakeEvent(chat, user, "تخلف اول متفاوت", 201)
+        await handler.handle_new_message(bot, event)
+        await asyncio.sleep(0)
+        assert tracker.get_count(chat, NATIVE_ID) == 1
+        assert len(actions.warnings) == 1
+
+        state["admin"] = True  # همین الان در سروش‌پلاس ادمین شد.
+        event = FakeEvent(chat, user, "تخلف دوم متفاوت", 202)
+        await handler.handle_new_message(bot, event)
+        await asyncio.sleep(0)
+        assert len(actions.warnings) == 1           # اخطار تازه‌ای نیامد
+        assert actions.punishes == actions.bans == actions.mutes == []
+        assert not any(202 in ids for _c, ids in deleted)
+
+    asyncio.run(scenario())
