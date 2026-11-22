@@ -519,6 +519,17 @@ async def guard_message(bot, event, chat_id, user_id, sender, message_id) -> boo
             logger.warning("ad-spam guard admin check failed: %r", exc)
             return False
 
+        # 🛡️ معافیت سراسری ادمین بومی گروه (مثل VIP): ضدتبلیغ هم به
+        # ادمین خودِ گروه گیر نمی‌دهد؛ ولی هیچ مجوز دستوری‌ای نمی‌سازد.
+        try:
+            from modules import native_admin_exemption
+
+            if await native_admin_exemption.exempt(
+                    bot, chat_id, user_id, sender):
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ad-spam guard native admin check failed: %r", exc)
+
     if not result["is_spam"]:
         return False
 
