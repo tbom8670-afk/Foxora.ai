@@ -299,3 +299,89 @@ def test_handler_exempts_when_direct_role_check_raises(tmp_path, monkeypatch):
         assert not warning_lock.is_active(bot, chat, NATIVE_ID)
 
     asyncio.run(scenario())
+
+
+# ===========================================================================
+# رگرسیون: عزل از ادمینی گروه باید دیده شود (کاربر عادی‌شده دوباره
+# مثل بقیه مشمول اخطار/حذف می‌شود، نه این‌که برای همیشه معاف بماند)
+# ===========================================================================
+def _participant(class_name):
+    return type(class_name, (), {})()
+
+
+def test_demotion_invalidates_cached_exemption():
+    chat, uid = -100123, 55
+    key = (normalize_group_id(chat), "55")
+    bot = SimpleNamespace(
+        native_group_admin_cache={key: (True, time.monotonic() + 60)},
+        native_group_admin_ids_cache={
+            key[0]: (frozenset({"55", "77"}), time.monotonic() + 120),
+        },
+    )
+    assert exempt_mod.cached_native_admin(bot, chat, uid)
+
+    # رویداد سروش‌پلاس: دیگر ادمین نیست، عضو عادی است.
+    assert exempt_mod.note_participant_role(
+        bot, chat, uid, _participant("ChannelParticipant")) is False
+    assert not exempt_mod.cached_native_admin(bot, chat, uid)
+    assert key not in bot.native_group_admin_cache
+    assert "55" not in bot.native_group_admin_ids_cache[key[0]][0]
+    assert "77" in bot.native_group_admin_ids_cache[key[0]][0]  # بقیه سالم
+
+    # و ارتقای دوباره هم همان لحظه برمی‌گردد.
+    assert exempt_mod.note_participant_role(
+        bot, chat, uid, _participant("ChannelParticipantAdmin")) is True
+    assert exempt_mod.cached_native_admin(bot, chat, uid)
+    assert "55" in bot.native_group_admin_ids_cache[key[0]][0]
+
+
+def test_light_spam_bypass_respects_cache_expiry(monkeypatch):
+    """لاین سبک اسپم قبلاً انقضای کش نقش را چک نمی‌کرد و ادمین عزل‌شده
+    برای همیشه از آن لاین معاف می‌ماند."""
+    from modules import admin_tools, light_spam_ingest, vip_storage
+    monkeypatch.setattr(admin_tools, "has_admin_permission",
+                        lambda *_a, **_kw: False)
+    monkeypatch.setattr(vip_storage, "is_vip", lambda *_a, **_kw: False)
+    chat, uid = -100123, 55
+    key = (normalize_group_id(chat), "55")
+    bot = SimpleNamespace(
+        bot_account_id=9999,
+        native_group_admin_cache={key: (True, time.monotonic() - 1)},
+    )
+    assert light_spam_ingest._cheap_admin_bypass(bot, chat, uid) is False
+    bot.native_group_admin_cache[key] = (True, time.monotonic() + 60)
+    assert light_spam_ingest._cheap_admin_bypass(bot, chat, uid) is True
+
+
+def test_demoted_admin_is_warned_again(tmp_path, monkeypatch):
+    """یکپارچه: تا وقتی ادمین است معاف است؛ به‌محض عزل، تخلف بعدی اخطار
+    می‌گیرد — دقیقاً باگ گزارش‌شده («از ادمینی درمیاد ولی باز گیر نمی‌ده»)."""
+    chat = -1_000_000_911_207
+    bot, deleted, tracker, actions = _scenario(tmp_path, monkeypatch, chat)
+    user = _user()
+
+    async def scenario():
+        # هنوز ادمین بومی است: تخلفش نادیده گرفته می‌شود.
+        event = FakeEvent(chat, user, "تخلف اول متفاوت", 201)
+        await handler.handle_new_message(bot, event)
+        await asyncio.sleep(0)
+        assert tracker.get_count(chat, NATIVE_ID) == 0
+        assert actions.warnings == []
+
+        # عزل از ادمینی گروه: رویداد تغییر نقش می‌رسد و نقش واقعی عوض
+        # می‌شود (از این به بعد get_permissions هم عضو عادی می‌گوید).
+        async def demoted_permissions(chat_arg, user_arg):
+            return SimpleNamespace(is_admin=False)
+
+        bot.client.get_permissions = demoted_permissions
+        exempt_mod.note_participant_role(
+            bot, chat, NATIVE_ID, _participant("ChannelParticipant"))
+
+        # تخلف بعدی: مثل هر کاربر عادی اخطار می‌گیرد.
+        event = FakeEvent(chat, user, "تخلف دوم متفاوت", 202)
+        await handler.handle_new_message(bot, event)
+        await asyncio.sleep(0)
+        assert tracker.get_count(chat, NATIVE_ID) == 1
+        assert len(actions.warnings) == 1
+
+    asyncio.run(scenario())

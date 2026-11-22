@@ -1775,6 +1775,29 @@ class SoroushAntiSpamBot:
             previous_name = previous.__class__.__name__ if previous else "None"
             current_name = current.__class__.__name__ if current else "None"
 
+            # 🛡️ تغییر نقش بومی (ارتقا/عزل ادمین یا سازنده) همان لحظه در کش
+            # معافیت اعمال می‌شود؛ وگرنه ادمینِ عزل‌شده تا انقضای کش همچنان
+            # معاف می‌ماند و مثل کاربر عادی با او رفتار نمی‌شود.
+            try:
+                _role_chat_id = getattr(update, "channel_id", None)
+                _role_user_id = getattr(update, "user_id", None)
+                if _role_chat_id is not None and _role_user_id is not None:
+                    from modules import native_admin_exemption
+                    _was_admin = native_admin_exemption.participant_is_admin(
+                        previous)
+                    _is_admin_now = native_admin_exemption.participant_is_admin(
+                        current)
+                    if _was_admin != _is_admin_now:
+                        native_admin_exemption.note_participant_role(
+                            self, _role_chat_id, _role_user_id, current)
+                        self.logger.log_info(
+                            "NATIVE ADMIN ROLE CHANGED "
+                            f"chat_id={_role_chat_id} user_id={_role_user_id} "
+                            f"admin={_is_admin_now}"
+                        )
+            except Exception:
+                pass
+
             if "Banned" not in previous_name or "Banned" in current_name:
                 return
 
@@ -1813,6 +1836,38 @@ class SoroushAntiSpamBot:
                 self.logger.log_error(
                     f"خطا در همگام‌سازی آزادسازی دستی {user_id}: {error}"
                 )
+
+        # 🛡️ گروه‌های ساده کانال نیستند؛ تغییر نقش ادمین آن‌ها با
+        # UpdateChatParticipant می‌آید. همان اعمال آنیِ کش معافیت این‌جا
+        # هم لازم است تا عزل ادمین بی‌درنگ دیده شود.
+        _chat_participant_update_type = getattr(
+            types, "UpdateChatParticipant", None)
+        if _chat_participant_update_type is not None:
+            @self.client.on(events.Raw(_chat_participant_update_type))
+            async def native_admin_chat_participant_update(update):
+                try:
+                    _chat_id = getattr(update, "chat_id", None)
+                    _user_id = getattr(update, "user_id", None)
+                    if _chat_id is None or _user_id is None:
+                        return
+                    from modules import native_admin_exemption
+                    _previous = getattr(update, "prev_participant", None)
+                    _current = getattr(update, "new_participant", None)
+                    _was_admin = native_admin_exemption.participant_is_admin(
+                        _previous)
+                    _is_admin_now = native_admin_exemption.participant_is_admin(
+                        _current)
+                    if _was_admin == _is_admin_now:
+                        return
+                    native_admin_exemption.note_participant_role(
+                        self, _chat_id, _user_id, _current)
+                    self.logger.log_info(
+                        "NATIVE ADMIN ROLE CHANGED "
+                        f"chat_id={_chat_id} user_id={_user_id} "
+                        f"admin={_is_admin_now}"
+                    )
+                except Exception:
+                    pass
 
 
         @self.client.on(events.ChatAction())
