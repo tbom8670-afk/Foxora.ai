@@ -147,6 +147,18 @@ def drop_if_active(bot, event):
         release(bot, chat_id, user_id)
         return False
 
+    # 🛡️ معافیت سراسری ادمین بومی: دوره‌های قدیمیِ پیش از این سیاست
+    # نباید پیام ادمین معاف را حذف کنند.
+    try:
+        from modules import native_admin_exemption
+        if (native_admin_exemption.enabled()
+                and native_admin_exemption.cached_native_admin(
+                    bot, chat_id, user_id)):
+            release(bot, chat_id, user_id)
+            return False
+    except Exception:
+        pass
+
     message = getattr(event, "message", None)
     message_id = getattr(message, "id", None)
     if not isinstance(message_id, int) or message_id <= 0:

@@ -157,6 +157,10 @@ def test_registered_admin_or_vip_can_escape_independent_lock(monkeypatch):
 
 def _setup_scenario(tmp_path, monkeypatch, chat_id, *, threshold=3,
                     native_id=440044, action="ban"):
+    # این فایل رفتار «قبلی» (فقط اخطار + دورهٔ حذف پنج‌دقیقه‌ای) را پوشش
+    # می‌دهد؛ معافیت سراسری جدید عمداً خاموش است تا همان رفتار سنجیده شود.
+    # رفتار پیش‌فرضِ جدید در tests/test_native_admin_exemption.py است.
+    monkeypatch.setenv("BOT_NATIVE_ADMIN_EXEMPT", "0")
     _setup_group(tmp_path, monkeypatch, chat_id, owner_id=1001)
     bio_link_storage.set_enabled(chat_id, False)
     monkeypatch.setattr(warning_threshold, "_BASE", tmp_path)

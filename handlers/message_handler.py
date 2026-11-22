@@ -199,6 +199,7 @@ from modules import ad_name_detector
 from modules import warning_threshold
 from modules import punishment_mode
 from modules import native_admin_warning_lock
+from modules import native_admin_exemption
 # 🖇 تشخیص لینک در بیوگرافی — منطق، storage و سرویس کاملاً مستقل.
 from modules import bio_link
 from modules import bio_link_storage
@@ -5284,13 +5285,27 @@ async def handle_new_message(bot, event):
                 )
             )
         )
-        # A native group admin who is not registered in the bot follows the
-        # warning counter; the only threshold consequence is the separate
-        # five-minute deletion period (no ban, silence or generic spam lock).
+        # A native group admin who is not registered in the bot is, by
+        # default, fully exempt from automatic moderation — like a VIP
+        # (``BOT_NATIVE_ADMIN_EXEMPT=0`` restores the legacy policy below:
+        # warning counter only, whose threshold consequence is the separate
+        # five-minute deletion period; never ban/silence/generic spam lock).
+        # The exemption is moderation-only: it never grants command
+        # authority, which stays registered-admin-only.
         # Registered bot admins retain the existing full bypass policy.
         native_admin_warn_only = native_admin_bypass and not registered_admin_bypass
+        native_admin_exempt = bool(
+            native_admin_warn_only and native_admin_exemption.enabled()
+        )
         admin_bypass = registered_admin_bypass
-        blocked_cache = False if is_vip_user else bot.is_spam_locked((chat_id, user_id))
+        blocked_cache = False if (is_vip_user or native_admin_exempt) else bot.is_spam_locked((chat_id, user_id))
+        if native_admin_exempt and native_admin_warning_lock.is_active(
+                bot, chat_id, user_id):
+            # Periods started before this policy (or before the role was
+            # known) must not keep deleting an exempt admin's messages.
+            native_admin_warning_lock.release(bot, chat_id, user_id)
+            _clear_native_admin_moderation_state(
+                bot, chat_id, user_id, force=True)
         if native_admin_warn_only and blocked_cache:
             # This is stale state created before the native role was known.
             # It must not delete the current or later admin messages.
@@ -10073,6 +10088,20 @@ async def handle_new_message(bot, event):
                     await event.reply("⚠️ این کاربر vip است و نمی‌تواند اخراج شود")
                     return
 
+                # 🛡️ معافیت سراسری ادمین بومی: ادمین خودِ گروه (که ادمین
+                # ثبت‌شدهٔ ربات نیست) اخراج/بن نمی‌شود (مثل VIP).
+                if (native_admin_exemption.enabled()
+                        and not admin_tools.has_admin_permission(
+                            chat_id, target_user.id,
+                            getattr(target_user, "username", None))
+                        and (_cached_native_group_admin(
+                                bot, chat_id, target_user.id)
+                             or await _is_native_group_admin(
+                                 bot, chat_id, target_user.id, target_user,
+                                 resolved_permission_chat))):
+                    await event.reply("⚠️ این کاربر ادمین این گروه است و نمی‌تواند اخراج شود")
+                    return
+
                 async def kick_succeeded(_result):
                     add_kick(chat_id)
                     target_username = getattr(target_user, "username", None)
@@ -10678,6 +10707,13 @@ async def handle_new_message(bot, event):
                         )
                     )
                 )
+
+                # 🛡️ معافیت سراسری ادمین بومی: اخطار دستی هم روی او ثبت
+                # نمی‌شود (مثل VIP). با BOT_NATIVE_ADMIN_EXEMPT=0 رفتار
+                # قبلی (شمارش + دورهٔ حذف پنج‌دقیقه‌ای) برمی‌گردد.
+                if target_native_warn_only and native_admin_exemption.enabled():
+                    await event.reply("⚠️ این کاربر ادمین این گروه است و نمی‌تواند اخطار بگیرد")
+                    return
 
                 count = bot.tracker.increment(chat_id, user.id)
                 threshold = warning_threshold.get_threshold(
@@ -11762,11 +11798,13 @@ async def handle_new_message(bot, event):
 
         # مدیر/مالک ثبت‌شده از فیلتر خودکار و فیلتر کلمات گروه عبور می‌کند،
         # اما اجرای راهنما، بازی‌ها و فرمان‌های مدیریت باید ادامه داشته باشد.
-        if is_group_moderator or fast_command or _vip_exempt:
+        if is_group_moderator or fast_command or _vip_exempt or native_admin_exempt:
             if is_group_moderator:
                 _debug_log(bot, f"✅ ADMIN BYPASS FILTER: {sender_username}")
             elif _vip_exempt:
                 _debug_log(bot, f"✅ VIP BYPASS FILTER: {sender_username}")
+            elif native_admin_exempt:
+                _debug_log(bot, f"✅ NATIVE ADMIN BYPASS FILTER: {sender_username}")
             is_spam = False
             reason = ""
         elif public_username_spam:
@@ -11837,6 +11875,17 @@ async def handle_new_message(bot, event):
                 )
                 if native_admin_warn_only:
                     auto_punish_protected = True
+                    if native_admin_exemption.enabled():
+                        # 🛡️ معافیت سراسری ادمین بومی: نه اخطار ثبت می‌شود،
+                        # نه پیام حذف و نه هیچ مجازاتی؛ پیام سر جایش می‌ماند.
+                        _clear_native_admin_moderation_state(
+                            bot, chat_id, user_id, force=True)
+                        bot.logger.log_info(
+                            "NATIVE ADMIN EXEMPT "
+                            f"chat_id={chat_id} user_id={user_id} "
+                            f"reason={reason!r} violation ignored"
+                        )
+                        return
             # Another worker may have completed the warning threshold while
             # this event awaited a role/profile RPC. Do not count or announce
             # a second warning after the five-minute period has started.

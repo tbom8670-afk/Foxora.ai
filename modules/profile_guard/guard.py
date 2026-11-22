@@ -485,6 +485,15 @@ async def guard_message(bot, event, chat_id, user_id, sender,
     if _is_exempt(chat_id, user_id, sender):
         return False
 
+    # 🛡️ معافیت سراسری ادمین بومی گروه (مثل VIP): پروفایل‌گارد هم به
+    # ادمین خودِ گروه گیر نمی‌دهد؛ ولی هیچ مجوز دستوری‌ای نمی‌سازد.
+    try:
+        from modules import native_admin_exemption
+        if await native_admin_exemption.exempt(bot, chat_id, user_id, sender):
+            return False
+    except Exception:
+        pass
+
     # 🩹 خودترمیمی: این کاربر قبلاً «سکوت دائمی» گرفته ولی دارد پیام می‌دهد
     # ⇒ سکوتش برداشته شده (ری‌استارت/باگ سرویس)؛ بدون معطلی برمی‌گردانیم.
     try:
