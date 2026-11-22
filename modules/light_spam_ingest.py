@@ -136,6 +136,17 @@ def _cheap_admin_bypass(bot, chat_id, user_id):
                 return True
         except Exception:
             pass
+    # 🛡️ معافیت سراسری ادمین بومی: فهرست ادمین‌های گروه (کش گرم‌شده با
+    # سینک پس‌زمینه) هم ملاک است تا این لاین سبک پیش از هندلر اصلی،
+    # ادمین خودِ گروه را وارد موج بن نکند.
+    try:
+        from modules import native_admin_exemption
+        if (native_admin_exemption.enabled()
+                and native_admin_exemption.cached_native_admin(
+                    bot, chat_id, user_id)):
+            return True
+    except Exception:
+        pass
     return False
 
 

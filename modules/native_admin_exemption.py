@@ -102,12 +102,172 @@ def _store_role(bot, chat_id, user_id, value, ttl):
         cache.pop(next(iter(cache)), None)
 
 
-async def is_native_admin(bot, chat_id, user_id, user=None) -> bool:
+#: عمر کش فهرست ادمین‌های گروه (تغییر نقش ادمین‌ها نادر است).
+GROUP_ADMINS_TTL = 600.0
+#: فاصلهٔ حداقلی سینک پس‌زمینهٔ فهرست ادمین‌ها برای هر گروه.
+SYNC_MIN_INTERVAL = 300.0
+
+
+def _list_cache(bot):
+    cache = getattr(bot, "native_group_admin_ids_cache", None)
+    if cache is None:
+        try:
+            cache = bot.native_group_admin_ids_cache = {}
+        except Exception:
+            return {}
+    return cache
+
+
+def _cached_admin_ids(bot, chat_id):
+    """فهرست کش‌شدهٔ ادمین‌های گروه اگر تازه است؛ وگرنه ``None``."""
+    if bot is None or chat_id is None:
+        return None
+    entry = _list_cache(bot).get(normalize_group_id(chat_id))
+    if entry and entry[1] > time.monotonic():
+        return frozenset(entry[0])
+    return None
+
+
+async def fetch_group_admin_ids(bot, chat_id, resolved_chat=None, *,
+                                force=False):
+    """فهرست شناسهٔ ادمین‌های واقعی همین گروه؛ ``None`` یعنی نامعلوم.
+
+    چند مسیر مستقل، به ترتیب — تا وقتی یکی جواب بدهد:
+      ۱) ``channels.GetParticipants`` با فیلتر ادمین‌ها (گروه‌های کانالی)
+      ۲) ``messages.GetFullChat`` (گروه‌های ساده)
+    نتیجه (حتی برای خواندن‌های بعدی هندلر) در همان کش مشترک
+    ``bot.native_group_admin_ids_cache`` می‌نشیند. هیچ استثنایی بیرون
+    نمی‌رود؛ خطای همهٔ مسیرها یعنی «نامعلوم»، نه «ادمین نیست».
+    """
+    if bot is None or chat_id is None:
+        return None
+    if not force:
+        cached = _cached_admin_ids(bot, chat_id)
+        if cached is not None:
+            return cached
+    client = getattr(bot, "client", None)
+    if client is None or not callable(client):
+        return None
+
+    ids = None
+    # مسیر ۱: فهرست ادمین‌های کانال/سوپرگروه.
+    try:
+        from splusthon import utils as _utils
+        from splusthon.tl import functions, types
+        peer = resolved_chat
+        if peer is not None:
+            try:
+                peer = _utils.get_input_peer(peer) or peer
+            except Exception:
+                peer = resolved_chat
+        if peer is None:
+            peer = chat_id
+        response = await client(functions.channels.GetParticipantsRequest(
+            channel=peer,
+            filter=types.ChannelParticipantsAdmins(),
+            offset=0, limit=200, hash=0,
+        ))
+        found = set()
+        for entry in getattr(response, "users", ()) or ():
+            entry_id = getattr(entry, "id", None)
+            if entry_id is not None:
+                found.add(str(entry_id))
+        for participant in getattr(response, "participants", ()) or ():
+            participant_id = getattr(participant, "user_id", None)
+            if participant_id is None:
+                participant_id = getattr(
+                    getattr(participant, "peer", None), "user_id", None)
+            if participant_id is not None and participant_is_admin(participant):
+                found.add(str(participant_id))
+        ids = frozenset(found)
+    except Exception:
+        ids = None
+
+    # مسیر ۲: گروه ساده.
+    if ids is None:
+        try:
+            from splusthon.tl import functions
+            short_id = int(normalize_group_id(chat_id))
+            response = await client(
+                functions.messages.GetFullChatRequest(chat_id=short_id))
+            container = getattr(
+                getattr(response, "full_chat", None), "participants", None)
+            found = set()
+            for participant in getattr(container, "participants", ()) or ():
+                if not participant_is_admin(participant):
+                    continue
+                participant_id = getattr(participant, "user_id", None)
+                if participant_id is None:
+                    participant_id = getattr(
+                        getattr(participant, "peer", None), "user_id", None)
+                if participant_id is not None:
+                    found.add(str(participant_id))
+            ids = frozenset(found)
+        except Exception:
+            ids = None
+
+    if ids is None:
+        try:
+            fail_state = bot._native_admin_list_fail
+        except Exception:
+            fail_state = None
+        if fail_state is None:
+            try:
+                fail_state = bot._native_admin_list_fail = {}
+            except Exception:
+                fail_state = {}
+        fail_state[normalize_group_id(chat_id)] = time.monotonic() + 60.0
+        return None
+    cache = _list_cache(bot)
+    cache[normalize_group_id(chat_id)] = (
+        ids, time.monotonic() + GROUP_ADMINS_TTL)
+    if len(cache) > 1000:
+        cache.pop(next(iter(cache)), None)
+    return ids
+
+
+async def sync_group_admins(bot, chat_id, resolved_chat=None):
+    """سینک پس‌زمینه و کم‌هزینهٔ فهرست ادمین‌های گروه (حداکثر هر ۵ دقیقه).
+
+    از مسیر پیام صدا زده می‌شود تا کش ادمین‌ها **پیش از** اولین تخلف
+    گرم باشد و معافیت به RPC لحظهٔ تخلف وابسته نماند. اگر فهرست تازه
+    است یا سینک به‌تازگی انجام شده، بی‌هزینه برمی‌گردد.
+    """
+    if bot is None or chat_id is None or not enabled():
+        return None
+    if _cached_admin_ids(bot, chat_id) is not None:
+        return _cached_admin_ids(bot, chat_id)
+    state = getattr(bot, "_native_admin_sync_next", None)
+    if state is None:
+        try:
+            state = bot._native_admin_sync_next = {}
+        except Exception:
+            state = {}
+    key = normalize_group_id(chat_id)
+    now = time.monotonic()
+    if state.get(key, 0) > now:
+        return None
+    state[key] = now + SYNC_MIN_INTERVAL
+    ids = await fetch_group_admin_ids(bot, chat_id, resolved_chat)
+    if ids is not None:
+        try:
+            bot.logger.log_info(
+                "NATIVE ADMIN SYNC "
+                f"chat_id={chat_id} admins={len(ids)}"
+            )
+        except Exception:
+            pass
+    return ids
+
+
+async def is_native_admin(bot, chat_id, user_id, user=None,
+                          resolved_chat=None) -> bool:
     """نقش واقعی کاربر در همین گروه: ادمین/سازندهٔ بومی هست یا نه.
 
-    ترتیب منابع: نقش همراه رویداد → کش روی bot → یک
-    ``get_permissions`` (با کش نتیجه). خطای RPC یعنی «نامعلوم» و
-    محافظه‌کارانه ``False`` برگردانده می‌شود تا مسیر عادی خراب نشود.
+    ترتیب منابع (از ارزان/مطمئن به گران): نقش همراه رویداد → کش نقش و
+    فهرست ادمین‌های گروه → خواندن فهرست ادمین‌های گروه → یک
+    ``get_permissions`` (با کش نتیجه). خطای همهٔ مسیرها یعنی «نامعلوم»
+    و محافظه‌کارانه ``False`` برگردانده می‌شود تا مسیر عادی خراب نشود.
     """
     if bot is None or chat_id is None or user_id is None:
         return False
@@ -118,6 +278,12 @@ async def is_native_admin(bot, chat_id, user_id, user=None) -> bool:
     cached = _cached_role(bot, chat_id, user_id)
     if cached is not None:
         return cached
+    ids = await fetch_group_admin_ids(bot, chat_id, resolved_chat)
+    if ids is not None:
+        result = str(user_id) in ids
+        _store_role(bot, chat_id, user_id, result,
+                    _POSITIVE_TTL if result else _NEGATIVE_TTL)
+        return result
     client = getattr(bot, "client", None)
     get_permissions = getattr(client, "get_permissions", None)
     if not callable(get_permissions):
