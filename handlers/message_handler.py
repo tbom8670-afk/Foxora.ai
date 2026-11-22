@@ -2118,9 +2118,15 @@ async def _is_native_group_admin(
     if cached and cached[1] > now:
         return cached[0]
     try:
-        is_admin = await _native_admin_from_resolved_peer(
-            bot, resolved_chat, sender, user_id
-        )
+        try:
+            is_admin = await _native_admin_from_resolved_peer(
+                bot, resolved_chat, sender, user_id
+            )
+        except Exception:
+            # 🩹 مسیر مستقیم (فهرست ادمین‌ها) روی بعضی گروه‌ها/نسخه‌های
+            # سروش خطا می‌دهد؛ قبلاً همان‌جا تسلیم می‌شدیم و ادمین بومی
+            # اشتباهی اخطار می‌گرفت. حالا حتماً مسیر جایگزین امتحان می‌شود.
+            is_admin = None
         if is_admin is None:
             permissions = await bot.client.get_permissions(
                 resolved_chat or chat_id, sender or user_id
@@ -5306,6 +5312,20 @@ async def handle_new_message(bot, event):
             native_admin_warning_lock.release(bot, chat_id, user_id)
             _clear_native_admin_moderation_state(
                 bot, chat_id, user_id, force=True)
+        if (not native_admin_bypass and native_admin_exemption.enabled()
+                and not event.is_private and user_id
+                and not registered_admin_bypass):
+            # 🔄 کش فهرست ادمین‌های گروه را در پس‌زمینه گرم نگه می‌داریم
+            # (حداکثر هر ۵ دقیقه برای هر گروه) تا معافیت ادمین بومی به
+            # RPC لحظهٔ تخلف وابسته نباشد و از همان پیام اول شناخته شود.
+            try:
+                _asyncio.create_task(
+                    native_admin_exemption.sync_group_admins(
+                        bot, chat_id, resolved_permission_chat),
+                    name="native-admin-sync",
+                )
+            except Exception:
+                pass
         if native_admin_warn_only and blocked_cache:
             # This is stale state created before the native role was known.
             # It must not delete the current or later admin messages.

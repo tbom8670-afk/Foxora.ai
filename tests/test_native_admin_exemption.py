@@ -217,3 +217,85 @@ def test_kill_switch_restores_warning_counter(tmp_path, monkeypatch):
         assert len(actions.warnings) == 1
 
     asyncio.run(scenario())
+
+
+# ===========================================================================
+# رگرسیون: خرابی مسیر مستقیم تشخیص نقش (علت «هنوز گیر می‌ده»)
+# ===========================================================================
+def test_handler_falls_back_to_get_permissions_when_direct_raises(monkeypatch):
+    """قبلاً اگر خواندن فهرست ادمین‌ها خطا می‌داد، get_permissions هیچ‌وقت
+    امتحان نمی‌شد و ادمین بومی اخطار می‌گرفت."""
+    async def broken_direct(*_args, **_kwargs):
+        raise RuntimeError("NOT_SUPPORTED")
+
+    async def get_permissions(chat, user):
+        return SimpleNamespace(
+            is_admin=getattr(user, "id", user) == NATIVE_ID)
+
+    bot = SimpleNamespace(
+        client=SimpleNamespace(get_permissions=get_permissions),
+        logger=SimpleNamespace(log_error=lambda *_a, **_kw: None),
+    )
+    monkeypatch.setattr(
+        handler, "_native_admin_from_resolved_peer", broken_direct)
+    result = asyncio.run(handler._is_native_group_admin(
+        bot, -1001, NATIVE_ID, SimpleNamespace(id=NATIVE_ID)))
+    assert result is True
+
+
+def test_is_native_admin_via_group_list_when_permissions_broken():
+    """فهرست ادمین‌های گروه ملاک است، حتی اگر get_permissions خراب باشد."""
+    class ListClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, request):
+            self.calls += 1
+            if type(request).__name__ == "GetParticipantsRequest":
+                return SimpleNamespace(
+                    users=[SimpleNamespace(id=7)], participants=[])
+            raise RuntimeError("unsupported")
+
+        async def get_permissions(self, chat, user):
+            raise KeyError(123)
+
+    bot = SimpleNamespace(client=ListClient())
+
+    async def scenario():
+        assert await exempt_mod.is_native_admin(
+            bot, -100123, 7, SimpleNamespace(id=7)) is True
+        # دفعهٔ دوم از کش نقش می‌آید؛ RPC تازه‌ای ساخته نمی‌شود.
+        assert await exempt_mod.is_native_admin(
+            bot, -100123, 7, SimpleNamespace(id=7)) is True
+        assert bot.client.calls == 1
+        # سینک پس‌زمینه هم با کش گرم، RPC تازه نمی‌سازد.
+        assert await exempt_mod.sync_group_admins(bot, -100123) is not None
+        assert bot.client.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_handler_exempts_when_direct_role_check_raises(tmp_path, monkeypatch):
+    """بازتولید یکپارچهٔ باگ: مسیر مستقیم خطا می‌دهد ولی ادمین معاف است."""
+    chat = -1_000_000_911_206
+    bot, deleted, tracker, actions = _scenario(tmp_path, monkeypatch, chat)
+
+    async def broken_direct(*_args, **_kwargs):
+        raise RuntimeError("NOT_SUPPORTED")
+
+    monkeypatch.setattr(
+        handler, "_native_admin_from_resolved_peer", broken_direct)
+
+    async def scenario():
+        for number in (1, 2, 3):
+            event = FakeEvent(chat, _user(), f"تخلف {number} متفاوت",
+                              200 + number)
+            await handler.handle_new_message(bot, event)
+            await asyncio.sleep(0)
+        assert tracker.get_count(chat, NATIVE_ID) == 0
+        assert actions.warnings == []
+        assert actions.punishes == actions.bans == actions.mutes == []
+        assert bot.sent_notices == []
+        assert not warning_lock.is_active(bot, chat, NATIVE_ID)
+
+    asyncio.run(scenario())
