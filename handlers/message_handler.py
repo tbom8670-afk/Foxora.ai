@@ -6424,6 +6424,17 @@ async def handle_new_message(bot, event):
                     "GROUP BROADCAST ROUTE FAILED "
                     f"chat_id={chat_id} error={broadcast_error!r}"
                 )
+            # 📣 «ارسال تبلیغات» از داخل گروه هم قابل شروع است (فقط مالک
+            # سراسری)؛ مقصد نهایی پیوی کاربران است، نه خود گروه.
+            try:
+                from handlers.private_ads_handler import handle_group_ads
+                if await handle_group_ads(bot, event, user_id, message_text):
+                    return
+            except Exception as ads_error:
+                bot.logger.log_error(
+                    "GROUP AD BROADCAST ROUTE FAILED "
+                    f"chat_id={chat_id} error={ads_error!r}"
+                )
         _legacy_commands = {
             "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
             "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",

@@ -86,6 +86,11 @@ from handlers.message_handler import (
     _resolved_event_peer,
 )
 from handlers.broadcast_handler import handle_private_broadcast
+from handlers.private_ads_handler import (
+    handle_private_ads,
+    has_ads_session,
+    match_ads_trigger,
+)
 from handlers.private_handler import (
     register_private_handlers,
     try_handle_private_start,
@@ -2413,6 +2418,21 @@ class SoroushAntiSpamBot:
                             f"owner_id={private_sender_id} text={raw_text!r} "
                             "reason=handler_not_broadcast"
                         )
+                    # 📣 «ارسال تبلیغات» مالک: همان قرارداد اطلاع‌رسانی،
+                    # فقط وقتی دستور تبلیغات یا session آن فعال است.
+                    if private_is_owner and (
+                        match_ads_trigger(raw_text) is not None
+                        or has_ads_session(private_sender_id)
+                    ):
+                        if await handle_private_ads(
+                            self, event, private_sender_id, raw_text
+                        ):
+                            self.logger.log_info(
+                                "AD BROADCAST READY "
+                                f"owner_id={private_sender_id} text={raw_text!r}"
+                            )
+                            self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='ad_broadcast handled' chat_id={_sd_chat} message_id={_sd_mid}")
+                            return
 
                 # BROADCAST TRACE: قبل از هر await ثبت می‌شود تا اگر یکی از
                 # فراخوانی‌های بعدی استثنا داد، بدانیم پیام اصلاً رسیده بود.
@@ -2599,6 +2619,21 @@ class SoroushAntiSpamBot:
                             "BROADCAST ROUTE NOT HANDLED "
                             f"owner_id={private_sender_id} text={text!r}"
                         )
+                    # 📣 مسیر سریع «ارسال تبلیغات» مالک، کنار اطلاع‌رسانی.
+                    if private_is_owner and (
+                        match_ads_trigger(text) is not None
+                        or has_ads_session(private_sender_id)
+                    ):
+                        handled = await handle_private_ads(
+                            self, event, private_sender_id, text
+                        )
+                        if handled:
+                            self.logger.log_info(
+                                "AD BROADCAST ROUTE HANDLED "
+                                f"owner_id={private_sender_id} text={text!r}"
+                            )
+                            self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='ad_broadcast handled' chat_id={_sd_chat} message_id={_sd_mid}")
+                            return
 
                 if (
                     event.out
@@ -2955,6 +2990,13 @@ class SoroushAntiSpamBot:
                                 f"BROADCAST ROUTE HANDLED text={text!r}"
                             )
                             self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='if await handle_private_broadcast(self, ' chat_id={_sd_chat} message_id={_sd_mid}")
+                            return
+                        # 📣 «ارسال تبلیغات» مالک (پیوی کاربران، نه گروه‌ها).
+                        if await handle_private_ads(self, event, sender_id, text):
+                            self.logger.log_info(
+                                f"AD BROADCAST ROUTE HANDLED text={text!r}"
+                            )
+                            self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='ad_broadcast handled' chat_id={_sd_chat} message_id={_sd_mid}")
                             return
                         if _is_broadcast_word:
                             self.logger.log_info(
