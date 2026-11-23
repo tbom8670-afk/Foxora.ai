@@ -212,6 +212,54 @@ def test_renewal_deletes_previous_notice():
     assert ge.notice_ids(CHAT) == [222]
 
 
+def test_expired_announcement_is_not_auto_deleted():
+    """رگرسیون «ربات بی‌صدا خاموش می‌شود»: پیام نهایی پایان مهلت نباید
+    وارد notice_cleanup شود (TTL پیش‌فرض ۶۰ ثانیه آن را یک دقیقه بعد از
+    ارسال پاک می‌کرد) و باید در گروه بماند."""
+    _fresh_expiry_file()
+    past = datetime.now(timezone.utc) - timedelta(days=10)
+    ge.set_expiry(CHAT, "یک هفته", title="گروه تست", now=past)
+
+    class Cleanup:
+        def __init__(self):
+            self.scheduled = []
+
+        def schedule(self, chat_id, message, ttl=None):
+            self.scheduled.append((chat_id, ttl))
+            return True
+
+    bot = Bot()
+    cleanup = Cleanup()
+    bot.notice_cleanup = cleanup
+    closed = asyncio.run(
+        geh.check_once(bot, lambda c, t: None, logger=bot.logger))
+
+    assert closed == 1
+    assert len(bot.client.sent) == 1
+    assert bot.client.sent[0][1] == ge.EXPIRED_MESSAGE
+    # پیام نهایی برای حذف زمان‌بندی نشده است؛ در گروه می‌ماند.
+    assert cleanup.scheduled == []
+
+
+def test_expiry_announcement_survives_deactivate_failure():
+    """خطای deactivate نباید جلوی ارسال پیام پایان مهلت را بگیرد."""
+    _fresh_expiry_file()
+    past = datetime.now(timezone.utc) - timedelta(days=10)
+    ge.set_expiry(CHAT, "یک هفته", title="گروه تست", now=past)
+
+    def boom(chat_id, title):
+        raise RuntimeError("db down")
+
+    bot = Bot()
+    closed = asyncio.run(
+        geh.check_once(bot, boom, logger=bot.logger))
+
+    assert closed == 1
+    assert len(bot.client.sent) == 1
+    assert bot.logger.has("DEACTIVATE FAILED")
+    assert ge.was_notified(CHAT)
+
+
 def test_notice_ids_survive_restart():
     """شناسه‌ها روی دیسک می‌مانند تا پس از ری‌استارت هم حذف شوند."""
     _fresh_expiry_file()

@@ -6691,19 +6691,34 @@ async def handle_new_message(bot, event):
             # یکی از دستورها را بفرستد.
             if group_expiry_blocks(chat_id, sender):
                 if not group_expiry.was_notified(chat_id):
-                    try:
-                        deactivate_group(chat_id)
-                    except Exception:
-                        pass
-                    group_expiry.mark_notified(chat_id)
                     exp_msg, exp_spans = group_expiry.build_expired_message()
+                    sent_ok = False
                     try:
                         await event.reply(
                             exp_msg,
                             formatting_entities=_group_expiry_entities(exp_spans)
                         )
-                    except Exception:
-                        pass
+                        sent_ok = True
+                    except Exception as error:
+                        # شکست ارسال لاگ می‌شود و «اعلام شده» علامت
+                        # نمی‌خورد تا واچر پس‌زمینه دوباره تلاش کند؛
+                        # قبلاً اول علامت می‌خورد و بعد بی‌صدا رد می‌شد.
+                        bot.logger.log_error(
+                            "GROUP EXPIRY NOTICE FAILED "
+                            f"chat_id={chat_id} error={error!r}"
+                        )
+                    if sent_ok:
+                        group_expiry.mark_notified(chat_id)
+                    try:
+                        _expiry_record = (
+                            group_expiry.get_record(chat_id) or {})
+                        deactivate_group(
+                            chat_id, _expiry_record.get("title", "") or "")
+                    except Exception as error:
+                        bot.logger.log_error(
+                            "GROUP EXPIRY DEACTIVATE FAILED "
+                            f"chat_id={chat_id} error={error!r}"
+                        )
                 return
 
         # 🦊 یک پیامِ منشنِ واقعی به‌ازای هر ادمینِ گروه/ربات. این مسیر بعد

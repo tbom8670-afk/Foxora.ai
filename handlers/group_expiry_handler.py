@@ -312,9 +312,11 @@ async def check_once(bot, deactivate, logger=None):
             _log(logger, f"GROUP EXPIRY DEACTIVATED chat_id={chat_id} "
                          f"title={title!r} expires_at={record.get('expires_at')}")
         except Exception as error:
+            # خطای غیرفعال‌سازی نباید جلوی اعلام را بگیرد: گروه به‌هرحال
+            # با is_expired بسته است و اعضا باید دلیلش را ببینند. قبلاً
+            # همین‌جا continue می‌شد و پیام هرگز ارسال نمی‌شد.
             _log_error(logger, f"GROUP EXPIRY DEACTIVATE FAILED "
                                f"chat_id={chat_id} error={error!r}")
-            continue
 
         message, spans = build_expired_message()
         sent_any = False
@@ -322,9 +324,11 @@ async def check_once(bot, deactivate, logger=None):
             try:
                 sent = await bot.client.send_message(
                     target, message, formatting_entities=_entities(spans))
-                cleanup = getattr(bot, "notice_cleanup", None)
-                if cleanup is not None:
-                    cleanup.schedule(target, sent)
+                # ⚠️ پیام نهایی انقضا عمداً وارد notice_cleanup نمی‌شود:
+                # TTL پیش‌فرض آن موتور ۶۰ ثانیه است و پیام را یک دقیقه
+                # بعد از ارسال پاک می‌کرد؛ گروه عملاً هیچ اعلامی
+                # نمی‌دید و ربات «بی‌صدا خاموش» به نظر می‌رسید. این پیام
+                # باید بماند تا اعضا دلیل توقف ربات را ببینند.
                 if not mark_notified(key):
                     _log_error(logger, "EXPIRY NOTIFICATION STATE FAILED "
                                        f"group_id={key}")
