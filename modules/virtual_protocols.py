@@ -667,6 +667,9 @@ class Store:
                         "outgoing_distinct_users": len(target_users),
                         "reply_to_own_bot": job.reply_to_bot,
                         "same_text_bot_replies": bot_repeat_count + int(job.reply_to_bot),
+                        # Only the exact-text messages in this short burst are
+                        # eligible for the protocol's wave cleanup.
+                        "fast_flood_prior_message_ids": [r[0] for r in exact_rows if 0 <= job.timestamp-r[1] <= 60] if signals['fast_exact_flood'] else [],
                         "repeated_reply_target_users": sorted(repeated_target_users),
                         "repeated_words": [{"word": w, "count": c} for w,c in sorted(word_counts.items(), key=lambda x: (-x[1],x[0]))],
                         "reply_only": bool(job.reply is not None and rows and all(r[4] is not None for r in rows)),
@@ -1258,6 +1261,19 @@ class Service:
                         self.log_action_skip('message deletion not confirmed', job)
                         await asyncio.to_thread(self.store.action_status, job, 'failed')
                         continue
+                    # Remove only the exact matches in the same 60-second
+                    # wave, never unrelated history. Failure of this optional
+                    # sweep is logged separately from the confirmed trigger.
+                    prior_ids = [mid for mid in evidence.get('fast_flood_prior_message_ids', ())
+                                 if isinstance(mid, int) and mid > 0 and mid != job.message][:200]
+                    if prior_ids:
+                        try:
+                            _count, remaining = await asyncio.wait_for(
+                                bot.message_delete_queue.enqueue(rpc_group, prior_ids, priority=1), 20)
+                            if remaining:
+                                LOG.warning('virtual protocol flood cleanup incomplete group=%s remaining=%s', job.group, len(remaining))
+                        except Exception:
+                            LOG.warning('virtual protocol flood cleanup failed group=%s', job.group, exc_info=True)
                     # Only suppress/clean replies after deletion was confirmed.
                     self.mark_deleted(job.group, job.message)
                     try:

@@ -988,6 +988,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     await intercept(self.service,event,bot_id=999)
                     if mid == 1:
                         await asyncio.wait_for(started.wait(),2)
+                    if mid == 3:
+                        other=SimpleNamespace(chat_id=1,sender_id=9,sender=sender,is_private=False,message=SimpleNamespace(id=20,message='جمله متفاوت عادی',reply_to=None))
+                        await intercept(self.service,other,bot_id=999)
                 await self.flush()
                 await asyncio.wait_for(self.service.action_queue.join(),2)
                 with sqlite3.connect(self.db) as db:
@@ -997,6 +1000,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(first_strong[0],6)
                 self.assertTrue(json.loads(first_strong[2])['signals']['fast_exact_flood'])
                 self.assertTrue(any(call.args[1] == [6] for call in bot.message_delete_queue.enqueue.await_args_list))
+                self.assertTrue(any(set(call.args[1]) == {1,2,3,4,5} for call in bot.message_delete_queue.enqueue.await_args_list))
                 self.assertEqual(bot.notice_cleanup.ttls,[70])
         finally:
             release.set()
