@@ -390,6 +390,27 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([e for e in enabled(7,'@x')[1] if type(e).__name__ == 'MessageEntityBlockquote']),7)
         self.assertEqual(progress(20)[0].count('❏'),20)
 
+    def test_protocol_quote_spacing_and_utf16_entities(self):
+        from modules.virtual_protocol_texts import enabled, progress, warning
+        def span(text, entity):
+            raw=text.encode('utf-16-le')
+            return raw[entity.offset*2:(entity.offset+entity.length)*2].decode('utf-16-le')
+        for (text,entities),expected in ((progress(20),2),(enabled(123,'@oela'),7)):
+            quotes=[e for e in entities if type(e).__name__=='MessageEntityBlockquote']
+            self.assertEqual(len(quotes),expected)
+            raw=text.encode('utf-16-le')
+            for left,right in zip(quotes,quotes[1:]):
+                gap=raw[(left.offset+left.length)*2:right.offset*2].decode('utf-16-le')
+                self.assertEqual(gap,'\n')
+            for q in quotes:
+                quoted=span(text,q)
+                self.assertTrue(quoted and not quoted.startswith('\n') and not quoted.endswith('\n'))
+                self.assertTrue(any(type(b).__name__=='MessageEntityBold' and b.offset==q.offset and b.length==q.length for b in entities))
+        text,entities=warning('@oela','کانال',4,matched='آزمون',members=7)
+        self.assertIn('⟲ کـاربر : @oela\n⟲ نـوع تشـخیص پـیام : کانال',text)
+        self.assertIn('⟲ نام کانال بیوگرافی : آزمون\n⟲ تعداد اعضا : 7\n⟲مـقام',text)
+        self.assertEqual([span(text,e) for e in entities if type(e).__name__=='MessageEntitySpoiler'],['آزمون','7'])
+
     async def test_direct_lists_work_with_guards_off_on_first_message(self):
         bot=self.fake_action_bot(); self.service.bot=bot
         await self.service.toggle(1,True)

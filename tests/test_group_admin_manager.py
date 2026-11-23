@@ -596,6 +596,8 @@ def test_real_message_pipeline_reaches_independent_handler(setup, monkeypatch):
     assert len(help_event.replies) == 2, (help_event.replies, bot.logger.errors)
     assert "🌡 برای روشن کردن حالت بحرانی" in help_event.replies[1]
     assert "🌐 برای اضافه کردن یک کاربر به ادمین های گروه" in help_event.replies[1]
+    assert "🪫برای فعال سازی پروتکل امنیتی روباه\nپروتکل روشن\nپروتکل خاموش" in help_event.replies[1]
+    assert "پروتکل روشن" not in help_event.replies[0]
     assert help_event.replies[1].endswith("تماس با سازنده : @OSINE2")
 
 

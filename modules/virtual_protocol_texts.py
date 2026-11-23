@@ -23,7 +23,7 @@ def progress(count):
     count = max(1, min(20, int(count)))
     b = _Builder()
     b.add('⚙ پروتکل روباه در حال فعال سازی', quote=True, bold=True)
-    b.add('\n\n')
+    b.add('\n')
     b.add('20 ثانیه تا کامل شدن فعال سازی', quote=True, bold=True)
     b.add('\n')
     b.add('❏' * count, bold=True)
@@ -36,8 +36,10 @@ def enabled(group_id, actor):
     rows = ['سطح امنیت : 98٪', f'گروه : {group_id}', f'روشن کننده : {actor}',
             'امنیت سختگیری : 68٪', 'اثر انگشت امنیتی : هرزنامه و ربات ها',
             'لایه ضد امنیت : 100٪', 'درصد تشخیص سریع : 100٪']
-    for row in rows:
-        b.add('\n\n')
+    for index, row in enumerate(rows):
+        # Keep the visual separation after the heading; adjacent quotes
+        # need one line break, not an empty line between every quote.
+        b.add('\n\n' if index == 0 else '\n')
         offset = u16(b._text)
         b.add(row, quote=True, bold=True)
         if row.startswith('روشن کننده : ') and str(actor).startswith('@'):
@@ -56,19 +58,19 @@ def warning(user, kind, count, *, matched=None, members=None):
     b.add('⚠️ : هشدار پروتکل امنیتی روباه', quote=True, bold=True)
     b.add('\n\n\n')
     _mention(b, user, '⟲ کـاربر : ')
-    b.add(f'\n\n⟲ نـوع تشـخیص پـیام : {kind}\n\n', bold=True)
+    b.add(f'\n⟲ نـوع تشـخیص پـیام : {kind}\n', bold=True)
     if kind == 'کانال':
         b.add('⟲ نام کانال بیوگرافی : ', bold=True)
         b.add(str(matched or ''), spoiler=True)
-        b.add('\n\n⟲ تعداد اعضا : ', bold=True)
+        b.add('\n⟲ تعداد اعضا : ', bold=True)
         b.add(str(members) if members is not None else 'نامشخص', spoiler=True)
-        b.add('\n\n')
+        b.add('\n')
     elif kind == 'بیوگرافی':
         b.add('⟲ کـلمه بیـوگرافی : ', bold=True)
         b.add(str(matched or ''), spoiler=True)
-        b.add('\n\n')
+        b.add('\n')
     else:
-        b.add(f'⟲ تـعداد تـکرار کـلمه : {count} بار\n\n', bold=True)
+        b.add(f'⟲ تـعداد تـکرار کـلمه : {count} بار\n', bold=True)
     b.add('⟲مـقام در گـروه : کاربر عادی', bold=True)
     b.add('\n\n\n')
     b.add('🔺  تـوضـیحات پـروتـکل', quote=True, bold=True)
