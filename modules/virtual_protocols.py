@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import closing
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 import json
@@ -27,6 +28,7 @@ LOG = logging.getLogger(__name__)
 WINDOW = 86400
 MAX_TEXT = 1024
 MAX_PENDING = 512
+PROFILE_CACHE_SECONDS = 5
 MAX_USER_MESSAGES = 200
 MAX_WORD_HITS = 500000
 MAX_PHRASE_HITS = 250000
@@ -39,7 +41,8 @@ WEIGHTS = {"repeat": 25, "burst": 15, "reply_repeat": 15,
            "cycle": 20, "cycle_burst": 10, "periodic": 20,
            "sustained_repeat": 25, "reply_target_burst": 30,
            "reply_target_concentration": 10, "explicit_filter": 70,
-           "word_repeat": 0, "repeat_multiple_users": 30}
+           "word_repeat": 0, "repeat_multiple_users": 30,
+           "bot_reply_burst": 30, "bot_repeat": 30}
 THRESHOLDS = {"review": 25, "suspicious": 45, "strong": 70}
 
 
@@ -197,7 +200,9 @@ def risk_level(signals, score, thresholds):
                         and signals.get("periodic"))
     targeted_repeat = (signals.get("repeat") and signals.get("reply_repeat")
                        and signals.get("repeat_multiple_users"))
-    if (positives >= 4 or scheduled_repeat or targeted_repeat) and score >= thresholds["strong"]:
+    bot_pattern = ((signals.get('bot_repeat') and signals.get('repeat') and signals.get('reply_repeat'))
+                   or (signals.get('bot_reply_burst') and signals.get('reply_target_burst') and signals.get('reply_target_concentration')))
+    if (positives >= 4 or scheduled_repeat or targeted_repeat or bot_pattern) and score >= thresholds["strong"]:
         return "strong"
     if positives >= 3 and score >= thresholds["suspicious"]:
         return "suspicious"
@@ -219,6 +224,8 @@ class Job:
     channel: bool | None = None
     direct_source: str | None = None
     direct_match: str | None = None
+    sender_event: object = None
+    reply_to_bot: bool = False
 
 
 def content_signals(text, group):
@@ -278,6 +285,7 @@ class Store:
           CREATE INDEX IF NOT EXISTS vp_phrase_window ON vp_phrase_hits(group_id,generation,user_id,normalized,ts);
           CREATE INDEX IF NOT EXISTS vp_phrase_expiry ON vp_phrase_hits(ts);
           CREATE INDEX IF NOT EXISTS vp_phrase_message ON vp_phrase_hits(group_id,generation,message_id);
+          CREATE INDEX IF NOT EXISTS vp_phrase_target ON vp_phrase_hits(group_id,generation,user_id,target_user,ts);
           CREATE TABLE IF NOT EXISTS vp_evidence (
             group_id TEXT NOT NULL, generation TEXT NOT NULL, user_id TEXT NOT NULL,
             message_id INTEGER NOT NULL, ts REAL NOT NULL, score INTEGER NOT NULL,
@@ -484,6 +492,8 @@ class Store:
             params = (job.group, job.generation, job.user, job.timestamp-WINDOW, job.timestamp)
             rows = db.execute("SELECT message_id,ts,text,normalized,reply_id,ad FROM vp_messages WHERE group_id=? AND generation=? AND user_id=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT ?", (*params, MAX_USER_MESSAGES)).fetchall()
             norm = normalize(job.text)
+            if job.reply_to_bot:
+                db.execute("UPDATE vp_phrase_hits SET target_user='@bot' WHERE group_id=? AND generation=? AND user_id=? AND reply_id=?", (job.group,job.generation,job.user,job.reply))
             has_phrase_index = db.execute("SELECT 1 FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? LIMIT 1", (job.group,job.generation,job.user)).fetchone()
             if not has_phrase_index and rows:
                 db.executemany("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)",
@@ -568,10 +578,16 @@ class Store:
             if job.reply is not None:
                 repeated_targets.append(job.reply)
             repeated_target_users = set()
-            repeated_target_users.update(str(target) for _mid,_ts,_norm,_reply,target in exact_rows if target and str(target) != job.user)
+            repeated_target_users.update(str(target) for _mid,_ts,_norm,_reply,target in exact_rows if target and target != '@bot' and str(target) != job.user)
             if repeated_targets:
                 marks = ','.join('?' for _ in repeated_targets[:200])
                 repeated_target_users.update(r[0] for r in db.execute('SELECT DISTINCT user_id FROM vp_messages WHERE group_id=? AND generation=? AND message_id IN ('+marks+') AND user_id!=?', (job.group,job.generation,*repeated_targets[:200],job.user)).fetchall())
+            bot_repeat_count = 0
+            if job.reply_to_bot and matches:
+                match_ids = [r[0] for r in matches]
+                marks = ','.join('?' for _ in match_ids)
+                bot_repeat_count = db.execute("SELECT COUNT(*) FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? AND target_user='@bot' AND message_id IN ("+marks+")", (job.group,job.generation,job.user,*match_ids)).fetchone()[0]
+            bot_recent = db.execute("SELECT COUNT(*) FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? AND target_user='@bot' AND ts>=? AND ts<=?", (job.group,job.generation,job.user,job.timestamp-60,job.timestamp)).fetchone()[0] if job.reply_to_bot else 0
             signals = {"repeat": len(matches) >= 3,
                        "burst": len(recent) >= 3,
                        "reply_repeat": job.reply is not None and len(reply_matches) >= 3,
@@ -585,7 +601,9 @@ class Store:
                        "reply_target_concentration": target_concentration,
                        "explicit_filter": bool(job.direct_source),
                        "word_repeat": bool(word_counts),
-                       "repeat_multiple_users": len(repeated_target_users) >= 3 and len(matches) >= 3}
+                       "repeat_multiple_users": len(repeated_target_users) >= 3 and len(matches) >= 3,
+                       "bot_repeat": job.reply_to_bot and bot_repeat_count >= 3,
+                       "bot_reply_burst": job.reply_to_bot and bot_recent >= 5}
             # Fetch existing moderation history only after multiple behavioral
             # indicators, never use old or unknown status as a standalone verdict.
             if sum(v for k, v in signals.items() if k not in ("history", "conversation")) >= 2 and not history:
@@ -610,6 +628,8 @@ class Store:
                         "reply_user_id": reply_row[0] if reply_row else None,
                         "incoming_distinct_users": incoming, "conversation_indicator": conversation,
                         "outgoing_distinct_users": len(target_users),
+                        "reply_to_own_bot": job.reply_to_bot,
+                        "same_text_bot_replies": bot_repeat_count + int(job.reply_to_bot),
                         "repeated_reply_target_users": sorted(repeated_target_users),
                         "repeated_words": [{"word": w, "count": c} for w,c in sorted(word_counts.items(), key=lambda x: (-x[1],x[0]))],
                         "reply_only": bool(job.reply is not None and rows and all(r[4] is not None for r in rows)),
@@ -622,7 +642,7 @@ class Store:
                         "cross_group": {"status": "checked" if others else "not_authorized", "matching_groups": sorted(set(cross_matches)), "matches": len(cross_matches)}, "decision": "evidence_recorded"}
             db.execute("INSERT INTO vp_messages VALUES(?,?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,job.text,norm,job.reply,int(ad) | (int(channel) << 1)))
             target_row = db.execute("SELECT user_id FROM vp_messages WHERE group_id=? AND generation=? AND message_id=? AND user_id!=?", (job.group,job.generation,job.reply,job.user)).fetchone() if job.reply is not None else None
-            db.execute("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,norm,job.reply,target_row[0] if target_row else None))
+            db.execute("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,norm,job.reply,'@bot' if job.reply_to_bot else (target_row[0] if target_row else None)))
             db.executemany("INSERT OR IGNORE INTO vp_word_hits VALUES(?,?,?,?,?,?)", ((job.group,job.generation,job.user,job.message,job.timestamp,w) for w in words))
             if level != "natural" or word_counts:
                 db.execute("INSERT INTO vp_evidence VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,score,level,json.dumps(evidence,ensure_ascii=False)))
@@ -662,6 +682,8 @@ class Service:
         self.pending = set()
         self.dropped = 0
         self.last_error = 0.0
+        self.last_profile_error = 0.0
+        self.last_action_skip = 0.0
         self.maintenance_task = None
         self.recovery_task = None
         self.retry_task = None
@@ -679,6 +701,12 @@ class Service:
         self.action_workers = set()
         self.action_probes = {}
         self.activations = {}
+        self.bot_messages = OrderedDict()
+        self.reply_queue = asyncio.Queue(maxsize=64)
+        self.reply_workers = set()
+        self.reply_locks = weakref.WeakValueDictionary()
+        self.reply_checked = OrderedDict()
+        self.reply_active = {}
 
     def start(self):
         if not self.groups:
@@ -804,8 +832,13 @@ class Service:
             if not enabled:
                 self.bio_results = {k:v for k,v in self.bio_results.items() if k[0] != group}
                 self.bio_recent = {k:v for k,v in self.bio_recent.items() if k[0] != group}
+                self.bot_messages = OrderedDict((k,v) for k,v in self.bot_messages.items() if k[0] != group)
+                self.reply_checked = OrderedDict((k,v) for k,v in self.reply_checked.items() if k[0] != group)
             if not enabled:
                 for request in tuple(self.bio_active.get(group, ())):
+                    request.cancel()
+            if not enabled:
+                for request in tuple(self.reply_active.get(group, ())):
                     request.cancel()
             if not enabled:
                 for probe in tuple(self.action_probes.get(group, ())):
@@ -816,7 +849,48 @@ class Service:
             self.maintenance_task.cancel()
             self.maintenance_task = None
 
-    def submit(self, group, user, message, text, reply=None):
+    def log_action_skip(self, reason, job):
+        now = time.monotonic()
+        if now-self.last_action_skip >= 30:
+            LOG.warning('virtual protocol action skipped: %s group=%s user=%s', reason, job.group, job.user)
+            self.last_action_skip = now
+
+    def remember_bot_message(self, group, message):
+        group = normalize_group_id(group)
+        generation = self.groups.get(group)
+        try:
+            message = int(message)
+        except (TypeError, ValueError):
+            return False
+        if not generation or message <= 0:
+            return False
+        now = time.monotonic()
+        self.bot_messages[(group, generation, message)] = now
+        self.bot_messages.move_to_end((group, generation, message))
+        while self.bot_messages:
+            oldest = next(iter(self.bot_messages))
+            if len(self.bot_messages) <= 20000 and now-self.bot_messages[oldest] <= WINDOW:
+                break
+            self.bot_messages.popitem(last=False)
+        return True
+
+    async def resolve_sender(self, job):
+        event = job.sender_event
+        if event is not None:
+            sender = getattr(event, 'sender', None)
+            if sender is None and callable(getattr(event, 'get_sender', None)):
+                try:
+                    sender = await asyncio.wait_for(event.get_sender(), 3)
+                except Exception:
+                    sender = None
+            if sender is not None and str(getattr(sender, 'id', '')) == job.user:
+                return sender
+        try:
+            return await asyncio.wait_for(self.bot.client.get_entity(int(job.user)), 3)
+        except Exception:
+            return None
+
+    def submit(self, group, user, message, text, reply=None, *, sender_event=None):
         group = normalize_group_id(group)
         generation = self.groups.get(group)
         if not generation:
@@ -833,7 +907,9 @@ class Service:
         key = (group, generation, message)
         if key in self.pending:
             return False
-        job = Job(group,str(user),message,text[:MAX_TEXT],reply,time.time(),generation)
+        bot_msg_time = self.bot_messages.get((group, generation, reply)) if reply is not None else None
+        reply_to_bot = bot_msg_time is not None and time.monotonic()-bot_msg_time <= WINDOW
+        job = Job(group,str(user),message,text[:MAX_TEXT],reply,time.time(),generation, sender_event=sender_event, reply_to_bot=reply_to_bot)
         if len(self.pending) >= MAX_PENDING:
             self.dropped += 1
             return False
@@ -847,6 +923,83 @@ class Service:
             self.word_task = asyncio.create_task(self._word_worker(), name="virtual-protocol-words")
         return True
 
+    def _forward_job(self, job):
+        self.queue.put_nowait(job)
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._worker(), name="virtual-protocols")
+
+    def _queue_reply_resolution(self, job):
+        event = job.sender_event
+        msg = getattr(event, 'message', None) if event is not None else None
+        getter = getattr(msg, 'get_reply_message', None)
+        if (job.reply is None or job.reply_to_bot or job.direct_source or not callable(getter)
+                or self.reply_queue.full()):
+            return False
+        self.reply_queue.put_nowait(job)
+        self.reply_workers = {t for t in self.reply_workers if not t.done()}
+        if len(self.reply_workers) < 4:
+            task = asyncio.create_task(self._reply_worker(), name='virtual-protocol-reply-lookup')
+            self.reply_workers.add(task)
+            task.add_done_callback(self.reply_workers.discard)
+        return True
+
+    async def _reply_worker(self):
+        from modules.light_spam_ingest import _peer_id
+        while not self.reply_queue.empty():
+            job = self.reply_queue.get_nowait()
+            forwarded = False
+            try:
+                key = (job.group, job.generation, job.reply)
+                lock = self.reply_locks.get(key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self.reply_locks[key] = lock
+                async with lock:
+                    bot_time = self.bot_messages.get(key)
+                    is_bot = bot_time is not None and time.monotonic()-bot_time <= WINDOW
+                    checked = self.reply_checked.get(key)
+                    if not is_bot and (checked is None or time.monotonic()-checked > 60):
+                        request = None
+                        try:
+                            request = asyncio.create_task(job.sender_event.message.get_reply_message())
+                            self.reply_active.setdefault(job.group, set()).add(request)
+                            target = await asyncio.wait_for(request, 2)
+                            target_id = getattr(target, 'id', None)
+                            bot_id = getattr(self.bot, 'bot_account_id', None)
+                            target_sender = _peer_id(getattr(target, 'sender_id', None) or getattr(target, 'from_id', None))
+                            is_bot = bool(target_id == job.reply and (getattr(target, 'out', False) or (bot_id is not None and target_sender == int(bot_id))))
+                            if target is not None and target_id == job.reply:
+                                if is_bot and self.groups.get(job.group) == job.generation:
+                                    self.remember_bot_message(job.group, job.reply)
+                                else:
+                                    self.reply_checked[key] = time.monotonic()
+                                    self.reply_checked.move_to_end(key)
+                                    while len(self.reply_checked) > 4096:
+                                        self.reply_checked.popitem(last=False)
+                        except asyncio.CancelledError:
+                            if self.groups.get(job.group) != job.generation:
+                                continue
+                            raise
+                        except Exception:
+                            pass  # Unknown is never treated as a bot or a human.
+                        finally:
+                            active = self.reply_active.get(job.group)
+                            if active:
+                                active.discard(request)
+                                if not active:
+                                    self.reply_active.pop(job.group, None)
+                async with self.lock:
+                    if self.groups.get(job.group) == job.generation and time.time()-job.timestamp <= QUEUE_TTL:
+                        self._forward_job(replace(job, reply_to_bot=is_bot))
+                        forwarded = True
+            except Exception:
+                self.dropped += 1
+                LOG.warning('virtual protocol reply lookup skipped', exc_info=True)
+            finally:
+                if not forwarded:
+                    self.pending.discard((job.group,job.generation,job.message))
+                self.reply_queue.task_done()
+
     async def _word_worker(self):
         while not self.word_queue.empty():
             job = self.word_queue.get_nowait()
@@ -855,10 +1008,10 @@ class Service:
                 async with self.lock:
                     if self.groups.get(job.group) == job.generation and time.time()-job.timestamp <= QUEUE_TTL:
                         ad, channel, source, matched = await asyncio.to_thread(content_signals, job.text, job.group)
-                        self.queue.put_nowait(replace(job, ad=ad, channel=channel, direct_source=source, direct_match=matched))
+                        job = replace(job, ad=ad, channel=channel, direct_source=source, direct_match=matched)
+                        if not self._queue_reply_resolution(job):
+                            self._forward_job(job)
                         forwarded = True
-                        if self.task is None or self.task.done():
-                            self.task = asyncio.create_task(self._worker(), name="virtual-protocols")
             except Exception:
                 self.dropped += 1
                 now = time.monotonic()
@@ -925,17 +1078,20 @@ class Service:
                         or str(getattr(bot, "bot_account_id", "")) == job.user):
                     continue
                 rpc_group = _chat_id_for_rpc(job.group)
+                resolved_user = await self.resolve_sender(job)
                 try:
-                    probe = asyncio.create_task(bot.client.get_permissions(rpc_group, int(job.user)))
+                    probe = asyncio.create_task(bot.client.get_permissions(rpc_group, resolved_user or int(job.user)))
                     self.action_probes.setdefault(job.group, set()).add(probe)
                     permissions = await asyncio.wait_for(probe, 5)
                     if getattr(permissions, "is_admin", None) is not False or getattr(permissions, "is_creator", False):
+                        self.log_action_skip('native role admin or unknown', job)
                         continue
                 except asyncio.CancelledError:
                     if self.groups.get(job.group) != job.generation:
                         continue
                     raise
                 except Exception:
+                    self.log_action_skip('native role lookup failed', job)
                     continue
                 finally:
                     probes = self.action_probes.get(job.group)
@@ -956,6 +1112,7 @@ class Service:
                     except Exception:
                         deleted = 0
                     if not deleted:
+                        self.log_action_skip('message deletion not confirmed', job)
                         await asyncio.to_thread(self.store.action_status, job, 'failed')
                         continue
                     bio = evidence.get('bio') or {}
@@ -970,7 +1127,7 @@ class Service:
                         category, matched = 'تبلیغات', None
                     else:
                         category, matched = 'هرزنامه', None
-                    user = await virtual_protocol_ui.user_label(bot, job.user)
+                    user = await virtual_protocol_ui.user_label(bot, job.user, job.sender_event)
                     if stage == 1:
                         try:
                             payload = virtual_protocol_texts.warning(user, category, evidence.get('repeat_count', 0), matched=matched, members=members)
@@ -988,24 +1145,24 @@ class Service:
                         await asyncio.to_thread(self.store.action_status, job, 'failed')
                         continue
                     completed = asyncio.get_running_loop().create_future()
-                    async def operation(_job=job, _stage=stage, _category=category, _matched=matched, _members=members, _user=user, _rpc=rpc_group):
+                    async def operation(_job=job, _stage=stage, _category=category, _matched=matched, _members=members, _user=user, _rpc=rpc_group, _resolved=resolved_user):
                         async with self.action_group_lock(_job.group):
                             if self.groups.get(_job.group) != _job.generation or time.time()-_job.timestamp > QUEUE_TTL:
                                 return False
                             if has_admin_permission(_job.group, _job.user, None) or vip_storage.is_vip(_job.group, _job.user):
                                 return False
                             try:
-                                role = await asyncio.wait_for(bot.client.get_permissions(_rpc, int(_job.user)), 5)
+                                role = await asyncio.wait_for(bot.client.get_permissions(_rpc, _resolved or int(_job.user)), 5)
                             except Exception:
                                 return False
                             if getattr(role, 'is_admin', None) is not False or getattr(role, 'is_creator', False):
                                 return False
                             mode = 'mute' if punishment_mode.is_mute(_job.group) else 'ban'
                             if _stage == 2:
-                                ok = await actions.mute_user(_rpc, int(_job.user), 4*3600)
+                                ok = await actions.mute_user(_rpc, int(_job.user), 4*3600, user=_resolved)
                                 kind = 'mute'
                             else:
-                                ok = await actions.ban_user(_rpc, int(_job.user), reason='virtual_protocols')
+                                ok = await actions.ban_user(_rpc, int(_job.user), reason='virtual_protocols', user=_resolved)
                                 kind = mode
                             if not ok:
                                 return False
@@ -1061,9 +1218,9 @@ class Service:
         if self.bio_queue.full():
             self.profile_dropped += 1
             return False
-        cached = self.bio_results.get(key) if now-self.bio_recent.get(key, -121) < 120 else None
+        cached = self.bio_results.get(key) if now-self.bio_recent.get(key, -PROFILE_CACHE_SECONDS-1) < PROFILE_CACHE_SECONDS else None
         if len(self.bio_recent) >= 1024:
-            self.bio_recent = {k:v for k,v in self.bio_recent.items() if now-v < 120}
+            self.bio_recent = {k:v for k,v in self.bio_recent.items() if now-v < PROFILE_CACHE_SECONDS}
             self.bio_results = {k:v for k,v in self.bio_results.items() if k in self.bio_recent}
             if len(self.bio_recent) >= 1024:
                 old = next(iter(self.bio_recent))
@@ -1090,8 +1247,10 @@ class Service:
                 if cached is None:
                     async def fetch_profile():
                         from modules.profile_guard import service as profile_service
-                        user = await asyncio.wait_for(self.bot.client.get_entity(int(job.user)), 3)
-                        return await profile_service.snapshot(self.bot, user, max_age=120)
+                        user = await self.resolve_sender(job)
+                        if user is None:
+                            return None
+                        return await profile_service.snapshot(self.bot, user, max_age=PROFILE_CACHE_SECONDS)
                     request = asyncio.create_task(fetch_profile())
                     self.bio_active.setdefault(job.group, set()).add(request)
                     try:
@@ -1108,6 +1267,9 @@ class Service:
                             active.discard(request)
                             if not active:
                                 self.bio_active.pop(job.group, None)
+                if profile is None and cached is None and time.monotonic()-self.last_profile_error >= 30:
+                    LOG.warning('virtual protocol profile unavailable group=%s user=%s', job.group, job.user)
+                    self.last_profile_error = time.monotonic()
                 async with self.lock:
                     if self.groups.get(job.group) == job.generation:
                         already_scheduled = bool(original[2].get('direct_filter'))
@@ -1140,6 +1302,10 @@ async def intercept(service, event, bot_id=None):
     uid = _event_user_id(event, message)
     if group is None:
         return False
+    if getattr(event, 'out', False) or (bot_id is not None and str(uid) == str(bot_id)):
+        if not (getattr(event, '_is_edited_message', False) or getattr(event, 'is_edit', False) or getattr(message, 'edit_date', None) is not None):
+            service.remember_bot_message(group, getattr(message, 'id', None))
+        return False
     command = text.strip() if isinstance(text, str) else ""
     if command in ("پروتکل روشن", "پروتکل خاموش"):
         from modules.admin_tools import has_admin_permission
@@ -1154,11 +1320,11 @@ async def intercept(service, event, bot_id=None):
         return True
     if not service.groups.get(normalize_group_id(group)):
         return False
-    if uid is None or (bot_id is not None and str(uid) == str(bot_id)):
+    if uid is None:
         return False
     if getattr(event, "_is_edited_message", False) or getattr(event, "is_edit", False) or getattr(message, "edit_date", None) is not None:
         return False
     reply_obj = getattr(message, "reply_to", None) or getattr(event, "reply_to", None)
     reply = (getattr(message, "reply_to_msg_id", None) or getattr(event, "reply_to_msg_id", None) or getattr(reply_obj, "reply_to_msg_id", None))
-    service.submit(group, uid, getattr(message, "id", None), text, reply)
+    service.submit(group, uid, getattr(message, "id", None), text, reply, sender_event=event)
     return False

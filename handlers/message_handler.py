@@ -1152,6 +1152,11 @@ def _schedule_reply(bot, event, *args, **kwargs):
                     _reply_id = extract_sent_id(sent)
                     if _reply_id is not None:
                         _register_bot_reply(_origin_chat_id, _origin_msg_id, _reply_id)
+                        # Also let the virtual protocol identify replies to our
+                        # own bot, without treating bot responses as human chat.
+                        _vp = getattr(bot, 'virtual_protocols', None)
+                        if _vp is not None:
+                            _vp.remember_bot_message(_origin_chat_id, _reply_id)
             except Exception:
                 pass
         except Exception as error:

@@ -21,6 +21,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def flush(self):
         await self.service.word_queue.join()
+        await self.service.reply_queue.join()
         await self.service.queue.join()
 
     async def asyncTearDown(self):
@@ -29,6 +30,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         await self.service.word_queue.join()
+        await self.service.reply_queue.join()
         await self.service.queue.join()
         await self.service.bio_queue.join()
         await self.service.action_queue.join()
@@ -781,6 +783,153 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[2]['repeated_reply_target_users'],['21','22','23','24'])
         self.assertFalse(result[2]['signals']['periodic'])
         self.assertIsNone(store.process(Job('1','9',1,'سلام',101,now,gen)))
+
+    async def test_real_profile_api_shape_detects_kanalam_on_first_message(self):
+        from splusthon.tl.types import User
+        from splusthon.tl.functions.users import GetFullUserRequest
+        from modules.profile_guard import service as profile_service
+        profile_service._cache.clear(); profile_service._retry_after.clear()
+        bot=self.fake_action_bot(); self.service.bot=bot
+        bot.client.get_entity=AsyncMock(side_effect=ValueError('ID not cached'))
+        await self.service.toggle(1,True)
+        sender=User(id=9,user_type=None,access_hash=123,first_name='Test')
+        event=SimpleNamespace(chat_id=1,sender_id=9,is_private=False,
+            message=SimpleNamespace(id=1,message='درود دوستان',reply_to=None),
+            get_sender=AsyncMock(return_value=sender))
+        async def rpc(client, make_request, user_id, **kwargs):
+            request=make_request()
+            self.assertIsInstance(request,GetFullUserRequest)
+            self.assertEqual(user_id,9)
+            return SimpleNamespace(full_user=SimpleNamespace(about='کانالم',personal_channel_id=None),chats=[])
+        with patch('modules.full_user_shared.get_full_user',side_effect=rpc) as fetch, patch('modules.profile_guard.service._throttle',new=AsyncMock()), patch('modules.profile_guard.storage.is_enabled',return_value=False), patch('modules.ad_spam_guard.storage.is_enabled',return_value=False), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            await intercept(self.service,event,bot_id=999)
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        fetch.assert_awaited_once()
+        event.get_sender.assert_awaited()
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+        self.assertIn('بیوگرافی',bot.client.send_message.await_args.args[1])
+        with sqlite3.connect(self.db) as db:
+            row=db.execute('select evidence from vp_evidence where message_id=1').fetchone()
+        self.assertEqual(json.loads(row[0])['direct_filter']['source'],'profile_bio')
+        profile_service._cache.clear(); profile_service._retry_after.clear()
+
+    async def test_repeated_replies_to_bot_ignored_as_human_conversation(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1,True)
+        bot_event=SimpleNamespace(chat_id=1,sender_id=999,out=True,is_private=False,
+            message=SimpleNamespace(id=100,message='پاسخ ربات',reply_to=None))
+        await intercept(self.service,bot_event,bot_id=999)
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid,text in enumerate(['اوف سلام','چخبر','جون','خوبیی','کجای','سلام'],1):
+                msg=SimpleNamespace(id=mid,message=text,reply_to=SimpleNamespace(reply_to_msg_id=100))
+                event=SimpleNamespace(message=msg,chat_id=1,sender_id=9,is_private=False)
+                await intercept(self.service,event,bot_id=999)
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        with sqlite3.connect(self.db) as db:
+            level,raw=db.execute('select level,evidence from vp_evidence where message_id=6').fetchone()
+        ev=json.loads(raw)
+        self.assertEqual(level,'strong')
+        self.assertTrue(ev['reply_to_own_bot'])
+        self.assertTrue(ev['signals']['bot_reply_burst'])
+        self.assertFalse(ev['signals']['conversation'])
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+
+    async def test_old_bot_target_resolved_from_actual_reply_without_history_scan(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1,True)
+        target=SimpleNamespace(id=100,sender_id=999,out=True)
+        lookup=AsyncMock(return_value=target)
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid,text in enumerate(['اوف سلام','چخبر','جون','خوبیی','کجای','سلام'],1):
+                msg=SimpleNamespace(id=mid,message=text,reply_to=SimpleNamespace(reply_to_msg_id=100),get_reply_message=lookup)
+                await intercept(self.service,SimpleNamespace(message=msg,chat_id=1,sender_id=9,is_private=False),bot_id=999)
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        lookup.assert_awaited_once()
+        with sqlite3.connect(self.db) as db:
+            level,raw=db.execute('select level,evidence from vp_evidence where message_id=6').fetchone()
+        self.assertEqual(level,'strong')
+        self.assertTrue(json.loads(raw)['reply_to_own_bot'])
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+
+    async def test_reply_to_real_user_is_not_guessed_to_be_bot(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1,True)
+        lookup=AsyncMock(return_value=SimpleNamespace(id=100,sender_id=8,out=False))
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid,text in enumerate(['اوف سلام','چخبر','جون','خوبیی','کجای','سلام'],1):
+                msg=SimpleNamespace(id=mid,message=text,reply_to=SimpleNamespace(reply_to_msg_id=100),get_reply_message=lookup)
+                await intercept(self.service,SimpleNamespace(message=msg,chat_id=1,sender_id=9,is_private=False),bot_id=999)
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        with sqlite3.connect(self.db) as db:
+            level,raw=db.execute('select level,evidence from vp_evidence where message_id=6').fetchone()
+        self.assertNotEqual(level,'strong')
+        self.assertFalse(json.loads(raw)['reply_to_own_bot'])
+        bot.client.send_message.assert_not_awaited()
+        lookup.assert_awaited_once()
+
+    async def test_disabling_cancels_inflight_reply_lookup(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1,True)
+        started=asyncio.Event()
+        async def slow():
+            started.set()
+            await asyncio.sleep(100)
+        msg=SimpleNamespace(id=1,message='درود دوستان',reply_to=SimpleNamespace(reply_to_msg_id=100),get_reply_message=slow)
+        event=SimpleNamespace(message=msg,chat_id=1,sender_id=9,is_private=False)
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]):
+            await intercept(self.service,event,bot_id=999)
+            await asyncio.wait_for(started.wait(),2)
+            await self.service.toggle(1,False)
+            await asyncio.wait_for(self.service.reply_queue.join(),2)
+            await self.service.queue.join()
+        bot.client.send_message.assert_not_awaited()
+        self.assertEqual(len(self.service.pending),0)
+
+    async def test_changed_bio_rechecked_after_short_cache(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1,True)
+        profiles=[{'status':'ok','about':None,'channel_title':None},{'status':'ok','about':'کانالم','channel_title':None}]
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=['کانالم']), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(side_effect=profiles)) as snapshot, patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            self.service.submit(1,9,1,'درود دوستان')
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+            bot.client.send_message.assert_not_awaited()
+            self.service.bio_recent[('1','9')] -= 6
+            self.service.submit(1,9,2,'درود دوستان تازه')
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        self.assertEqual(snapshot.await_count,2)
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+        self.assertIn('بیوگرافی',bot.client.send_message.await_args.args[1])
+
+    async def test_bot_reply_to_user_is_not_human_response(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1,True)
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid in range(1,5):
+                self.service.remember_bot_message(1,100+mid)
+                msg=SimpleNamespace(id=mid,message='سلام',reply_to=SimpleNamespace(reply_to_msg_id=100+mid))
+                event=SimpleNamespace(message=msg,chat_id=1,sender_id=9,is_private=False)
+                await intercept(self.service,event,bot_id=999)
+                outgoing=SimpleNamespace(chat_id=1,sender_id=999,out=True,is_private=False,message=SimpleNamespace(id=200+mid,message='درود',reply_to=SimpleNamespace(reply_to_msg_id=mid)))
+                await intercept(self.service,outgoing,bot_id=999)
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        with sqlite3.connect(self.db) as db:
+            level,raw=db.execute('select level,evidence from vp_evidence where message_id=4').fetchone()
+        ev=json.loads(raw)
+        self.assertEqual(level,'strong')
+        self.assertFalse(ev['signals']['conversation'])
+        self.assertEqual(ev['incoming_distinct_users'],0)
+        self.assertTrue(ev['signals']['bot_repeat'])
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+
+    async def test_simple_reply_registers_its_sent_id_for_protocol(self):
+        from handlers.message_handler import _schedule_reply
+        bot=self.fake_action_bot(); bot.virtual_protocols=self.service; self.service.bot=bot
+        await self.service.toggle(1,True)
+        event=SimpleNamespace(chat_id=1,message=SimpleNamespace(id=1),reply=AsyncMock(return_value=SimpleNamespace(id=125)))
+        await _schedule_reply(bot,event,'سلام')
+        self.assertIn(('1',self.service.groups['1'],125),self.service.bot_messages)
+        await self.service.toggle(1,False)
+        self.assertFalse(self.service.bot_messages)
 
     async def test_feedback_requires_new_strong_matching_activity(self):
         await self.service.toggle(1, True)
