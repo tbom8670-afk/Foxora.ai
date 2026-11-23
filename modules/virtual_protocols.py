@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import unicodedata
@@ -27,13 +28,18 @@ WINDOW = 86400
 MAX_TEXT = 1024
 MAX_PENDING = 512
 MAX_USER_MESSAGES = 200
+MAX_WORD_HITS = 500000
+MAX_PHRASE_HITS = 250000
 QUEUE_TTL = 120
 # Scores are heuristic, not calibrated probabilities or identity judgements.
 WEIGHTS = {"repeat": 25, "burst": 15, "reply_repeat": 15,
-           "same_reply_target": 10, "ad_repeat": 15, "coordination": 20,
+           "same_reply_target": 15, "ad_repeat": 15, "coordination": 20,
            "conversation": -20, "cross_group": 15, "channel_repeat": 15,
            "history": 5, "bio_confirmed": 10, "manager_feedback": -30,
-           "cycle": 20, "cycle_burst": 10, "periodic": 10}
+           "cycle": 20, "cycle_burst": 10, "periodic": 20,
+           "sustained_repeat": 25, "reply_target_burst": 30,
+           "reply_target_concentration": 10, "explicit_filter": 70,
+           "word_repeat": 0, "repeat_multiple_users": 30}
 THRESHOLDS = {"review": 25, "suspicious": 45, "strong": 70}
 
 
@@ -44,11 +50,27 @@ def normalize(text):
     return "".join(c for c in s if c.isalnum())
 
 
+def message_words(text):
+    """Distinct words of four or more letters; no punctuation or emoji.
+
+    Count messages containing a word, not repeated letters inside one message.
+    """
+    value = unicodedata.normalize('NFKC', str(text or '')).casefold()
+    value = value.translate(str.maketrans({'ي':'ی','ى':'ی','ك':'ک','آ':'ا','أ':'ا','إ':'ا','ة':'ه'}))
+    value = ''.join(c for c in value if unicodedata.category(c) not in ('Mn','Me') and c != 'ـ')
+    return {w for w in re.findall(r'[^\W_]+', value, flags=re.UNICODE)
+            if sum(c.isalpha() for c in w) >= 4}
+
+
 def similar(a, b):
-    if not a or not b or min(len(a), len(b)) < 6:
+    if not a or not b or min(len(a), len(b)) < 2:
         return False
+    # Short replies are frequent in conversation: only exact normalized
+    # equality counts; fuzzy matching starts at six characters.
     if a == b:
         return True
+    if min(len(a), len(b)) < 6:
+        return False
     if max(len(a), len(b)) > 256:
         return False  # Long texts are compared exactly to bound CPU and avoid prefix matches.
     if abs(len(a) - len(b)) > max(len(a), len(b)) * .18:
@@ -168,8 +190,14 @@ def history_snapshot(group, user, now):
 
 
 def risk_level(signals, score, thresholds):
-    positives = sum(v for k, v in signals.items() if k not in ("conversation", "manager_feedback"))
-    if positives >= 4 and score >= thresholds["strong"]:
+    if signals.get('explicit_filter'):
+        return 'strong'  # explicit configured filter is itself a violation
+    positives = sum(v for k, v in signals.items() if k not in ("conversation", "manager_feedback", "word_repeat"))
+    scheduled_repeat = (signals.get("repeat") and signals.get("sustained_repeat")
+                        and signals.get("periodic"))
+    targeted_repeat = (signals.get("repeat") and signals.get("reply_repeat")
+                       and signals.get("repeat_multiple_users"))
+    if (positives >= 4 or scheduled_repeat or targeted_repeat) and score >= thresholds["strong"]:
         return "strong"
     if positives >= 3 and score >= thresholds["suspicious"]:
         return "suspicious"
@@ -189,10 +217,28 @@ class Job:
     generation: str
     ad: bool | None = None
     channel: bool | None = None
+    direct_source: str | None = None
+    direct_match: str | None = None
 
 
-def content_signals(text):
-    return ad_signal(text), channel_signal(text)
+def content_signals(text, group):
+    """Read the actual existing lists, regardless of the other guards' toggles."""
+    from modules import group_words_storage
+    from modules.profile_guard import filters, matcher
+    group_word = group_words_storage.find_matching_filter_word(text, group_words_storage.get_words(group))
+    phrase = matcher.find_match(text, matcher.compile_phrases(filters.channel_names() + filters.bio_sentences()))
+    normalized = patterns.normalize(text)
+    ad_match = next((p for p in patterns.TEXT_MARKERS + patterns.SPAM_PHRASES + patterns.AD_CTA_PHRASES
+                     if patterns.normalize(p) and patterns.normalize(p) in normalized), None)
+    if group_word:
+        source, matched = 'group_word', group_word
+    elif phrase:
+        source, matched = 'profile_list_in_message', phrase.raw
+    elif ad_match:
+        source, matched = 'ad_list', ad_match
+    else:
+        source, matched = None, None
+    return bool(ad_match), bool(phrase), source, matched
 
 
 class Store:
@@ -218,6 +264,20 @@ class Store:
           CREATE INDEX IF NOT EXISTS vp_group_time ON vp_messages(group_id,generation,ts);
           CREATE INDEX IF NOT EXISTS vp_user_global ON vp_messages(user_id,ts);
           CREATE INDEX IF NOT EXISTS vp_reply ON vp_messages(group_id,generation,reply_id,ts);
+          CREATE TABLE IF NOT EXISTS vp_word_hits (
+            group_id TEXT NOT NULL, generation TEXT NOT NULL, user_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL, ts REAL NOT NULL, word TEXT NOT NULL,
+            PRIMARY KEY(group_id,generation,user_id,message_id,word));
+          CREATE INDEX IF NOT EXISTS vp_word_window ON vp_word_hits(group_id,generation,user_id,word,ts);
+          CREATE INDEX IF NOT EXISTS vp_word_expiry ON vp_word_hits(ts);
+          CREATE TABLE IF NOT EXISTS vp_phrase_hits (
+            group_id TEXT NOT NULL, generation TEXT NOT NULL, user_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL, ts REAL NOT NULL, normalized TEXT NOT NULL,
+            reply_id INTEGER, target_user TEXT,
+            PRIMARY KEY(group_id,generation,user_id,message_id));
+          CREATE INDEX IF NOT EXISTS vp_phrase_window ON vp_phrase_hits(group_id,generation,user_id,normalized,ts);
+          CREATE INDEX IF NOT EXISTS vp_phrase_expiry ON vp_phrase_hits(ts);
+          CREATE INDEX IF NOT EXISTS vp_phrase_message ON vp_phrase_hits(group_id,generation,message_id);
           CREATE TABLE IF NOT EXISTS vp_evidence (
             group_id TEXT NOT NULL, generation TEXT NOT NULL, user_id TEXT NOT NULL,
             message_id INTEGER NOT NULL, ts REAL NOT NULL, score INTEGER NOT NULL,
@@ -287,6 +347,10 @@ class Store:
         with closing(self.connect()) as db, db:
             db.execute("DELETE FROM vp_pending WHERE ts < ?", (now-QUEUE_TTL,))
             db.execute("DELETE FROM vp_messages WHERE ts < ?", (now-WINDOW,))
+            db.execute("DELETE FROM vp_phrase_hits WHERE ts < ?", (now-WINDOW,))
+            db.execute("DELETE FROM vp_phrase_hits WHERE rowid IN (SELECT rowid FROM vp_phrase_hits ORDER BY ts DESC LIMIT -1 OFFSET ?)", (MAX_PHRASE_HITS,))
+            db.execute("DELETE FROM vp_word_hits WHERE ts < ?", (now-WINDOW,))
+            db.execute("DELETE FROM vp_word_hits WHERE rowid IN (SELECT rowid FROM vp_word_hits ORDER BY ts DESC LIMIT -1 OFFSET ?)", (MAX_WORD_HITS,))
             db.execute("DELETE FROM vp_evidence WHERE ts < ?", (now-7*WINDOW,))
             db.execute("DELETE FROM vp_feedback WHERE ts < ?", (now-30*WINDOW,))
             db.execute("DELETE FROM vp_actions WHERE ts < ?", (now-30*WINDOW,))
@@ -353,44 +417,38 @@ class Store:
             if linked:
                 db.execute("UPDATE vp_actions SET status='released',released_at=? WHERE group_id=? AND generation=? AND message_id=?", (time.time(),group,row[0],row[1]))
 
-    def update_bio(self, job, status, about, weights, thresholds, cached=None, profile=None):
-        from modules import bio_link
-        with closing(self.connect()) as db, db:
-            row = db.execute("SELECT evidence FROM vp_evidence WHERE group_id=? AND generation=? AND message_id=?", (job.group,job.generation,job.message)).fetchone()
-            if not row:
-                return
-            evidence = json.loads(row[0])
-            bio = {"status": str(status), "link": None, "ad_signal": None, "channel_signal": None, "confirmed": False, "matched": None}
-            if cached is not None:
-                bio = dict(cached)
-                bio["confirmed"] = bool((evidence["ad_signal"] and (bio.get("ad_signal") or bio.get("link") or bio.get("matched"))) or (evidence["channel_signal"] and (bio.get("channel_signal") or bio.get("matched"))))
-            elif status == "ok" and about:
-                link = bool(bio_link.analyze(about, detect_username=True)[0])
-                ad = ad_signal(about)
-                channel = channel_signal(about)
-                from modules.profile_guard import filters, matcher
-                match = matcher.find_match(about, matcher.compile_phrases(filters.bio_sentences()))
-                matched = match.raw if match is not None else None
-                confirmed = ((evidence["ad_signal"] and (ad or link or bool(matched))) or
-                             (evidence["channel_signal"] and (channel or bool(matched))))
-                bio.update(link=link, ad_signal=ad, channel_signal=channel, confirmed=bool(confirmed), matched=matched)
-            if profile and evidence.get('channel_signal'):
-                from modules.profile_guard import filters, matcher
+    def update_bio(self, job, original, profile, weights, thresholds, cached=None):
+        """Apply real profile-list matches; never persist the full profile bio."""
+        from modules.profile_guard import filters, matcher
+        level, score, evidence = original
+        if cached is None:
+            bio = {"status": str((profile or {}).get('status', 'unavailable')),
+                   "confirmed": False, "matched": None}
+            if profile and profile.get('status') in ('ok', 'empty'):
+                about = profile.get('about')
                 title = profile.get('channel_title')
-                found = matcher.find_match(title, matcher.compile_phrases(filters.channel_names())) if title else None
-                if found:
-                    bio['channel_profile_confirmed'] = True
-                    bio['channel_title'] = str(title)[:256]
-                    bio['channel_members'] = profile.get('participants')
-                    bio['confirmed'] = True
-            if cached and bio.get('channel_profile_confirmed') and not evidence.get('channel_signal'):
-                bio['channel_profile_confirmed'] = False
-            evidence["bio"] = bio
-            evidence["signals"]["bio_confirmed"] = bio["confirmed"]
-            score = max(0, sum(weights[k] for k, v in evidence["signals"].items() if v))
-            level = risk_level(evidence["signals"], score, thresholds)
-            db.execute("UPDATE vp_evidence SET score=?,level=?,evidence=? WHERE group_id=? AND generation=? AND message_id=?", (score,level,json.dumps(evidence,ensure_ascii=False),job.group,job.generation,job.message))
-            return level, score, evidence
+                found_bio = matcher.find_match(about, matcher.compile_phrases(filters.bio_sentences())) if about else None
+                found_channel = matcher.find_match(title, matcher.compile_phrases(filters.channel_names())) if title else None
+                if found_bio:
+                    bio.update(confirmed=True, matched=found_bio.raw)
+                if found_channel:
+                    bio.update(confirmed=True, channel_profile_confirmed=True,
+                               channel_title=str(title)[:256], channel_members=profile.get('participants'))
+        else:
+            bio = dict(cached)
+        evidence['bio'] = bio
+        evidence['signals']['bio_confirmed'] = bool(bio.get('confirmed'))
+        if bio.get('confirmed'):
+            evidence['signals']['explicit_filter'] = True
+            if not evidence.get('direct_filter'):
+                evidence['direct_filter'] = {'source': 'profile_channel' if bio.get('channel_profile_confirmed') else 'profile_bio',
+                                             'matched': bio.get('channel_title') or bio.get('matched')}
+        score = max(0, sum(weights.get(k, 0) for k, v in evidence['signals'].items() if v))
+        level = risk_level(evidence['signals'], score, thresholds)
+        if level != 'natural':
+            with closing(self.connect()) as db, db:
+                db.execute("INSERT INTO vp_evidence VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(group_id,generation,message_id) DO UPDATE SET score=excluded.score,level=excluded.level,evidence=excluded.evidence", (job.group,job.generation,job.user,job.message,job.timestamp,score,level,json.dumps(evidence,ensure_ascii=False)))
+        return level, score, evidence
 
     def reports(self, group, limit=50):
         if not self.path.exists():
@@ -416,13 +474,37 @@ class Store:
         if now - job.timestamp > QUEUE_TTL or job.timestamp > now + 60:
             return None
         with closing(self.connect()) as db, db:
+            # Check and insert must be atomic even when recovery and a second
+            # service instance race on the same staged message.
+            db.execute("BEGIN IMMEDIATE")
             # A replay must not increment features or generate a second report.
-            if db.execute("SELECT 1 FROM vp_messages WHERE group_id=? AND generation=? AND message_id=?", (job.group, job.generation, job.message)).fetchone():
+            if (db.execute("SELECT 1 FROM vp_messages WHERE group_id=? AND generation=? AND message_id=?", (job.group, job.generation, job.message)).fetchone()
+                    or db.execute("SELECT 1 FROM vp_phrase_hits WHERE group_id=? AND generation=? AND message_id=?", (job.group,job.generation,job.message)).fetchone()):
                 return None
             params = (job.group, job.generation, job.user, job.timestamp-WINDOW, job.timestamp)
             rows = db.execute("SELECT message_id,ts,text,normalized,reply_id,ad FROM vp_messages WHERE group_id=? AND generation=? AND user_id=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT ?", (*params, MAX_USER_MESSAGES)).fetchall()
             norm = normalize(job.text)
+            has_phrase_index = db.execute("SELECT 1 FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? LIMIT 1", (job.group,job.generation,job.user)).fetchone()
+            if not has_phrase_index and rows:
+                db.executemany("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)",
+                    ((job.group,job.generation,job.user,r[0],r[1],r[3],r[4],None) for r in rows))
+            exact_rows = db.execute("SELECT message_id,ts,normalized,reply_id,target_user FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? AND normalized=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT ?", (job.group,job.generation,job.user,norm,job.timestamp-WINDOW,job.timestamp,MAX_USER_MESSAGES)).fetchall()
+            words = sorted(message_words(job.text))
+            # First encounter after upgrading: index the retained old messages
+            # for this user, without reprocessing or acting on their history.
+            has_index = db.execute("SELECT 1 FROM vp_word_hits WHERE group_id=? AND generation=? AND user_id=? LIMIT 1", (job.group,job.generation,job.user)).fetchone()
+            if not has_index and rows:
+                db.executemany("INSERT OR IGNORE INTO vp_word_hits VALUES(?,?,?,?,?,?)",
+                    ((job.group,job.generation,job.user,r[0],r[1],w) for r in rows for w in message_words(r[2])))
+            word_counts = {}
+            if words:
+                marks = ','.join('?' for _ in words)
+                hits = db.execute("SELECT word,COUNT(*) FROM vp_word_hits WHERE group_id=? AND generation=? AND user_id=? AND ts>=? AND ts<=? AND word IN ("+marks+") GROUP BY word", (job.group,job.generation,job.user,job.timestamp-WINDOW,job.timestamp,*words)).fetchall()
+                word_counts = {word: count+1 for word,count in hits}
             matches = [row for row in rows if similar(norm, row[3])]
+            seen_ids = {r[0] for r in rows}
+            matches.extend((mid,ts,normalized,normalized,reply_id,0) for mid,ts,normalized,reply_id,_target in exact_rows if mid not in seen_ids)
+            matches.sort(key=lambda r: r[1], reverse=True)
             recent = [r for r in matches if job.timestamp-r[1] <= 300]
             reply_matches = [r for r in matches if r[4] is not None]
             same_target = [r for r in reply_matches if job.reply is not None and r[4] == job.reply]
@@ -434,6 +516,15 @@ class Store:
             cycle = cycle_size([r[3] for r in chronological] + [norm])
             cycle_fast = bool(cycle and job.timestamp-chronological[-(2*cycle-1)][1] <= 300)
             periodic = regular_interval([r[1] for r in matches[:9]] + [job.timestamp])
+            repeat_span = job.timestamp-min([r[1] for r in matches], default=job.timestamp)
+            # Slow periodic campaigns can be spread over the whole 24h window;
+            # the old five-minute burst gate missed them completely.
+            sustained_repeat = len(matches) >= 5 and repeat_span >= 600
+            target_recent = [r for r in rows if job.reply is not None and r[4] == job.reply
+                             and 0 <= job.timestamp-r[1] <= 60]
+            all_recent = [r for r in rows if 0 <= job.timestamp-r[1] <= 60]
+            target_burst = len(target_recent) >= 5
+            target_concentration = bool(target_burst and len(target_recent)+1 >= .8*(len(all_recent)+1))
             replies = ([job.reply] if job.reply is not None else []) + [r[4] for r in rows if r[4] is not None]
             target_users = set()
             if replies:
@@ -456,8 +547,9 @@ class Store:
             incoming = db.execute("""SELECT COUNT(DISTINCT r.user_id) FROM vp_messages r
                 JOIN vp_messages p ON r.group_id=p.group_id AND r.generation=p.generation AND r.reply_id=p.message_id
                 WHERE p.group_id=? AND p.generation=? AND p.user_id=? AND r.user_id!=? AND r.ts>=? AND r.ts<=?""", (job.group,job.generation,job.user,job.user,job.timestamp-WINDOW,job.timestamp)).fetchone()[0]
-            distinct = len({r[3] for r in rows if r[3]})
-            conversation = incoming >= 2 and len(rows) >= 4 and distinct / len(rows) >= .7
+            # A distinct participant replying to this user's messages is
+            # conversational evidence, including for a short greeting.
+            conversation = incoming >= 1
             # Similarity among two users once is not coordination: require
             # at least three matching messages, and at least two other users.
             nearby = db.execute("SELECT user_id,normalized FROM vp_messages WHERE group_id=? AND generation=? AND user_id!=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT 300", (job.group,job.generation,job.user,job.timestamp-300,job.timestamp)).fetchall()
@@ -472,6 +564,14 @@ class Store:
                         related.append(other_user)
                         coord_groups.add(other_group)
             coordinated = len(related) >= 3 and len(set(related)) >= 2 and len(matches) >= 2
+            repeated_targets = [r[4] for r in reply_matches if r[4] is not None]
+            if job.reply is not None:
+                repeated_targets.append(job.reply)
+            repeated_target_users = set()
+            repeated_target_users.update(str(target) for _mid,_ts,_norm,_reply,target in exact_rows if target and str(target) != job.user)
+            if repeated_targets:
+                marks = ','.join('?' for _ in repeated_targets[:200])
+                repeated_target_users.update(r[0] for r in db.execute('SELECT DISTINCT user_id FROM vp_messages WHERE group_id=? AND generation=? AND message_id IN ('+marks+') AND user_id!=?', (job.group,job.generation,*repeated_targets[:200],job.user)).fetchall())
             signals = {"repeat": len(matches) >= 3,
                        "burst": len(recent) >= 3,
                        "reply_repeat": job.reply is not None and len(reply_matches) >= 3,
@@ -480,7 +580,12 @@ class Store:
                        "channel_repeat": repeated_channel, "cross_group": cross_group,
                        "history": bool(history.get("relevant_active")),
                        "bio_confirmed": False, "manager_feedback": False, "conversation": conversation,
-                       "cycle": bool(cycle), "cycle_burst": cycle_fast, "periodic": periodic}
+                       "cycle": bool(cycle), "cycle_burst": cycle_fast, "periodic": periodic,
+                       "sustained_repeat": sustained_repeat, "reply_target_burst": target_burst,
+                       "reply_target_concentration": target_concentration,
+                       "explicit_filter": bool(job.direct_source),
+                       "word_repeat": bool(word_counts),
+                       "repeat_multiple_users": len(repeated_target_users) >= 3 and len(matches) >= 3}
             # Fetch existing moderation history only after multiple behavioral
             # indicators, never use old or unknown status as a standalone verdict.
             if sum(v for k, v in signals.items() if k not in ("history", "conversation")) >= 2 and not history:
@@ -499,25 +604,36 @@ class Store:
                 reply_row = db.execute("SELECT user_id,text FROM vp_messages WHERE group_id=? AND generation=? AND message_id=?", (job.group,job.generation,job.reply)).fetchone()
             evidence = {"text": job.text, "previous_text": matches[0][2] if matches else None,
                         "repeat_count": len(matches)+1, "window_seconds": WINDOW,
-                        "repeat_span_seconds": job.timestamp-min([r[1] for r in matches], default=job.timestamp),
+                        "repeat_span_seconds": repeat_span,
+                        "same_target_replies_60_seconds": len(target_recent)+1 if job.reply is not None else 0,
                         "reply_id": job.reply, "reply_text": reply_row[1] if reply_row else None,
                         "reply_user_id": reply_row[0] if reply_row else None,
                         "incoming_distinct_users": incoming, "conversation_indicator": conversation,
                         "outgoing_distinct_users": len(target_users),
+                        "repeated_reply_target_users": sorted(repeated_target_users),
+                        "repeated_words": [{"word": w, "count": c} for w,c in sorted(word_counts.items(), key=lambda x: (-x[1],x[0]))],
                         "reply_only": bool(job.reply is not None and rows and all(r[4] is not None for r in rows)),
                         "cycle_size": cycle,
                         "coordinated_user_ids": sorted(set(related)) if coordinated else [],
                         "coordination_groups": sorted(coord_groups) if coordinated else [],
                         "ad_signal": ad, "channel_signal": channel, "signals": signals,
+                        "direct_filter": {"source": job.direct_source, "matched": job.direct_match} if job.direct_source else None,
                         "bio": {"status": "not_checked"}, "history": history or {"status": "not_checked"},
                         "cross_group": {"status": "checked" if others else "not_authorized", "matching_groups": sorted(set(cross_matches)), "matches": len(cross_matches)}, "decision": "evidence_recorded"}
             db.execute("INSERT INTO vp_messages VALUES(?,?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,job.text,norm,job.reply,int(ad) | (int(channel) << 1)))
-            if level != "natural":
+            target_row = db.execute("SELECT user_id FROM vp_messages WHERE group_id=? AND generation=? AND message_id=? AND user_id!=?", (job.group,job.generation,job.reply,job.user)).fetchone() if job.reply is not None else None
+            db.execute("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,norm,job.reply,target_row[0] if target_row else None))
+            db.executemany("INSERT OR IGNORE INTO vp_word_hits VALUES(?,?,?,?,?,?)", ((job.group,job.generation,job.user,job.message,job.timestamp,w) for w in words))
+            if level != "natural" or word_counts:
                 db.execute("INSERT INTO vp_evidence VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,score,level,json.dumps(evidence,ensure_ascii=False)))
             # Bound individual profiles even under a sustained flood.
             db.execute("DELETE FROM vp_messages WHERE group_id=? AND generation=? AND user_id=? AND message_id NOT IN (SELECT message_id FROM vp_messages WHERE group_id=? AND generation=? AND user_id=? ORDER BY ts DESC LIMIT ?)", (job.group,job.generation,job.user,job.group,job.generation,job.user,MAX_USER_MESSAGES))
             if now-self.last_cleanup > 300:
                 db.execute("DELETE FROM vp_messages WHERE ts < ?", (now-WINDOW,))
+                db.execute("DELETE FROM vp_phrase_hits WHERE ts < ?", (now-WINDOW,))
+                db.execute("DELETE FROM vp_phrase_hits WHERE rowid IN (SELECT rowid FROM vp_phrase_hits ORDER BY ts DESC LIMIT -1 OFFSET ?)", (MAX_PHRASE_HITS,))
+                db.execute("DELETE FROM vp_word_hits WHERE ts < ?", (now-WINDOW,))
+                db.execute("DELETE FROM vp_word_hits WHERE rowid IN (SELECT rowid FROM vp_word_hits ORDER BY ts DESC LIMIT -1 OFFSET ?)", (MAX_WORD_HITS,))
                 db.execute("DELETE FROM vp_evidence WHERE ts < ?", (now-7*WINDOW,))
                 # Global hard caps for installations with many different users.
                 db.execute("DELETE FROM vp_messages WHERE rowid IN (SELECT rowid FROM vp_messages ORDER BY ts DESC LIMIT -1 OFFSET 100000)")
@@ -550,12 +666,13 @@ class Service:
         self.recovery_task = None
         self.retry_task = None
         self.bio_queue = asyncio.Queue(maxsize=64)
-        self.bio_worker = None
-        self.bio_active = None
+        self.bio_workers = set()
+        self.bio_active = {}
         self.bio_recent = {}
         self.bio_results = {}
         self.bio_pending = set()
         self.bio_waiting = {}
+        self.profile_dropped = 0
         self.action_locks = weakref.WeakValueDictionary()
         self.feedback_tasks = set()
         self.action_queue = asyncio.Queue(maxsize=64)
@@ -687,8 +804,9 @@ class Service:
             if not enabled:
                 self.bio_results = {k:v for k,v in self.bio_results.items() if k[0] != group}
                 self.bio_recent = {k:v for k,v in self.bio_recent.items() if k[0] != group}
-            if not enabled and self.bio_active and self.bio_active[0] == group:
-                self.bio_active[1].cancel()
+            if not enabled:
+                for request in tuple(self.bio_active.get(group, ())):
+                    request.cancel()
             if not enabled:
                 for probe in tuple(self.action_probes.get(group, ())):
                     probe.cancel()
@@ -736,8 +854,8 @@ class Service:
             try:
                 async with self.lock:
                     if self.groups.get(job.group) == job.generation and time.time()-job.timestamp <= QUEUE_TTL:
-                        ad, channel = await asyncio.to_thread(content_signals, job.text)
-                        self.queue.put_nowait(replace(job, ad=ad, channel=channel))
+                        ad, channel, source, matched = await asyncio.to_thread(content_signals, job.text, job.group)
+                        self.queue.put_nowait(replace(job, ad=ad, channel=channel, direct_source=source, direct_match=matched))
                         forwarded = True
                         if self.task is None or self.task.done():
                             self.task = asyncio.create_task(self._worker(), name="virtual-protocols")
@@ -763,9 +881,12 @@ class Service:
                             continue
                         result = await asyncio.to_thread(self.store.process, job, self.peers_for(job.group), self.weights, self.thresholds)
                         await asyncio.to_thread(self.store.acknowledge, job)
-                        if result and result[0] in ("suspicious", "strong"):
+                        if result:
+                            # Explicit text matches should not wait for profile RPC.
+                            if result[2].get('direct_filter'):
+                                self._schedule_action(job, result[2])
                             scheduled = self._schedule_bio(job, result)
-                            if not scheduled and result[0] == "strong":
+                            if not scheduled and result[0] == "strong" and not result[2].get('direct_filter'):
                                 self._schedule_action(job, result[2])
             except Exception:
                 now = time.monotonic()
@@ -843,6 +964,8 @@ class Service:
                         category, matched, members = 'کانال', bio.get('channel_title'), bio.get('channel_members')
                     elif bio.get('confirmed') and bio.get('matched'):
                         category, matched = 'بیوگرافی', bio['matched']
+                    elif (evidence.get('direct_filter') or {}).get('source') == 'group_word':
+                        category, matched = 'هرزنامه', None
                     elif evidence.get('ad_signal') or evidence.get('channel_signal'):
                         category, matched = 'تبلیغات', None
                     else:
@@ -926,19 +1049,21 @@ class Service:
             await self._recover()
 
     def _schedule_bio(self, job, result):
-        if self.bot is None or self.bio_queue.full():
+        if self.bot is None:
             return False
         now = time.monotonic()
         key = (job.group, job.user)
-        # A later message received before the first lookup/warning is not a
-        # fresh post-warning offense; don't dispatch it ahead of that lookup.
+        # Coalesce same-user lookups even if the queue is otherwise full.
         if key in self.bio_pending:
             if len(self.bio_waiting) < 64 or key in self.bio_waiting:
                 self.bio_waiting[key] = (job, result)
             return True
-        cached = self.bio_results.get(key) if now-self.bio_recent.get(key, -3601) < 3600 else None
+        if self.bio_queue.full():
+            self.profile_dropped += 1
+            return False
+        cached = self.bio_results.get(key) if now-self.bio_recent.get(key, -121) < 120 else None
         if len(self.bio_recent) >= 1024:
-            self.bio_recent = {k:v for k,v in self.bio_recent.items() if now-v < 3600}
+            self.bio_recent = {k:v for k,v in self.bio_recent.items() if now-v < 120}
             self.bio_results = {k:v for k,v in self.bio_results.items() if k in self.bio_recent}
             if len(self.bio_recent) >= 1024:
                 old = next(iter(self.bio_recent))
@@ -946,42 +1071,31 @@ class Service:
                 self.bio_results.pop(old, None)
         self.bio_pending.add(key)
         self.bio_queue.put_nowait((job,result,cached))
-        if self.bio_worker is None or self.bio_worker.done():
-            self.bio_worker = asyncio.create_task(self._bio_worker(), name="virtual-protocol-bio")
+        self.bio_workers = {t for t in self.bio_workers if not t.done()}
+        if len(self.bio_workers) < 4:
+            task = asyncio.create_task(self._bio_worker(), name="virtual-protocol-bio")
+            self.bio_workers.add(task)
+            task.add_done_callback(self.bio_workers.discard)
         return True
 
     async def _bio_worker(self):
-        from modules import bio_link_service
         while not self.bio_queue.empty():
             job, original, cached = self.bio_queue.get_nowait()
             key = (job.group,job.user)
+            request = None
             try:
                 if self.groups.get(job.group) != job.generation:
                     continue
-                status, about = ('cached', None)
-                if cached is None:
-                    request = asyncio.create_task(bio_link_service.fetch_about(self.bot, int(job.user), use_cache=True))
-                    self.bio_active = (job.group, request)
-                    try:
-                        status, about = await asyncio.wait_for(request, timeout=8)
-                    except asyncio.CancelledError:
-                        if self.groups.get(job.group) != job.generation:
-                            continue
-                        raise
-                    except Exception:
-                        status, about = 'error', None
-                    finally:
-                        self.bio_active = None
                 profile = None
-                if cached is None and original[2].get('channel_signal') and self.groups.get(job.group) == job.generation:
+                if cached is None:
                     async def fetch_profile():
                         from modules.profile_guard import service as profile_service
                         user = await asyncio.wait_for(self.bot.client.get_entity(int(job.user)), 3)
-                        return await profile_service.snapshot(self.bot, user)
+                        return await profile_service.snapshot(self.bot, user, max_age=120)
+                    request = asyncio.create_task(fetch_profile())
+                    self.bio_active.setdefault(job.group, set()).add(request)
                     try:
-                        profile_task = asyncio.create_task(fetch_profile())
-                        self.bio_active = (job.group, profile_task)
-                        profile = await asyncio.wait_for(profile_task, 8)
+                        profile = await asyncio.wait_for(request, 8)
                     except asyncio.CancelledError:
                         if self.groups.get(job.group) != job.generation:
                             continue
@@ -989,19 +1103,23 @@ class Service:
                     except Exception:
                         profile = None
                     finally:
-                        self.bio_active = None
+                        active = self.bio_active.get(job.group)
+                        if active:
+                            active.discard(request)
+                            if not active:
+                                self.bio_active.pop(job.group, None)
                 async with self.lock:
                     if self.groups.get(job.group) == job.generation:
-                        result = await asyncio.to_thread(self.store.update_bio, job, status, about, self.weights, self.thresholds, cached, profile)
-                        if result is not None:
-                            if cached is None:
-                                self.bio_recent[key] = time.monotonic()
-                                self.bio_results[key] = dict(result[2]['bio'])
-                            if result[0] == 'strong':
-                                self._schedule_action(job, result[2])
+                        already_scheduled = bool(original[2].get('direct_filter'))
+                        result = await asyncio.to_thread(self.store.update_bio, job, original, profile, self.weights, self.thresholds, cached)
+                        if cached is None and profile and profile.get('status') in ('ok', 'empty'):
+                            self.bio_recent[key] = time.monotonic()
+                            self.bio_results[key] = dict(result[2]['bio'])
+                        if result[0] == 'strong' and not already_scheduled:
+                            self._schedule_action(job, result[2])
             except Exception:
-                LOG.warning("virtual protocol bio lookup failed", exc_info=True)
-                if self.groups.get(job.group) == job.generation and original[0] == 'strong':
+                LOG.warning("virtual protocol profile lookup failed", exc_info=True)
+                if self.groups.get(job.group) == job.generation and original[0] == 'strong' and not original[2].get('direct_filter'):
                     self._schedule_action(job, original[2])
             finally:
                 self.bio_pending.discard(key)

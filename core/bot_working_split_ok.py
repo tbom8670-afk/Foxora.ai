@@ -3350,8 +3350,8 @@ class SoroushAntiSpamBot:
                     pass
                 if not getattr(event, "is_private", False):
                     return
-            # Protocol controls are consumed silently until the owner supplies
-            # templates. Monitoring never changes the main dispatch outcome.
+            # Protocol commands are consumed here. Behavioral analysis runs
+            # asynchronously without changing normal message dispatch.
             if self.virtual_protocols is not None:
                 try:
                     from modules.virtual_protocols import intercept as _vp_intercept
