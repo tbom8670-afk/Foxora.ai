@@ -1191,6 +1191,17 @@ class SoroushAntiSpamBot:
         for _name, _factory in _defaults.items():
             if not hasattr(self, _name):
                 setattr(self, _name, _factory())
+        # Optional observational protocol: initialization failure must not stop
+        # the existing moderation pipeline. No worker or database is started
+        # until an enabled group supplies a new message.
+        try:
+            from modules.virtual_protocols import Service as _VirtualProtocols
+            self.virtual_protocols = _VirtualProtocols(bot=self)
+            self.virtual_protocols.start()
+        except Exception:
+            self.virtual_protocols = None
+            import logging
+            logging.getLogger(__name__).exception("virtual protocols initialization failed")
         if not hasattr(self, "moderation_queue"):
             self.moderation_queue = ModerationQueue(self.logger)
         if not hasattr(self, "group_dispatcher"):
@@ -3339,6 +3350,19 @@ class SoroushAntiSpamBot:
                     pass
                 if not getattr(event, "is_private", False):
                     return
+            # Protocol controls are consumed silently until the owner supplies
+            # templates. Monitoring never changes the main dispatch outcome.
+            if self.virtual_protocols is not None:
+                try:
+                    from modules.virtual_protocols import intercept as _vp_intercept
+                    if await _vp_intercept(
+                        self.virtual_protocols, event,
+                        getattr(self, "bot_account_id", None),
+                    ):
+                        return
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("virtual protocols intercept failed")
             # 🔌 کنترل از راه دور گروه‌ها (فقط مالک سراسری): «گروها» و
             # «ربات خاموش|روشن <شناسه>» همین‌جا و پیش از هر مسیر دیگری
             # مصرف می‌شوند تا هم دستور و هم متنِ دلیلِ بعدی مالک (که پیام

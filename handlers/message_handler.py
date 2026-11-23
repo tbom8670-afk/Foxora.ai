@@ -10435,6 +10435,12 @@ async def handle_new_message(bot, event):
                 _s = sender
                 async def _on_ok(_r):
                     try:
+                        _vp = getattr(_b, "virtual_protocols", None)
+                        if _vp is not None:
+                            _vp.schedule_release(_c, _u.id, getattr(_s, "id", None), "unban")
+                    except Exception:
+                        pass
+                    try:
                         before_spam = _b.tracker.get_count(_c, _u.id)
                         before_warning = before_spam
                         _b.logger.log_info(
@@ -11120,6 +11126,12 @@ async def handle_new_message(bot, event):
 
                 async def unmute_succeeded(_result):
                     target_id = getattr(target_user, "id", None)
+                    try:
+                        _vp = getattr(bot, "virtual_protocols", None)
+                        if _vp is not None:
+                            _vp.schedule_release(chat_id, target_id, getattr(sender, "id", None), "unmute")
+                    except Exception:
+                        pass
                     target_key = f"{chat_id}:{target_id}"
                     try:
                         from modules import manual_mute_storage
