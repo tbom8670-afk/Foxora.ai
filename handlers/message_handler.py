@@ -6435,6 +6435,19 @@ async def handle_new_message(bot, event):
                     "GROUP AD BROADCAST ROUTE FAILED "
                     f"chat_id={chat_id} error={ads_error!r}"
                 )
+        # 🔌 «گروها» / «ربات خاموش|روشن <شناسه>» — فقط مالک سراسری، در
+        # گروه و پیوی. کنترل از راه دور گروه‌هاست؛ هندلر خودش دستور و
+        # session دلیل را تشخیص می‌دهد و برای بقیهٔ پیام‌ها False می‌دهد.
+        if is_global_owner(user_id):
+            try:
+                from handlers.group_power_handler import handle_group_power
+                if await handle_group_power(bot, event, user_id, message_text):
+                    return
+            except Exception as power_error:
+                bot.logger.log_error(
+                    "GROUP POWER ROUTE FAILED "
+                    f"chat_id={chat_id} error={power_error!r}"
+                )
         _legacy_commands = {
             "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
             "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",

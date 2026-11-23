@@ -91,6 +91,11 @@ from handlers.private_ads_handler import (
     has_ads_session,
     match_ads_trigger,
 )
+from handlers.group_power_handler import (
+    handle_group_power,
+    has_power_session,
+    is_power_command,
+)
 from handlers.private_handler import (
     register_private_handlers,
     try_handle_private_start,
@@ -244,6 +249,14 @@ def _is_group_renewal_command(text):
             return False
         normalized = normalize_command_text(str(text))
         if normalized in _OWNER_GROUP_MODE_COMMANDS:
+            return True
+        # کنترل از راه دور گروه («گروها» / «ربات خاموش|روشن <شناسه>»):
+        # مالک باید بتواند داخل همان گروهِ خاموش هم روشنش کند یا فهرست
+        # بگیرد، پس این‌ها هم از گیت عبور می‌کنند (مجوز نهایی با مالک
+        # سراسری داخل هندلر دوباره چک می‌شود).
+        if normalized in {"گروها", "گروه ها"}:
+            return True
+        if normalized.startswith(("ربات خاموش ", "ربات روشن ")):
             return True
         # دستورهای تمدیدِ مهلت (مثل «۵ روز»، «یک هفته»، «دو هفته»، «یک ماه»).
         # همان تابعی است که بای‌پسِ انقضای دیسپچر هم استفاده می‌کند، پس
@@ -2433,6 +2446,20 @@ class SoroushAntiSpamBot:
                             )
                             self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='ad_broadcast handled' chat_id={_sd_chat} message_id={_sd_mid}")
                             return
+                    # 🔌 کنترل گروه‌ها («گروها»/«ربات خاموش|روشن») مالک.
+                    if private_is_owner and (
+                        is_power_command(raw_text)
+                        or has_power_session(private_sender_id)
+                    ):
+                        if await handle_group_power(
+                            self, event, private_sender_id, raw_text
+                        ):
+                            self.logger.log_info(
+                                "GROUP POWER READY "
+                                f"owner_id={private_sender_id} text={raw_text!r}"
+                            )
+                            self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='group_power handled' chat_id={_sd_chat} message_id={_sd_mid}")
+                            return
 
                 # BROADCAST TRACE: قبل از هر await ثبت می‌شود تا اگر یکی از
                 # فراخوانی‌های بعدی استثنا داد، بدانیم پیام اصلاً رسیده بود.
@@ -2633,6 +2660,20 @@ class SoroushAntiSpamBot:
                                 f"owner_id={private_sender_id} text={text!r}"
                             )
                             self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='ad_broadcast handled' chat_id={_sd_chat} message_id={_sd_mid}")
+                            return
+                    # 🔌 مسیر سریع کنترل گروه‌ها («گروها»/«ربات خاموش|روشن»).
+                    if private_is_owner and (
+                        is_power_command(text) or has_power_session(private_sender_id)
+                    ):
+                        handled = await handle_group_power(
+                            self, event, private_sender_id, text
+                        )
+                        if handled:
+                            self.logger.log_info(
+                                "GROUP POWER ROUTE HANDLED "
+                                f"owner_id={private_sender_id} text={text!r}"
+                            )
+                            self.debug_message_log(f"SPAM DEBUG EARLY RETURN reason='group_power handled' chat_id={_sd_chat} message_id={_sd_mid}")
                             return
 
                 if (
@@ -3298,6 +3339,33 @@ class SoroushAntiSpamBot:
                     pass
                 if not getattr(event, "is_private", False):
                     return
+            # 🔌 کنترل از راه دور گروه‌ها (فقط مالک سراسری): «گروها» و
+            # «ربات خاموش|روشن <شناسه>» همین‌جا و پیش از هر مسیر دیگری
+            # مصرف می‌شوند تا هم دستور و هم متنِ دلیلِ بعدی مالک (که پیام
+            # عادی طبقه‌بندی می‌شود) حتماً به هندلر برسند.
+            try:
+                if not getattr(event, "is_private", False):
+                    _power_sid = getattr(event, "sender_id", None)
+                    if _power_sid is not None and is_global_owner(_power_sid):
+                        _power_text = (
+                            getattr(getattr(event, "message", None), "message", None)
+                            or getattr(getattr(event, "message", None), "caption", None)
+                            or ""
+                        )
+                        if is_power_command(_power_text) or has_power_session(_power_sid):
+                            if await handle_group_power(
+                                self, event, _power_sid, _power_text
+                            ):
+                                return
+            except Exception as _power_error:
+                try:
+                    self.logger.log_error(
+                        "GROUP POWER EARLY ROUTE FAILED "
+                        f"chat_id={getattr(event, 'chat_id', None)} "
+                        f"error={_power_error!r}"
+                    )
+                except Exception:
+                    pass
             # ⚖️ حکم دادگاه روباه: در پنجرهٔ ۶۰ ثانیه‌ایِ مجازات، پیام محکوم
             # حذف می‌شود — بدون هیچ استثنایی برای مالک ربات، مالک گروه، ادمین
             # ثبت‌شده، ادمین واقعی گروه یا VIP. این قلاب پیش از هر گیت و
