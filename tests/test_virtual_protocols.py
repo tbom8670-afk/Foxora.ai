@@ -921,6 +921,100 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ev['signals']['bot_repeat'])
         self.assertEqual(bot.notice_cleanup.ttls,[70])
 
+    async def test_three_replies_to_actual_scheduled_bot_responses(self):
+        from handlers.message_handler import _schedule_reply
+        bot = self.fake_action_bot(); bot.virtual_protocols = self.service; self.service.bot = bot
+        await self.service.toggle(1, True)
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid in range(1,4):
+                self.service.remember_bot_message(1,100) if mid == 1 else None
+                msg=SimpleNamespace(id=mid,message='سلام',reply_to=SimpleNamespace(reply_to_msg_id=100 if mid == 1 else 100+mid-1))
+                event=SimpleNamespace(message=msg,chat_id=1,sender_id=9,is_private=False,reply=AsyncMock(return_value=SimpleNamespace(id=100+mid)))
+                await intercept(self.service,event,bot_id=999)
+                await _schedule_reply(bot,event,'سلام')
+                await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+                if mid < 3:
+                    bot.client.send_message.assert_not_awaited()
+            with sqlite3.connect(self.db) as db:
+                level,raw=db.execute('select level,evidence from vp_evidence where message_id=3').fetchone()
+            self.assertEqual(level, 'strong')
+            self.assertTrue(json.loads(raw)['reply_to_own_bot'])
+            self.assertEqual(bot.notice_cleanup.ttls,[70], self.service.ad_behavior._store)
+
+    async def test_late_scheduled_reply_is_deleted_after_confirmed_action(self):
+        from handlers.message_handler import _schedule_reply
+        from modules.bot_reply_registry import clear
+        clear()
+        bot=self.fake_action_bot(); bot.virtual_protocols=self.service; self.service.bot=bot
+        bot.message_delete_queue.enqueue=AsyncMock(return_value=(1,[]))
+        await self.service.toggle(1, True)
+        started=asyncio.Event(); release=asyncio.Event()
+        async def send(*args, **kwargs):
+            started.set(); await release.wait(); return SimpleNamespace(id=444)
+        event=SimpleNamespace(chat_id=1,message=SimpleNamespace(id=7),reply=send)
+        task=_schedule_reply(bot,event,'سلام')
+        await started.wait()
+        evidence={'signals': {'explicit_filter': True}, 'direct_filter': {'source':'group_word'}, 'bio':{}, 'repeat_count':1}
+        with patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            self.service._schedule_action(Job('1','9',7,'مثال',None,time.time(),self.service.groups['1']),evidence)
+            await self.service.action_queue.join()
+            self.assertTrue(self.service.was_deleted(1,7))
+            release.set(); await task
+        calls=bot.message_delete_queue.enqueue.await_args_list
+        self.assertEqual(calls[0].args[1],[7])
+        self.assertEqual(calls[1].args[1],[444])
+        skipped=AsyncMock()
+        await _schedule_reply(bot, SimpleNamespace(chat_id=1,message=SimpleNamespace(id=7),reply=skipped),'سلام')
+        skipped.assert_not_awaited()
+
+    async def test_ad_detector_identity_used_when_independent_guards_off(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1, True)
+        sender=SimpleNamespace(id=9,first_name='استرومو ببین',last_name='',username='')
+        event=SimpleNamespace(chat_id=1,sender_id=9,sender=sender,is_private=False,message=SimpleNamespace(id=1,message='درود دوستان',reply_to=None))
+        with patch('modules.profile_guard.storage.is_enabled',return_value=False), patch('modules.ad_spam_guard.storage.is_enabled',return_value=False), patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            await intercept(self.service,event,bot_id=999)
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        with sqlite3.connect(self.db) as db:
+            level,raw=db.execute('select level,evidence from vp_evidence where message_id=1').fetchone()
+        self.assertEqual(level,'strong')
+        self.assertTrue(json.loads(raw)['ad_detector']['identity_hit'])
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+
+    async def test_ad_behavior_uses_resolved_human_targets_with_guards_off(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1, True)
+        sender=SimpleNamespace(id=9,first_name='کیان',last_name='',username='')
+        with patch('modules.profile_guard.storage.is_enabled',return_value=False), patch('modules.ad_spam_guard.storage.is_enabled',return_value=False), patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid in range(1,4):
+                target=SimpleNamespace(id=100+mid,sender_id=20+mid,out=False)
+                msg=SimpleNamespace(id=mid,message='سلام',reply_to=SimpleNamespace(reply_to_msg_id=100+mid),get_reply_message=AsyncMock(return_value=target))
+                event=SimpleNamespace(chat_id=1,sender_id=9,sender=sender,is_private=False,message=msg)
+                await intercept(self.service,event,bot_id=999)
+                await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+            with sqlite3.connect(self.db) as db:
+                level,raw=db.execute('select level,evidence from vp_evidence where message_id=3').fetchone()
+        self.assertEqual(level,'strong')
+        self.assertIn('repeat-to-many',json.loads(raw)['ad_detector']['behavior_reasons'])
+        self.assertEqual(bot.notice_cleanup.ttls,[70])
+
+    async def test_many_repeated_words_alone_do_not_trigger_ad_guard(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        await self.service.toggle(1, True)
+        with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            for mid in range(1,4): self.service.submit(1,9,mid,'سلام')
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        bot.client.send_message.assert_not_awaited()
+
+    async def test_protocol_does_not_act_on_admin_or_unknown_role(self):
+        for role in (SimpleNamespace(is_admin=True,is_creator=False), SimpleNamespace(is_admin=None,is_creator=False)):
+            bot=self.fake_action_bot(); bot.client.get_permissions=AsyncMock(return_value=role); self.service.bot=bot
+            await self.service.toggle(1,True)
+            with patch('modules.group_words_storage.get_words',return_value=['مسدود']), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+                self.service.submit(1,9,100 if role.is_admin else 101,'مسدود')
+                await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+            bot.client.send_message.assert_not_awaited()
+
     async def test_simple_reply_registers_its_sent_id_for_protocol(self):
         from handlers.message_handler import _schedule_reply
         bot=self.fake_action_bot(); bot.virtual_protocols=self.service; self.service.bot=bot

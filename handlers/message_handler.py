@@ -1142,7 +1142,19 @@ def _schedule_reply(bot, event, *args, **kwargs):
 
     async def run():
         try:
+            vp = getattr(bot, 'virtual_protocols', None)
+            if vp is not None and vp.was_deleted(_origin_chat_id, _origin_msg_id):
+                return
             sent = await event.reply(*args, **kwargs)
+            # If deletion completed while the send RPC was in flight, remove
+            # this late response too; never suppress it on an unconfirmed action.
+            if vp is not None and vp.was_deleted(_origin_chat_id, _origin_msg_id):
+                from modules.notice_cleanup import extract_sent_id
+                reply_id = extract_sent_id(sent)
+                queue = getattr(bot, 'message_delete_queue', None)
+                if reply_id is not None and queue:
+                    await queue.enqueue(_origin_chat_id, [reply_id], priority=1)
+                return
             # ثبتِ بی‌صدا و بدونِ I/O؛ هر خطا فقط بلعیده می‌شود و هرگز مسیرِ
             # پاسخ را نمی‌شکند.
             try:

@@ -42,7 +42,8 @@ WEIGHTS = {"repeat": 25, "burst": 15, "reply_repeat": 15,
            "sustained_repeat": 25, "reply_target_burst": 30,
            "reply_target_concentration": 10, "explicit_filter": 70,
            "word_repeat": 0, "repeat_multiple_users": 30,
-           "bot_reply_burst": 30, "bot_repeat": 30}
+           "bot_reply_burst": 30, "bot_repeat": 30,
+           "bot_three_replies": 40, "bot_three_fast": 30}
 THRESHOLDS = {"review": 25, "suspicious": 45, "strong": 70}
 
 
@@ -200,7 +201,8 @@ def risk_level(signals, score, thresholds):
                         and signals.get("periodic"))
     targeted_repeat = (signals.get("repeat") and signals.get("reply_repeat")
                        and signals.get("repeat_multiple_users"))
-    bot_pattern = ((signals.get('bot_repeat') and signals.get('repeat') and signals.get('reply_repeat'))
+    bot_pattern = ((signals.get('bot_three_replies') and signals.get('bot_three_fast'))
+                   or (signals.get('bot_repeat') and signals.get('repeat') and signals.get('reply_repeat'))
                    or (signals.get('bot_reply_burst') and signals.get('reply_target_burst') and signals.get('reply_target_concentration')))
     if (positives >= 4 or scheduled_repeat or targeted_repeat or bot_pattern) and score >= thresholds["strong"]:
         return "strong"
@@ -226,6 +228,7 @@ class Job:
     direct_match: str | None = None
     sender_event: object = None
     reply_to_bot: bool = False
+    reply_target_user: int | None = None
 
 
 def content_signals(text, group):
@@ -425,6 +428,28 @@ class Store:
             if linked:
                 db.execute("UPDATE vp_actions SET status='released',released_at=? WHERE group_id=? AND generation=? AND message_id=?", (time.time(),group,row[0],row[1]))
 
+    def update_ad_detector(self, job, original, verdict):
+        """Record the existing ad-spam detector result, without running its actions."""
+        _level, _score, previous = original
+        evidence = dict(previous)
+        evidence['signals'] = dict(previous['signals'])
+        evidence['signals']['explicit_filter'] = True
+        evidence['ad_signal'] = True
+        evidence['ad_detector'] = {'score': verdict.get('score'),
+            'identity_hit': bool(verdict.get('identity_hit')),
+            'content_hit': bool(verdict.get('content_hit')),
+            'signals': dict(verdict.get('signals') or {}),
+            'behavior_reasons': list(verdict.get('behavior_reasons') or [])}
+        evidence['direct_filter'] = {'source': 'ad_spam_detector', 'matched': None}
+        score = max(_score, self._ad_score_floor())
+        with closing(self.connect()) as db, db:
+            db.execute("INSERT INTO vp_evidence VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(group_id,generation,message_id) DO UPDATE SET score=excluded.score,level=excluded.level,evidence=excluded.evidence", (job.group,job.generation,job.user,job.message,job.timestamp,score,'strong',json.dumps(evidence,ensure_ascii=False)))
+        return 'strong', score, evidence
+
+    @staticmethod
+    def _ad_score_floor():
+        return 70
+
     def update_bio(self, job, original, profile, weights, thresholds, cached=None):
         """Apply real profile-list matches; never persist the full profile bio."""
         from modules.profile_guard import filters, matcher
@@ -583,10 +608,13 @@ class Store:
                 marks = ','.join('?' for _ in repeated_targets[:200])
                 repeated_target_users.update(r[0] for r in db.execute('SELECT DISTINCT user_id FROM vp_messages WHERE group_id=? AND generation=? AND message_id IN ('+marks+') AND user_id!=?', (job.group,job.generation,*repeated_targets[:200],job.user)).fetchall())
             bot_repeat_count = 0
+            bot_matching_recent = 0
             if job.reply_to_bot and matches:
                 match_ids = [r[0] for r in matches]
                 marks = ','.join('?' for _ in match_ids)
-                bot_repeat_count = db.execute("SELECT COUNT(*) FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? AND target_user='@bot' AND message_id IN ("+marks+")", (job.group,job.generation,job.user,*match_ids)).fetchone()[0]
+                bot_rows = db.execute("SELECT ts FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? AND target_user='@bot' AND message_id IN ("+marks+")", (job.group,job.generation,job.user,*match_ids)).fetchall()
+                bot_repeat_count = len(bot_rows)
+                bot_matching_recent = sum(0 <= job.timestamp-r[0] <= 300 for r in bot_rows)
             bot_recent = db.execute("SELECT COUNT(*) FROM vp_phrase_hits WHERE group_id=? AND generation=? AND user_id=? AND target_user='@bot' AND ts>=? AND ts<=?", (job.group,job.generation,job.user,job.timestamp-60,job.timestamp)).fetchone()[0] if job.reply_to_bot else 0
             signals = {"repeat": len(matches) >= 3,
                        "burst": len(recent) >= 3,
@@ -603,7 +631,9 @@ class Store:
                        "word_repeat": bool(word_counts),
                        "repeat_multiple_users": len(repeated_target_users) >= 3 and len(matches) >= 3,
                        "bot_repeat": job.reply_to_bot and bot_repeat_count >= 3,
-                       "bot_reply_burst": job.reply_to_bot and bot_recent >= 5}
+                       "bot_reply_burst": job.reply_to_bot and bot_recent >= 5,
+                       "bot_three_replies": job.reply_to_bot and bot_repeat_count >= 2,
+                       "bot_three_fast": job.reply_to_bot and bot_matching_recent >= 2}
             # Fetch existing moderation history only after multiple behavioral
             # indicators, never use old or unknown status as a standalone verdict.
             if sum(v for k, v in signals.items() if k not in ("history", "conversation")) >= 2 and not history:
@@ -702,11 +732,16 @@ class Service:
         self.action_probes = {}
         self.activations = {}
         self.bot_messages = OrderedDict()
+        self.deleted_messages = OrderedDict()
         self.reply_queue = asyncio.Queue(maxsize=64)
         self.reply_workers = set()
         self.reply_locks = weakref.WeakValueDictionary()
         self.reply_checked = OrderedDict()
         self.reply_active = {}
+        # Independent state: enabling the protocol does not toggle or mutate
+        # the standalone ad guard's tracker/cooldown.
+        from modules.ad_spam_guard.behavior import BehaviorTracker
+        self.ad_behavior = BehaviorTracker()
 
     def start(self):
         if not self.groups:
@@ -830,9 +865,11 @@ class Service:
             await asyncio.to_thread(write_json, self.config_path, new)
             self.groups = new
             if not enabled:
+                self.ad_behavior.forget_chat(group)
                 self.bio_results = {k:v for k,v in self.bio_results.items() if k[0] != group}
                 self.bio_recent = {k:v for k,v in self.bio_recent.items() if k[0] != group}
                 self.bot_messages = OrderedDict((k,v) for k,v in self.bot_messages.items() if k[0] != group)
+                self.deleted_messages = OrderedDict((k,v) for k,v in self.deleted_messages.items() if k[0] != group)
                 self.reply_checked = OrderedDict((k,v) for k,v in self.reply_checked.items() if k[0] != group)
             if not enabled:
                 for request in tuple(self.bio_active.get(group, ())):
@@ -873,6 +910,25 @@ class Service:
                 break
             self.bot_messages.popitem(last=False)
         return True
+
+    def was_deleted(self, group, message):
+        try:
+            key = (normalize_group_id(group), int(message))
+        except (TypeError, ValueError):
+            return False
+        ts = self.deleted_messages.get(key)
+        return ts is not None and time.monotonic() - ts < 600
+
+    def mark_deleted(self, group, message):
+        key = (normalize_group_id(group), int(message))
+        now = time.monotonic()
+        self.deleted_messages[key] = now
+        self.deleted_messages.move_to_end(key)
+        while self.deleted_messages:
+            oldest = next(iter(self.deleted_messages))
+            if len(self.deleted_messages) <= 4000 and now-self.deleted_messages[oldest] < 600:
+                break
+            self.deleted_messages.popitem(last=False)
 
     async def resolve_sender(self, job):
         event = job.sender_event
@@ -958,7 +1014,8 @@ class Service:
                     bot_time = self.bot_messages.get(key)
                     is_bot = bot_time is not None and time.monotonic()-bot_time <= WINDOW
                     checked = self.reply_checked.get(key)
-                    if not is_bot and (checked is None or time.monotonic()-checked > 60):
+                    target_sender = checked[1] if checked and time.monotonic()-checked[0] <= 60 else None
+                    if not is_bot and (checked is None or time.monotonic()-checked[0] > 60):
                         request = None
                         try:
                             request = asyncio.create_task(job.sender_event.message.get_reply_message())
@@ -972,7 +1029,7 @@ class Service:
                                 if is_bot and self.groups.get(job.group) == job.generation:
                                     self.remember_bot_message(job.group, job.reply)
                                 else:
-                                    self.reply_checked[key] = time.monotonic()
+                                    self.reply_checked[key] = (time.monotonic(), target_sender)
                                     self.reply_checked.move_to_end(key)
                                     while len(self.reply_checked) > 4096:
                                         self.reply_checked.popitem(last=False)
@@ -990,7 +1047,7 @@ class Service:
                                     self.reply_active.pop(job.group, None)
                 async with self.lock:
                     if self.groups.get(job.group) == job.generation and time.time()-job.timestamp <= QUEUE_TTL:
-                        self._forward_job(replace(job, reply_to_bot=is_bot))
+                        self._forward_job(replace(job, reply_to_bot=is_bot, reply_target_user=target_sender))
                         forwarded = True
             except Exception:
                 self.dropped += 1
@@ -1035,6 +1092,30 @@ class Service:
                         result = await asyncio.to_thread(self.store.process, job, self.peers_for(job.group), self.weights, self.thresholds)
                         await asyncio.to_thread(self.store.acknowledge, job)
                         if result:
+                            # Run the existing ad guard's behavior engine for EVERY
+                            # accepted message, independently of the profile queue.
+                            from modules.ad_spam_guard import detector as ad_detector
+                            event = job.sender_event
+                            sender = getattr(event, 'sender', None) if event else None
+                            target = (getattr(self.bot, 'bot_account_id', None) if job.reply_to_bot
+                                      else (job.reply_target_user or ad_detector._reply_target_user_id(event)) if event else None)
+                            behavior = self.ad_behavior.observe(job.group, job.user, job.message, job.text,
+                                target, bot_user_id=getattr(self.bot, 'bot_account_id', None))
+                            verdict = ad_detector.evaluate(sender, job.text, behavior,
+                                cooling=self.ad_behavior.in_cooldown(job.group, job.user))
+                            # The user explicitly chose not to punish a repeated
+                            # word alone, even though the standalone guard can.
+                            reasons = [r for r in verdict['behavior_reasons'] if r != 'one-word-repeat']
+                            if (result[2]['signals'].get('conversation') or result[2]['signals'].get('manager_feedback')
+                                    or (behavior.get('one_word') and not (target or behavior.get('contact') or behavior.get('cta')))
+                                    or (behavior.get('window_count', 0) < 3 and not (behavior.get('contact') or behavior.get('cta')))
+                                    or (not job.reply_to_bot and behavior.get('targets_count', 0) < 2
+                                        and not (behavior.get('repeat') or behavior.get('contact') or behavior.get('cta')))):
+                                reasons = []
+                            identity_content = ad_detector.evaluate(sender, job.text)['is_spam']
+                            if (identity_content or reasons) and not result[2].get('direct_filter'):
+                                verdict['behavior_reasons'] = reasons
+                                result = await asyncio.to_thread(self.store.update_ad_detector, job, result, verdict)
                             # Explicit text matches should not wait for profile RPC.
                             if result[2].get('direct_filter'):
                                 self._schedule_action(job, result[2])
@@ -1115,6 +1196,17 @@ class Service:
                         self.log_action_skip('message deletion not confirmed', job)
                         await asyncio.to_thread(self.store.action_status, job, 'failed')
                         continue
+                    # Only suppress/clean replies after deletion was confirmed.
+                    self.mark_deleted(job.group, job.message)
+                    try:
+                        from modules.bot_reply_registry import pop_reply_ids
+                        reply_ids = pop_reply_ids(job.group, job.message)
+                        if reply_ids:
+                            await asyncio.wait_for(bot.message_delete_queue.enqueue(rpc_group, reply_ids, priority=1), 20)
+                    except Exception:
+                        LOG.warning('virtual protocol bot-reply cleanup failed', exc_info=True)
+                    if evidence.get('ad_detector'):
+                        self.ad_behavior.mark_hit(job.group, job.user)
                     bio = evidence.get('bio') or {}
                     members = None
                     if bio.get('channel_profile_confirmed'):
@@ -1244,29 +1336,39 @@ class Service:
                 if self.groups.get(job.group) != job.generation:
                     continue
                 profile = None
-                if cached is None:
-                    async def fetch_profile():
-                        from modules.profile_guard import service as profile_service
-                        user = await self.resolve_sender(job)
-                        if user is None:
-                            return None
+                async def inspect_profile_and_ad():
+                    nonlocal original
+                    from modules.profile_guard import service as profile_service
+                    from modules.ad_spam_guard import detector as ad_detector
+                    user = await self.resolve_sender(job)
+                    if user is None:
+                        return None
+                    if not original[2].get('direct_filter') and not getattr(job.sender_event, 'sender', None):
+                        verdict = await asyncio.to_thread(ad_detector.evaluate, user, job.text)
+                        if verdict.get('is_spam'):
+                            async with self.lock:
+                                if self.groups.get(job.group) == job.generation:
+                                    original = await asyncio.to_thread(self.store.update_ad_detector, job, original, verdict)
+                                    self._schedule_action(job, original[2])
+                    if cached is None:
                         return await profile_service.snapshot(self.bot, user, max_age=PROFILE_CACHE_SECONDS)
-                    request = asyncio.create_task(fetch_profile())
-                    self.bio_active.setdefault(job.group, set()).add(request)
-                    try:
-                        profile = await asyncio.wait_for(request, 8)
-                    except asyncio.CancelledError:
-                        if self.groups.get(job.group) != job.generation:
-                            continue
-                        raise
-                    except Exception:
-                        profile = None
-                    finally:
-                        active = self.bio_active.get(job.group)
-                        if active:
-                            active.discard(request)
-                            if not active:
-                                self.bio_active.pop(job.group, None)
+                    return None
+                request = asyncio.create_task(inspect_profile_and_ad())
+                self.bio_active.setdefault(job.group, set()).add(request)
+                try:
+                    profile = await asyncio.wait_for(request, 8)
+                except asyncio.CancelledError:
+                    if self.groups.get(job.group) != job.generation:
+                        continue
+                    raise
+                except Exception:
+                    profile = None
+                finally:
+                    active = self.bio_active.get(job.group)
+                    if active:
+                        active.discard(request)
+                        if not active:
+                            self.bio_active.pop(job.group, None)
                 if profile is None and cached is None and time.monotonic()-self.last_profile_error >= 30:
                     LOG.warning('virtual protocol profile unavailable group=%s user=%s', job.group, job.user)
                     self.last_profile_error = time.monotonic()
