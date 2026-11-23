@@ -126,6 +126,36 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         result = store.process(Job('1','2',3,'پیام تکراری نمونه',None,now,'g'))
         self.assertEqual(result[2]['repeat_count'], 2)
 
+    def test_window_is_active_from_first_message_not_after_a_day(self):
+        store=Store(self.db); start=1_000_000.0
+        with patch('modules.virtual_protocols.time.time',return_value=start):
+            first=store.process(Job('1','9',1,'سلام',None,start,'g'))
+        self.assertEqual(first[2]['repeat_count'],1)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute('select count(*) from vp_word_hits where message_id=1').fetchone()[0],1)
+        with patch('modules.virtual_protocols.time.time',return_value=start+1):
+            second=store.process(Job('1','9',2,'سلام',None,start+1,'g'))
+        self.assertEqual(second[2]['repeat_count'],2)
+        self.assertNotEqual(second[0],'strong')
+        with patch('modules.virtual_protocols.time.time',return_value=start+86399):
+            last=store.process(Job('1','9',3,'سلام',None,start+86399,'g'))
+        self.assertEqual(last[2]['repeat_count'],3)
+        with patch('modules.virtual_protocols.time.time',return_value=start+86401):
+            expired=store.process(Job('1','9',4,'سلام',None,start+86401,'g'))
+        self.assertEqual(expired[2]['repeat_count'],3) # second and third only
+
+    def test_reply_target_resolved_from_external_message_is_persisted(self):
+        store=Store(self.db); now=time.time()
+        for mid, target in enumerate([21,22,23],1):
+            job=Job('1','9',mid,'سلام',100+mid,now+mid-3,'g',reply_target_user=target)
+            store.process(job)
+        with sqlite3.connect(self.db) as db:
+            targets=db.execute('select target_user from vp_phrase_hits order by message_id').fetchall()
+        self.assertEqual(targets,[('21',),('22',),('23',)])
+        result=store.process(Job('1','9',4,'سلام',104,now,'g',reply_target_user=24))
+        self.assertEqual(result[0],'strong')
+        self.assertTrue(result[2]['signals']['repeat_multiple_users'])
+
     async def test_similarity_alone_is_not_coordination(self):
         await self.service.toggle(1, True)
         self.service.submit(1, 2, 1, 'متن یکسان نمونه بلند')
@@ -940,6 +970,78 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(level, 'strong')
             self.assertTrue(json.loads(raw)['reply_to_own_bot'])
             self.assertEqual(bot.notice_cleanup.ttls,[70], self.service.ad_behavior._store)
+
+    async def test_fast_exact_flood_acts_without_waiting_for_blocked_profile(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        bot.message_delete_queue.enqueue=AsyncMock(return_value=(1, []))
+        await self.service.toggle(1, True)
+        started=asyncio.Event(); release=asyncio.Event()
+        async def blocked_profile(*args, **kwargs):
+            started.set(); await release.wait()
+            return {'status':'empty', 'about':None, 'channel_title':None}
+        sender=SimpleNamespace(id=9,first_name='کاربر',username='')
+        verdict={'is_spam':False,'behavior_reasons':[],'signals':{}}
+        try:
+            with patch('modules.profile_guard.filters.channel_names',return_value=[]), patch('modules.profile_guard.filters.bio_sentences',return_value=[]), patch('modules.group_words_storage.get_words',return_value=[]), patch('modules.profile_guard.service.snapshot',new=blocked_profile), patch('modules.ad_spam_guard.detector.evaluate',return_value=verdict), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+                for mid in range(1,7):
+                    event=SimpleNamespace(chat_id=1,sender_id=9,sender=sender,is_private=False,message=SimpleNamespace(id=mid,message='سلام',reply_to=None))
+                    await intercept(self.service,event,bot_id=999)
+                    if mid == 1:
+                        await asyncio.wait_for(started.wait(),2)
+                await self.flush()
+                await asyncio.wait_for(self.service.action_queue.join(),2)
+                with sqlite3.connect(self.db) as db:
+                    rows=db.execute('select message_id,level,evidence from vp_evidence order by message_id').fetchall()
+                first_strong=next((r for r in rows if r[1]=='strong'),None)
+                self.assertIsNotNone(first_strong)
+                self.assertEqual(first_strong[0],6)
+                self.assertTrue(json.loads(first_strong[2])['signals']['fast_exact_flood'])
+                self.assertTrue(any(call.args[1] == [6] for call in bot.message_delete_queue.enqueue.await_args_list))
+                self.assertEqual(bot.notice_cleanup.ttls,[70])
+        finally:
+            release.set()
+            await self.service.bio_queue.join()
+            await self.service.action_queue.join()
+
+    async def test_soroush_filtered_admin_list_used_when_get_permissions_not_supported(self):
+        from splusthon.tl import types
+        from modules import native_admin_exemption
+        peer=types.InputPeerChannel(channel_id=1,access_hash=123)
+        class Client:
+            def __init__(self, ids):
+                self.ids=ids; self.requests=[]
+                self.get_permissions=AsyncMock(side_effect=RuntimeError('NOT_SUPPORTED'))
+                self.get_entity=AsyncMock(return_value=SimpleNamespace(id=9))
+                self.send_message=AsyncMock(return_value=SimpleNamespace(id=88))
+            async def __call__(self, request):
+                self.requests.append(request)
+                return SimpleNamespace(users=[SimpleNamespace(id=i) for i in self.ids],participants=[])
+        for ids, expected in (([],1),([9],0)):
+            bot=self.fake_action_bot(); bot.client=Client(ids); self.service.bot=bot
+            bot.message_delete_queue.enqueue=AsyncMock(return_value=(1, []))
+            await self.service.toggle(1,True)
+            sender=SimpleNamespace(id=9,first_name='کاربر',username='')
+            msg=SimpleNamespace(id=10+expected,message='مسدود',reply_to=None,_input_chat=peer)
+            event=SimpleNamespace(chat_id=1,sender_id=9,sender=sender,is_private=False,message=msg)
+            with patch('modules.group_words_storage.get_words',return_value=['مسدود']), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+                await intercept(self.service,event,bot_id=999)
+                await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+            self.assertEqual(bot.message_delete_queue.enqueue.await_count,expected)
+            self.assertTrue(bot.client.requests)
+            self.assertEqual(type(bot.client.requests[0]).__name__,'GetParticipantsRequest')
+            bot.client.get_permissions.assert_not_awaited()
+            await self.service.toggle(1,False)
+
+    async def test_unknown_native_role_never_causes_punishment(self):
+        bot=self.fake_action_bot(); self.service.bot=bot
+        bot.client.get_permissions=AsyncMock(side_effect=RuntimeError('unavailable'))
+        bot.message_delete_queue.enqueue=AsyncMock(return_value=(1,[]))
+        await self.service.toggle(1,True)
+        with patch('modules.group_words_storage.get_words',return_value=['مسدود']), patch('modules.profile_guard.service.snapshot',new=AsyncMock(return_value=None)), patch('modules.admin_tools.has_admin_permission',return_value=False), patch('modules.vip_storage.is_vip',return_value=False):
+            self.service.submit(1,9,1,'مسدود')
+            await self.flush(); await self.service.bio_queue.join(); await self.service.action_queue.join()
+        bot.message_delete_queue.enqueue.assert_not_awaited()
+        bot.client.send_message.assert_not_awaited()
 
     async def test_late_scheduled_reply_is_deleted_after_confirmed_action(self):
         from handlers.message_handler import _schedule_reply

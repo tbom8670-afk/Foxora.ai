@@ -5,6 +5,7 @@ Scores are heuristic evidence, not proof of account ownership or intent.
 from __future__ import annotations
 
 import asyncio
+import copy
 from contextlib import closing
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -43,7 +44,8 @@ WEIGHTS = {"repeat": 25, "burst": 15, "reply_repeat": 15,
            "reply_target_concentration": 10, "explicit_filter": 70,
            "word_repeat": 0, "repeat_multiple_users": 30,
            "bot_reply_burst": 30, "bot_repeat": 30,
-           "bot_three_replies": 40, "bot_three_fast": 30}
+           "bot_three_replies": 40, "bot_three_fast": 30,
+           "fast_exact_flood": 40}
 THRESHOLDS = {"review": 25, "suspicious": 45, "strong": 70}
 
 
@@ -204,7 +206,7 @@ def risk_level(signals, score, thresholds):
     bot_pattern = ((signals.get('bot_three_replies') and signals.get('bot_three_fast'))
                    or (signals.get('bot_repeat') and signals.get('repeat') and signals.get('reply_repeat'))
                    or (signals.get('bot_reply_burst') and signals.get('reply_target_burst') and signals.get('reply_target_concentration')))
-    if (positives >= 4 or scheduled_repeat or targeted_repeat or bot_pattern) and score >= thresholds["strong"]:
+    if (positives >= 4 or scheduled_repeat or targeted_repeat or bot_pattern or signals.get('fast_exact_flood')) and score >= thresholds["strong"]:
         return "strong"
     if positives >= 3 and score >= thresholds["suspicious"]:
         return "suspicious"
@@ -603,6 +605,8 @@ class Store:
             if job.reply is not None:
                 repeated_targets.append(job.reply)
             repeated_target_users = set()
+            if job.reply_target_user is not None and not job.reply_to_bot and str(job.reply_target_user) != job.user:
+                repeated_target_users.add(str(job.reply_target_user))
             repeated_target_users.update(str(target) for _mid,_ts,_norm,_reply,target in exact_rows if target and target != '@bot' and str(target) != job.user)
             if repeated_targets:
                 marks = ','.join('?' for _ in repeated_targets[:200])
@@ -633,7 +637,10 @@ class Store:
                        "bot_repeat": job.reply_to_bot and bot_repeat_count >= 3,
                        "bot_reply_burst": job.reply_to_bot and bot_recent >= 5,
                        "bot_three_replies": job.reply_to_bot and bot_repeat_count >= 2,
-                       "bot_three_fast": job.reply_to_bot and bot_matching_recent >= 2}
+                       "bot_three_fast": job.reply_to_bot and bot_matching_recent >= 2,
+                       # Exact repetition plus a high-rate burst is separate
+                       # evidence; an isolated repeated word is not a verdict.
+                       "fast_exact_flood": sum(0 <= job.timestamp-r[1] <= 60 for r in exact_rows) >= 5}
             # Fetch existing moderation history only after multiple behavioral
             # indicators, never use old or unknown status as a standalone verdict.
             if sum(v for k, v in signals.items() if k not in ("history", "conversation")) >= 2 and not history:
@@ -672,7 +679,11 @@ class Store:
                         "cross_group": {"status": "checked" if others else "not_authorized", "matching_groups": sorted(set(cross_matches)), "matches": len(cross_matches)}, "decision": "evidence_recorded"}
             db.execute("INSERT INTO vp_messages VALUES(?,?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,job.text,norm,job.reply,int(ad) | (int(channel) << 1)))
             target_row = db.execute("SELECT user_id FROM vp_messages WHERE group_id=? AND generation=? AND message_id=? AND user_id!=?", (job.group,job.generation,job.reply,job.user)).fetchone() if job.reply is not None else None
-            db.execute("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,norm,job.reply,'@bot' if job.reply_to_bot else (target_row[0] if target_row else None)))
+            # Preserve the user resolved from the actual reply even if that
+            # target's message predates activation or is outside our DB.
+            target_user = (str(job.reply_target_user) if job.reply_target_user is not None
+                           and str(job.reply_target_user) != job.user else None)
+            db.execute("INSERT OR IGNORE INTO vp_phrase_hits VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,norm,job.reply,'@bot' if job.reply_to_bot else (target_user or (target_row[0] if target_row else None))))
             db.executemany("INSERT OR IGNORE INTO vp_word_hits VALUES(?,?,?,?,?,?)", ((job.group,job.generation,job.user,job.message,job.timestamp,w) for w in words))
             if level != "natural" or word_counts:
                 db.execute("INSERT INTO vp_evidence VALUES(?,?,?,?,?,?,?,?)", (job.group,job.generation,job.user,job.message,job.timestamp,score,level,json.dumps(evidence,ensure_ascii=False)))
@@ -728,6 +739,7 @@ class Service:
         self.action_locks = weakref.WeakValueDictionary()
         self.feedback_tasks = set()
         self.action_queue = asyncio.Queue(maxsize=64)
+        self.action_dropped = 0
         self.action_workers = set()
         self.action_probes = {}
         self.activations = {}
@@ -1089,6 +1101,9 @@ class Service:
                         if not await asyncio.to_thread(self.store.stage, job):
                             self.dropped += 1
                             continue
+                        if job.reply is not None and job.reply_target_user is None and job.sender_event is not None:
+                            from modules.ad_spam_guard.detector import _reply_target_user_id
+                            job = replace(job, reply_target_user=_reply_target_user_id(job.sender_event))
                         result = await asyncio.to_thread(self.store.process, job, self.peers_for(job.group), self.weights, self.thresholds)
                         await asyncio.to_thread(self.store.acknowledge, job)
                         if result:
@@ -1116,12 +1131,11 @@ class Service:
                             if (identity_content or reasons) and not result[2].get('direct_filter'):
                                 verdict['behavior_reasons'] = reasons
                                 result = await asyncio.to_thread(self.store.update_ad_detector, job, result, verdict)
-                            # Explicit text matches should not wait for profile RPC.
-                            if result[2].get('direct_filter'):
-                                self._schedule_action(job, result[2])
-                            scheduled = self._schedule_bio(job, result)
-                            if not scheduled and result[0] == "strong" and not result[2].get('direct_filter'):
-                                self._schedule_action(job, result[2])
+                            # A strong verdict must never wait for the coalesced
+                            # profile queue: intermediate jobs may be replaced.
+                            if result[0] == 'strong':
+                                result[2]['action_queued'] = self._schedule_action(job, result[2])
+                            self._schedule_bio(job, result)
             except Exception:
                 now = time.monotonic()
                 if now - self.last_error >= 60:
@@ -1136,14 +1150,62 @@ class Service:
 
     def _schedule_action(self, job, evidence):
         if self.bot is None or self.action_queue.full():
+            self.action_dropped += 1
+            self.log_action_skip('action queue unavailable or full', job)
             return False
-        self.action_queue.put_nowait((job, evidence))
+        self.action_queue.put_nowait((job, copy.deepcopy(evidence)))
         self.action_workers = {t for t in self.action_workers if not t.done()}
         if len(self.action_workers) < 4:
             task = asyncio.create_task(self._action_worker(), name="virtual-protocol-actions")
             self.action_workers.add(task)
             task.add_done_callback(self.action_workers.discard)
         return True
+
+    async def native_role(self, job, rpc_group, resolved_user):
+        """True=admin, False=confirmed non-admin, None=unknown.
+
+        Soroush channels may reject get_permissions/GetParticipant. Prefer the
+        existing supported filtered-admin-list path with the actual event peer.
+        Never interpret a failed lookup as proof the user is not an admin.
+        """
+        from modules.light_spam_ingest import _event_rpc_peer
+        event = job.sender_event
+        peer = _event_rpc_peer(event) if event is not None else None
+        if peer is None and event is not None:
+            peer = getattr(event, '_bot_cached_chat', None)
+            getter = getattr(event, 'get_input_chat', None)
+            if peer is None and callable(getter):
+                try:
+                    peer = await asyncio.wait_for(getter(), 2)
+                except Exception:
+                    pass
+        if peer is None:
+            getter = getattr(self.bot.client, 'get_input_entity', None)
+            if callable(getter):
+                try:
+                    peer = await asyncio.wait_for(getter(rpc_group), 2)
+                except Exception:
+                    pass
+        if peer is not None:
+            try:
+                from handlers.message_handler import _native_admin_from_resolved_peer
+                role = await _native_admin_from_resolved_peer(
+                    self.bot, peer, resolved_user, int(job.user), force=True)
+                if role is True or role is False:
+                    return role
+            except Exception:
+                LOG.debug('virtual protocol filtered admin lookup failed', exc_info=True)
+        try:
+            permissions = await self.bot.client.get_permissions(peer or rpc_group, resolved_user or int(job.user))
+            admin = getattr(permissions, 'is_admin', None)
+            creator = getattr(permissions, 'is_creator', None)
+            if admin is True or creator is True:
+                return True
+            if admin is False and creator is not True:
+                return False
+        except Exception:
+            LOG.debug('virtual protocol permission fallback failed', exc_info=True)
+        return None
 
     async def _action_worker(self):
         from modules.admin_tools import has_admin_permission
@@ -1161,10 +1223,10 @@ class Service:
                 rpc_group = _chat_id_for_rpc(job.group)
                 resolved_user = await self.resolve_sender(job)
                 try:
-                    probe = asyncio.create_task(bot.client.get_permissions(rpc_group, resolved_user or int(job.user)))
+                    probe = asyncio.create_task(self.native_role(job, rpc_group, resolved_user))
                     self.action_probes.setdefault(job.group, set()).add(probe)
-                    permissions = await asyncio.wait_for(probe, 5)
-                    if getattr(permissions, "is_admin", None) is not False or getattr(permissions, "is_creator", False):
+                    role = await asyncio.wait_for(probe, 8)
+                    if role is not False:
                         self.log_action_skip('native role admin or unknown', job)
                         continue
                 except asyncio.CancelledError:
@@ -1244,10 +1306,10 @@ class Service:
                             if has_admin_permission(_job.group, _job.user, None) or vip_storage.is_vip(_job.group, _job.user):
                                 return False
                             try:
-                                role = await asyncio.wait_for(bot.client.get_permissions(_rpc, _resolved or int(_job.user)), 5)
+                                role = await asyncio.wait_for(self.native_role(_job, _rpc, _resolved), 8)
                             except Exception:
                                 return False
-                            if getattr(role, 'is_admin', None) is not False or getattr(role, 'is_creator', False):
+                            if role is not False:
                                 return False
                             mode = 'mute' if punishment_mode.is_mute(_job.group) else 'ban'
                             if _stage == 2:
@@ -1343,13 +1405,13 @@ class Service:
                     user = await self.resolve_sender(job)
                     if user is None:
                         return None
-                    if not original[2].get('direct_filter') and not getattr(job.sender_event, 'sender', None):
+                    if not original[2].get('direct_filter') and not original[2].get('action_queued') and not getattr(job.sender_event, 'sender', None):
                         verdict = await asyncio.to_thread(ad_detector.evaluate, user, job.text)
                         if verdict.get('is_spam'):
                             async with self.lock:
                                 if self.groups.get(job.group) == job.generation:
                                     original = await asyncio.to_thread(self.store.update_ad_detector, job, original, verdict)
-                                    self._schedule_action(job, original[2])
+                                    original[2]['action_queued'] = self._schedule_action(job, original[2])
                     if cached is None:
                         return await profile_service.snapshot(self.bot, user, max_age=PROFILE_CACHE_SECONDS)
                     return None
@@ -1374,7 +1436,7 @@ class Service:
                     self.last_profile_error = time.monotonic()
                 async with self.lock:
                     if self.groups.get(job.group) == job.generation:
-                        already_scheduled = bool(original[2].get('direct_filter'))
+                        already_scheduled = bool(original[2].get('action_queued'))
                         result = await asyncio.to_thread(self.store.update_bio, job, original, profile, self.weights, self.thresholds, cached)
                         if cached is None and profile and profile.get('status') in ('ok', 'empty'):
                             self.bio_recent[key] = time.monotonic()
@@ -1383,7 +1445,7 @@ class Service:
                             self._schedule_action(job, result[2])
             except Exception:
                 LOG.warning("virtual protocol profile lookup failed", exc_info=True)
-                if self.groups.get(job.group) == job.generation and original[0] == 'strong' and not original[2].get('direct_filter'):
+                if self.groups.get(job.group) == job.generation and original[0] == 'strong' and not original[2].get('action_queued'):
                     self._schedule_action(job, original[2])
             finally:
                 self.bio_pending.discard(key)

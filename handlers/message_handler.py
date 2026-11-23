@@ -2083,7 +2083,7 @@ async def _native_admin_from_resolved_peer(
             list_cache = bot.native_group_admin_ids_cache = {}
         now = _asyncio.get_running_loop().time()
         cached = list_cache.get(list_key)
-        if cached and cached[1] > now:
+        if not force and cached and cached[1] > now:
             return str(user_id) in cached[0]
 
         request = functions.channels.GetParticipantsRequest(
@@ -2094,6 +2094,13 @@ async def _native_admin_from_resolved_peer(
             hash=0,
         )
         response = await bot.client(request)
+        # An absent or truncated admin list is not proof that this user is
+        # ordinary. Fall back to another role source instead of guessing.
+        if response is None or (not hasattr(response, 'participants') and not hasattr(response, 'users')):
+            raise RuntimeError('admin-list response unavailable')
+        count = getattr(response, 'count', None)
+        if isinstance(count, int) and count > 200:
+            raise RuntimeError('admin-list response truncated')
         admin_ids = {
             str(getattr(user, "id", ""))
             for user in (getattr(response, "users", ()) or ())
