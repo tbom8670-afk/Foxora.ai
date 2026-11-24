@@ -47,13 +47,16 @@ def _active(story):
     return True
 
 
+def _items(response):
+    # GetPeerStories -> response.stories.stories; GetStoriesByID -> response.stories.
+    container = getattr(response, 'stories', None)
+    items = container if isinstance(container, (list, tuple)) else getattr(container, 'stories', None)
+    return items if isinstance(items, (list, tuple)) else None
+
+
 def matching_caption(response):
     """Return the first matching caption, never media/empty/skipped items."""
-    container = getattr(response, 'stories', None)
-    items = getattr(container, 'stories', None)
-    if not isinstance(items, (list, tuple)):
-        return None
-    for item in items:
+    for item in _items(response) or ():
         caption = getattr(item, 'caption', None)
         if isinstance(caption, str) and _active(item) and matcher.find_match(caption, _TERMS):
             return caption
@@ -62,15 +65,28 @@ def matching_caption(response):
 
 async def _exempt(bot, chat_id, user_id, sender):
     from modules.profile_guard import guard
-    if not storage.is_enabled(chat_id) or guard._is_exempt(chat_id, user_id, sender):
+    if not storage.is_enabled(chat_id):
+        _log(bot, f'skip chat_id={chat_id} user_id={user_id} reason=disabled')
+        return True
+    if guard._is_exempt(chat_id, user_id, sender):
+        _log(bot, f'skip chat_id={chat_id} user_id={user_id} reason=local_exemption')
         return True
     if str(user_id) == str(getattr(bot, 'bot_account_id', None)):
         return True
     try:
         from modules import native_admin_exemption
-        return bool(await native_admin_exemption.exempt(bot, chat_id, user_id, sender, fresh=True))
-    except Exception:
-        # No definitive exemption result: fail closed for this new feature.
+        exempt = bool(
+            native_admin_exemption.enabled()
+            and await native_admin_exemption.is_native_admin(
+                bot, chat_id, user_id, sender, fresh=True
+            )
+        )
+        if exempt:
+            _log(bot, f'skip chat_id={chat_id} user_id={user_id} reason=native_admin')
+        return exempt
+    except Exception as error:
+        # Unexpected exemption errors must not permit punishment.
+        _log(bot, f'skip chat_id={chat_id} user_id={user_id} reason=exemption_error error={type(error).__name__}', error=True)
         return True
 
 
@@ -78,7 +94,8 @@ async def _fetch_caption(bot, sender, scheduled):
     """A fresh RPC; None is unknown/no matching caption, never an infraction."""
     global _last_request
     from modules.profile_guard import service
-    from splusthon.tl.functions.stories import GetPeerStoriesRequest
+    from splusthon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
+    from splusthon.tl.types import StoryItemSkipped
     async with _semaphore():
         if time.monotonic() - scheduled > _MAX_PENDING_AGE or time.monotonic() < _flood_until:
             raise TimeoutError("story request expired or flood cooldown active")
@@ -90,7 +107,32 @@ async def _fetch_caption(bot, sender, scheduled):
         response = await asyncio.wait_for(
             bot.client(GetPeerStoriesRequest(peer=peer)), timeout=service.fetch_timeout()
         )
-    return matching_caption(response)
+        items = _items(response)
+        if items is None:
+            _log(bot, 'invalid response shape', error=True)
+            return None
+        caption = matching_caption(response)
+        skipped = [int(item.id) for item in items
+                   if isinstance(item, StoryItemSkipped) and _active(item) and item.id is not None]
+        _log(bot, f'peer stories count={len(items)} captions={sum(isinstance(getattr(i, "caption", None), str) for i in items)} skipped={len(skipped)}')
+        if caption or not skipped:
+            return caption
+        # Some servers return only IDs for skipped stories; request their full
+        # content instead of treating those as proof that there is no caption.
+        wait = service.rpc_min_interval() - (time.monotonic() - _last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request = time.monotonic()
+        expanded = await asyncio.wait_for(
+            bot.client(GetStoriesByIDRequest(peer=peer, id=skipped[:100])),
+            timeout=service.fetch_timeout(),
+        )
+        expanded_items = _items(expanded)
+        if expanded_items is None:
+            _log(bot, 'invalid expanded response shape', error=True)
+            return None
+        _log(bot, f'expanded stories count={len(expanded_items)} captions={sum(isinstance(getattr(i, "caption", None), str) for i in expanded_items)}')
+        return matching_caption(expanded)
 
 
 async def _act(bot, event, chat_id, user_id, sender, message_id, caption):

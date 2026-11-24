@@ -6,7 +6,10 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
-from splusthon.tl.functions.stories import GetPeerStoriesRequest
+from splusthon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByIDRequest
+from splusthon.tl.types import StoryItemSkipped
+from modules import native_admin_exemption as native
+_REAL_IS_NATIVE_ADMIN = native.is_native_admin
 from modules.profile_guard import story_guard as story, guard, storage, texts
 
 
@@ -19,8 +22,11 @@ def isolated(monkeypatch):
     monkeypatch.setattr(story, '_flood_until', 0.0)
     monkeypatch.setattr(storage, 'is_enabled', lambda group: True)
     monkeypatch.setattr(guard, '_is_exempt', lambda *args: False)
-    from modules import native_admin_exemption
-    monkeypatch.setattr(native_admin_exemption, 'exempt', AsyncMock(return_value=False))
+    monkeypatch.setenv('BOT_NATIVE_ADMIN_EXEMPT', '1')
+    async def member_role(bot, chat_id, user_id, user=None, resolved_chat=None, *, fresh=False):
+        return False
+    # Keep the real module and a signature-compatible role checker.
+    monkeypatch.setattr(native, 'is_native_admin', member_role)
 
 
 def result(*items):
@@ -145,9 +151,10 @@ def test_group_disabled_before_action_and_native_admin(monkeypatch):
         monkeypatch.setattr(storage, 'is_enabled', lambda group: next(calls))
         sent, recorded = await run_check(bot, monkeypatch)
         assert not sent and not recorded and not bot.client.deleted
-        from modules import native_admin_exemption
         monkeypatch.setattr(storage, 'is_enabled', lambda group: True)
-        monkeypatch.setattr(native_admin_exemption, 'exempt', AsyncMock(return_value=True))
+        async def admin_role(bot, chat_id, user_id, user=None, resolved_chat=None, *, fresh=False):
+            return True
+        monkeypatch.setattr(native, 'is_native_admin', admin_role)
         bot2 = make_bot(result(item('کانالم')))
         sent, recorded = await run_check(bot2, monkeypatch)
         assert not bot2.client.requests and not sent
@@ -192,3 +199,43 @@ def test_handler_schedules_after_profile_guard():
     source = (Path(__file__).resolve().parents[1] / 'handlers/message_handler.py').read_text(encoding='utf-8')
     assert 'elif _profile_guard.storage.is_enabled(chat_id):' in source
     assert '_story_guard.schedule(' in source
+
+
+def test_real_native_role_path_accepts_fresh_and_checks_authority(monkeypatch):
+    """Exercise the real role checker, with only server calls faked."""
+    async def go():
+        monkeypatch.setattr(native, 'is_native_admin', _REAL_IS_NATIVE_ADMIN)
+        async def no_list(*args, **kwargs): return None
+        monkeypatch.setattr(native, 'fetch_group_admin_ids', no_list)
+        bot = make_bot(result(item('کانالم')))
+        bot.client.get_permissions = AsyncMock(return_value=NS(is_admin=False, is_creator=False))
+        sent, _ = await run_check(bot, monkeypatch)
+        assert bot.client.get_permissions.await_count >= 1
+        assert len(bot.client.requests) == 1
+        assert sent and bot.client.deleted == [(11, [33])]
+        bot2 = make_bot(result(item('کانالم')))
+        bot2.client.get_permissions = AsyncMock(return_value=NS(is_admin=True, is_creator=False))
+        sent2, _ = await run_check(bot2, monkeypatch)
+        assert not bot2.client.requests and not bot2.client.deleted and not sent2
+    asyncio.run(go())
+
+
+def test_skipped_story_is_fetched_by_id_before_matching(monkeypatch):
+    async def go():
+        skipped = StoryItemSkipped(id=42, date=datetime.now(timezone.utc),
+                                   expire_date=datetime.now(timezone.utc) + timedelta(minutes=5))
+        bot = make_bot(result(skipped))
+        async def request(req):
+            bot.client.requests.append(req)
+            if isinstance(req, GetPeerStoriesRequest):
+                return result(skipped)
+            assert isinstance(req, GetStoriesByIDRequest) and req.id == [42]
+            return NS(stories=[item('کانالم')])
+        # Special methods resolve on the class, not the instance.
+        class SkippedClient(Client):
+            async def __call__(self, req): return await request(req)
+        bot.client = SkippedClient(None)
+        sent, _ = await run_check(bot, monkeypatch)
+        assert len(bot.client.requests) == 2 and sent
+        assert 'کانالم' in sent[0][0][0]
+    asyncio.run(go())
