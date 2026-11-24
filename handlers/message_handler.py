@@ -5014,6 +5014,28 @@ async def handle_new_message(bot, event):
                         f"error={_violator_gate_error!r}"
                     )
 
+        # ===== 🚨 ضد استوری: دستور، تنظیم گروه و صف کاملاً مستقل =====
+        if (not event.is_private and chat_id and user_id
+                and not _is_own_bot_message):
+            try:
+                from modules.profile_guard import story_guard as _story_guard
+                from modules.profile_guard import story_storage as _story_storage
+                _story_mode = _story_storage.toggle_mode(message_text)
+                if _story_mode is not None:
+                    if await _story_guard.handle_toggle(
+                            bot, event, chat_id, user_id, sender, _story_mode):
+                        return
+                elif _story_storage.is_enabled(chat_id):
+                    _story_guard.schedule(
+                        bot, event, chat_id, user_id, sender,
+                        getattr(event.message, "id", None),
+                    )
+            except Exception as _story_error:
+                bot.logger.log_error(
+                    "STORY GUARD ROUTER FAILED "
+                    f"chat_id={chat_id} user_id={user_id} error={type(_story_error).__name__}"
+                )
+
         # ===== 🛡️ گیت «ضد ربات تبلیغاتی» =====
         # مستقل از ضد-اسپم عادی: بر پایهٔ هویتِ فرستنده (نام/یوزرنیم/سری
         # ایموجی) به‌همراه محتوای پیام تصمیم می‌گیرد و با صفِ حذفِ اختصاصی
@@ -5119,13 +5141,6 @@ async def handle_new_message(bot, event):
                             bot, event, chat_id, is_edited_message
                         )
                         return
-                    # Story captions are checked asynchronously; the same
-                    # anti-channel group switch and exemptions apply.
-                    from modules.profile_guard import story_guard as _story_guard
-                    _story_guard.schedule(
-                        bot, event, chat_id, user_id, sender,
-                        getattr(event.message, "id", None),
-                    )
                     profiler.note(
                         "profile_guard",
                         (time.perf_counter() - _pg_guard_started) * 1000,

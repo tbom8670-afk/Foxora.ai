@@ -62,7 +62,7 @@ def test_blocks_count_and_contact():
     # + ۱ بلوک «سپر محافظتی» (سپر روشن/سپر خاموش) = ۶۰)
     # + ۱ نقل‌قول دوسطریِ مشترکِ «ادمین گروه» / «لغو ادمین گروه» = ۶۱
     # + ۱ نقل‌قول تک‌خطیِ «تگ ادمین ها» = ۶۲
-    assert len(bquote_entities) == 63
+    assert len(bquote_entities) == 64
     contact_note = "تماس با سازنده : @OSINE2"
     assert ADMIN_HELP_TEXT.endswith(contact_note)
 
@@ -148,7 +148,7 @@ def test_blockquotes_span_exact_lines():
     # + ۱ نقل‌قولِ «محدودیت دستورات»
     # + ۱ نقل‌قولِ «سپر محافظتی» = ۶۰؛ نقل‌قول دوسطریِ گروه = ۶۱.
     # + ۱ نقل‌قول «تگ ادمین ها» = ۶۲.
-    assert len(bquote_entities) == 63
+    assert len(bquote_entities) == 64
 
     for ent in bquote_entities:
         sliced = _slice_u16(ADMIN_HELP_TEXT, ent.offset, ent.length)
@@ -174,7 +174,7 @@ def test_bold_entities_content():
     # + ۱ هدرِ «🌡 سپر محافظتی» + 2 دستورِ Boldِ «سپر روشن/سپر خاموش»
     # + عنوان و دو دستورِ Bold برای «ادمین گروه» = ۷۰
     # + عنوان و دستورِ Bold برای «تگ ادمین ها» = ۷۲
-    assert len(bold_entities) == 75
+    assert len(bold_entities) == 78
 
     # بلوک‌هایی که به‌درخواستِ کارفرما کلِ متن‌شان (چندخطی) Bold است.
     for ent in bold_entities:
@@ -351,7 +351,7 @@ def test_messages_are_chunked_to_avoid_lost_quotes():
     chunks = ADMIN_HELP_MESSAGES
     assert len(chunks) == 2, "بلوک جدید باید داخل پیام دومِ همان لیست باشد"
     assert [sum(isinstance(entity, MessageEntityBlockquote)
-                for entity in entities) for _, entities in chunks] == [32, 31]
+                for entity in entities) for _, entities in chunks] == [32, 32]
 
     total_quotes = 0
     for text, entities in chunks:
@@ -391,3 +391,17 @@ def test_every_row_keeps_its_quote_in_chunks():
     for text, entities in ADMIN_HELP_MESSAGES:
         got.update(quotes_of(text, entities))
     assert wanted == got, "بعضی نقل‌قول‌ها در تکه‌بندی گم شده‌اند"
+
+
+def test_anti_story_admin_help_has_exact_format_and_real_entities():
+    title = '🚨برای روشن کردن ضد استوری تبلیغات و ربات ها'
+    commands = 'ضد استوری روشن\nضد استوری خاموش'
+    full = title + '\n' + commands
+    assert ADMIN_HELP_TEXT.count(full) == 1
+    assert len(ADMIN_HELP_MESSAGES) == 2
+    text, entities = next((t, es) for t, es in ADMIN_HELP_MESSAGES if full in t)
+    bolds = [_slice_u16(text, e.offset, e.length) for e in entities if isinstance(e, MessageEntityBold)]
+    quotes = [_slice_u16(text, e.offset, e.length) for e in entities if isinstance(e, MessageEntityBlockquote)]
+    assert title in bolds
+    assert 'ضد استوری روشن' in bolds and 'ضد استوری خاموش' in bolds
+    assert commands in quotes

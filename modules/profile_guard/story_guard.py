@@ -1,18 +1,65 @@
-"""Experimental anti-channel check for a visible active story's caption.
+"""Independent anti-story check of visible active story captions.
 
-Runs only for groups where profile guard is enabled, in the background after a
-user message. No OCR; errors/skipped stories are unknown, not violations. No
-captions are logged or persisted. Existing owner/admin/VIP exemptions apply.
+Uses its own per-group switch and queue. No OCR; API errors and unavailable
+stories are unknown, not violations. Captions are not logged or persisted.
 """
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
 import time
+import re
+from functools import lru_cache
 
-from modules.profile_guard import matcher, storage, texts
+from modules.manage_features.queue import PerGroupQueue, QueueFull
+from modules.profile_guard import filters, matcher, story_storage as storage, texts
 
-_TERMS = matcher.build(["کانالم"])
+_EXTRA_TERMS = ("داغم", "داغ", "حشری", "فیلم سوپر")
+QUEUE = PerGroupQueue("story_guard", max_pending_per_key=32,
+                      max_pending_total=128, max_keys=128, task_timeout=90.0)
+_REPEAT = re.compile(r"([^\W_])(?:[\W_]*\1)+", re.UNICODE)
+
+
+def filter_terms():
+    # Use the live lists, including owner imports and per-instance edits.
+    return tuple(dict.fromkeys(filters.channel_names() + filters.bio_sentences() + list(_EXTRA_TERMS)))
+
+
+def _fold_stretched(value):
+    # Repeated characters even with punctuation/emoji/space between them.
+    # Do not discard arbitrary letters or match inside unrelated longer words.
+    return _REPEAT.sub(r"\1", matcher.normalize(value)).replace('_', ' ')
+
+
+@lru_cache(maxsize=16)
+def _patterns(terms):
+    return matcher.build(terms), matcher.build(tuple(_fold_stretched(p) for p in terms))
+
+
+def caption_match(caption):
+    original, stretched = _patterns(filter_terms())
+    return matcher.find_match(caption, original) or matcher.find_match(_fold_stretched(caption), stretched)
+
+
+async def handle_toggle(bot, event, chat_id, user_id, sender, mode):
+    from modules.profile_guard import guard
+    if not guard._is_admin(chat_id, user_id, sender):
+        try:
+            await event.reply("🏕 فقط ادمین های ثبت شده مجاز هستند")
+        except Exception:
+            pass
+        return True
+    if mode == 'on':
+        storage.enable(chat_id)
+        filters.reload()
+        await guard._send(bot, event, chat_id, texts.story_enabled(len(filter_terms())))
+    else:
+        storage.disable(chat_id)
+        await guard._send(bot, event, chat_id, texts.story_disabled())
+    _log(bot, f'{mode} chat_id={chat_id} user_id={user_id}')
+    return True
+
+
 _inflight: set[tuple[str, str]] = set()
 _tasks: set[asyncio.Task] = set()
 _retry_after: dict[tuple[str, str], float] = {}
@@ -58,7 +105,7 @@ def matching_caption(response):
     """Return the first matching caption, never media/empty/skipped items."""
     for item in _items(response) or ():
         caption = getattr(item, 'caption', None)
-        if isinstance(caption, str) and _active(item) and matcher.find_match(caption, _TERMS):
+        if isinstance(caption, str) and _active(item) and caption_match(caption):
             return caption
     return None
 
@@ -136,7 +183,7 @@ async def _fetch_caption(bot, sender, scheduled):
 
 
 async def _act(bot, event, chat_id, user_id, sender, message_id, caption):
-    from modules.profile_guard import guard, penalties
+    from modules.profile_guard import guard
     duration = guard.bio_mute_seconds()
     deleted = muted = False
     try:
@@ -149,11 +196,6 @@ async def _act(bot, event, chat_id, user_id, sender, message_id, caption):
             muted = bool(await bot.admin_actions.mute_user(chat_id, user_id, duration, user=sender, chat=None))
     except Exception as error:
         _log(bot, f'mute failed chat_id={chat_id} user_id={user_id} error={type(error).__name__}', error=True)
-    if muted:
-        try:
-            penalties.record(chat_id, user_id, 'story', time.time() + duration)
-        except Exception as error:
-            _log(bot, f'penalty record failed error={type(error).__name__}', error=True)
     # Bound the untrusted caption so the warning fits message size limits.
     shown = caption if len(caption) <= 1500 else caption[:1500] + '…'
     payload = texts.notice_story(guard._display_name(sender), shown,
@@ -212,7 +254,23 @@ def schedule(bot, event, chat_id, user_id, sender, message_id):
     try:
         loop = asyncio.get_running_loop()
         _inflight.add(key)
-        task = loop.create_task(_run(bot, event, chat_id, user_id, sender, message_id, key, now))
+        async def submit_job():
+            try:
+                future = await QUEUE.submit(
+                    chat_id,
+                    lambda: _run(bot, event, chat_id, user_id, sender, message_id, key, now),
+                    dedupe_key=user_id, logger=getattr(bot, 'logger', None),
+                )
+                await future
+            except QueueFull:
+                _log(bot, f'queue full chat_id={chat_id} user_id={user_id}', error=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _log(bot, f'queue error chat_id={chat_id} user_id={user_id} error={type(error).__name__}', error=True)
+            finally:
+                _inflight.discard(key)
+        task = loop.create_task(submit_job())
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
         return True

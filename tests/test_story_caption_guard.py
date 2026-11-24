@@ -10,11 +10,14 @@ from splusthon.tl.functions.stories import GetPeerStoriesRequest, GetStoriesByID
 from splusthon.tl.types import StoryItemSkipped
 from modules import native_admin_exemption as native
 _REAL_IS_NATIVE_ADMIN = native.is_native_admin
-from modules.profile_guard import story_guard as story, guard, storage, texts
+from modules.profile_guard import story_guard as story, guard, story_storage as storage, texts
+from modules.manage_features.queue import PerGroupQueue
+_REAL_STORY_ENABLED = storage.is_enabled
 
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
+    monkeypatch.setattr(story, 'QUEUE', PerGroupQueue('story_test', max_pending_per_key=32, max_pending_total=128, max_keys=128, task_timeout=90))
     monkeypatch.setattr(story, '_inflight', set())
     monkeypatch.setattr(story, '_retry_after', {})
     monkeypatch.setattr(story, '_sem', None)
@@ -91,7 +94,7 @@ def test_full_matching_request_punishment_and_caption(monkeypatch):
         assert isinstance(bot.client.requests[0], GetPeerStoriesRequest)
         assert bot.client.deleted == [(11, [33])]
         assert bot.admin_actions.mute_user.await_args.args[:3] == (11, 22, guard.bio_mute_seconds())
-        assert recorded and recorded[0][2] == 'story'
+        assert not recorded  # Do not overwrite anti-channel penalty state.
         assert sent[0][1] is True
         text, entities = sent[0][0]
         assert 'کپشن استوری : بیا تو کانالم دوستان' in text
@@ -194,11 +197,11 @@ def test_story_caption_entity_offsets_handle_emoji():
     assert '🌹 کانالم 🌹' in text
 
 
-def test_handler_schedules_after_profile_guard():
+def test_handler_schedules_independently_of_profile_guard():
     from pathlib import Path
     source = (Path(__file__).resolve().parents[1] / 'handlers/message_handler.py').read_text(encoding='utf-8')
-    assert 'elif _profile_guard.storage.is_enabled(chat_id):' in source
-    assert '_story_guard.schedule(' in source
+    assert 'elif _story_storage.is_enabled(chat_id):' in source
+    assert source.index('_story_guard.schedule(') < source.index('# ===== 🦊 گیت «ضد کانال')
 
 
 def test_real_native_role_path_accepts_fresh_and_checks_authority(monkeypatch):
@@ -239,3 +242,152 @@ def test_skipped_story_is_fetched_by_id_before_matching(monkeypatch):
         assert len(bot.client.requests) == 2 and sent
         assert 'کانالم' in sent[0][0][0]
     asyncio.run(go())
+
+
+def test_complete_live_channel_and_bio_lists_plus_requested_words():
+    from modules.profile_guard import filters
+    terms = story.filter_terms()
+    assert set(filters.channel_names()) <= set(terms)
+    assert set(filters.bio_sentences()) <= set(terms)
+    for phrase in ('داغم', 'داغ', 'حشری', 'فیلم سوپر'):
+        assert phrase in terms
+        assert story.caption_match(phrase), phrase
+    for phrase in terms:
+        assert story.caption_match(phrase), phrase
+
+
+@pytest.mark.parametrize('caption', [
+    'د ا ا ا غ غ م', 'دــااااغــم', 'د-ا-غ-م', 'د_ا_غ_م',
+    'حشششری', 'ح.ش.ش.ش.ر.ی', 'فیییلم سوووپر', 'ف-ی-ل-م س-و-پ-ر',
+    'بیا تو كــااااناللللم', 'چ.ن.ل.م',
+])
+def test_obfuscated_captions(caption):
+    assert story.caption_match(caption), caption
+
+
+def test_matching_avoids_several_unrelated_longer_words():
+    for phrase in ('داغستان', 'یک کتاب خوب', 'فيلمبرداری', 'کسی آمد'):
+        assert not story.caption_match(phrase), phrase
+
+
+def test_filter_lists_update_without_restart(monkeypatch):
+    monkeypatch.setattr(story.filters, 'channel_names', lambda: ['عبارت اختصاصی تازه'])
+    monkeypatch.setattr(story.filters, 'bio_sentences', lambda: ['بیو اختصاصی تازه'])
+    assert story.caption_match('عبارت اختصاصی تازه')
+    assert story.caption_match('بیو اختصاصی تازه')
+    monkeypatch.setattr(story.filters, 'channel_names', lambda: ['عبارت جدید دوم'])
+    assert story.caption_match('عبارت جدید دوم')
+    assert not story.caption_match('عبارت اختصاصی تازه')
+
+
+def test_independent_group_switch_and_commands(tmp_path, monkeypatch):
+    # Use the real persistence layer rather than the fixture's always-on stub.
+    from modules.profile_guard import story_storage, storage as channel_storage
+    monkeypatch.setattr(story_storage, 'is_enabled', _REAL_STORY_ENABLED)
+    monkeypatch.setattr(story_storage, 'FILE', tmp_path / 'story.json')
+    monkeypatch.setattr(story_storage, '_cache', None)
+    monkeypatch.setattr(story_storage, '_cache_mtime', None)
+    monkeypatch.setattr(channel_storage, 'FILE', tmp_path / 'channel.json')
+    monkeypatch.setattr(channel_storage, '_cache', None)
+    monkeypatch.setattr(channel_storage, '_cache_mtime', None)
+    assert story_storage.toggle_mode('ضد استوری روشن') == 'on'
+    assert story_storage.toggle_mode('ضد استوری خاموش') == 'off'
+    assert story_storage.toggle_mode('ضد کانال روشن') is None
+    assert not story_storage.is_enabled('1')
+    story_storage.enable('1')
+    assert story_storage.is_enabled('1') and not story_storage.is_enabled('2')
+    assert not channel_storage.is_enabled('1')
+    channel_storage.enable('2')
+    assert not story_storage.is_enabled('2')
+    story_storage.disable('1')
+    assert not story_storage.is_enabled('1') and channel_storage.is_enabled('2')
+
+
+def test_story_toggle_is_admin_only_and_uses_profile_style(monkeypatch):
+    async def go():
+        sent = []
+        evt = NS(reply=AsyncMock())
+        bot = NS()
+        async def fake_send(bot, event, chat, payload, **kw): sent.append(payload)
+        monkeypatch.setattr(guard, '_send', fake_send)
+        monkeypatch.setattr(guard, '_is_admin', lambda *args: False)
+        on = AsyncMock()
+        monkeypatch.setattr(storage, 'enable', on)
+        assert await story.handle_toggle(bot, evt, 11, 22, NS(), 'on')
+        evt.reply.assert_awaited_once()
+        on.assert_not_called()
+        monkeypatch.setattr(guard, '_is_admin', lambda *args: True)
+        enabled = []
+        monkeypatch.setattr(storage, 'enable', lambda gid: enabled.append(gid))
+        await story.handle_toggle(bot, evt, 11, 22, NS(), 'on')
+        assert enabled == [11]
+        assert 'ضد استوری' in sent[-1][0]
+        assert any(isinstance(e, texts.MessageEntityBold) for e in sent[-1][1])
+        disabled = []
+        monkeypatch.setattr(storage, 'disable', lambda gid: disabled.append(gid))
+        await story.handle_toggle(bot, evt, 11, 22, NS(), 'off')
+        assert disabled == [11] and 'خاموش شد' in sent[-1]
+    asyncio.run(go())
+
+
+def test_story_queue_is_dedicated_and_serializes_same_group(monkeypatch):
+    async def go():
+        calls = []
+        first_waiting, release = asyncio.Event(), asyncio.Event()
+        async def run(bot, event, gid, uid, sender, mid, key, scheduled):
+            calls.append(('start', uid))
+            if uid == 1:
+                first_waiting.set()
+                await release.wait()
+            calls.append(('end', uid))
+        monkeypatch.setattr(story, '_run', run)
+        bot = NS()
+        evt = NS(is_private=False)
+        assert story.schedule(bot, evt, 11, 1, NS(id=1), 101)
+        await asyncio.wait_for(first_waiting.wait(), 1)
+        assert story.schedule(bot, evt, 11, 2, NS(id=2), 102)
+        await asyncio.sleep(.02)
+        assert calls == [('start', 1)]
+        release.set()
+        await story.QUEUE.drain()
+        assert calls == [('start', 1), ('end', 1), ('start', 2), ('end', 2)]
+        assert story.QUEUE.name == 'story_test'
+    asyncio.run(go())
+
+
+def test_real_message_handler_routes_toggle_and_independent_check(tmp_path, monkeypatch):
+    from handlers import message_handler
+    from test_native_admin_warning_period import _setup_scenario
+    from test_bio_link_guard import FakeEvent
+    from modules.profile_guard import storage as channel_storage
+    monkeypatch.setattr(storage, 'is_enabled', _REAL_STORY_ENABLED)
+    monkeypatch.setattr(storage, 'FILE', tmp_path / 'stories.json')
+    monkeypatch.setattr(storage, '_cache', None)
+    monkeypatch.setattr(storage, '_cache_mtime', None)
+    monkeypatch.setattr(channel_storage, 'is_enabled', lambda chat: False)
+    chat = -10012345
+    bot, deleted, tracker, actions = _setup_scenario(tmp_path, monkeypatch, chat)
+    monkeypatch.setattr(guard, '_is_admin', lambda group, uid, sender: uid == 1001)
+    sender = NS(id=1001, username='owner', first_name='مالک', last_name='')
+    user = NS(id=223344, username='member', first_name='کاربر', last_name='')
+    calls = []
+    monkeypatch.setattr(story, 'schedule', lambda *args: calls.append(args) or True)
+    async def go():
+        await message_handler.handle_new_message(bot, FakeEvent(chat, sender, 'ضد استوری روشن', 20))
+        assert storage.is_enabled(chat)
+        assert any('ضد استوری' in x[1] and 'فعال شد' in x[1] for x in bot.sent_notices)
+        await message_handler.handle_new_message(bot, FakeEvent(chat, user, 'سلام معمولی', 21))
+        assert len(calls) == 1 and calls[0][2] == chat and calls[0][3] == user.id
+        await message_handler.handle_new_message(bot, FakeEvent(chat, sender, 'ضد استوری خاموش', 22))
+        assert not storage.is_enabled(chat)
+        await message_handler.handle_new_message(bot, FakeEvent(chat, user, 'سلام معمولی', 23))
+        assert len(calls) == 1
+    asyncio.run(go())
+
+
+def test_each_list_term_resists_repetition_and_dash_on_its_own():
+    for phrase in story.filter_terms():
+        original, folded = story._patterns((phrase,))
+        decorated = '-'.join(ch * 3 for ch in phrase if ch.isalnum())
+        assert (story.matcher.find_match(decorated, original)
+                or story.matcher.find_match(story._fold_stretched(decorated), folded)), phrase
