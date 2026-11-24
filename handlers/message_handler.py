@@ -5119,6 +5119,13 @@ async def handle_new_message(bot, event):
                             bot, event, chat_id, is_edited_message
                         )
                         return
+                    # Story captions are checked asynchronously; the same
+                    # anti-channel group switch and exemptions apply.
+                    from modules.profile_guard import story_guard as _story_guard
+                    _story_guard.schedule(
+                        bot, event, chat_id, user_id, sender,
+                        getattr(event.message, "id", None),
+                    )
                     profiler.note(
                         "profile_guard",
                         (time.perf_counter() - _pg_guard_started) * 1000,
