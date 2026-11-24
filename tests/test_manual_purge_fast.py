@@ -39,6 +39,7 @@ def check(title, condition, detail=""):
     else:
         FAILED += 1
         print(f"  ❌ {title}  {detail}")
+        raise AssertionError(f"{title}: {detail}")
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +79,18 @@ class _Client:
         self.active = 0
         self.max_active = 0
         self.get_calls = 0
+        self.visible = set(range(1, history_top + 1))
 
-    async def get_messages(self, entity, limit=None, ids=None):
+    async def get_messages(self, entity, limit=None, ids=None, offset_id=0):
         self.get_calls += 1
         if ids is not None:
-            return _Msg(ids)
-        top = self.history_top if self.history_limit is None else min(
-            self.history_top, self.history_limit)
-        count = min(int(limit or 0), top)
-        return [_Msg(top - offset) for offset in range(count)]
+            if isinstance(ids, list):
+                return [_Msg(mid) if mid in self.visible else None for mid in ids]
+            return _Msg(ids) if ids in self.visible else None
+        ceiling = offset_id or self.history_top + 1
+        rows = [mid for mid in sorted(self.visible, reverse=True) if mid < ceiling]
+        count = min(int(limit or 0), self.history_limit or int(limit or 0))
+        return [_Msg(mid) for mid in rows[:count]]
 
     async def delete_messages(self, entity, message_ids):
         self.batch_sizes.append(len(message_ids))
@@ -97,6 +101,8 @@ class _Client:
             if any(mid in self.fail_ids for mid in message_ids):
                 raise RuntimeError("message id invalid")
             self.deleted.extend(message_ids)
+            self.visible.difference_update(message_ids)
+            return True
         finally:
             self.active -= 1
 
@@ -201,7 +207,7 @@ def test_reply_text_reports_real_count():
 
 
 def test_history_short_falls_back_to_id_range():
-    """اگر سرور فقط ۵۰ پیام از ۸۰۰ را برگرداند، ۸۰۰ تا کامل شود."""
+    """If each page is capped at 50, page through actual messages, not IDs."""
     async def scenario():
         client = _Client(history_top=4000, history_limit=50)
         bot = _Bot(client)
@@ -211,7 +217,7 @@ def test_history_short_falls_back_to_id_range():
         return client
 
     client = asyncio.run(scenario())
-    check("با هیستوریِ ناقص هم ۸۰۰ پیام پاک شد",
+    check("با صفحه‌های ۵۰تایی هم ۸۰۰ پیام واقعی پاک شد",
           len(client.deleted) == 800, f"{len(client.deleted)}")
     check("شناسه‌ها یکتا هستند", len(set(client.deleted)) == 800)
 
@@ -230,7 +236,7 @@ def test_retry_reports_remaining_only_when_real():
     check("۱۹۹ پیامِ سالم پاک شد (شناسهٔ خراب ۴۰۰ پاک نشد)",
           len(set(client.deleted)) == 199, f"{len(set(client.deleted))}")
     check("شناسهٔ خراب داخلِ بازمانده‌ها گزارش شد", 400 not in client.deleted)
-    check("گزارشِ نقص ارسال شد", "باقی" in event.replies[0], event.replies[0])
+    check("گزارشِ نقص ارسال شد", "تأیید نشد" in event.replies[0], event.replies[0])
     check("لاگِ INCOMPLETE ثبت شد",
           len(bot.logger.logged("MANUAL DELETE INCOMPLETE")) == 1)
 
@@ -260,10 +266,9 @@ def test_per_admin_cooldown_only():
 
     check("بعد از اتمام، دوباره آزاد می‌شود", asyncio.run(scenario2()) is True)
 
-    # قفلِ تخمینی نباید بیش از حد طول بکشد
+    # A slow verification must not expire the guard while the task is active.
     expected = mh._manual_purge_expected_seconds(800)
-    check("سقفِ انتظارِ ۸۰۰ پیام معقول است (کمتر از ۶۰ ثانیه)",
-          expected < 60, f"{expected}")
+    check("سقف قفل بررسی تک‌پیامی کند را پوشش می‌دهد", expected > 800, f"{expected}")
 
 
 def test_two_admins_run_in_parallel():
@@ -309,3 +314,135 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_800_sparse_actual_messages_across_server_capped_pages():
+    async def scenario():
+        client = _Client(history_top=5200, history_limit=100, latency=0)
+        client.visible = {i for i in range(1, 5201) if i % 3 == 0 or i % 7 == 0}
+        before = sorted((i for i in client.visible if i < 5000), reverse=True)
+        event = _Event(5000); bot = _Bot(client)
+        await mh._run_manual_purge(bot, event, -100, 9, {}, 'admin', 800, -100, anchor_id=5000)
+        return before, client, event
+    before, client, event = asyncio.run(scenario())
+    assert set(client.deleted) == set(before[:800])
+    assert len(client.deleted) == 800
+    assert '８００ پیام پاک شد' in event.replies[0]
+    assert client.get_calls >= 16  # history and verification, not guessed IDs
+
+
+def test_history_partial_failure_never_invents_ids_or_claims_requested_count():
+    class PartialHistory(_Client):
+        async def get_messages(self, entity, limit=None, ids=None, offset_id=0):
+            if ids is None and offset_id and offset_id <= self.history_top - 100:
+                raise ConnectionError('history offline')
+            return await super().get_messages(entity, limit=limit, ids=ids, offset_id=offset_id)
+    async def scenario():
+        client = PartialHistory(history_top=3000, latency=0)
+        bot = _Bot(client); event = _Event(3000)
+        await mh._run_manual_purge(bot, event, -100, 9, {}, 'admin', 800, -100, anchor_id=3000)
+        return client, event
+    client, event = asyncio.run(scenario())
+    assert len(client.deleted) == 100
+    assert set(client.deleted) == set(range(2900,3000))
+    assert '１００ پیام پاک‌شده' in event.replies[0]
+    assert 'فقط １００ پیام' in event.replies[0]
+    assert '８００ پیام پاک شد' not in event.replies[0]
+
+
+def test_acknowledged_rpc_without_deletion_is_not_counted():
+    class SilentNoDelete(_Client):
+        async def delete_messages(self, entity, ids):
+            self.batch_sizes.append(len(ids))
+            # Only one hundred are actually deleted although every RPC reports success.
+            done = [mid for mid in ids if 901 <= mid <= 1000]
+            self.visible.difference_update(done)
+            self.deleted.extend(done)
+            return True
+    async def scenario():
+        client=SilentNoDelete(history_top=1100,latency=0)
+        bot=_Bot(client); event=_Event(1001)
+        await mh._run_manual_purge(bot,event,-100,9,{},'admin',800,-100,anchor_id=1001)
+        return client,event
+    client,event=asyncio.run(scenario())
+    assert len(set(client.deleted)) == 100
+    assert '１００ پیام پاک‌شده' in event.replies[0]
+    assert 'حذف ７００ پیام تأیید نشد' in event.replies[0]
+    assert '８００ پیام پاک شد' not in event.replies[0]
+
+
+def test_short_id_lookup_falls_back_to_individual_checks_not_assumptions():
+    class ShortLookup(_Client):
+        def __init__(self):
+            super().__init__(history_top=20,latency=0)
+            self.single_lookups = []
+        async def delete_messages(self, entity, ids):
+            self.visible.difference_update([1,2])
+            return True
+        async def get_messages(self, entity, limit=None, ids=None, offset_id=0):
+            if isinstance(ids,list):
+                # Server silently truncates the response; omitted != deleted.
+                return [_Msg(mid) for mid in ids if mid in self.visible][:1]
+            if ids is not None:
+                self.single_lookups.append(ids)
+            return await super().get_messages(entity,limit=limit,ids=ids,offset_id=offset_id)
+    async def scenario():
+        client=ShortLookup(); bot=_Bot(client)
+        deleted,unconfirmed=await mh._manual_purge_delete(bot,-100,[1,2,3,4],-100)
+        return client,deleted,unconfirmed
+    client,deleted,unconfirmed=asyncio.run(scenario())
+    assert deleted == 2
+    assert set(unconfirmed) == {3,4}
+    assert {1,2,4}.issubset(client.single_lookups)
+
+
+def test_verify_failure_is_unknown_never_reported_as_success():
+    class UnavailableVerification(_Client):
+        async def get_messages(self, entity, limit=None, ids=None, offset_id=0):
+            if ids is not None:
+                raise RuntimeError('lookup unavailable')
+            return await super().get_messages(entity,limit=limit,ids=ids,offset_id=offset_id)
+    async def scenario():
+        client=UnavailableVerification(history_top=200,latency=0)
+        bot=_Bot(client); event=_Event(200)
+        await mh._run_manual_purge(bot,event,-100,9,{},'admin',100,-100,anchor_id=200)
+        return client,event
+    client,event=asyncio.run(scenario())
+    assert len(client.deleted) == 100
+    assert len(client.batch_sizes) == 1  # unknown does not cause blind retries
+    assert '０ پیام پاک‌شده' in event.replies[0]
+    assert 'حذف １００ پیام تأیید نشد' in event.replies[0]
+    assert '１００ پیام پاک شد' not in event.replies[0]
+
+
+def test_missing_anchor_does_not_delete_command_or_any_messages():
+    async def scenario():
+        client=_Client(history_top=200,latency=0)
+        bot=_Bot(client); event=_Event(200)
+        await mh._run_manual_purge(bot,event,-100,9,{},'admin',100,-100,anchor_id=None)
+        return client,event
+    client,event=asyncio.run(scenario())
+    assert client.deleted == []
+    assert 'فقط ０ پیام' in event.replies[0]
+
+
+def test_800_deletions_verified_with_omitted_entries_and_single_lookup():
+    class OmittedResults(_Client):
+        def __init__(self):
+            super().__init__(history_top=5000,history_limit=100,latency=0)
+            self.single_count=0
+        async def get_messages(self, entity, limit=None, ids=None, offset_id=0):
+            if isinstance(ids, list):
+                # Some real library responses omit absent entries entirely.
+                return [_Msg(mid) for mid in ids if mid in self.visible]
+            if ids is not None:
+                self.single_count += 1
+            return await super().get_messages(entity,limit=limit,ids=ids,offset_id=offset_id)
+    async def scenario():
+        client=OmittedResults(); bot=_Bot(client); event=_Event(5000)
+        await mh._run_manual_purge(bot,event,-100,9,{},'admin',800,-100,anchor_id=5000)
+        return client,event
+    client,event=asyncio.run(scenario())
+    assert len(set(client.deleted)) == 800
+    assert client.single_count == 800
+    assert '８００ پیام پاک شد' in event.replies[0]

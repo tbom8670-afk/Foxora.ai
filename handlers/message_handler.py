@@ -2578,8 +2578,8 @@ def _schedule_late_reply_cleanup(bot, chat_id, user_message_id,
 # چرا جدا از bot.message_delete_queue؟ آن صف کارِ پاکسازیِ خودکار، ضدِهرزنامه،
 # بازیِ دادگاه و پیامِ مهلت را هم انجام می‌دهد و ترتیبش اولویت‌محور است؛ پس
 # «پاک ۸۰۰» پشتِ صدها حذفِ تک‌پیامی می‌ماند و کند حس می‌شود. این صف فقط
-# مالِ همین دستور است: نه چیزی جلوی آن می‌ایستد، نه چیزی پشتش صبر می‌کند.
-MANUAL_PURGE_BATCH_SIZE = 100        # اندازهٔ هر RPC (سرور سروش ۱۰۰تایی را قبول می‌کند)
+# مالِ همین دستور است. تعداد نهایی پس از بازخوانی شناسه‌های واقعی اعلام می‌شود.
+MANUAL_PURGE_BATCH_SIZE = 100        # حداکثر تعداد شناسه در هر RPC
 MANUAL_PURGE_PARALLEL = 4            # چند RPC هم‌زمان
 MANUAL_PURGE_RPC_TIMEOUT = 8.0
 MANUAL_PURGE_MAX_PER_ADMIN = {}      # (chat_id, admin) → لحظهٔ آزادشدن
@@ -2587,14 +2587,16 @@ MANUAL_PURGE_MAX_ENTRIES = 2000
 
 
 def _manual_purge_expected_seconds(count):
-    """سقفِ زمانیِ تخمینیِ یک پاک تا ادمین بی‌جهت قفل نماند."""
+    """Conservative guard; normally released as soon as the task completes."""
     try:
         count = max(0, int(count))
     except (TypeError, ValueError):
         count = 0
-    batches = max(1, -(-count // MANUAL_PURGE_BATCH_SIZE))
-    waves = max(1, -(-batches // MANUAL_PURGE_PARALLEL))
-    return waves * (MANUAL_PURGE_RPC_TIMEOUT + 2.0) + 15.0
+    # Three verification rounds, possibly one lookup per message, plus RPCs.
+    single_waves = -(-count // MANUAL_PURGE_PARALLEL)
+    batches = -(-count // MANUAL_PURGE_BATCH_SIZE)
+    batch_waves = -(-batches // MANUAL_PURGE_PARALLEL)
+    return max(60.0, 180 + 3 * (single_waves + batch_waves) * MANUAL_PURGE_RPC_TIMEOUT)
 
 
 def _prune_manual_purge(now=None):
@@ -2668,98 +2670,90 @@ def _manual_purge_flood_seconds(error):
 
 
 async def _manual_purge_ids(bot, chat_id, count, target, *, anchor_id=None):
-    """فهرستِ *دقیقِ* پیام‌هایی که باید پاک شوند (به ترتیبِ جدید→قدیم).
+    """Read actual existing messages, page by page, strictly before the command.
 
-    * ابتدا آخرین `count` پیام از خودِ سرور خوانده می‌شود — همان ۱ تا ۸۰۰
-      واقعیِ گروه، نه حدس.
-    * پیام‌های تازه‌تر از پیامِ دستور (خودِ «پاک ۸۰۰» و پیامِ گزارش) از
-      فهرست حذف می‌شوند تا از شمارش کم نشوند.
-    * اگر سرور کمتر از خواسته برگرداند (سقفِ هیستوری/شکستِ موقت)، از شناسهٔ
-      پیامِ دستور به پایین شمرده می‌شود تا همان تعداد کامل شود؛ هیچ پیامِ
-      نامربوطی وارد فهرست نمی‌شود.
+    IDs may have gaps and server history may be capped per request. Never invent
+    IDs to fill a short history, and stop if the server ignores the cursor.
     """
+    if not isinstance(anchor_id, int) or isinstance(anchor_id, bool) or anchor_id <= 0:
+        raise ValueError('manual purge requires the command message ID')
     ids = []
-    last_error = None
-    for _attempt in (1, 2):
-        try:
-            messages = await _asyncio.wait_for(
-                bot.client.get_messages(target, limit=count),
-                timeout=MANUAL_PURGE_RPC_TIMEOUT,
-            )
-        except _asyncio.CancelledError:
-            raise
-        except Exception as error:
-            last_error = error
-            await _asyncio.sleep(0)
-            continue
-        # نتیجه ممکن است لیست، شیءِ list-like یا حتی یک پیامِ تنها باشد؛
-        # هیچ‌کدام نباید استثنا بدهد و هیچ‌کدام نباید باعثِ شمارشِ غلط شود.
-        if isinstance(messages, (list, tuple)):
-            rows = messages
-        elif messages is None:
-            rows = ()
-        else:
-            rows = [messages]
-        for message in rows:
-            message_id = getattr(message, "id", None)
-            if not isinstance(message_id, int):
-                try:
-                    message_id = int(message_id)
-                except (TypeError, ValueError):
-                    continue
-            if message_id > 0:
-                ids.append(message_id)
-        if ids:
+    seen = set()
+    cursor = anchor_id
+    while len(ids) < count:
+        messages = None
+        last_error = None
+        for attempt in range(2):
+            try:
+                messages = await _asyncio.wait_for(
+                    bot.client.get_messages(target,
+                        limit=min(MANUAL_PURGE_BATCH_SIZE, count-len(ids)),
+                        offset_id=cursor), timeout=MANUAL_PURGE_RPC_TIMEOUT)
+                break
+            except _asyncio.CancelledError:
+                raise
+            except Exception as error:
+                last_error = error
+                if attempt == 0:
+                    await _asyncio.sleep(0.1)
+        if messages is None:
+            if last_error is not None:
+                bot.logger.log_error('MANUAL PURGE HISTORY FAILED '
+                    f'chat_id={chat_id} found={len(ids)} error={last_error!r}')
             break
-
-    ids = list(dict.fromkeys(ids))
-    if anchor_id is not None:
-        ids = [message_id for message_id in ids if message_id < anchor_id]
-
-    if anchor_id is not None and len(ids) < count:
-        seen = set(ids)
-        candidate = anchor_id - 1
-        while candidate > 0 and len(ids) < count:
-            if candidate not in seen:
-                ids.append(candidate)
-                seen.add(candidate)
-            candidate -= 1
-
-    if len(ids) < count and last_error is not None:
-        bot.logger.log_error(
-            "MANUAL PURGE HISTORY SHORT "
-            f"chat_id={chat_id} requested={count} found={len(ids)} "
-            f"error={last_error!r}"
-        )
-    return ids[:count]
+        if not isinstance(messages, (list, tuple)):
+            bot.logger.log_error(f'MANUAL PURGE INVALID HISTORY chat_id={chat_id}')
+            break
+        page = []
+        for message in messages:
+            if message is None or type(message).__name__ == 'MessageEmpty':
+                continue
+            message_id = getattr(message, 'id', None)
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
+                if cursor and message_id >= cursor:
+                    continue
+                if anchor_id and message_id >= anchor_id:
+                    continue
+                if message_id not in seen:
+                    page.append(message_id)
+        page = sorted(set(page), reverse=True)
+        if not page:
+            if messages:
+                bot.logger.log_error(f'MANUAL PURGE HISTORY NO PROGRESS chat_id={chat_id} cursor={cursor}')
+            break
+        ids.extend(page[:count-len(ids)])
+        seen.update(page)
+        cursor = page[-1]
+    return ids
 
 
 async def _manual_purge_delete(bot, chat_id, ids, target):
-    """حذفِ موازیِ صدرصد: هر ۱۰۰ شناسه یک RPC، چند RPC هم‌زمان.
+    """Delete selected actual IDs and count only those absent on read-back.
 
-    اولویت و ترتیب مهم نیست چون ترتیبِ حذف روی نتیجه اثر ندارد؛ همین باعث
-    می‌شود ۸۰۰ پیام در ۲ موجِ ۴تایی (۸ RPC) تمام شود، نه ۵۴ RPCِ پشتِ‌سرهم.
+    A successful delete RPC is not a per-message receipt (and may even return
+    False/None). Re-read each batch by ID; missing from a successful response
+    means no longer visible. On failed/malformed read-back the status is unknown,
+    never counted as deleted. Retry still-visible IDs in bounded batches.
     """
-    ids = list(ids or ())
+    ids = list(dict.fromkeys(i for i in (ids or ())
+                             if isinstance(i, int) and not isinstance(i, bool) and i > 0))
     if not ids:
         return 0, []
-
-    deleted = 0
-    remaining = []
     semaphore = _asyncio.Semaphore(MANUAL_PURGE_PARALLEL)
-    batches = [ids[start:start + MANUAL_PURGE_BATCH_SIZE]
-               for start in range(0, len(ids), MANUAL_PURGE_BATCH_SIZE)]
 
-    async def _delete_batch(batch):
-        nonlocal deleted
+    split_budget = 64
+
+    async def delete_batch(batch):
+        nonlocal split_budget
+        split_invalid = False
         async with semaphore:
-            for attempt in (1, 2, 3):
+            for attempt in range(1, 4):
                 try:
-                    await _asyncio.wait_for(
+                    result = await _asyncio.wait_for(
                         bot.client.delete_messages(target, list(batch)),
-                        timeout=MANUAL_PURGE_RPC_TIMEOUT,
-                    )
-                    deleted += len(batch)
+                        timeout=MANUAL_PURGE_RPC_TIMEOUT)
+                    if result is False:
+                        bot.logger.log_error(f'MANUAL PURGE DELETE RETURNED FALSE chat_id={chat_id} count={len(batch)}')
                     return
                 except _asyncio.CancelledError:
                     raise
@@ -2768,32 +2762,110 @@ async def _manual_purge_delete(bot, chat_id, ids, target):
                     if wait is not None and wait <= 10 and attempt < 3:
                         await _asyncio.sleep(wait)
                         continue
-                    if attempt < 3 and isinstance(
-                        error, (TimeoutError, ConnectionError, OSError)
-                    ):
-                        await _asyncio.sleep(0.15 * attempt)
+                    if attempt < 3 and isinstance(error, (TimeoutError, ConnectionError, OSError)):
+                        await _asyncio.sleep(0.15*attempt)
                         continue
-                    bot.logger.log_error(
-                        "MANUAL PURGE BATCH FAILED "
-                        f"chat_id={chat_id} count={len(batch)} "
-                        f"attempt={attempt} error={error!r}"
-                    )
+                    label = (type(error).__name__ + ' ' + str(error)).lower().replace('_', ' ')
+                    split_invalid = 'message id invalid' in label and len(batch) > 1
+                    bot.logger.log_error(f'MANUAL PURGE BATCH FAILED chat_id={chat_id} count={len(batch)} error={error!r}')
                     break
-            remaining.extend(batch)
+        # Split only an explicit invalid-message failure, not permission,
+        # network, flood or ambiguous failures; cap extra RPC amplification.
+        if split_invalid and split_budget > 0:
+            split_budget -= 1
+            middle = len(batch)//2
+            await _asyncio.gather(delete_batch(batch[:middle]), delete_batch(batch[middle:]))
 
-    await _asyncio.gather(*[_delete_batch(batch) for batch in batches],
-                          return_exceptions=True)
+    async def verify_one(mid):
+        async with semaphore:
+            try:
+                result = await _asyncio.wait_for(
+                    bot.client.get_messages(target, ids=mid),
+                    timeout=MANUAL_PURGE_RPC_TIMEOUT)
+                if result is None:
+                    return mid, 'absent'
+                actual = getattr(result, 'id', None)
+                if type(result).__name__ == 'MessageEmpty':
+                    if actual is None or actual == mid:
+                        return mid, 'absent'
+                    raise ValueError('invalid empty message ID')
+                if isinstance(actual, int) and not isinstance(actual, bool) and actual == mid:
+                    return mid, 'visible'
+                raise ValueError('invalid individual lookup response')
+            except _asyncio.CancelledError:
+                raise
+            except Exception as error:
+                bot.logger.log_error(f'MANUAL PURGE VERIFY ID FAILED chat_id={chat_id} id={mid} error={error!r}')
+                return mid, 'unknown'
 
-    # موجِ دوم برای بازمانده‌ها: تک‌تک (با همان موازی‌سازی). چیزی داخلِ گروه
-    # جا نمی‌ماند مگر سرور واقعاً اجازه ندهد.
-    if remaining:
-        leftovers = list(dict.fromkeys(remaining))
-        remaining = []
-        await _asyncio.gather(
-            *[_delete_batch([message_id]) for message_id in leftovers],
-            return_exceptions=True,
-        )
-    return deleted, remaining
+    async def verify_batch(batch):
+        try:
+            async with semaphore:
+                result = await _asyncio.wait_for(
+                    bot.client.get_messages(target, ids=list(batch)),
+                    timeout=MANUAL_PURGE_RPC_TIMEOUT)
+            if not isinstance(result, (list, tuple)) or len(result) > len(batch):
+                raise ValueError('unexpected message lookup response')
+            wanted = set(batch)
+            visible = set()
+            for message in result:
+                if message is None:
+                    continue
+                mid = getattr(message, 'id', None)
+                if type(message).__name__ == 'MessageEmpty':
+                    if mid is not None and mid not in wanted:
+                        raise ValueError('invalid empty message ID')
+                    continue
+                if not isinstance(mid, int) or isinstance(mid, bool) or mid not in wanted or mid in visible:
+                    raise ValueError('invalid message in lookup response')
+                visible.add(mid)
+            missing = wanted-visible
+            if len(result) == len(batch):
+                # A full response with explicit None/MessageEmpty slots gives a
+                # status for every ID even if the entries are reordered.
+                return visible, missing, set()
+            # Some SPlusthon/server responses omit missing IDs entirely. A
+            # short response can also be truncated, so do not guess: check
+            # each omitted ID individually with bounded concurrency.
+            singles = await _asyncio.gather(*(verify_one(mid) for mid in batch if mid in missing))
+            absent = {mid for mid, status in singles if status == 'absent'}
+            visible.update(mid for mid, status in singles if status == 'visible')
+            unknown = {mid for mid, status in singles if status == 'unknown'}
+            return visible, absent, unknown
+        except _asyncio.CancelledError:
+            raise
+        except Exception as error:
+            bot.logger.log_error(f'MANUAL PURGE VERIFY FAILED chat_id={chat_id} count={len(batch)} error={error!r}')
+            return set(), set(), set(batch)
+
+    verified_deleted = set()
+    all_unknown = []
+    pending = list(ids)
+    # At most three deletion rounds. Unknown verification results are not
+    # retried as deletions: a timeout may mean the previous RPC succeeded.
+    for round_number in range(3):
+        if not pending:
+            break
+        batches = [pending[i:i+MANUAL_PURGE_BATCH_SIZE]
+                   for i in range(0, len(pending), MANUAL_PURGE_BATCH_SIZE)]
+        await _asyncio.gather(*(delete_batch(batch) for batch in batches))
+        results = await _asyncio.gather(*(verify_batch(batch) for batch in batches))
+        next_pending = []
+        unknown = []
+        for batch, (visible, absent, uncertain) in zip(batches, results):
+            verified_deleted.update(absent)
+            next_pending.extend(mid for mid in batch if mid in visible)
+            unknown.extend(mid for mid in batch if mid in uncertain)
+        # A failed read-back is reported as unknown; do not claim success.
+        if unknown:
+            bot.logger.log_error(f'MANUAL PURGE VERIFICATION UNKNOWN chat_id={chat_id} count={len(unknown)}')
+        if round_number < 2 and next_pending:
+            await _asyncio.sleep(0.15)
+        # Keep unknown IDs to report but do not send their delete RPC again.
+        pending = next_pending
+        all_unknown.extend(unknown)
+    unresolved = set(pending) | set(all_unknown)
+    return len(verified_deleted), [mid for mid in ids if mid in unresolved]
 
 
 async def _run_manual_purge(bot, event, chat_id, user_id, sender,
@@ -2807,6 +2879,7 @@ async def _run_manual_purge(bot, event, chat_id, user_id, sender,
         ids = await _manual_purge_ids(
             bot, chat_id, count, target, anchor_id=anchor_id)
         found = len(ids)
+        remaining = list(ids)  # unexpected errors leave outcomes unconfirmed
         deleted, remaining = await _manual_purge_delete(
             bot, chat_id, ids, target)
     except _asyncio.CancelledError:
@@ -2823,7 +2896,7 @@ async def _run_manual_purge(bot, event, chat_id, user_id, sender,
             add_deleted_count(chat_id, user_id, sender_username or "", deleted)
         admin_tools.log_action(
             chat_id, sender, "حذف دسته‌ای پیام",
-            note=(f"درخواست {count}، یافت {found}، حذف واقعی {deleted}"
+            note=(f"درخواست {count}، یافت {found}، حذف تأییدشده {deleted}"
                   + (f"، باقی‌مانده {len(remaining)}" if remaining else "")))
         bot.logger.log_info(
             "MANUAL PURGE DONE "
@@ -2840,12 +2913,13 @@ async def _run_manual_purge(bot, event, chat_id, user_id, sender,
         pass
 
     try:
-        if remaining:
-            await event.reply(
-                f"{_fullwidth_digits(deleted)} پیام پاک شد 💣\n"
-                f"⏳ {_fullwidth_digits(len(remaining))} پیام باقی ماند؛ "
-                f"دوباره «پاک {len(remaining)}» را بزنید"
-            )
+        if remaining or found < count:
+            lines = [f"{_fullwidth_digits(deleted)} پیام پاک‌شده در بازبینی تأیید شد 💣"]
+            if remaining:
+                lines.append(f"حذف {_fullwidth_digits(len(remaining))} پیام تأیید نشد یا هنوز قابل مشاهده است.")
+            if found < count:
+                lines.append(f"از {_fullwidth_digits(count)} پیام درخواستی، فقط {_fullwidth_digits(found)} پیام در تاریخچه پیدا شد؛ بقیه قابل بررسی نبودند.")
+            await event.reply("\n".join(lines))
         else:
             await event.reply(f"{_fullwidth_digits(deleted)} پیام پاک شد 💣")
     except Exception:
