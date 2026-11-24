@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 from modules.runtime_paths import PROJECT_ROOT, runtime_config_file
+from modules.global_profile_terms import GLOBAL_PROFILE_TERMS
 
 CHANNEL_LIST_FILE = "profile_channel_names.txt"
 BIO_LIST_FILE = "profile_bio_sentences.txt"
@@ -113,7 +114,8 @@ def _load(name: str) -> List[str]:
                 }
         except OSError:
             pass
-        for phrase in _NEW_CHANNEL_BIO_DEFAULTS:
+        for phrase in (_NEW_CHANNEL_BIO_DEFAULTS +
+                       (GLOBAL_PROFILE_TERMS if name == BIO_LIST_FILE else ())):
             if phrase in shipped_set and phrase not in items and phrase not in disabled:
                 items.append(phrase)
     _cache[name] = (signature, items)

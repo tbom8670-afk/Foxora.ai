@@ -3,6 +3,8 @@ import re
 import unicodedata
 
 from modules.user_display import format_user
+from modules.global_profile_terms import GLOBAL_PROFILE_TERMS
+from modules.profile_guard import matcher as profile_matcher
 
 # فیلتر سراسریِ نام خود ربات (مثل «خاله» و «بیوچک»)، نه فیلتر اسمِ
 # قابل‌ویرایش هر گروه. صورت‌های سانسورشده و حروف تکراری هم بررسی می‌شوند.
@@ -80,6 +82,9 @@ _ROBUST_TERMS = tuple(
 _SHORT_PI = re.compile(r"(?<!\w)پ(?:\s*پ)*\s*ی(?:\s*ی)*(?!\w)")
 
 
+_GLOBAL_NAME_PHRASES = profile_matcher.build(GLOBAL_PROFILE_TERMS)
+
+
 def display_name(user):
     return format_user(user)
 
@@ -88,6 +93,10 @@ def reason(user):
     username_raw = getattr(user, "username", None) or ""
     first = getattr(user, "first_name", None) or ""
     last = getattr(user, "last_name", None) or ""
+    for raw in (username_raw, f"{first} {last}".strip()):
+        hit = profile_matcher.find_match(raw, _GLOBAL_NAME_PHRASES)
+        if hit:
+            return hit.raw
     for raw in (username_raw, first, last):
         for emoji in _NAME_EMOJIS:
             if emoji in str(raw):

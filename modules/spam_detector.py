@@ -135,6 +135,7 @@ class SpamDetector:
         if not value:
             return ""
         t = str(value).lower().replace("\ufe0f", "").replace("\ufe0e", "")
+        t = t.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
         t = re.sub(r"[\u0640\u064b-\u065f\u0670]", "", t)
         t = (
             t.replace("ي", "ی").replace("ى", "ی").replace("ئ", "ی")
