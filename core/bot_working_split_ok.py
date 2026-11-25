@@ -3312,6 +3312,23 @@ class SoroushAntiSpamBot:
                                 pass
             except Exception:
                 pass
+            # گزارش موضوعی مالک: طبق درخواست، مشاهدهٔ غیرفعال و ارسال
+            # خصوصی پیش از گیتِ اشتراک انجام می‌شود، حتی برای گروه غیرفعال.
+            # این مسیر هرگز خودکار به گروه پیام/مجازات نمی‌دهد. دستورِ
+            # «هشدار: ...» فقط در پیوی مالک و ریپلای به گزارش معتبر است.
+            try:
+                from modules import owner_topic_report as _owner_topic_report
+                if await _owner_topic_report.handle_owner_reply(self, event):
+                    return
+                _owner_topic_report.observe(self, event)
+            except Exception as _owner_topic_error:
+                try:
+                    self.logger.log_error(
+                        "OWNER TOPIC REPORT ROUTE FAILED "
+                        f"error={type(_owner_topic_error).__name__}"
+                    )
+                except Exception:
+                    pass
             # 🚪 گیتِ واحدِ «اشتراک گروه» — فعال‌سازی + انقضا.
             #
             # اگر گروه هنوز «فعال» نشده باشد (تا رسیدنِ دستورِ فعال‌سازی) یا
