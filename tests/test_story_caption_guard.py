@@ -409,3 +409,95 @@ def test_new_requested_terms_individually_and_obfuscated(phrase, decorated, monk
 def test_robot_term_is_not_a_substring_of_longer_unrelated_word(monkeypatch):
     monkeypatch.setattr(story, 'filter_terms', lambda: ('ربات',))
     assert not story.caption_match('رباتیک')
+
+
+@pytest.mark.parametrize('caption', [
+    'ببین https://example.com/a', 'http://site.ir', 'example.org',
+    'example.photography', 'https://example.app', 'splus.ir',
+    'splus.ir/c/25372045/841', 't.me/example', 'sapp.ir/example',
+    'www.example.com', 'example[.]com', 's p l u s . i r / example',
+    'https://localhost:8080/path', 'tg://resolve?domain=example',
+    'https://مثال.ایران/خبر', 'مثال.ایران',
+])
+def test_link_only_captions_trigger(caption, monkeypatch):
+    # No filter terms: a prior match must not hide missing link detection.
+    monkeypatch.setattr(story, 'filter_terms', lambda: ())
+    assert story.caption_match(caption), caption
+    assert story.matching_caption(result(item(caption))) == caption
+
+
+@pytest.mark.parametrize('caption', [
+    'سلام دوستان', 'فقط @username', 'contact@example.com', 'عکس image.jpg',
+    'نسخه 1.0.0.0', 'http://', 'یادداشت file.pdf',
+])
+def test_not_a_link_alone(caption, monkeypatch):
+    monkeypatch.setattr(story, 'filter_terms', lambda: ())
+    assert not story.caption_match(caption), caption
+
+
+def test_hidden_caption_link_entities_and_expiry(monkeypatch):
+    from splusthon.tl.types import MessageEntityTextUrl, MessageEntityUrl, MessageEntityBold
+    monkeypatch.setattr(story, 'filter_terms', lambda: ())
+    hidden = item('اینجا را ببینید')
+    hidden.entities = [MessageEntityTextUrl(offset=0, length=4, url='https://example.com')]
+    assert story.matching_caption(result(hidden)) == hidden.caption
+    hidden.expire_date = datetime.now(timezone.utc) - timedelta(seconds=1)
+    assert story.matching_caption(result(hidden)) is None
+    visible = item('نشانی')
+    visible.entities = [MessageEntityUrl(offset=0, length=5)]
+    assert story.matching_caption(result(visible)) == visible.caption
+    visible.entities = [MessageEntityBold(offset=0, length=5)]
+    assert story.matching_caption(result(visible)) is None
+
+
+def test_link_only_uses_existing_story_warning_and_moderation(monkeypatch):
+    async def go():
+        monkeypatch.setattr(story, 'filter_terms', lambda: ())
+        bot = make_bot(result(item('https://example.org/profile')))
+        sent, recorded = await run_check(bot, monkeypatch)
+        assert bot.client.deleted == [(11, [33])]
+        bot.admin_actions.mute_user.assert_awaited_once()
+        assert sent[0][1] is True
+        assert 'https://example.org/profile' in sent[0][0][0]
+        assert not recorded
+    asyncio.run(go())
+
+
+def test_link_only_does_not_bypass_disabled_or_admin_exemption(monkeypatch):
+    async def go():
+        monkeypatch.setattr(story, 'filter_terms', lambda: ())
+        bot = make_bot(result(item('https://example.org')))
+        monkeypatch.setattr(storage, 'is_enabled', lambda group: False)
+        sent, _ = await run_check(bot, monkeypatch)
+        assert not bot.client.requests and not bot.client.deleted and not sent
+        monkeypatch.setattr(storage, 'is_enabled', lambda group: True)
+        async def admin(*args, **kwargs): return True
+        monkeypatch.setattr(native, 'is_native_admin', admin)
+        sent, _ = await run_check(bot, monkeypatch)
+        assert not bot.client.requests and not bot.client.deleted and not sent
+    asyncio.run(go())
+
+
+def test_skipped_story_hidden_link_is_fetched_and_actioned(monkeypatch):
+    from splusthon.tl.types import MessageEntityTextUrl
+    async def go():
+        monkeypatch.setattr(story, 'filter_terms', lambda: ())
+        skipped = StoryItemSkipped(id=42, date=datetime.now(timezone.utc),
+                                   expire_date=datetime.now(timezone.utc) + timedelta(minutes=5))
+        linked = item('مشاهده')
+        linked.entities = [MessageEntityTextUrl(offset=0, length=6, url='https://example.org')]
+        class SkippedClient(Client):
+            async def __call__(self, request):
+                self.requests.append(request)
+                if isinstance(request, GetPeerStoriesRequest):
+                    return result(skipped)
+                assert isinstance(request, GetStoriesByIDRequest)
+                return NS(stories=[linked])
+        bot = make_bot(None)
+        bot.client = SkippedClient(None)
+        sent, _ = await run_check(bot, monkeypatch)
+        assert len(bot.client.requests) == 2
+        assert bot.client.deleted == [(11, [33])]
+        bot.admin_actions.mute_user.assert_awaited_once()
+        assert sent and 'مشاهده' in sent[0][0][0]
+    asyncio.run(go())

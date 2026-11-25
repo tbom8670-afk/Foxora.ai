@@ -11,6 +11,7 @@ import time
 import re
 from functools import lru_cache
 
+from modules import bio_link
 from modules.manage_features.queue import PerGroupQueue, QueueFull
 from modules.profile_guard import filters, matcher, story_storage as storage, texts
 
@@ -21,6 +22,12 @@ _EXTRA_TERMS = (
 QUEUE = PerGroupQueue("story_guard", max_pending_per_key=32,
                       max_pending_total=128, max_keys=128, task_timeout=90.0)
 _REPEAT = re.compile(r"([^\W_])(?:[\W_]*\1)+", re.UNICODE)
+# Beyond the shared bio detector, recognize arbitrary domain suffixes and
+# common app/deep-link schemes, not just a hardcoded list of TLDs.
+_URL_SCHEME = re.compile(r"(?<![\w@])(?:https?|ftps?|hxxps?|splus|soroush|tg|telegram)://[^\s/]+", re.I)
+_DOMAIN = re.compile(r"(?<![\w@.-])([\w](?:[\w-]{0,61}[\w])?(?:\.[\w](?:[\w-]{0,61}[\w])?)*\.([^\W\d_]{2,63}))(?![\w-])", re.UNICODE)
+_FILE_SUFFIXES = frozenset(('jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf', 'doc', 'docx',
+                            'txt', 'mp3', 'mp4', 'zip', 'rar', 'exe', 'apk', 'py', 'sh'))
 
 
 def filter_terms():
@@ -39,9 +46,41 @@ def _patterns(terms):
     return matcher.build(terms), matcher.build(tuple(_fold_stretched(p) for p in terms))
 
 
+def _caption_link(caption):
+    """Detect links without treating a bare @username or email as a URL."""
+    if not isinstance(caption, str) or not caption.strip():
+        return False
+    label = bio_link.find_link(caption, detect_username=False)
+    if label and not label.startswith('آیدی '):
+        return True
+    value = bio_link.compact(caption)
+    if _URL_SCHEME.search(value):
+        return True
+    for match in _DOMAIN.finditer(value):
+        # Bare filenames are ambiguous; a protocol or path is still a link.
+        if match.group(2).lower() in _FILE_SUFFIXES and value[match.end():match.end()+1] != '/':
+            continue
+        return True
+    return False
+
+
 def caption_match(caption):
     original, stretched = _patterns(filter_terms())
-    return matcher.find_match(caption, original) or matcher.find_match(_fold_stretched(caption), stretched)
+    return (matcher.find_match(caption, original)
+            or matcher.find_match(_fold_stretched(caption), stretched)
+            or ('لینک' if _caption_link(caption) else None))
+
+
+def _caption_entity_link(item):
+    # The API exposes hidden text URLs as entities, not in caption text.
+    # Do not infer a link from formatting entities such as bold or mentions.
+    for entity in getattr(item, 'entities', None) or ():
+        kind = type(entity).__name__
+        if kind == 'MessageEntityUrl':
+            return True
+        if kind == 'MessageEntityTextUrl' and str(getattr(entity, 'url', '') or '').strip():
+            return True
+    return False
 
 
 async def handle_toggle(bot, event, chat_id, user_id, sender, mode):
@@ -108,7 +147,8 @@ def matching_caption(response):
     """Return the first matching caption, never media/empty/skipped items."""
     for item in _items(response) or ():
         caption = getattr(item, 'caption', None)
-        if isinstance(caption, str) and _active(item) and caption_match(caption):
+        if (isinstance(caption, str) and caption.strip() and _active(item)
+                and (caption_match(caption) or _caption_entity_link(item))):
             return caption
     return None
 
