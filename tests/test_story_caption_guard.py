@@ -249,7 +249,7 @@ def test_complete_live_channel_and_bio_lists_plus_requested_words():
     terms = story.filter_terms()
     assert set(filters.channel_names()) <= set(terms)
     assert set(filters.bio_sentences()) <= set(terms)
-    for phrase in ('داغم', 'داغ', 'حشری', 'فیلم سوپر'):
+    for phrase in ('داغم', 'داغ', 'حشری', 'فیلم سوپر', 'ربات', 'ربات فیلم', 'منتظرتم بیا', 'فروش فیلم'):
         assert phrase in terms
         assert story.caption_match(phrase), phrase
     for phrase in terms:
@@ -391,3 +391,21 @@ def test_each_list_term_resists_repetition_and_dash_on_its_own():
         decorated = '-'.join(ch * 3 for ch in phrase if ch.isalnum())
         assert (story.matcher.find_match(decorated, original)
                 or story.matcher.find_match(story._fold_stretched(decorated), folded)), phrase
+
+
+@pytest.mark.parametrize('phrase,decorated', [
+    ('ربات', 'ر-بـااات'),
+    ('ربات فیلم', 'ر.ب.ا.ت ف.ی.ل.م'),
+    ('منتظرتم بیا', 'ممم.ن.ت.ظ.ر.ت.م ب-ی-ا'),
+    ('فروش فیلم', 'فــرروووش ف.ی.ل.م'),
+])
+def test_new_requested_terms_individually_and_obfuscated(phrase, decorated, monkeypatch):
+    # Isolate each phrase so an overlapping shorter existing term cannot hide a bug.
+    monkeypatch.setattr(story, 'filter_terms', lambda: (phrase,))
+    assert story.matching_caption(result(item(phrase))) == phrase
+    assert story.matching_caption(result(item(decorated))) == decorated
+
+
+def test_robot_term_is_not_a_substring_of_longer_unrelated_word(monkeypatch):
+    monkeypatch.setattr(story, 'filter_terms', lambda: ('ربات',))
+    assert not story.caption_match('رباتیک')

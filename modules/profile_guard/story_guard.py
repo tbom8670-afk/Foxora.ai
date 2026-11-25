@@ -14,7 +14,10 @@ from functools import lru_cache
 from modules.manage_features.queue import PerGroupQueue, QueueFull
 from modules.profile_guard import filters, matcher, story_storage as storage, texts
 
-_EXTRA_TERMS = ("داغم", "داغ", "حشری", "فیلم سوپر")
+_EXTRA_TERMS = (
+    "داغم", "داغ", "حشری", "فیلم سوپر",
+    "ربات", "ربات فیلم", "منتظرتم بیا", "فروش فیلم",
+)
 QUEUE = PerGroupQueue("story_guard", max_pending_per_key=32,
                       max_pending_total=128, max_keys=128, task_timeout=90.0)
 _REPEAT = re.compile(r"([^\W_])(?:[\W_]*\1)+", re.UNICODE)
