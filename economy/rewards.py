@@ -23,6 +23,9 @@ _REWARDS = {
     # --- بازی‌های عادی → برنز -------------------------------------------
     "riddle":          (3, BRONZE, "حدس چیستان"),
     "emoji":           (4, BRONZE, "حدس ایموجی"),
+    "clue_guess":      (4, BRONZE, "سرنخ"),
+    "missing_word":    (4, BRONZE, "کلمه ناقص"),
+    "related_word":    (5, BRONZE, "کلمه مرتبط"),
     "flag":            (3, BRONZE, "حدس پرچم"),
     "name_family":     (6, BRONZE, "اسم فامیل"),
     "correction":      (3, BRONZE, "تصحیح کلمات"),

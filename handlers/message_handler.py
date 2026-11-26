@@ -113,6 +113,8 @@ from modules.word_puzzle import (
     start as start_word_puzzle,
     timeout as word_puzzle_timeout,
 )
+from modules.three_guess_games import game as three_guess_game
+from handlers.three_guess_games import route as route_three_guess_games
 from modules import message_dedup
 from modules.jadvalestan import (
     texts as JADVALESTAN_TEXTS,
@@ -1185,6 +1187,7 @@ def is_game_answer_active(chat_id, user_id):
         name_family_active(chat_id)
         or fox_game_active(chat_id)
         or emoji_guess_active(chat_id, user_id)
+        or three_guess_game.active(chat_id, user_id)
         or flag_guess_active(chat_id)
         or get_correction(chat_id) is not None
         or get_active_question(chat_id) is not None
@@ -4496,6 +4499,7 @@ _INTERNAL_EXACT_COMMANDS = frozenset({
     "اسم فامیل", "اسم چین", "اسم‌چین", "جدولستان", "بازی جدولستان",
     "پازل کلمه", "پازل کلمات", "پازل",
     "حدس ایموجی", "حدس پرچم", "چهار گزینه ای", "جای خالی", "چیستان",
+    "سرنخ", "سه سرنخ", "کلمه ناقص", "کلمه مرتبط",
     "کی بیشتر بلده", "دروغ یا حقیقت",
     "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه",
     "دانستنی", "تیکه کلام", "تیکه‌کلام", "حافظه من", "حذف اسم", "حذف حافظه", "قوانین",
@@ -4539,6 +4543,7 @@ def _is_known_internal_command(clean_text, chat_id, user_id):
         name_family_active(chat_id)
         or fox_game_active(chat_id)
         or emoji_guess_active(chat_id)
+        or three_guess_game.active(chat_id, user_id)
         or flag_guess_active(chat_id)
         or get_correction(chat_id) is not None
         or get_active_question(chat_id) is not None
@@ -5823,6 +5828,7 @@ async def handle_new_message(bot, event):
                 "لیست ادمین", "لیست ادمینی", "لیست کاربران", "رتبه ها", "رتبه‌ها",
                 "موجودی", "فروشگاه", "انتقال سکه", "قفل", "باز", "اخطار",
                 "اسم چین", "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+                "سرنخ", "سه سرنخ", "کلمه ناقص", "کلمه مرتبط",
                 "بمب سرعت", "بمب ساعتی", "بمب سرعت روباه", "زامبی", "گروه آخرالزمان",
                 "مین یاب", "سابقه ها", "سابقه‌ها", "سطح گروه", "دستاورد",
                 "فعال", "غیر فعال", "فعال سازی",
@@ -7969,6 +7975,25 @@ async def handle_new_message(bot, event):
             await event.reply(msg)
             return
 
+        # سه بازی تک‌نفره؛ پیش از روترهای دیگر تا جواب هر کاربر فقط
+        # به مرحلهٔ خود او برسد. دستورها و گیت سرگرمی مشترک‌اند.
+        _three_busy = False
+        if clean_text in three_guess_game.GAMES:
+            _three_busy = bool(
+                _chat_game_busy(chat_id) or fox_game_active(chat_id)
+                or emoji_guess_active(chat_id, user_id)
+                or word_puzzle_active(chat_id, user_id)
+                or jadvalestan_active(chat_id, user_id)
+                or get_fill_token(chat_id, user_id) is not None
+                or get_riddle_token(chat_id, user_id) is not None
+            )
+        if await route_three_guess_games(
+            bot, event, chat_id, user_id, sender, message_text,
+            busy=_three_busy, is_command=_game_text_is_command,
+            track_timer=_track_group_timer, reply_id=_search_reply_message_id(event),
+        ):
+            return
+
         # ---- بازی‌های Fox AI (کاملاً مستقل، فقط از این نقطه وصل می‌شوند) ----
         if getattr(event, "is_private", False):
             from handlers.fox_games_router import handle_private_zombie_selection
@@ -8909,6 +8934,12 @@ async def handle_new_message(bot, event):
             bot.logger.log_info(f"HANDLER CALLED handler=game_list command={clean_text!r}")
             games_text = (
                 "🎮 لیست بازی‌های روباه\n\n"
+                "⛵سرنخ\n"
+                "با سرنخ های که بهتون میدن جمله رو بگید\n\n"
+                "🗻کلمه ناقص\n"
+                "کلمه های ناقص رو کامل کن و جمله رو بگو\n\n"
+                "🧳کلمه مرتبط\n"
+                "با کلمه های که بهت میگن حدس بزن\n\n"
                 "🧩 چیستان\n"
                 "معماهای متنوع برای افزایش هوش و دقت.\n\n"
                 "😀 حدس ایموجی\n"
@@ -8978,6 +9009,9 @@ async def handle_new_message(bot, event):
 
             for word in [
                 "🎮 لیست بازی‌های روباه",
+                "⛵سرنخ",
+                "🗻کلمه ناقص",
+                "🧳کلمه مرتبط",
                 "🧩 چیستان",
                 "😀 حدس ایموجی",
                 "🌍 حدس پرچم",

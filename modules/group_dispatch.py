@@ -176,6 +176,7 @@ _COMMAND_EXACT = frozenset({
     "بیوگرافی", "جک", "دانستنی", "تیکه کلام", "تیکه‌کلام", "ترجمه", "یاد آوری",
     "حافظه من", "حذف اسم", "قوانین",
     "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+    "سرنخ", "سه سرنخ", "کلمه ناقص", "کلمه مرتبط",
     "مین یاب", "بهترین جواب", "نبرد", "بخند یا بباز",
     "جعبه شانسی", "خون آشام", "خون‌آشام",
     "اسم فامیل", "اسم چین", "جدولستان", "پازل کلمه", "چهار گزینه ای", "جای خالی", "چیستان", "تصحیح کلمات",
@@ -255,6 +256,7 @@ _GAME_EXACT = frozenset(normalize_dispatch_text(word) for word in (
     "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "بازی ها", "بازی‌ها",
     "جک", "دانستنی", "تیکه کلام", "تیکه‌کلام",
     "حدس ایموجی", "حدس جمله", "ساخت جمله", "معما", "حدس پرچم",
+    "سرنخ", "سه سرنخ", "کلمه ناقص", "کلمه مرتبط",
     "مین یاب", "بهترین جواب", "نبرد", "بخند یا بباز", "بقا",
     "جعبه شانسی", "خون آشام", "خون‌آشام",
     "اسم فامیل", "اسم چین", "جدولستان", "پازل کلمه", "چهار گزینه ای",
@@ -336,6 +338,17 @@ def _is_active_game_answer(event):
     chat_id = getattr(event, "chat_id", None)
     if chat_id is None or getattr(event, "is_private", False):
         return False
+    # Dedicated per-user games must reach the command lane even when no
+    # group-wide Fox game exists; otherwise normal spam traffic can drop
+    # their 30-second answers before the game handler sees them.
+    user_id = _event_user_id(event)
+    if user_id is not None:
+        try:
+            from modules.three_guess_games import game as _three
+            if _three.active(chat_id, user_id):
+                return True
+        except Exception:
+            pass
     try:
         from handlers.fox_games_router import any_active
         if not any_active(chat_id):
