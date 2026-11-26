@@ -318,3 +318,12 @@ def test_core_priority_dispatch_reaches_real_game_and_pays(tmp_path, monkeypatch
         for task in tasks: task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     asyncio.run(go())
+
+
+def test_clue_game_shows_three_clues_as_in_sample():
+    state = game.start(CHAT, 101, 'سرنخ')
+    text, _ = game.payload(state)
+    clue_line = text.splitlines()[2]
+    assert clue_line.count(' « ') == 2
+    assert all(part.strip() for part in clue_line.split(' « '))
+    assert 'من چی هستم؟؟' in text

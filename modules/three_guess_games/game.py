@@ -84,7 +84,8 @@ def payload(state):
     header = state['header']
     item = state['item']
     if state['game'] == 'clue_guess':
-        body = f"{item['description']}\nمن چی هستم؟؟"
+        body = (f"{item['description']} « {item['clues'][0]} « "
+                f"{item['clues'][2]}\nمن چی هستم؟؟")
     elif state['game'] == 'missing_word':
         body = f"{item['description']}\n{_masked(item['answer'], state['index'])}\nکلمه ناقص رو با سرنخ کامل کن"
     else:
