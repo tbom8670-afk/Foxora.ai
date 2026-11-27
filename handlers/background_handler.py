@@ -2,21 +2,17 @@
 
 Only the global owner can register a numbered photo in a group. Every user
 receives each number at most once, across all groups. A photo is downloaded to
-the bot's private runtime directory, so source-message deletion and restarts
+the bot's Saved Messages (or the original group message as a fallback), so restarts
 do not break the gallery. Captions are always sent WITH the photo, never alone.
 """
 from __future__ import annotations
 
 import asyncio
-import os
-from pathlib import Path
 import re
-import tempfile
 import time
 
 from modules import runtime_db
 from modules.owner_check import is_global_owner
-from modules.runtime_paths import DATA_DIR
 
 COMMAND = "پس زمینه"
 SETUP = "تنظیم پس زمینه"
@@ -24,13 +20,11 @@ CANCEL = "لغو پس زمینه"
 PHOTOS = "background_gallery_v1"
 SEEN = "background_seen_v1"
 TIMEOUT = 900
-MAX_PHOTO_BYTES = 20 * 1024 * 1024
-_GALLERY_DIR = DATA_DIR / "background_gallery"
 _sessions = {}  # (chat_id, owner_id) -> monotonic timestamp
 _user_locks = {}
 _catalog_lock = None
 _DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
-_CAPTION_NUMBER = re.compile(r"^\s*عکس\s*شماره\s*([0-9۰-۹٠-٩]+)(?=\s|$)")
+_CAPTION_NUMBER = re.compile(r"^\s*(?:عکس\s*)?شماره\s*([0-9۰-۹٠-٩]+)(?=\s|$)")
 
 
 def _session_key(chat_id, user_id):
@@ -67,10 +61,6 @@ def _number(caption):
     return value if 1 <= value <= 10000 else None
 
 
-def _path(number):
-    return _GALLERY_DIR / f"{number}.jpg"
-
-
 def _catalog_numbers():
     rows = runtime_db.query_all(
         "SELECT item_key FROM runtime_kv WHERE namespace=?", (PHOTOS,))
@@ -85,26 +75,41 @@ def _lock_for(user_id):
     return lock
 
 
-async def _download_photo(bot, message, number):
-    _GALLERY_DIR.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f"{number}-", suffix=".jpg", dir=_GALLERY_DIR)
-    os.close(fd)
-    temp = Path(temp_name)
+def _media(message):
+    return getattr(message, "media", None) or getattr(message, "photo", None)
+
+
+async def _archive_photo(bot, event, caption):
+    """Reuse server-side media; no GetFile/download or file upload required.
+
+    First try a private copy in the account's Saved Messages, so deletion of
+    the owner's group post does not break a background. If that chat is not
+    available, retain the original group message as the source.
+    """
+    source = {"chat_id": getattr(event, "chat_id", None),
+              "message_id": getattr(event.message, "id", None)}
+    if source["chat_id"] is None or source["message_id"] is None:
+        raise ValueError("source message has no chat/message id")
+    archived = False
     try:
-        result = await bot.client.download_media(message, file=str(temp))
-        if isinstance(result, bytes):
-            temp.write_bytes(result)
-        elif isinstance(result, (str, os.PathLike)) and Path(result) != temp:
-            source = Path(result)
-            if not source.is_file():
-                raise ValueError("download returned a missing photo")
-            temp.write_bytes(source.read_bytes())
-        size = temp.stat().st_size
-        if size == 0 or size > MAX_PHOTO_BYTES:
-            raise ValueError("photo is empty or exceeds 20 MB")
-        os.replace(temp, _path(number))
-    finally:
-        temp.unlink(missing_ok=True)
+        copy = await bot.client.send_file("me", _media(event.message), caption=caption)
+        copied_id = getattr(copy, "id", None)
+        if copied_id is not None:
+            source = {"chat_id": "me", "message_id": copied_id}
+            archived = True
+    except Exception as error:
+        bot.logger.log_error(f"BACKGROUND SAVED-MESSAGES COPY FAILED: {error!r}")
+    return source, archived
+
+
+async def _source_media(bot, ref):
+    if not isinstance(ref, dict):
+        return None
+    chat_id, message_id = ref.get("chat_id"), ref.get("message_id")
+    if chat_id is None or message_id is None:
+        return None
+    message = await bot.client.get_messages(chat_id, ids=message_id)
+    return _media(message) if message is not None and _photo(message) else None
 
 
 async def handle(bot, event, chat_id, user_id, text):
@@ -146,15 +151,17 @@ async def handle(bot, event, chat_id, user_id, text):
                 await event.reply(f"❌ عکس شماره {number} قبلاً ثبت شده؛ شمارهٔ دیگری انتخاب کنید.")
                 return True
             try:
-                await _download_photo(bot, message, number)
-                runtime_db.kv_set(PHOTOS, str(number), {"caption": caption})
+                ref, archived = await _archive_photo(bot, event, caption)
+                runtime_db.kv_set(PHOTOS, str(number),
+                                  {"caption": caption, "source": ref})
             except Exception as error:
-                _path(number).unlink(missing_ok=True)
                 bot.logger.log_error(f"BACKGROUND SAVE FAILED number={number} error={error!r}")
-                await event.reply("❌ عکس ذخیره نشد؛ دوباره ارسال کنید.")
+                await event.reply("❌ عکس ثبت نشد؛ دوباره ارسال کنید.")
                 return True
         _sessions.pop(_session_key(chat_id, user_id), None)
-        await event.reply(f"✅ عکس شماره {number} با کپشن در مجموعهٔ پس‌زمینه ثبت شد.")
+        await event.reply(
+            f"✅ عکس شماره {number} همراه کپشن ثبت شد."
+            + ("" if archived else " ⚠️ پیام اصلی عکس را حذف نکنید."))
         return True
     if value != COMMAND:
         return False
@@ -174,17 +181,20 @@ async def handle(bot, event, chat_id, user_id, text):
             return True
         number = remaining[0]
         entry = runtime_db.kv_get(PHOTOS, str(number)) or {}
-        photo_file = _path(number)
-        if not photo_file.is_file():
-            bot.logger.log_error(f"BACKGROUND PHOTO MISSING number={number}")
-            await event.reply("❌ فایل پس‌زمینه در دسترس نیست؛ به مالک ربات اطلاع دهید.")
+        try:
+            media = await _source_media(bot, entry.get("source"))
+        except Exception as error:
+            bot.logger.log_error(f"BACKGROUND PHOTO FETCH FAILED number={number} error={error!r}")
+            media = None
+        if media is None:
+            await event.reply("❌ عکس پس‌زمینه در دسترس نیست؛ به مالک ربات اطلاع دهید.")
             return True
         # Claim durably BEFORE the network RPC: if the process crashes after
         # delivery, this user must not receive the same number again.
         runtime_db.kv_set(SEEN, str(user_id), sorted(seen | {number}))
         try:
             await bot.client.send_file(
-                chat_id, str(photo_file), caption=entry.get("caption", ""),
+                chat_id, media, caption=entry.get("caption", ""),
                 reply_to=getattr(getattr(event, "message", None), "id", None),
             )
         except Exception as error:
