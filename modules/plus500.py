@@ -149,6 +149,39 @@ def resolve(chat_id, text):
     return text
 
 
+def routing_priority(chat_id, user_id, text, event=None):
+    """Select the original command's direct lane before normal-message ingest.
+
+    The classifier's static tables cannot know aliases stored in the DB. A
+    returned lane changes scheduling only; it NEVER changes handler access.
+    """
+    if chat_id is None or getattr(event, "is_private", False):
+        return None
+    from modules.group_dispatch import (
+        classify_priority, PRIORITY_ADMIN, LANE_ADMIN,
+        PRIORITY_COMMAND, LANE_COMMAND,
+    )
+    if is_awaiting(chat_id, user_id):
+        return PRIORITY_ADMIN, LANE_ADMIN
+    original = resolve(chat_id, text)
+    if original != text:
+        priority, lane = classify_priority(original, event)
+        return (priority, lane) if lane in {LANE_ADMIN, LANE_COMMAND} else (
+            PRIORITY_COMMAND, LANE_COMMAND)
+    # If a renamed canonical command is missing from the static classifier,
+    # it still must reach the notifier instead of being dropped as chat.
+    value = normalize(text)
+    aliases = _aliases(chat_id)
+    matches = sorted((name for name in supported_commands()
+                      if value == name or value.startswith(name + " ")),
+                     key=len, reverse=True) if aliases else []
+    if matches and matches[0] in aliases:
+        priority, lane = classify_priority(text, event)
+        return (priority, lane) if lane in {LANE_ADMIN, LANE_COMMAND} else (
+            PRIORITY_COMMAND, LANE_COMMAND)
+    return None
+
+
 def _valid_alias(chat_id, canonical, alias):
     if len(alias) < 2 or len(alias) > 48 or len(alias.split()) > 4:
         return "نام دستور باید بین ۲ تا ۴۸ نویسه و حداکثر چهار کلمه باشد."

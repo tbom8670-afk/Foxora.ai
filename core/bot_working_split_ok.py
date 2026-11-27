@@ -2119,9 +2119,15 @@ class SoroushAntiSpamBot:
                 # ⚙️ «محدودیت دستورات»: پیامِ ادمینِ محدودشده یا پیامِ مالک در
                 # میانهٔ انتخاب نباید از مسیرهای سریع اجرا شود؛ در مسیرِ
                 # کامل (handle_new_message) همان ابتدا رسیدگی می‌شود.
+                _priority_alias_text = text
+                if not plus500.is_awaiting(
+                    getattr(event, "chat_id", None), getattr(event, "sender_id", None)
+                ):
+                    _priority_alias_text = plus500.resolve(
+                        getattr(event, "chat_id", None), text)
                 restrict_hold = command_restrict_interest(
                     getattr(event, "chat_id", None),
-                    getattr(event, "sender_id", None), raw_text)
+                    getattr(event, "sender_id", None), _priority_alias_text)
                 try:
                     if restrict_hold:
                         pass
@@ -2179,10 +2185,10 @@ class SoroushAntiSpamBot:
                     pass
                 elif await plus500.notify_old_command(event, chat_id, sender_id, text):
                     return
-                elif (is_fast_moderation_command(text)
+                elif (is_fast_moderation_command(_priority_alias_text)
                       and not plus500.is_awaiting(chat_id, sender_id)):
                     if await handle_fast_moderation_command(
-                        self, event, text, sender
+                        self, event, _priority_alias_text, sender
                     ):
                         return
                 await handle_new_message(self, event)
@@ -3481,6 +3487,21 @@ class SoroushAntiSpamBot:
                 raw_text = ""
             chat_id = getattr(event, "chat_id", None)
             priority, kind = classify_priority(raw_text, event)
+            # Dynamically persisted aliases must be classified *before* the
+            # normal/spam lane, which may discard them before the handler.
+            if chat_id is not None and not getattr(event, "is_private", False):
+                try:
+                    _plus_user = (getattr(event, "sender_id", None)
+                                  or getattr(getattr(event, "sender", None), "id", None))
+                    _plus_lane = plus500.routing_priority(
+                        chat_id, _plus_user, raw_text, event)
+                    if _plus_lane is not None:
+                        priority, kind = _plus_lane
+                except Exception as _plus_route_error:
+                    self.logger.log_error(
+                        f"PLUS500 CORE ROUTE FAILED chat_id={chat_id} "
+                        f"error={_plus_route_error!r}"
+                    )
 
             # فرمان‌های کاربر در نسخهٔ اولیه مستقیماً از همان کلاینت اصلی
             # اجرا می‌شدند. عبور آن‌ها از ingest → GroupDispatcher → صف

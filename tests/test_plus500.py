@@ -108,7 +108,7 @@ class Plus500Tests(unittest.TestCase):
             ReplyEvent(), 202, 7, 'سکوت')))
         source = (Path(__file__).resolve().parents[1] / 'core/bot_working_split_ok.py').read_text()
         self.assertLess(source.index('await plus500.notify_old_command('),
-                        source.index('elif (is_fast_moderation_command(text)'))
+                        source.index('elif (is_fast_moderation_command(_priority_alias_text)'))
         self.run_message(owner, 101, 7, 'لغو plus500')
         self.assertFalse(asyncio.run(plus500.notify_old_command(
             ReplyEvent(), 101, 7, 'سکوت')))
@@ -136,6 +136,26 @@ class Plus500Tests(unittest.TestCase):
         for line in lines.split('\n'):
             self.assertIn(line, [extract(e) for e in entities if type(e).__name__ == 'MessageEntityBold'])
 
+    def test_alias_uses_original_command_direct_lane_before_normal_ingest(self):
+        from modules.group_dispatch import classify_priority, LANE_ADMIN, LANE_NORMAL
+        self.run_message(ReplyEvent(), 101, 7, 'plus500')
+        self.run_message(ReplyEvent(), 101, 7, 'سکوت')
+        self.run_message(ReplyEvent(), 101, 7, 'ساکن')
+        event = SimpleNamespace(chat_id=101, sender_id=42, is_private=False)
+        self.assertEqual(classify_priority('ساکن', event)[1], LANE_NORMAL)
+        rewritten = plus500.resolve(101, 'ساکن')
+        self.assertEqual(rewritten, 'سکوت')
+        self.assertEqual(classify_priority(rewritten, event)[1], LANE_ADMIN)
+        self.assertEqual(plus500.routing_priority(101, 42, 'ساکن', event)[1], LANE_ADMIN)
+        self.assertEqual(plus500.routing_priority(101, 42, 'ساکن 10', event)[1], LANE_ADMIN)
+        self.assertEqual(plus500.routing_priority(101, 7, 'سکوت', event)[1], LANE_ADMIN)
+        self.assertIsNone(plus500.routing_priority(202, 42, 'ساکن', event))
+        self.assertEqual(plus500.resolve(101, 'ساکن 10'), 'سکوت 10')
+        core = (Path(__file__).resolve().parents[1] / 'core/bot_working_split_ok.py').read_text()
+        self.assertLess(core.index('_plus_lane = plus500.routing_priority('),
+                        core.index('decision = ingest_event(self, event)'))
+        self.assertIn('priority, kind = _plus_lane', core)
+
     def test_timed_mute_reuses_authorization_and_passes_duration(self):
         from tests.test_fast_moderation import User, Event, Bot
         sender, target = User(7, 'owner'), User(31, 'target')
@@ -158,6 +178,8 @@ class Plus500Tests(unittest.TestCase):
     def test_fast_lane_guards_and_numeric_mute(self):
         core = (Path(__file__).resolve().parents[1] / 'core/bot_working_split_ok.py').read_text()
         self.assertIn('not plus500.is_awaiting(chat_id, sender_id)', core)
+        self.assertIn('is_fast_moderation_command(_priority_alias_text)', core)
+        self.assertIn('sender_id", None), _priority_alias_text)', core)
         source = (Path(__file__).resolve().parents[1] / 'handlers/message_handler.py').read_text()
         self.assertLess(source.index('message_text = plus500.resolve('), source.index('Numeric timed mute uses'))
         self.assertIn('duration_seconds=duration_minutes * 60', source)
