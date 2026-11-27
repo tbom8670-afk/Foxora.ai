@@ -156,6 +156,7 @@ _ADMIN_PREFIXES = (
     "لغو عضویت اجباری ", "حذف کانال من ",
     "محدودیت پیام ",
     "خاموشی گروه ",
+    "تنظیم عکس ", "لغو عکس ",
     "پاک ", "بن ", "اخراج ", "سکوت ",
     "سکوت نام", "اخراج نام",
     "فیلتر اسم", "لغو اسم", "فیلتر نام", "لغو نام",
@@ -224,6 +225,8 @@ def classify_priority(text, event=None):
     """Return ``(priority, kind)`` from the message text alone."""
     raw = normalize_dispatch_text(text)
     if not raw:
+        if _is_active_command_photo_input(event):
+            return PRIORITY_ADMIN, LANE_ADMIN
         return PRIORITY_NORMAL, LANE_NORMAL
     if raw in _ADMIN_EXACT:
         return PRIORITY_ADMIN, LANE_ADMIN
@@ -240,7 +243,7 @@ def classify_priority(text, event=None):
         return PRIORITY_ADMIN, LANE_ADMIN
     if _is_active_group_admin_input(event):
         return PRIORITY_ADMIN, LANE_ADMIN
-    if _is_active_background_input(event):
+    if _is_active_background_input(event) or _is_active_command_photo_input(event):
         return PRIORITY_ADMIN, LANE_ADMIN
     if raw.startswith(_COMMAND_PREFIXES):
         return PRIORITY_COMMAND, LANE_COMMAND
@@ -327,6 +330,18 @@ def _is_active_group_admin_input(event):
     try:
         from handlers import group_admin_handler
         return group_admin_handler.is_awaiting(chat_id, user_id)
+    except Exception:
+        return False
+
+
+def _is_active_command_photo_input(event):
+    """Pending owner photo goes to the admin lane, even without a caption."""
+    if event is None or getattr(event, "is_private", False):
+        return False
+    try:
+        from handlers import command_photo_handler
+        return command_photo_handler.is_awaiting(
+            getattr(event, "chat_id", None), _event_user_id(event))
     except Exception:
         return False
 

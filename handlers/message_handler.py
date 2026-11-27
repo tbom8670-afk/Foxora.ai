@@ -4925,6 +4925,17 @@ async def handle_new_message(bot, event):
                     f"error={restrict_error!r}"
                 )
 
+        # One entry point for ALL normal group command handlers, including
+        # two-factor and full-purge paths that return before clean_text exists.
+        # Fast-core and protocol paths are wired at their own entry points.
+        if not getattr(event, "is_private", False) and not (
+                getattr(event, "is_edit", False)
+                or getattr(event, "_is_edited_message", False)
+                or getattr(getattr(event, "message", None), "edit_date", None)):
+            from handlers.command_photo_handler import install_on_event
+            install_on_event(bot, event, normalize_command(message_text),
+                             skip_if_game_active=True)
+
         if not getattr(event, "is_private", False):
             try:
                 early_command = normalize_command(message_text)
@@ -6153,15 +6164,6 @@ async def handle_new_message(bot, event):
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
         # می‌بلعید و «راهنما»/«روباه» هیچ‌وقت به handler نمی‌رسیدند.
         clean_text = normalize_command(message_text)
-        # Scope the photo to the command's first response on this event.
-        # Game timers and subsequent stage messages use the original sender.
-        if not getattr(event, "is_private", False) and not (
-                getattr(event, "is_edit", False)
-                or getattr(event, "_is_edited_message", False)
-                or getattr(event.message, "edit_date", None)
-                or is_game_answer_active(chat_id, user_id)):
-            from handlers.command_photo_handler import install_on_event
-            install_on_event(bot, event, clean_text)
 
         # 👑 مسیر مستقل ادمینِ واقعیِ همین گروه، پیش از تطبیقِ پیشوندیِ
         # «لغو ادمین» قدیمی (که فقط admins.json ربات را تغییر می‌دهد).

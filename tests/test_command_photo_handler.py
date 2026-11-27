@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from handlers import command_photo_handler as photos
 from modules import runtime_db
+from modules.group_dispatch import classify_priority, LANE_ADMIN
 
 
 class Event:
@@ -70,7 +71,9 @@ class PhotoTests(unittest.TestCase):
             start = Event(group, 7, 'تنظیم عکس بازی')
             self.assertTrue(await photos.handle_setup(self.bot, start, group, 7, start.message.message))
             self.assertTrue(photos.is_awaiting(1234, 7))
+            self.assertEqual(classify_priority(start.message.message, start)[1], LANE_ADMIN)
             image = Event(group, 7, 'ignored caption', photo=True, mid=55)
+            self.assertEqual(classify_priority('', image)[1], LANE_ADMIN)
             self.assertTrue(await photos.handle_setup(self.bot, image, group, 7, image.message.message))
             self.assertEqual(photos.photo_for('بازی')['source'], {'chat_id': 'me', 'message_id': 101})
             other = Event(-1005432, 12, 'بازی', mid=56)
@@ -90,6 +93,30 @@ class PhotoTests(unittest.TestCase):
             self.assertEqual(photos.photo_for('بازی')['source']['message_id'], 101)
             self.assertTrue(await photos.handle_setup(self.bot, Event(group, 7, 'لغو عکس بازی'), group, 7, 'لغو عکس بازی'))
             self.assertIsNone(photos.photo_for('بازی'))
+        asyncio.run(run())
+
+    def test_full_purge_early_route_keeps_formatted_confirmation(self):
+        import inspect
+        from handlers import message_handler
+        from modules.full_purge import service
+        source = inspect.getsource(message_handler.handle_new_message)
+        hook = source.index('install_on_event(bot, event, normalize_command(message_text),')
+        self.assertLess(hook, source.index('_full_purge.claims('))
+        self.assertLess(hook, source.index('_two_factor_gate('))
+
+        async def run():
+            runtime_db.kv_set(photos.NAMESPACE, 'پاکسازی کامل',
+                              {'source': {'chat_id': 'me', 'message_id': 101}})
+            self.bot.client.archive[101] = SimpleNamespace(photo=object(), media=None)
+            event = Event(-1000000000007, 7, 'پاکسازی کامل')
+            photos.install_on_event(self.bot, event, 'پاکسازی کامل')
+            result = await service.send_confirm(self.bot, event, event.chat_id)
+            self.assertEqual(result.id, 202)
+            self.assertEqual(event.replies, [])
+            sent = self.bot.client.sent[-1]
+            self.assertEqual(sent[2]['caption'], service.texts.confirm_text())
+            self.assertEqual(len(sent[2]['formatting_entities']),
+                             len(service.texts.confirm_entities(sent[2]['caption'])))
         asyncio.run(run())
 
     def test_core_fast_owner_register_group_uses_photo(self):
@@ -159,6 +186,16 @@ class PhotoTests(unittest.TestCase):
             await deactivate(service, event)
             self.assertEqual(sent[-1][2]['caption'], '🔺 پروتکل امنیتی روباه خاموش شد')
         asyncio.run(run())
+
+    def test_game_stage_is_not_photographed(self):
+        from handlers import message_handler as handler
+        runtime_db.kv_set(photos.NAMESPACE, 'بازی',
+                          {'source': {'chat_id': 'me', 'message_id': 101}})
+        event = Event(-1000000000007, 7, 'بازی')
+        with patch.object(handler, 'is_game_answer_active', return_value=True):
+            self.assertIsNone(photos.install_on_event(
+                self.bot, event, 'بازی', skip_if_game_active=True))
+        self.assertEqual(self.bot.client.sent, [])
 
     def test_unconfigured_commands_do_not_query_sqlite(self):
         photos.warm_config()

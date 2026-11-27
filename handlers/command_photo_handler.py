@@ -43,8 +43,9 @@ def _pending(chat_id, user_id):
 
 
 def is_awaiting(chat_id, user_id):
-    return (chat_id is not None and user_id is not None
-            and is_global_owner(user_id) and _pending(chat_id, user_id) is not None)
+    return bool(_sessions and chat_id is not None and user_id is not None
+                and _pending(chat_id, user_id) is not None
+                and is_global_owner(user_id))
 
 
 def warm_config():
@@ -216,13 +217,21 @@ class FirstPhotoReply:
         return await original(*args, **kwargs)
 
 
-def install_on_event(bot, event, command):
+def install_on_event(bot, event, command, *, skip_if_game_active=False):
     """Wrap just this event; no global client/handler monkeypatch or access change."""
     if getattr(event, "is_private", False) or getattr(event, "_command_photo_reply", None):
         return None
     entry = photo_for(command)
     if not isinstance(entry, dict) or not entry.get("source"):
         return None
+    if skip_if_game_active:
+        # Only for configured triggers. Game answers/stages must NEVER receive
+        # the photo meant for the opening message of a game.
+        from handlers.message_handler import is_game_answer_active
+        actor = (getattr(event, "sender_id", None)
+                 or getattr(getattr(event, "sender", None), "id", None))
+        if is_game_answer_active(getattr(event, "chat_id", None), actor):
+            return None
     overlay = FirstPhotoReply(bot, event, normalize(command), entry)
     try:
         for attr in ("reply", "respond"):
