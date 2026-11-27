@@ -8,7 +8,6 @@ from modules.admin_storage import is_admin, add_admin, remove_admin
 from modules.riddles import new_riddle, check_answer, get_answer
 from modules.spam_history import get_user_history, clear_user as clear_spam_history
 from modules import message_tracker
-from modules import plus500
 from modules.group_id import normalize_group_id
 from modules.group_stats import add_message, add_deleted, add_kick, add_mute, make_report
 from modules import ConfigManager, SpamDetector, BotLogger, UserTracker, AdminActions
@@ -2119,15 +2118,9 @@ class SoroushAntiSpamBot:
                 # ⚙️ «محدودیت دستورات»: پیامِ ادمینِ محدودشده یا پیامِ مالک در
                 # میانهٔ انتخاب نباید از مسیرهای سریع اجرا شود؛ در مسیرِ
                 # کامل (handle_new_message) همان ابتدا رسیدگی می‌شود.
-                _priority_alias_text = text
-                if not plus500.is_awaiting(
-                    getattr(event, "chat_id", None), getattr(event, "sender_id", None)
-                ):
-                    _priority_alias_text = plus500.resolve(
-                        getattr(event, "chat_id", None), text)
                 restrict_hold = command_restrict_interest(
                     getattr(event, "chat_id", None),
-                    getattr(event, "sender_id", None), _priority_alias_text)
+                    getattr(event, "sender_id", None), raw_text)
                 try:
                     if restrict_hold:
                         pass
@@ -2183,12 +2176,9 @@ class SoroushAntiSpamBot:
                     return
                 if restrict_hold:
                     pass
-                elif await plus500.notify_old_command(event, chat_id, sender_id, text):
-                    return
-                elif (is_fast_moderation_command(_priority_alias_text)
-                      and not plus500.is_awaiting(chat_id, sender_id)):
+                elif is_fast_moderation_command(text):
                     if await handle_fast_moderation_command(
-                        self, event, _priority_alias_text, sender
+                        self, event, text, sender
                     ):
                         return
                 await handle_new_message(self, event)
@@ -2315,8 +2305,7 @@ class SoroushAntiSpamBot:
                         f"chat_id={getattr(event, 'chat_id', None)} "
                         f"error={_entry_error!r}"
                     )
-                raw_text = (getattr(event.message, "message", None)
-                            or getattr(event.message, "caption", None) or "")
+                raw_text = event.message.message or ""
                 command_priority_text = normalize_command_text(raw_text)
                 command_priority = command_priority_text in {
                     "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
@@ -3487,29 +3476,6 @@ class SoroushAntiSpamBot:
                 raw_text = ""
             chat_id = getattr(event, "chat_id", None)
             priority, kind = classify_priority(raw_text, event)
-            _plus_resolved = raw_text
-            # Dynamically persisted aliases must be classified *before* the
-            # normal/spam lane, which may discard them before the handler.
-            if chat_id is not None and not getattr(event, "is_private", False):
-                try:
-                    _plus_user = (getattr(event, "sender_id", None)
-                                  or getattr(getattr(event, "sender", None), "id", None))
-                    _plus_lane = plus500.routing_priority(
-                        chat_id, _plus_user, raw_text, event)
-                    if _plus_lane is not None:
-                        priority, kind = _plus_lane
-                        _plus_resolved = plus500.resolve(chat_id, raw_text)
-                        if _plus_resolved != raw_text:
-                            self.logger.log_info(
-                                f"PLUS500 CORE ROUTED chat_id={chat_id} "
-                                f"alias={raw_text!r} original={_plus_resolved!r} "
-                                f"lane={kind}"
-                            )
-                except Exception as _plus_route_error:
-                    self.logger.log_error(
-                        f"PLUS500 CORE ROUTE FAILED chat_id={chat_id} "
-                        f"error={_plus_route_error!r}"
-                    )
 
             # فرمان‌های کاربر در نسخهٔ اولیه مستقیماً از همان کلاینت اصلی
             # اجرا می‌شدند. عبور آن‌ها از ingest → GroupDispatcher → صف
@@ -3527,13 +3493,7 @@ class SoroushAntiSpamBot:
                 except Exception:
                     _game_token = None
                 try:
-                    if _plus_resolved != raw_text:
-                        await plus500.dispatch_as_original(
-                            event, raw_text, _plus_resolved,
-                            process_priority_command,
-                        )
-                    else:
-                        await process_priority_command(event)
+                    await process_priority_command(event)
                 finally:
                     if _game_token is not None:
                         try:

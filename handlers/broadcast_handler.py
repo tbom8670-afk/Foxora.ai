@@ -39,7 +39,7 @@ from modules.group_id import normalize_group_id
 from modules.group_storage import is_active, load_groups
 
 
-PROMPT = "📢 متن اطلاع‌رسانی یا عکس با کپشن را ارسال کنید."
+PROMPT = "📢 متن اطلاع‌رسانی را ارسال کنید."
 
 PREVIEW_HEADER = (
     "━━━━━━━━━━━━━━\n\n"
@@ -115,53 +115,6 @@ async def _broadcast_reply(bot, event, text, entities=None):
     return message
 
 
-def _announcement_photo(message):
-    """Only real photos, not link previews, stickers or arbitrary documents."""
-    photo = getattr(message, "photo", None)
-    media = getattr(message, "media", None)
-    if photo is not None or type(media).__name__ == "MessageMediaPhoto":
-        return media or photo or message
-    return None
-
-
-def _photo_reference(event):
-    message = getattr(event, "message", None)
-    chat_id = getattr(event, "chat_id", None)
-    message_id = getattr(message, "id", None)
-    if chat_id is not None and message_id is not None:
-        return {"chat_id": chat_id, "message_id": message_id}
-    return None
-
-
-async def _photo_from_state(bot, payload):
-    media = payload.get("media")
-    if media is not None:
-        return media
-    ref = payload.get("media_ref")
-    if not isinstance(ref, dict):
-        return None
-    if ref.get("chat_id") is None or ref.get("message_id") is None:
-        return None
-    source = await bot.client.get_messages(ref["chat_id"], ids=ref["message_id"])
-    if not source or _announcement_photo(source) is None:
-        raise ValueError("عکس اصلی دیگر در دسترس نیست")
-    return source
-
-
-async def _photo_preview(bot, event, photo, caption, entities):
-    """Photo and its caption always stay one media message; controls are separate."""
-    sent = await bot.client.send_file(
-        getattr(event, "chat_id", None), photo, caption=caption,
-        formatting_entities=entities or None,
-    )
-    message_id = getattr(sent, "id", None)
-    if message_id is not None:
-        if not hasattr(bot, "broadcast_bot_message_ids"):
-            bot.broadcast_bot_message_ids = set()
-        bot.broadcast_bot_message_ids.add(message_id)
-    await _broadcast_reply(bot, event, "📢 پیش‌نمایش عکس بالا؛ ارسال شود؟\n✅ تایید\n❌ لغو")
-
-
 def _preview(text, entities=None):
     """Build the preview body and re-align entity offsets to it."""
     preview_text = f"{PREVIEW_HEADER}{text}{PREVIEW_FOOTER}"
@@ -169,7 +122,7 @@ def _preview(text, entities=None):
     return preview_text, preview_entities
 
 
-async def _broadcast_to_groups(bot, text, entities=None, origin="unknown", photo=None):
+async def _broadcast_to_groups(bot, text, entities=None, origin="unknown"):
     successful = 0
     failed = 0
     # کلیدها همیشه نرمال‌سازی می‌شوند: iter_dialogs شناسهٔ کامل (-100…) می‌دهد
@@ -233,15 +186,11 @@ async def _broadcast_to_groups(bot, text, entities=None, origin="unknown", photo
         seen_group_ids.add(group_key)
         try:
             send_calls += 1
-            if photo is not None:
-                await bot.client.send_file(
-                    target, photo, caption=text,
-                    formatting_entities=entities or None,
-                )
-            else:
-                await bot.client.send_message(
-                    target, text, formatting_entities=entities or None,
-                )
+            await bot.client.send_message(
+                target,
+                text,
+                formatting_entities=entities or None,
+            )
             successful += 1
             _log_phase(
                 bot,
@@ -404,8 +353,6 @@ async def handle_private_broadcast(bot, event, owner_id, text, origin_key=None):
         if text in {"تایید", "تأیید", "✅ تایید"}:
             _log_phase(bot, "CONFIRMED", owner_id)
             _log_phase(bot, "BROADCAST CONFIRM", owner_id, "action=consume_state")
-            # Read the photo before consume_confirmation clears this session.
-            photo_payload = get(owner_id) or {}
             announcement_text, announcement_entities = consume_confirmation(owner_id)
             if announcement_text is None:
                 _log_phase(bot, "STATE CLEARED", owner_id, "reason=no_active_session")
@@ -433,20 +380,11 @@ async def handle_private_broadcast(bot, event, owner_id, text, origin_key=None):
                 f"entities=[{_describe_entities(announcement_entities)}]",
             )
             try:
-                try:
-                    photo = await _photo_from_state(bot, photo_payload)
-                except Exception as error:
-                    bot.logger.log_error(f"BROADCAST PHOTO RECOVERY FAILED: {error!r}")
-                    await _broadcast_reply(bot, event, "❌ عکس اطلاع‌رسانی در دسترس نیست؛ دوباره شروع کنید.")
-                    return True
-                if photo_payload.get("media_ref") and photo is None:
-                    await _broadcast_reply(bot, event, "❌ عکس اطلاع‌رسانی در دسترس نیست؛ دوباره شروع کنید.")
-                    return True
                 successful, failed = await _broadcast_to_groups(
                     bot,
                     announcement_text,
                     announcement_entities,
-                    origin=f"confirm:owner={owner_id}", photo=photo,
+                    origin=f"confirm:owner={owner_id}",
                 )
                 await _broadcast_reply(
                     bot,
@@ -476,16 +414,9 @@ async def handle_private_broadcast(bot, event, owner_id, text, origin_key=None):
             await _broadcast_reply(bot, event, "📢 ابتدا متن اطلاع‌رسانی را ارسال کنید.")
             return True
 
-        # The unstripped caption is stored: trimming shifts entity offsets.
-        photo = _announcement_photo(getattr(event, "message", None))
-        if photo is not None and _u16_len(raw_text) > 1024:
-            await _broadcast_reply(bot, event, "❌ کپشن عکس بیش از ۱۰۲۴ نویسه است؛ متن را کوتاه‌تر کنید.")
-            return True
-        if photo is not None and _photo_reference(event) is None:
-            await _broadcast_reply(bot, event, "❌ شناسهٔ عکس مشخص نیست؛ عکس را دوباره بفرستید.")
-            return True
-        set_message(owner_id, raw_text, entities, media=photo,
-                    media_ref=_photo_reference(event) if photo is not None else None)
+        # The unstripped body is stored: stripping would shift every entity
+        # offset and misalign the formatting.
+        set_message(owner_id, raw_text, entities)
         _log_phase(
             bot,
             "BROADCAST MESSAGE STORED",
@@ -501,15 +432,7 @@ async def handle_private_broadcast(bot, event, owner_id, text, origin_key=None):
             f"shift={_u16_len(PREVIEW_HEADER)} "
             f"preview_entities=[{_describe_entities(preview_entities)}]",
         )
-        if photo is not None:
-            try:
-                await _photo_preview(bot, event, photo, raw_text, entities)
-            except Exception as error:
-                clear(owner_id)
-                bot.logger.log_error(f"BROADCAST PHOTO PREVIEW FAILED: {error!r}")
-                await _broadcast_reply(bot, event, "❌ پیش‌نمایش عکس ارسال نشد؛ دوباره شروع کنید.")
-        else:
-            await _broadcast_reply(bot, event, preview_text, preview_entities)
+        await _broadcast_reply(bot, event, preview_text, preview_entities)
         return True
 
     # The sending state is intentionally not allowed to recreate a preview.

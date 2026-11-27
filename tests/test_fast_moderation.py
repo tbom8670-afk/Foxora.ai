@@ -229,7 +229,7 @@ class FastModerationTests(unittest.TestCase):
         source = (ROOT / "core" / "bot_working_split_ok.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("is_fast_moderation_command(_priority_alias_text)", source)
+        self.assertIn("is_fast_moderation_command(text)", source)
         self.assertIn("await handle_fast_moderation_command(", source)
         self.assertTrue(mh.is_fast_moderation_command("سکوت"))
         self.assertTrue(mh.is_fast_moderation_command("قفل"))

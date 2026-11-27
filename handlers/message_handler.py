@@ -2,7 +2,6 @@ import asyncio
 import asyncio as _asyncio
 import contextvars
 import inspect
-import re
 from collections import Counter, deque
 from datetime import date
 import os
@@ -65,7 +64,6 @@ from modules import speed_bomb as _speed_bomb
 from handlers.photo_download_handler import handle as handle_photo_download
 # 👑 مدیریت ادمین واقعی گروه: فقط مالک ثبت‌شده، مستقل از admins.json.
 from handlers import group_admin_handler as native_group_admin
-from modules import plus500
 # 🦊 منشنِ یک‌بارهٔ ادمین‌های واقعی و ثبت‌شدهٔ همین گروه.
 from modules import admin_tagging
 # ⏳ تاریخ انقضای گروه — قابلیتی کاملاً مستقل با مسیر پردازش جدا.
@@ -3836,12 +3834,7 @@ async def handle_fast_moderation_command(
     the existing compatibility path may still verify native Soroush admins.
     """
     clean_text = normalize_command(text or "")
-    ascii_text = clean_text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
-    timed_match = re.fullmatch(r"سکوت ([1-9][0-9]{0,3})", ascii_text)
-    duration_minutes = int(timed_match.group(1)) if timed_match else None
-    if duration_minutes is not None and duration_minutes > 1440:
-        duration_minutes = None
-    if clean_text not in FAST_MODERATION_COMMANDS and duration_minutes is None:
+    if clean_text not in FAST_MODERATION_COMMANDS:
         return False
     if getattr(event, "is_private", False):
         return False
@@ -3988,9 +3981,8 @@ async def handle_fast_moderation_command(
                 "target_user": target_user,
             }
         muted = await bot.admin_actions.mute_user(
-            chat_id, target_user.id,
-            duration_seconds=duration_minutes * 60 if duration_minutes is not None else None,
-            user=target_user, chat=resolved_permission_chat,
+            chat_id, target_user.id, user=target_user,
+            chat=resolved_permission_chat,
         )
         if not muted:
             raise RuntimeError("mute operation returned False")
@@ -4022,21 +4014,21 @@ async def handle_fast_moderation_command(
             await event.reply("❌ انجام سکوت ناموفق بود")
             return
         add_mute(chat_id)
-        # Timed mutes expire natively and must not be persisted as permanent.
-        if duration_minutes is None:
-            try:
-                from modules import manual_mute_storage
-                _t_uname = getattr(target_user, "username", None)
-                _t_dname = " ".join(
-                    p for p in (getattr(target_user, "first_name", None),
-                                getattr(target_user, "last_name", None)) if p
-                ).strip()
-                manual_mute_storage.add_manual_mute(
-                    chat_id, target_user.id, username=_t_uname, display_name=_t_dname
-                )
-            except Exception as mm_error:
-                bot.logger.log_error(
-                    f"MANUAL MUTE MARK FAILED: {mm_error}")
+        # ثبت «سکوت دستی»: «آزاد» روی این سکوت عمل نمی‌کند و رفعش فقط
+        # با «رفع سکوت» است.
+        try:
+            from modules import manual_mute_storage
+            _t_uname = getattr(target_user, "username", None)
+            _t_dname = " ".join(
+                p for p in (getattr(target_user, "first_name", None),
+                            getattr(target_user, "last_name", None)) if p
+            ).strip()
+            manual_mute_storage.add_manual_mute(
+                chat_id, target_user.id, username=_t_uname, display_name=_t_dname
+            )
+        except Exception as mm_error:
+            bot.logger.log_error(
+                f"MANUAL MUTE MARK FAILED: {mm_error}")
         await _delete_successful_mute_messages(bot, event, chat_id, reply_id)
         admin_tools.log_action(
             chat_id, sender, "سکوت کاربر", target=target_user
@@ -4045,8 +4037,7 @@ async def handle_fast_moderation_command(
             user_history.add_mute(
                 chat_id,
                 target_user,
-                (f"سکوت {duration_minutes} دقیقه‌ای توسط مالک یا ادمین"
-                 if duration_minutes is not None else "سکوت دستی توسط مالک یا ادمین"),
+                "سکوت دستی توسط مالک یا ادمین",
             )
         except Exception as history_error:
             bot.logger.log_error(
@@ -4055,8 +4046,7 @@ async def handle_fast_moderation_command(
         # Bold با ** (Markdown پیش‌فرض). نام کاربری و در نبود
         # آن، نام نمایشی از policy واحد format_user می‌آید.
         await event.reply(
-            f"「 {_format_banned_user(target_user, target_user.id)} 」"
-            f"**{f'سکوت {duration_minutes} دقیقه‌ای شد' if duration_minutes is not None else 'سکوت دائم شد'}** 🔊"
+            f"「 {_format_banned_user(target_user, target_user.id)} 」**سکوت دائم شد** 🔊"
         )
 
     async def fast_mute_failed(_error):
@@ -4778,7 +4768,6 @@ async def handle_new_message(bot, event):
     profiler = MessagePerformance()
     response_token = begin_response_measurement()
     chat_id = getattr(event, "chat_id", None)
-    _plus_restore = None
     try:
         # SPAM DEBUG INCOMING — اولین خط handler قبل از هر فیلتر
         try:
@@ -4851,9 +4840,14 @@ async def handle_new_message(bot, event):
             f"text={message_text!r}"
         )
         # برای کپشن عکس/فایل هم چک کن
-        if not message_text:
-            # Some SPlusthon photo updates expose only caption (no .file).
-            message_text = getattr(event.message, 'caption', None) or ""
+        if not message_text and hasattr(
+                event.message, 'file') and event.message.file:
+            # اگر فایل دارد، نام فایل یا کپشن را چک کن
+            try:
+                caption = getattr(event.message, 'caption', None) or ""
+                message_text = caption
+            except BaseException:
+                pass
 
         # Independent five-minute native-admin warning consequence. This is
         # before owner/command/game/profile/media shortcuts, so no later
@@ -4867,31 +4861,6 @@ async def handle_new_message(bot, event):
                 bot.logger.log_error(
                     "NATIVE ADMIN WARNING DELETE FAILED "
                     f"chat_id={chat_id} error={warning_drop_error!r}"
-                )
-
-        # Plus500 only rewrites the *command text* before existing security,
-        # two-factor, and command routers. It never grants execution permission.
-        if not getattr(event, "is_private", False) and message_text:
-            _plus_actor = (getattr(event, "sender_id", None)
-                           or getattr(getattr(event, "sender", None), "id", None)
-                           or getattr(getattr(event, "_bot_cached_sender", None), "id", None))
-            try:
-                if await plus500.handle(event, chat_id, _plus_actor, message_text):
-                    return
-                if await plus500.notify_old_command(event, chat_id, _plus_actor, message_text):
-                    return
-                _plus_original = plus500.resolve(chat_id, message_text)
-                if _plus_original != message_text:
-                    _plus_restore = plus500.install_original_text(event, _plus_original)
-                    bot.logger.log_info(
-                        f"PLUS500 ALIAS DISPATCH chat_id={chat_id} "
-                        f"alias={message_text!r} original={_plus_original!r} "
-                        f"event_rewritten={bool(_plus_restore)}"
-                    )
-                message_text = _plus_original
-            except Exception as plus_error:
-                bot.logger.log_error(
-                    f"PLUS500 HOOK FAILED chat_id={chat_id} error={plus_error!r}"
                 )
 
         # ⚙️ «محدودیت دستورات»: یک نقطهٔ مرکزی، پیش از همهٔ هندلرها و
@@ -6151,15 +6120,6 @@ async def handle_new_message(bot, event):
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
         # می‌بلعید و «راهنما»/«روباه» هیچ‌وقت به handler نمی‌رسیدند.
         clean_text = normalize_command(message_text)
-
-        # Numeric timed mute uses the existing protected fast moderation
-        # operation. Both «سکوت 10» and aliases (e.g. «ساکت 10») arrive here.
-        if re.fullmatch(r"سکوت [1-9][0-9]{0,3}", clean_text.translate(
-                str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))):
-            if await handle_fast_moderation_command(bot, event, clean_text, sender):
-                return
-            await event.reply(ADMIN_PERMISSION_DENIED_TEXT)
-            return
 
         # 👑 مسیر مستقل ادمینِ واقعیِ همین گروه، پیش از تطبیقِ پیشوندیِ
         # «لغو ادمین» قدیمی (که فقط admins.json ربات را تغییر می‌دهد).
@@ -12477,7 +12437,6 @@ async def handle_new_message(bot, event):
         import traceback
         traceback.print_exc()
     finally:
-        plus500.restore_original_text(event, _plus_restore)
         profiler.set("SEND_RESPONSE", response_rpc_ms())
         performance_result = profiler.finish(bot.logger, chat_id)
         try:
