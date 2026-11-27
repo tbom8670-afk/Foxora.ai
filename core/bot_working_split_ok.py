@@ -1031,6 +1031,8 @@ class SoroushAntiSpamBot:
                 self.outgoing_sender.client = new_client
                 # re-install wrapper for new client
                 install_outgoing_sender(new_client, self, self.logger)
+                from handlers.command_photo_handler import install_client as _install_photo_client
+                _install_photo_client(self)
             if getattr(self, "performance_monitor", None) is not None:
                 self.performance_monitor.update_client(new_client)
             self.admin_actions = AdminActions(
@@ -1347,6 +1349,8 @@ class SoroushAntiSpamBot:
         # never pay a SQLite query merely to discover they have no photo.
         from handlers.command_photo_handler import warm_config as _warm_command_photos
         _warm_command_photos()
+        from handlers.command_photo_handler import install_client as _install_photo_client
+        _install_photo_client(self)
         # One process-wide watchdog: any AWAIT START without a terminal line
         # after (deadline + grace) is logged and its inner RPC task cancelled.
         policy = self._rpc_policy()

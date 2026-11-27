@@ -234,6 +234,14 @@ def classify_priority(text, event=None):
         return PRIORITY_ADMIN, LANE_ADMIN
     if raw in _COMMAND_EXACT:
         return PRIORITY_COMMAND, LANE_COMMAND
+    # Owner-configured commands not yet listed above must not fall into the
+    # droppable normal/chat lane. The index is memory-only after startup.
+    try:
+        from handlers.command_photo_handler import photo_for
+        if photo_for(raw) is not None:
+            return PRIORITY_COMMAND, LANE_COMMAND
+    except Exception:
+        pass
     # فراخوانی مستقیم روباه نباید پشت موج پیام‌های عادی بماند.
     if raw.startswith(("روباه ", "روباه،", "روباه,", "ربات ", "ربات،", "ربات,")):
         return PRIORITY_COMMAND, LANE_COMMAND

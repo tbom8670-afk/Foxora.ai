@@ -4785,6 +4785,7 @@ async def handle_new_message(bot, event):
     _wrap_event_reply_for_registry(event)
     profiler = MessagePerformance()
     response_token = begin_response_measurement()
+    command_photo_token = None
     chat_id = getattr(event, "chat_id", None)
     try:
         # SPAM DEBUG INCOMING — اولین خط handler قبل از هر فیلتر
@@ -4933,8 +4934,10 @@ async def handle_new_message(bot, event):
                 or getattr(event, "_is_edited_message", False)
                 or getattr(getattr(event, "message", None), "edit_date", None)):
             from handlers.command_photo_handler import install_on_event
-            install_on_event(bot, event, normalize_command(message_text),
-                             skip_if_game_active=True)
+            from handlers.command_photo_handler import bind_overlay
+            overlay = install_on_event(bot, event, normalize_command(message_text),
+                                       skip_if_game_active=True)
+            command_photo_token = bind_overlay(overlay)
 
         if not getattr(event, "is_private", False):
             try:
@@ -12502,4 +12505,6 @@ async def handle_new_message(bot, event):
             event._bot_performance_result = performance_result
         except Exception:
             pass
+        from handlers.command_photo_handler import unbind_overlay
+        unbind_overlay(command_photo_token)
         end_response_measurement(response_token)

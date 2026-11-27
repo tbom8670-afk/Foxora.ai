@@ -76,6 +76,8 @@ class PhotoTests(unittest.TestCase):
             self.assertEqual(classify_priority('', image)[1], LANE_ADMIN)
             self.assertTrue(await photos.handle_setup(self.bot, image, group, 7, image.message.message))
             self.assertEqual(photos.photo_for('بازی')['source'], {'chat_id': 'me', 'message_id': 101})
+            self.assertEqual(classify_priority('بازی', Event(group, 8, 'بازی'))[1],
+                             'command')
             other = Event(-1005432, 12, 'بازی', mid=56)
             overlay = photos.install_on_event(self.bot, other, 'بازی')
             self.assertIsNotNone(overlay)
@@ -185,6 +187,33 @@ class PhotoTests(unittest.TestCase):
                                                       7, image.message.message))
             await deactivate(service, event)
             self.assertEqual(sent[-1][2]['caption'], '🔺 پروتکل امنیتی روباه خاموش شد')
+        asyncio.run(run())
+
+    def test_direct_client_sender_is_scoped_to_current_command(self):
+        from modules.profile_guard import guard, texts
+        async def run():
+            entry = {'source': {'chat_id': 'me', 'message_id': 101}}
+            runtime_db.kv_set(photos.NAMESPACE, 'ضد استوری روشن', entry)
+            self.bot.client.archive[101] = SimpleNamespace(photo=object(), media=None)
+            photos.install_client(self.bot)
+            event = Event(-1000000000007, 7, 'ضد استوری روشن')
+            overlay = photos.install_on_event(self.bot, event, 'ضد استوری روشن')
+            token = photos.bind_overlay(overlay)
+            payload = texts.story_enabled(5)
+            try:
+                # The anti-story handler sends through bot.client, not event.reply.
+                with patch('modules.manage_features.peers.group_peer', return_value=event.chat_id):
+                    await guard._send(self.bot, event, event.chat_id, payload)
+                    await guard._send(self.bot, event, event.chat_id, payload)
+            finally:
+                photos.unbind_overlay(token)
+            sent = self.bot.client.sent
+            self.assertEqual(sent[0][2]['caption'], payload[0])
+            self.assertIs(sent[0][2]['formatting_entities'], payload[1])
+            self.assertIsNone(sent[1][1])  # second notice stays text-only
+            await self.bot.client.send_message(event.chat_id, 'ordinary message')
+            self.assertIsNone(sent[-1][1])
+            self.assertTrue(overlay.used)
         asyncio.run(run())
 
     def test_game_stage_is_not_photographed(self):

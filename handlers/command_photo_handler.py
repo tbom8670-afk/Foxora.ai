@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import time
 import json
+import contextvars
+import functools
 from modules import runtime_db
 from modules.group_id import normalize_group_id
 from modules.owner_check import is_global_owner
@@ -22,6 +24,7 @@ _sessions = {}  # (normalized group, global owner) -> (command, monotonic)
 _configured = None  # In-memory index: NEVER query SQLite on each incoming command.
 _config_file = None
 _media_cache = {}  # command -> server-side media, refreshed on send failure
+_active_photo = contextvars.ContextVar("command_photo_current", default=None)
 
 
 def normalize(value):
@@ -188,6 +191,61 @@ async def send_command_photo(bot, peer, command, text, entities, *, parse_mode=N
         "formatting_entities": entities, "parse_mode": parse_mode,
     })
     return sent, sent is not None
+
+
+def bind_overlay(overlay):
+    """Bind one configured command to its task; never a global chat setting."""
+    return _active_photo.set(overlay) if overlay is not None else None
+
+
+def unbind_overlay(token):
+    if token is not None:
+        overlay = _active_photo.get()
+        if overlay is not None:
+            overlay.closed = True
+        _active_photo.reset(token)
+
+
+def install_client(bot):
+    """Catch command handlers that send through client.send_message directly.
+
+    The installed wrapper is inert for all other tasks and unconfigured
+    commands: one contextvar read, no disk lookup or network request.
+    """
+    client = getattr(bot, "client", None)
+    original = getattr(client, "send_message", None)
+    if not callable(original) or getattr(original, "_command_photo_client_wrapped", False):
+        return False
+
+    @functools.wraps(original)
+    async def wrapped(*args, **kwargs):
+        overlay = _active_photo.get()
+        if (overlay is not None and not overlay.used
+                and not getattr(overlay, "closed", False) and len(args) <= 2):
+            peer = args[0] if args else kwargs.get("entity", kwargs.get("peer"))
+            text = (args[1] if len(args) > 1 else
+                    kwargs.get("message", kwargs.get("text")))
+            if isinstance(text, str):
+                from modules.outgoing_sender import _chat_key
+                if _chat_key(peer) == _chat_key(overlay.event.chat_id):
+                    overlay.used = True
+                    options = {"formatting_entities": kwargs.get("formatting_entities")}
+                    for key in ("parse_mode", "buttons", "silent", "schedule",
+                                "background", "reply_to"):
+                        if key in kwargs:
+                            options[key] = kwargs[key]
+                    sent = await _send_photo(bot, peer, overlay.command, overlay.entry,
+                                             text, options)
+                    if sent is not None:
+                        return sent
+        return await original(*args, **kwargs)
+
+    wrapped._command_photo_client_wrapped = True
+    try:
+        client.send_message = wrapped
+    except (AttributeError, TypeError):
+        return False
+    return True
 
 
 class FirstPhotoReply:
