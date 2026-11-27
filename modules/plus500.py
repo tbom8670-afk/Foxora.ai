@@ -182,6 +182,37 @@ def routing_priority(chat_id, user_id, text, event=None):
     return None
 
 
+def install_original_text(event, original):
+    """Make legacy handlers that read event.message see the canonical command.
+
+    Restore in the caller's finally; never alter the on-server message, reply
+    target, sender, group, or permission checks.
+    """
+    message = getattr(event, "message", None)
+    previous = {}
+    if message is None:
+        return previous
+    for field in ("message", "caption"):
+        try:
+            value = getattr(message, field, None)
+            if field == "message" or value:
+                setattr(message, field, original)
+                previous[field] = value
+        except (AttributeError, TypeError):
+            continue
+    return previous
+
+
+def restore_original_text(event, previous):
+    message = getattr(event, "message", None)
+    if message is not None:
+        for field, value in (previous or {}).items():
+            try:
+                setattr(message, field, value)
+            except (AttributeError, TypeError):
+                pass
+
+
 def _valid_alias(chat_id, canonical, alias):
     if len(alias) < 2 or len(alias) > 48 or len(alias.split()) > 4:
         return "نام دستور باید بین ۲ تا ۴۸ نویسه و حداکثر چهار کلمه باشد."

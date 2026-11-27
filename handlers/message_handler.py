@@ -4778,6 +4778,7 @@ async def handle_new_message(bot, event):
     profiler = MessagePerformance()
     response_token = begin_response_measurement()
     chat_id = getattr(event, "chat_id", None)
+    _plus_restore = None
     try:
         # SPAM DEBUG INCOMING — اولین خط handler قبل از هر فیلتر
         try:
@@ -4879,7 +4880,15 @@ async def handle_new_message(bot, event):
                     return
                 if await plus500.notify_old_command(event, chat_id, _plus_actor, message_text):
                     return
-                message_text = plus500.resolve(chat_id, message_text)
+                _plus_original = plus500.resolve(chat_id, message_text)
+                if _plus_original != message_text:
+                    _plus_restore = plus500.install_original_text(event, _plus_original)
+                    bot.logger.log_info(
+                        f"PLUS500 ALIAS DISPATCH chat_id={chat_id} "
+                        f"alias={message_text!r} original={_plus_original!r} "
+                        f"event_rewritten={bool(_plus_restore)}"
+                    )
+                message_text = _plus_original
             except Exception as plus_error:
                 bot.logger.log_error(
                     f"PLUS500 HOOK FAILED chat_id={chat_id} error={plus_error!r}"
@@ -12468,6 +12477,7 @@ async def handle_new_message(bot, event):
         import traceback
         traceback.print_exc()
     finally:
+        plus500.restore_original_text(event, _plus_restore)
         profiler.set("SEND_RESPONSE", response_rpc_ms())
         performance_result = profiler.finish(bot.logger, chat_id)
         try:

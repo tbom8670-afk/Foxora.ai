@@ -3497,6 +3497,13 @@ class SoroushAntiSpamBot:
                         chat_id, _plus_user, raw_text, event)
                     if _plus_lane is not None:
                         priority, kind = _plus_lane
+                        _plus_resolved = plus500.resolve(chat_id, raw_text)
+                        if _plus_resolved != raw_text:
+                            self.logger.log_info(
+                                f"PLUS500 CORE ROUTED chat_id={chat_id} "
+                                f"alias={raw_text!r} original={_plus_resolved!r} "
+                                f"lane={kind}"
+                            )
                 except Exception as _plus_route_error:
                     self.logger.log_error(
                         f"PLUS500 CORE ROUTE FAILED chat_id={chat_id} "

@@ -151,6 +151,14 @@ class Plus500Tests(unittest.TestCase):
         self.assertEqual(plus500.routing_priority(101, 7, 'سکوت', event)[1], LANE_ADMIN)
         self.assertIsNone(plus500.routing_priority(202, 42, 'ساکن', event))
         self.assertEqual(plus500.resolve(101, 'ساکن 10'), 'سکوت 10')
+        target_event = SimpleNamespace(
+            message=SimpleNamespace(message='ساکن', caption=None),
+            reply_to=SimpleNamespace(reply_to_msg_id=1234))
+        before = plus500.install_original_text(target_event, rewritten)
+        self.assertEqual(target_event.message.message, 'سکوت')
+        self.assertEqual(target_event.reply_to.reply_to_msg_id, 1234)
+        plus500.restore_original_text(target_event, before)
+        self.assertEqual(target_event.message.message, 'ساکن')
         core = (Path(__file__).resolve().parents[1] / 'core/bot_working_split_ok.py').read_text()
         self.assertLess(core.index('_plus_lane = plus500.routing_priority('),
                         core.index('decision = ingest_event(self, event)'))
@@ -181,9 +189,44 @@ class Plus500Tests(unittest.TestCase):
         self.assertIn('is_fast_moderation_command(_priority_alias_text)', core)
         self.assertIn('sender_id", None), _priority_alias_text)', core)
         source = (Path(__file__).resolve().parents[1] / 'handlers/message_handler.py').read_text()
-        self.assertLess(source.index('message_text = plus500.resolve('), source.index('Numeric timed mute uses'))
+        self.assertLess(source.index('_plus_original = plus500.resolve('), source.index('Numeric timed mute uses'))
         self.assertIn('duration_seconds=duration_minutes * 60', source)
         self.assertTrue(mh.is_fast_moderation_command('سکوت'))
+
+
+class Plus500SqlitePersistenceTests(unittest.TestCase):
+    def test_persists_per_group_after_database_reopen_and_reset_isolated(self):
+        from modules import runtime_db
+        with tempfile.TemporaryDirectory() as folder:
+            original_file, original_conn = runtime_db.DB_FILE, runtime_db._CONN
+            runtime_db.DB_FILE = Path(folder) / 'real.sqlite3'
+            runtime_db._CONN = None
+            plus500._SESSIONS.clear()
+            try:
+                with patch.object(plus500, 'get_group_owner', return_value=7):
+                    event = ReplyEvent()
+                    group = -1000023164149
+                    for word in ('plus500', 'اخراج', 'سیک'):
+                        self.assertTrue(asyncio.run(plus500.handle(
+                            event, group, 7, word)))
+                    runtime_db.kv_set('unrelated', 'setting', {'enabled': True})
+                    self.assertEqual(plus500.resolve(group, 'سیک'), 'اخراج')
+                    self.assertEqual(plus500.resolve(123456, 'سیک'), 'سیک')
+                    runtime_db._CONN.close()
+                    runtime_db._CONN = None  # simulate a fresh process
+                    plus500._SESSIONS.clear()
+                    self.assertEqual(plus500.resolve(23164149, 'سیک'), 'اخراج')
+                    self.assertTrue(asyncio.run(plus500.notify_old_command(
+                        ReplyEvent(), group, 42, 'اخراج')))
+                    asyncio.run(plus500.handle(event, group, 7, 'لغو plus500'))
+                    self.assertEqual(plus500.resolve(group, 'سیک'), 'سیک')
+                    self.assertEqual(runtime_db.kv_get('unrelated', 'setting'),
+                                     {'enabled': True})
+            finally:
+                if runtime_db._CONN is not None:
+                    runtime_db._CONN.close()
+                runtime_db.DB_FILE, runtime_db._CONN = original_file, original_conn
+                plus500._SESSIONS.clear()
 
 
 if __name__ == '__main__':
