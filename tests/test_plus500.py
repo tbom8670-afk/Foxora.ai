@@ -164,6 +164,31 @@ class Plus500Tests(unittest.TestCase):
                         core.index('decision = ingest_event(self, event)'))
         self.assertIn('priority, kind = _plus_lane', core)
 
+    def test_alias_runs_real_dispatch_with_original_text_and_reply_target(self):
+        self.run_message(ReplyEvent(), 101, 7, 'plus500')
+        self.run_message(ReplyEvent(), 101, 7, 'اخراج')
+        self.run_message(ReplyEvent(), 101, 7, 'سیکتیر')
+        canonical = plus500.resolve(101, 'سیکتیر')
+        self.assertEqual(canonical, 'اخراج')
+        event = SimpleNamespace(chat_id=101, is_private=False, sender_id=7,
+            message=SimpleNamespace(message='سیکتیر', caption=None, edit_date=None),
+            reply_to=SimpleNamespace(reply_to_msg_id=1234))
+        observed = []
+        async def original_pipeline(ev):
+            observed.append((ev.message.message, ev.reply_to.reply_to_msg_id,
+                             getattr(ev, '_plus500_alias_source', None)))
+            self.assertFalse(await plus500.notify_old_command(
+                ev, 101, 7, ev.message.message))
+            return 'executed'
+        result = asyncio.run(plus500.dispatch_as_original(
+            event, 'سیکتیر', canonical, original_pipeline))
+        self.assertEqual(result, 'executed')
+        self.assertEqual(observed, [('اخراج', 1234, 'سیکتیر')])
+        self.assertEqual(event.message.message, 'سیکتیر')
+        self.assertFalse(hasattr(event, '_plus500_alias_source'))
+        core = (Path(__file__).resolve().parents[1] / 'core/bot_working_split_ok.py').read_text()
+        self.assertIn('await plus500.dispatch_as_original(', core)
+
     def test_timed_mute_reuses_authorization_and_passes_duration(self):
         from tests.test_fast_moderation import User, Event, Bot
         sender, target = User(7, 'owner'), User(31, 'target')

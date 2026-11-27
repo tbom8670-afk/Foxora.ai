@@ -213,6 +213,24 @@ def restore_original_text(event, previous):
                 pass
 
 
+async def dispatch_as_original(event, source, original, handler):
+    """Run the existing pipeline as if it received the original command.
+
+    The original event/reply context is kept; its text is restored even if
+    the handler raises. No Plus500 handler executes the command itself.
+    """
+    previous = install_original_text(event, original)
+    event._plus500_alias_source = source
+    try:
+        return await handler(event)
+    finally:
+        restore_original_text(event, previous)
+        try:
+            del event._plus500_alias_source
+        except (AttributeError, TypeError):
+            pass
+
+
 def _valid_alias(chat_id, canonical, alias):
     if len(alias) < 2 or len(alias) > 48 or len(alias.split()) > 4:
         return "نام دستور باید بین ۲ تا ۴۸ نویسه و حداکثر چهار کلمه باشد."
@@ -283,6 +301,8 @@ async def notify_old_command(event, chat_id, user_id, text):
     """
     if chat_id is None or getattr(event, "is_private", False):
         return False
+    if getattr(event, "_plus500_alias_source", None) is not None:
+        return False  # Canonical text was installed for an alias; not an old command.
     if (getattr(event, "_is_edited_message", False)
             or getattr(event, "is_edit", False)
             or getattr(getattr(event, "message", None), "edit_date", None)):

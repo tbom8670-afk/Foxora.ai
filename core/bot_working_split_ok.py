@@ -3487,6 +3487,7 @@ class SoroushAntiSpamBot:
                 raw_text = ""
             chat_id = getattr(event, "chat_id", None)
             priority, kind = classify_priority(raw_text, event)
+            _plus_resolved = raw_text
             # Dynamically persisted aliases must be classified *before* the
             # normal/spam lane, which may discard them before the handler.
             if chat_id is not None and not getattr(event, "is_private", False):
@@ -3526,7 +3527,13 @@ class SoroushAntiSpamBot:
                 except Exception:
                     _game_token = None
                 try:
-                    await process_priority_command(event)
+                    if _plus_resolved != raw_text:
+                        await plus500.dispatch_as_original(
+                            event, raw_text, _plus_resolved,
+                            process_priority_command,
+                        )
+                    else:
+                        await process_priority_command(event)
                 finally:
                     if _game_token is not None:
                         try:
