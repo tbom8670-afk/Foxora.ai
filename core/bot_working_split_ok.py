@@ -2177,6 +2177,8 @@ class SoroushAntiSpamBot:
                     return
                 if restrict_hold:
                     pass
+                elif await plus500.notify_old_command(event, chat_id, sender_id, text):
+                    return
                 elif (is_fast_moderation_command(text)
                       and not plus500.is_awaiting(chat_id, sender_id)):
                     if await handle_fast_moderation_command(

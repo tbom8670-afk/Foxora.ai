@@ -63,6 +63,9 @@ class Plus500Tests(unittest.TestCase):
         self.assertEqual(plus500.resolve(101, 'ساکت 10'), 'سکوت 10')
         self.assertEqual(plus500.resolve(101, 'سکوت 10'), 'سکوت 10')
         self.assertEqual(plus500.resolve(202, 'ساکت 10'), 'ساکت 10')
+        self.assertFalse(plus500.is_awaiting(101, 7))
+        self.assertFalse(self.run_message(event, 101, 7, 'قفل'))
+        self.assertTrue(self.run_message(event, 101, 7, 'plus500'))
         self.assertTrue(self.run_message(event, 101, 7, 'قفل'))
         self.assertTrue(self.run_message(event, 101, 7, 'ساکت'))
         self.assertIn('قبلاً', event.replies[-1][0])
@@ -72,13 +75,48 @@ class Plus500Tests(unittest.TestCase):
         self.assertIn('تداخل', event.replies[-1][0])
         plus500._SESSIONS.clear()  # simulate restart: DB persists, session does not
         self.assertEqual(plus500.resolve(101, 'ساکت 10'), 'سکوت 10')
+        self.assertTrue(asyncio.run(plus500.notify_old_command(
+            ReplyEvent(), 101, 8, 'سکوت 10')))
         self.assertTrue(self.run_message(event, 101, 7, 'لغو plus500'))
         self.assertEqual(plus500.resolve(101, 'ساکت 10'), 'ساکت 10')
         self.assertFalse(self.data)
 
+    def test_after_rename_original_only_notifies_and_selection_is_explicit(self):
+        owner = ReplyEvent()
+        self.run_message(owner, 101, 7, 'plus500')
+        self.assertIn('اسم کدام دستور', owner.replies[-1][0])
+        self.run_message(owner, 101, 7, 'سکوت')
+        self.assertIn('نام جدید دستور را', owner.replies[-1][0])
+        self.run_message(owner, 101, 7, 'ساکت')
+        self.assertFalse(plus500.is_awaiting(101, 7))
+        self.assertFalse(self.run_message(owner, 101, 7, 'سکوت'))
+        notice = ReplyEvent()
+        self.assertTrue(asyncio.run(plus500.notify_old_command(
+            notice, 101, 7, 'سکوت')))
+        self.assertEqual(len(notice.replies), 1)
+        self.assertIn('مالک ثبت‌شده', notice.replies[0][0])
+        self.assertIn('ساکت', notice.replies[0][0])
+        def spans(kind):
+            raw = notice.replies[0][0].encode('utf-16-le')
+            return [raw[e.offset*2:(e.offset+e.length)*2].decode('utf-16-le')
+                    for e in notice.replies[0][1] if type(e).__name__ == kind]
+        self.assertIn('🔺 نام قبلی دستور : سکوت', spans('MessageEntityBlockquote'))
+        self.assertIn('🔺 نام جدید دستور : ساکت', spans('MessageEntityBlockquote'))
+        self.assertFalse(asyncio.run(plus500.notify_old_command(
+            ReplyEvent(), 101, 7, 'ساکت 10')))
+        self.assertFalse(asyncio.run(plus500.notify_old_command(
+            ReplyEvent(), 202, 7, 'سکوت')))
+        source = (Path(__file__).resolve().parents[1] / 'core/bot_working_split_ok.py').read_text()
+        self.assertLess(source.index('await plus500.notify_old_command('),
+                        source.index('elif (is_fast_moderation_command(text)'))
+        self.run_message(owner, 101, 7, 'لغو plus500')
+        self.assertFalse(asyncio.run(plus500.notify_old_command(
+            ReplyEvent(), 101, 7, 'سکوت')))
+
     def test_utf16_format_entities_and_admin_help(self):
         for payload in (plus500._prompt(), plus500._request_new('سکوت'),
-                        plus500._success('سکوت', 'ساکت'), plus500._reset()):
+                        plus500._success('سکوت', 'ساکت'),
+                        plus500._renamed_notice('سکوت', 'ساکت'), plus500._reset()):
             text, entities = payload
             encoded = text.encode('utf-16-le')
             for entity in entities:

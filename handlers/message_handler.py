@@ -4877,6 +4877,8 @@ async def handle_new_message(bot, event):
             try:
                 if await plus500.handle(event, chat_id, _plus_actor, message_text):
                     return
+                if await plus500.notify_old_command(event, chat_id, _plus_actor, message_text):
+                    return
                 message_text = plus500.resolve(chat_id, message_text)
             except Exception as plus_error:
                 bot.logger.log_error(

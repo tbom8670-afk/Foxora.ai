@@ -189,10 +189,10 @@ def _prompt():
 
 
 def _request_new(canonical):
-    heading = "🔺 نام دستور تغییر کرد"
+    heading = "🔺 نام قبلی دستور ثبت شد؛ حالا نام جدید دستور را بنویسید"
     previous = "نام قبلی : " + canonical
     new = "نام جدید :"
-    text = heading + "\n" + previous + "\n" + new + "\nلطفا نام جدید ارسال کنید"
+    text = heading + "\n" + previous + "\n" + new + "\nلطفاً نام جدید دستور را ارسال کنید"
     return _entities(text, bold_spans=(heading,), quotes=(previous, new))
 
 
@@ -201,6 +201,49 @@ def _success(canonical, alias):
     previous, new = "نام قبلی : " + canonical, "نام جدید : " + alias
     text = heading + "\n" + previous + "\n" + new + "\nاز این پس برای دستور «" + canonical + "» بنویسید " + alias
     return _entities(text, bold_spans=(heading,), quotes=(previous, new))
+
+
+def _renamed_notice(canonical, alias):
+    heading = "⚙️ این دستور توسط مالک ثبت‌شدهٔ گروه تغییر نام داده است"
+    previous = "🔺 نام قبلی دستور : " + canonical
+    new = "🔺 نام جدید دستور : " + alias
+    text = heading + "\n" + previous + "\n" + new + "\nلطفاً نام جدید را ارسال کنید"
+    return _entities(text, bold_spans=(heading,), quotes=(previous, new))
+
+
+async def notify_old_command(event, chat_id, user_id, text):
+    """The old spelling no longer runs; advertise the new spelling instead.
+
+    This is called before the fast moderation lane and the normal router.
+    The owner’s explicit Plus500 selection flow takes precedence.
+    """
+    if chat_id is None or getattr(event, "is_private", False):
+        return False
+    if (getattr(event, "_is_edited_message", False)
+            or getattr(event, "is_edit", False)
+            or getattr(getattr(event, "message", None), "edit_date", None)):
+        return False
+    if user_id is not None and is_awaiting(chat_id, user_id):
+        return False
+    value = normalize(text)
+    if value in (START, RESET):
+        return False
+    aliases = _aliases(chat_id)
+    if not aliases:
+        return False
+    commands = supported_commands()
+    # Longest original command wins: «سکوت نام» is not «سکوت» + argument.
+    matching = sorted((name for name in commands
+                       if value == name or value.startswith(name + " ")),
+                      key=len, reverse=True)
+    if not matching:
+        return False
+    canonical = matching[0]
+    alias = aliases.get(canonical)
+    if not alias:
+        return False
+    await _reply(event, _renamed_notice(canonical, alias))
+    return True
 
 
 def _reset():
@@ -255,6 +298,6 @@ async def handle(event, chat_id, user_id, text):
     aliases = _aliases(chat_id)
     aliases[canonical] = value
     runtime_db.kv_set(NAMESPACE, key[0], {"aliases": aliases})
-    _SESSIONS[key] = ("old", None, time.monotonic())
+    _SESSIONS.pop(key, None)  # End this rename; never mistake a command for another answer.
     await _reply(event, _success(canonical, value))
     return True
