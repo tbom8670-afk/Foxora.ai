@@ -9138,6 +9138,8 @@ async def handle_new_message(bot, event):
                 "📥 دانلود عکس مستقیم:\n"
                 "برای دانلود عکس به صورت مستقیم، بنویسید:\n"
                 "دانلود عکس\n\n"
+                "🏝️ برای دریافت پس زمینه و والپیپر بنویسید\n"
+                "پس زمینه\n\n"
 
                 "🎮 لیست بازی‌ها:\n\n"
                 "برای مشاهده بازی‌ها بنویسید:\n"
@@ -9320,6 +9322,7 @@ async def handle_new_message(bot, event):
                 "📥 دانلود عکس مستقیم:",
                 "برای دانلود عکس به صورت مستقیم، بنویسید:",
                 "دانلود عکس",
+                "🏝️ برای دریافت پس زمینه و والپیپر بنویسید",
                 "برای مشاهده بازی‌ها بنویسید:",
                 "برای بازی خصوصی و انلاین بنویسید",
                 "🧩 معما:\nبا ارسال «معما» یک معما از روی ایموجی‌ها شروع می‌شود.\nفقط خودت می‌توانی پاسخ دهی. زمان: ۴۰ ثانیه.\nپاسخ صحیح: ۳ سکه برنز.",
@@ -9419,6 +9422,18 @@ async def handle_new_message(bot, event):
                         )
                     )
                     search_from = pos + len(word)
+
+            # «پس زمینه» در توضیح هم آمده است. فقط خودِ خط دستور را
+            # جداگانه Bold کن تا entityها روی هم نیفتند.
+            background_heading = "🏝️ برای دریافت پس زمینه و والپیپر بنویسید"
+            background_block = background_heading + "\nپس زمینه"
+            background_at = help_text.find(background_block)
+            if background_at >= 0:
+                command_at = background_at + len(background_heading) + 1
+                entities.append(MessageEntityBold(
+                    offset=u16(help_text[:command_at]),
+                    length=u16("پس زمینه"),
+                ))
 
             admin_command_quotes = (
                 ("دیدن لیست ادمین‌ها\nبنویسید:\nلیست ادمین", "لیست ادمین"),

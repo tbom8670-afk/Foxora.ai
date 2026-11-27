@@ -776,6 +776,21 @@ def test_help_has_no_markdown_and_all_spans_fit():
         assert _spans(text, [entity], type(entity).__name__)[0] in text
 
 
+def test_user_list_background_label_and_command_are_real_bold():
+    text, entities = _help_output("لیست کاربران")
+    label = "🏝️ برای دریافت پس زمینه و والپیپر بنویسید"
+    block = label + "\nپس زمینه"
+    assert text.count(block) == 1
+    bolds = _spans(text, entities, "MessageEntityBold")
+    assert label in bolds
+    assert "پس زمینه" in bolds
+    raw = text.encode("utf-16-le")
+    assert all(0 <= e.offset and e.offset + e.length <= len(raw) // 2
+               for e in entities)
+    admin_text, _ = _help_output("لیست ادمینی")
+    assert block not in admin_text
+
+
 def test_user_list_help_does_not_show_admin_commands():
     text, _entities = _help_output("لیست کاربران")
     assert HELP_BLOCK not in text
