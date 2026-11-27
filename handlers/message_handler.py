@@ -3543,7 +3543,8 @@ async def send_activation_message(bot, event, chat_id, title):
             length=u16_length(activation_hint),
         ),
     ]
-    await event.respond(activation_text, formatting_entities=entities)
+    from handlers.command_photo_handler import send_activation
+    await send_activation(bot, event, activation_text, entities)
 
 
 # Owner/management commands that must not wait on the heavy group pipeline.
@@ -4868,6 +4869,16 @@ async def handle_new_message(bot, event):
                     bot, event, chat_id, background_actor, message_text):
                 return
 
+        # 🖼 عکسِ پاسخ دستور: فقط مالک اصلی عکس را ثبت می‌کند؛ کپشنِ
+        # ثبت‌شده جای متن خروجی دستور را نمی‌گیرد.
+        if not getattr(event, "is_private", False):
+            from handlers import command_photo_handler
+            photo_actor = (getattr(event, "sender_id", None)
+                           or getattr(getattr(event, "sender", None), "id", None))
+            if await command_photo_handler.handle_setup(
+                    bot, event, chat_id, photo_actor, message_text):
+                return
+
         # ⚙️ «محدودیت دستورات»: یک نقطهٔ مرکزی، پیش از همهٔ هندلرها و
         # مسیرهای سریع. بررسیِ اول فقط چند lookup در حافظه است.
         if not getattr(event, "is_private", False) and message_text:
@@ -6125,6 +6136,15 @@ async def handle_new_message(bot, event):
         # پیش‌تر این گیتِ دوم، فرمانی را که از گیت اول عبور کرده بود دوباره
         # می‌بلعید و «راهنما»/«روباه» هیچ‌وقت به handler نمی‌رسیدند.
         clean_text = normalize_command(message_text)
+        # Scope the photo to the command's first response on this event.
+        # Game timers and subsequent stage messages use the original sender.
+        if not getattr(event, "is_private", False) and not (
+                getattr(event, "is_edit", False)
+                or getattr(event, "_is_edited_message", False)
+                or getattr(event.message, "edit_date", None)
+                or is_game_answer_active(chat_id, user_id)):
+            from handlers.command_photo_handler import install_on_event
+            install_on_event(bot, event, clean_text)
 
         # 👑 مسیر مستقل ادمینِ واقعیِ همین گروه، پیش از تطبیقِ پیشوندیِ
         # «لغو ادمین» قدیمی (که فقط admins.json ربات را تغییر می‌دهد).
