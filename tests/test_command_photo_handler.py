@@ -86,6 +86,31 @@ class PhotoTests(unittest.TestCase):
             self.assertIsNone(photos.photo_for('بازی'))
         asyncio.run(run())
 
+    def test_core_fast_owner_register_group_uses_photo(self):
+        from handlers import message_handler as handler
+        from unittest.mock import AsyncMock
+
+        async def run():
+            runtime_db.kv_set(photos.NAMESPACE, 'ثبت گروه',
+                              {'source': {'chat_id': 'me', 'message_id': 101}})
+            self.bot.client.archive[101] = SimpleNamespace(photo=object(), media=None)
+            self.bot.logger.log_info = lambda _: None
+            event = Event(-1005432, 7, 'ثبت گروه')
+            with (patch.object(handler, 'is_global_owner', return_value=True),
+                  patch.object(handler, '_fast_owner_chat', new_callable=AsyncMock,
+                               return_value=(SimpleNamespace(title='تست'), event.chat_id, 'تست')),
+                  patch.object(handler, '_group_main_owner_display', new_callable=AsyncMock,
+                               return_value='مالک'),
+                  patch.object(handler, 'activate_group')):
+                result = await handler.handle_fast_owner_command(self.bot, event, 'ثبت گروه')
+            self.assertTrue(result)
+            self.assertEqual(event.replies, [])
+            sent = self.bot.client.sent[-1]
+            self.assertEqual(sent[0], event.chat_id)
+            self.assertIn('ثبت شد', sent[2]['caption'])
+            self.assertEqual(sent[2]['reply_to'], event.message.id)
+        asyncio.run(run())
+
     def test_activation_entities_and_missing_media_fallback(self):
         async def run():
             runtime_db.kv_set(photos.NAMESPACE, 'فعال سازی', {'source': {'chat_id': 'me', 'message_id': 101}})

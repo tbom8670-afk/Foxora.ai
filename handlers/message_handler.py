@@ -3661,6 +3661,15 @@ async def handle_fast_owner_command(bot, event, text=None):
         f"user_id={user_id}",
     )
     owner = is_global_owner(user_id)
+    # These five commands bypass handle_new_message in the core fast lane.
+    # Install their photo here, before the original reply, in BOTH entry paths.
+    # Activation uses send_activation_message's own formatted-media sender.
+    if owner and text != "فعال سازی" and not (
+            getattr(event, "is_edit", False)
+            or getattr(event, "_is_edited_message", False)
+            or getattr(getattr(event, "message", None), "edit_date", None)):
+        from handlers.command_photo_handler import install_on_event
+        install_on_event(bot, event, text)
 
     async def finish(replied=True):
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -3879,6 +3888,14 @@ async def handle_fast_moderation_command(
                 bot.logger.log_error(f"FAST MSG LIMIT OBSERVE FAILED: {_ml_fast_err!r}")
             except Exception:
                 pass
+
+    # The core executes these commands before handle_new_message too; keep
+    # the original asynchronous reply/notice on the same media message.
+    if not (getattr(event, "is_edit", False)
+            or getattr(event, "_is_edited_message", False)
+            or getattr(getattr(event, "message", None), "edit_date", None)):
+        from handlers.command_photo_handler import install_on_event
+        install_on_event(bot, event, clean_text)
 
     if clean_text in {"قفل", "باز"}:
         action = "lock" if clean_text == "قفل" else "unlock"
