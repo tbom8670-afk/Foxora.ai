@@ -8,6 +8,7 @@ from modules.admin_storage import is_admin, add_admin, remove_admin
 from modules.riddles import new_riddle, check_answer, get_answer
 from modules.spam_history import get_user_history, clear_user as clear_spam_history
 from modules import message_tracker
+from modules import plus500
 from modules.group_id import normalize_group_id
 from modules.group_stats import add_message, add_deleted, add_kick, add_mute, make_report
 from modules import ConfigManager, SpamDetector, BotLogger, UserTracker, AdminActions
@@ -2176,7 +2177,8 @@ class SoroushAntiSpamBot:
                     return
                 if restrict_hold:
                     pass
-                elif is_fast_moderation_command(text):
+                elif (is_fast_moderation_command(text)
+                      and not plus500.is_awaiting(chat_id, sender_id)):
                     if await handle_fast_moderation_command(
                         self, event, text, sender
                     ):
@@ -2305,7 +2307,8 @@ class SoroushAntiSpamBot:
                         f"chat_id={getattr(event, 'chat_id', None)} "
                         f"error={_entry_error!r}"
                     )
-                raw_text = event.message.message or ""
+                raw_text = (getattr(event.message, "message", None)
+                            or getattr(event.message, "caption", None) or "")
                 command_priority_text = normalize_command_text(raw_text)
                 command_priority = command_priority_text in {
                     "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",

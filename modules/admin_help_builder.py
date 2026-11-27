@@ -38,7 +38,7 @@ READY_BLOCK = object()
 #: به‌صورت ۳۲/۳۲ تقسیم می‌شوند تا بلوک تازه داخل پیام دوم بماند.
 #: سقف واقعی سرور و نمایش ۳۲ نقل‌قول هنوز نیازمند آزمون زنده است؛
 #: این عدد تضمین سازگاری همهٔ نسخه‌های سروش نیست.
-MAX_QUOTES_PER_MESSAGE = 32
+MAX_QUOTES_PER_MESSAGE = 24
 MAX_UNITS_PER_MESSAGE = 3500
 
 
@@ -393,6 +393,12 @@ def _admin_rows():
         MessageEntityBold(offset=add_offset, length=_u16(group_admin_add)),
         MessageEntityBold(offset=remove_offset, length=_u16(group_admin_remove)),
     ]))
+
+    # 📓 Plus500 is part of the admin command list, not a standalone reply.
+    # Both bold commands share exactly one genuine Soroush blockquote.
+    add_item("📓 برای تغییر نام دستورات ربات بنویسید",
+             ["برای فعال سازی : plus500", "خاموش کردن : لغو plus500"],
+             bold_cmds=True, quote=True)
 
     contact = "تماس با سازنده : @OSINE2"
     rows.append((contact, [
