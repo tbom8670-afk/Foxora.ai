@@ -36,6 +36,12 @@ class Client:
         return SimpleNamespace(id=202)
     async def get_messages(self, target, ids):
         return self.archive.get(ids) if target == 'me' else None
+    async def send_message(self, target, text, **kwargs):
+        self.sent.append((target, None, {"text": text, **kwargs}))
+        return SimpleNamespace(id=203)
+    async def edit_message(self, target, mid, text, **kwargs):
+        self.sent.append((target, "edit", {"mid": mid, "text": text, **kwargs}))
+        return SimpleNamespace(id=mid)
 
 
 class PhotoTests(unittest.TestCase):
@@ -110,6 +116,55 @@ class PhotoTests(unittest.TestCase):
             self.assertIn('ثبت شد', sent[2]['caption'])
             self.assertEqual(sent[2]['reply_to'], event.message.id)
         asyncio.run(run())
+
+    def test_protocol_activation_keeps_photo_and_updates_caption(self):
+        from modules.virtual_protocol_ui import activate, deactivate
+        class Service:
+            def __init__(self, bot):
+                self.bot = bot
+                self.groups = {}
+                self.activations = {}
+            async def toggle(self, group, enabled):
+                if enabled:
+                    self.groups[str(group)] = 1
+                else:
+                    self.groups.pop(str(group), None)
+
+        async def run():
+            runtime_db.kv_set(photos.NAMESPACE, 'پروتکل روشن',
+                              {'source': {'chat_id': 'me', 'message_id': 101}})
+            self.bot.client.archive[101] = SimpleNamespace(photo=object(), media=None)
+            service = Service(self.bot)
+            event = SimpleNamespace(chat_id=-1000000000007, sender_id=7,
+                                    sender=SimpleNamespace(username='owner'))
+            await activate(service, event, step_seconds=.001)
+            self.assertEqual(service.groups.get('7'), 1)
+            sent = self.bot.client.sent
+            self.assertEqual(sent[0][0], event.chat_id)
+            self.assertIsNotNone(sent[0][1])
+            self.assertIn('پروتکل روباه در حال فعال سازی', sent[0][2]['caption'])
+            self.assertEqual(sent[-1][1], 'edit')
+            self.assertIn('امـنیتی', sent[-1][2]['text'])
+            self.assertEqual(sent[-1][2]['mid'], 202)
+            # Repeat uses cached media; no extra get_messages RPC is needed.
+            with patch.object(self.bot.client, 'get_messages', side_effect=AssertionError('slow fetch')):
+                await activate(service, event, step_seconds=.001)
+            self.assertIsNotNone(sent[-1][1])
+            setup = Event(event.chat_id, 7, 'تنظیم عکس پروتکل خاموش')
+            image = Event(event.chat_id, 7, 'caption ignored', photo=True, mid=67)
+            self.assertTrue(await photos.handle_setup(self.bot, setup, event.chat_id,
+                                                      7, setup.message.message))
+            self.assertTrue(await photos.handle_setup(self.bot, image, event.chat_id,
+                                                      7, image.message.message))
+            await deactivate(service, event)
+            self.assertEqual(sent[-1][2]['caption'], '🔺 پروتکل امنیتی روباه خاموش شد')
+        asyncio.run(run())
+
+    def test_unconfigured_commands_do_not_query_sqlite(self):
+        photos.warm_config()
+        with patch.object(runtime_db, 'query_all', side_effect=AssertionError('per-message DB read')):
+            for _ in range(1000):
+                self.assertIsNone(photos.photo_for('دستور بدون عکس'))
 
     def test_activation_entities_and_missing_media_fallback(self):
         async def run():

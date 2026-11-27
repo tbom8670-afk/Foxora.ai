@@ -11,9 +11,16 @@ from modules.user_display import format_user
 LOG = logging.getLogger(__name__)
 
 
-async def send(bot, peer, payload, ttl=None):
+async def send(bot, peer, payload, ttl=None, *, command=None):
     text, entities = payload
-    sent = await bot.client.send_message(peer, text, formatting_entities=entities, parse_mode=None)
+    sent, photo_sent = (None, False)
+    if command is not None:
+        from handlers.command_photo_handler import send_command_photo
+        sent, photo_sent = await send_command_photo(
+            bot, peer, command, text, entities, parse_mode=None)
+    if not photo_sent:
+        sent = await bot.client.send_message(
+            peer, text, formatting_entities=entities, parse_mode=None)
     if ttl is not None:
         cleanup = getattr(bot, 'notice_cleanup', None)
         scheduled = False
@@ -59,10 +66,10 @@ async def activate(service, event, *, step_seconds=1.0):
     bot = service.bot
     try:
         if service.groups.get(group):
-            await send(bot, peer, texts.enabled(group, await user_label(bot, getattr(event, 'sender_id', None), event)))
+            await send(bot, peer, texts.enabled(group, await user_label(bot, getattr(event, 'sender_id', None), event)), command="پروتکل روشن")
             return
         # The first square is displayed immediately, then 19 incremental edits.
-        sent = await send(bot, peer, texts.progress(1))
+        sent = await send(bot, peer, texts.progress(1), command="پروتکل روشن")
         mid = extract_sent_id(sent)
         if not mid:
             return
@@ -113,6 +120,6 @@ async def deactivate(service, event):
             pass
     await service.toggle(group, False)
     try:
-        await send(service.bot, event_peer(event), texts.disabled())
+        await send(service.bot, event_peer(event), texts.disabled(), command="پروتکل خاموش")
     except Exception:
         LOG.exception('virtual protocol deactivation notice failed')

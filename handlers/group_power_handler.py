@@ -199,6 +199,15 @@ async def handle_group_power(bot, event, owner_id, text):
     is_new_command = bool(
         match_list_command(normalized) or parse_power_command(normalized)
     )
+    # This command family is consumed by the core before the normal message
+    # handler; only the initial command reply (never the follow-up reason)
+    # should carry its owner-configured image.
+    if is_new_command and not getattr(event, "is_private", False) and not (
+            getattr(event, "is_edit", False)
+            or getattr(event, "_is_edited_message", False)
+            or getattr(getattr(event, "message", None), "edit_date", None)):
+        from handlers.command_photo_handler import install_on_event
+        install_on_event(bot, event, normalized)
     if session is not None and not is_new_command:
         if str(session["chat_key"]) != chat_key:
             return False

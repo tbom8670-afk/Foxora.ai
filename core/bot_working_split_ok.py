@@ -1343,6 +1343,10 @@ class SoroushAntiSpamBot:
         self.outgoing_sender = install_outgoing_sender(
             self.client, self, self.logger
         )
+        # Prime the command-photo index once at boot. Ordinary commands must
+        # never pay a SQLite query merely to discover they have no photo.
+        from handlers.command_photo_handler import warm_config as _warm_command_photos
+        _warm_command_photos()
         # One process-wide watchdog: any AWAIT START without a terminal line
         # after (deadline + grace) is logged and its inner RPC task cancelled.
         policy = self._rpc_policy()
