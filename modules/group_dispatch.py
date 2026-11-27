@@ -115,6 +115,7 @@ _ADMIN_EXACT = frozenset({
     "ریست آمار", "ریست اخراجی ها",
     "حذف اخطار", "حذف اخطارها",
     "اطلاع رسانی", "تایید", "✅ تایید", "لغو", "❌ لغو",
+    "تنظیم پس زمینه",
     "لیست ادمین", "لیست ادمینی", "تگ ادمین ها",
     "سنجاق",
     "فعال کلمات ممنوعه", "لغو کلمات ممنوعه",
@@ -167,7 +168,7 @@ _ADMIN_PREFIXES = (
 
 # Public / user commands.  Checked only after admin so «ثبت ادمین» stays admin.
 _COMMAND_EXACT = frozenset({
-    "راهنما", "help",
+    "راهنما", "help", "پس زمینه",
     "لیست بازی", "لیست بازی ها", "لیست بازی‌ها", "بازی ها", "بازی‌ها",
     "لیست کاربران",
     "موجودی", "فروشگاه", "انتقال سکه",
@@ -238,6 +239,8 @@ def classify_priority(text, event=None):
     if _is_active_group_shutdown_input(event):
         return PRIORITY_ADMIN, LANE_ADMIN
     if _is_active_group_admin_input(event):
+        return PRIORITY_ADMIN, LANE_ADMIN
+    if _is_active_background_input(event):
         return PRIORITY_ADMIN, LANE_ADMIN
     if raw.startswith(_COMMAND_PREFIXES):
         return PRIORITY_COMMAND, LANE_COMMAND
@@ -324,6 +327,18 @@ def _is_active_group_admin_input(event):
     try:
         from handlers import group_admin_handler
         return group_admin_handler.is_awaiting(chat_id, user_id)
+    except Exception:
+        return False
+
+
+def _is_active_background_input(event):
+    """The global owner's pending photo must not be lost on the normal lane."""
+    if event is None or getattr(event, "is_private", False):
+        return False
+    try:
+        from handlers import background_handler
+        return background_handler.is_awaiting(
+            getattr(event, "chat_id", None), _event_user_id(event))
     except Exception:
         return False
 

@@ -4858,6 +4858,16 @@ async def handle_new_message(bot, event):
                     f"chat_id={chat_id} error={warning_drop_error!r}"
                 )
 
+        # 🖼 Public group backgrounds and global-owner photo registration.
+        # Route before generic text/media handlers; no other command changes.
+        if not getattr(event, "is_private", False):
+            from handlers import background_handler
+            background_actor = (getattr(event, "sender_id", None)
+                                or getattr(getattr(event, "sender", None), "id", None))
+            if await background_handler.handle(
+                    bot, event, chat_id, background_actor, message_text):
+                return
+
         # ⚙️ «محدودیت دستورات»: یک نقطهٔ مرکزی، پیش از همهٔ هندلرها و
         # مسیرهای سریع. بررسیِ اول فقط چند lookup در حافظه است.
         if not getattr(event, "is_private", False) and message_text:
