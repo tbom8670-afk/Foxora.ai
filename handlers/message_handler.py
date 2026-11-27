@@ -4840,14 +4840,9 @@ async def handle_new_message(bot, event):
             f"text={message_text!r}"
         )
         # برای کپشن عکس/فایل هم چک کن
-        if not message_text and hasattr(
-                event.message, 'file') and event.message.file:
-            # اگر فایل دارد، نام فایل یا کپشن را چک کن
-            try:
-                caption = getattr(event.message, 'caption', None) or ""
-                message_text = caption
-            except BaseException:
-                pass
+        if not message_text:
+            # Some SPlusthon photo updates expose only caption (no .file).
+            message_text = getattr(event.message, 'caption', None) or ""
 
         # Independent five-minute native-admin warning consequence. This is
         # before owner/command/game/profile/media shortcuts, so no later

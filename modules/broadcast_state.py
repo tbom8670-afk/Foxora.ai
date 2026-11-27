@@ -36,6 +36,7 @@ def _load_pending():
                     "phase": phase,
                     "text": state.get("text", ""),
                     "entities": [],
+                    "media_ref": state.get("media_ref"),
                     # مبدأ session (کلید گروه) — None یعنی پیوی مثل قبل.
                     "origin": state.get("origin"),
                 }
@@ -57,6 +58,7 @@ def _save_pending():
                     # Entities are process-local API objects; text and phase
                     # are the durable recovery contract.
                     "entities": [],
+                    "media_ref": state.get("media_ref"),
                     "origin": state.get("origin"),
                 }
                 for owner, state in _PENDING_BROADCASTS.items()
@@ -161,7 +163,7 @@ def get(owner_id):
     return _PENDING_BROADCASTS.get(str(owner_id))
 
 
-def set_message(owner_id, text, entities=None):
+def set_message(owner_id, text, entities=None, media=None, media_ref=None):
     """Store the announcement body together with its formatting entities."""
     # Keep entities in RAM for the current workflow; _save_pending strips
     # non-JSON API objects while persisting the durable text/phase.
@@ -170,6 +172,9 @@ def set_message(owner_id, text, entities=None):
         "phase": "awaiting_confirmation",
         "text": text,
         "entities": list(entities) if entities else [],
+        # Keep the photo in memory; source ids allow re-fetch after a restart.
+        "media": media,
+        "media_ref": media_ref,
     }
     if previous.get("origin") is not None:
         state["origin"] = previous["origin"]

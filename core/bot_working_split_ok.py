@@ -2305,7 +2305,8 @@ class SoroushAntiSpamBot:
                         f"chat_id={getattr(event, 'chat_id', None)} "
                         f"error={_entry_error!r}"
                     )
-                raw_text = event.message.message or ""
+                raw_text = (getattr(event.message, "message", None)
+                            or getattr(event.message, "caption", None) or "")
                 command_priority_text = normalize_command_text(raw_text)
                 command_priority = command_priority_text in {
                     "راهنما", "لیست بازی", "لیست بازی ها", "لیست بازی‌ها",
